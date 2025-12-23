@@ -1,127 +1,220 @@
-﻿//Services/AuthService.cs
+﻿using Microsoft.AspNetCore.Identity;
 using Microsoft.Extensions.Options;
 using MongoDB.Driver;
-using tdtd_be.Caching;
-using tdtd_be.Common.Exceptions;
-using tdtd_be.Common.Security;
+using tdtd_be.Common.Cache;
 using tdtd_be.Data;
+using tdtd_be.Data.Infrastructure;
+using tdtd_be.DTOs;
 using tdtd_be.DTOs.Auth;
 using tdtd_be.Models;
 using tdtd_be.Options;
+
 namespace tdtd_be.Services
 {
     public sealed class AuthService
     {
-        private readonly MongoDbContext _db;
-        private readonly IJwtService _jwt;
-        private readonly JwtOptions _jwtOpt;
-        private readonly IAppCache _cache;
+        private readonly MongoDbContext _ctx;
+        private readonly IOptions<MongoOptions> _opt;
+        private readonly JwtService _jwt;
+        private readonly RedisUserCache _cache;
+        private readonly PasswordHasher<AppUser> _hasher = new();
 
-        public AuthService(MongoDbContext db, IJwtService jwt, IOptions<JwtOptions> jwtOpt, IAppCache cache)
+        public AuthService(
+            MongoDbContext ctx,
+            IOptions<MongoOptions> opt,
+            JwtService jwt,
+            RedisUserCache cache
+        )
         {
-            _db = db;
+            _ctx = ctx;
+            _opt = opt;
             _jwt = jwt;
-            _jwtOpt = jwtOpt.Value;
             _cache = cache;
         }
 
-        public async Task<TokenResponse> LoginAsync(LoginRequest req, CancellationToken ct)
+        private IMongoCollection<AppUser> Users => _ctx.Users;
+        private IMongoCollection<RefreshTokenDoc> RefreshTokens => _ctx.RefreshTokens;
+
+        public async Task<(AuthResponse resp, string refreshRaw)> SignUpAsync(SignUpRequest req, CancellationToken ct)
         {
-            if (string.IsNullOrWhiteSpace(req.Username) || string.IsNullOrWhiteSpace(req.Password))
-                throw AppException.BadRequest("Thiếu Username/Password.");
+            var username = req.Username?.Trim();
+            if (string.IsNullOrWhiteSpace(username))
+                throw new InvalidOperationException("Username không hợp lệ.");
 
-            // Anti brute-force (nhẹ)
-            var failKey = CacheKeys.LoginFail(req.Username);
-            var failCount = await _cache.GetAsync<int>(failKey, ct);
-            if (failCount >= 8)
-                throw new AppException(429, "TOO_MANY_ATTEMPTS", "Thử lại sau (tạm khóa 15 phút).");
+            // friendly check (unique index vẫn là tuyến cuối)
+            var exists = await Users.Find(x => x.Username == username).AnyAsync(ct);
+            if (exists) throw new InvalidOperationException("Username đã tồn tại.");
 
-            // Cache user theo username 2 phút
-            var userKey = CacheKeys.UserByUsername(req.Username);
-            var user = await _cache.GetAsync<AppUser>(userKey, ct);
-
-            if (user is null)
+            var user = new AppUser
             {
-                user = await _db.Users.Find(x => x.Username == req.Username).FirstOrDefaultAsync(ct);
-                if (user is not null)
-                    await _cache.SetAsync(userKey, user, TimeSpan.FromMinutes(2), ct);
+                Username = username,
+                FullName = string.IsNullOrWhiteSpace(req.FullName) ? username : req.FullName.Trim(),
+                UnitTypeId = new List<string>(),
+                UnitId = "",
+                UnitName = "",
+                Roles = new List<string>(),
+                IsActive = true,
+                CreatedAt = DateTime.UtcNow
+            };
+
+            user.PasswordHash = _hasher.HashPassword(user, req.Password);
+
+            try
+            {
+                await Users.InsertOneAsync(user, cancellationToken: ct);
+            }
+            catch (MongoWriteException ex) when (ex.WriteError.Category == ServerErrorCategory.DuplicateKey)
+            {
+                throw new InvalidOperationException("Username đã tồn tại.");
             }
 
-            if (user is null || !user.IsActive || !PasswordHasher.Verify(req.Password, user.PasswordHash))
+            return await IssueTokensAsync(user, ct);
+        }
+
+        public async Task<(AuthResponse resp, string refreshRaw)> LoginAsync(LoginRequest req, CancellationToken ct)
+        {
+            var key = req.Username?.Trim();
+            if (string.IsNullOrWhiteSpace(key))
+                throw new InvalidOperationException("Sai tài khoản hoặc mật khẩu.");
+
+            var user = await Users.Find(x => x.Username == key).FirstOrDefaultAsync(ct);
+            if (user is null) throw new InvalidOperationException("Sai tài khoản hoặc mật khẩu.");
+
+            var vr = _hasher.VerifyHashedPassword(user, user.PasswordHash, req.Password);
+            if (vr == PasswordVerificationResult.Failed)
+                throw new InvalidOperationException("Sai tài khoản hoặc mật khẩu.");
+
+            if (!user.IsActive)
+                throw new InvalidOperationException("Tài khoản đang bị khóa.");
+
+            return await IssueTokensAsync(user, ct);
+        }
+
+        public async Task<(AuthResponse resp, string refreshRaw)> RefreshAsync(string refreshRaw, CancellationToken ct)
+        {
+            if (string.IsNullOrWhiteSpace(refreshRaw))
+                throw new InvalidOperationException("Refresh token không hợp lệ hoặc đã hết hạn.");
+
+            var hash = _jwt.Sha256(refreshRaw);
+
+            var tokenDoc = await RefreshTokens.Find(x => x.TokenHash == hash).FirstOrDefaultAsync(ct);
+            if (tokenDoc is null || !tokenDoc.IsActive)
+                throw new InvalidOperationException("Refresh token không hợp lệ hoặc đã hết hạn.");
+
+            var user = await Users.Find(x => x.Id == tokenDoc.UserId).FirstOrDefaultAsync(ct);
+            if (user is null) throw new InvalidOperationException("User không tồn tại.");
+            if (!user.IsActive) throw new InvalidOperationException("Tài khoản đang bị khóa.");
+
+            // rotation: revoke old + issue new
+            var newRefreshRaw = _jwt.CreateRefreshTokenRaw();
+            var newHash = _jwt.Sha256(newRefreshRaw);
+
+            tokenDoc.RevokedAt = DateTime.UtcNow;
+            tokenDoc.ReplacedByTokenHash = newHash;
+            await RefreshTokens.ReplaceOneAsync(x => x.Id == tokenDoc.Id, tokenDoc, cancellationToken: ct);
+
+            var newDoc = new RefreshTokenDoc
             {
-                await _cache.SetAsync(failKey, failCount + 1, TimeSpan.FromMinutes(15), ct);
-                throw AppException.Unauthorized("Sai tài khoản hoặc mật khẩu.");
-            }
+                UserId = user.Id,
+                TokenHash = newHash,
+                CreatedAt = DateTime.UtcNow,
+                ExpiresAt = DateTime.UtcNow.AddDays(_jwt.RefreshTokenDays())
+            };
+            await RefreshTokens.InsertOneAsync(newDoc, cancellationToken: ct);
 
-            // clear fail
-            await _cache.RemoveAsync(failKey, ct);
+            // tv + cache me
+            await _cache.EnsureTokenVersionAsync(user.Id);
+            var tv = await _cache.GetTokenVersionAsync(user.Id);
 
-            var accessToken = _jwt.CreateAccessToken(user);
+            var access = _jwt.CreateAccessToken(user, tv);
+            var me = ToMeResponse(user);
 
-            // refresh token: lưu HASH vào Mongo (raw trả về client)
+            await _cache.SetMeAsync(me);
+
+            var resp = new AuthResponse(
+                AccessToken: access.token,
+                ExpiresInSeconds: _jwt.AccessTokenExpiresInSeconds(),
+                User: me
+            );
+
+            return (resp, newRefreshRaw);
+        }
+
+        public async Task LogoutAsync(string refreshRaw, CancellationToken ct)
+        {
+            if (string.IsNullOrWhiteSpace(refreshRaw)) return;
+
+            var hash = _jwt.Sha256(refreshRaw);
+
+            var tokenDoc = await RefreshTokens.Find(x => x.TokenHash == hash).FirstOrDefaultAsync(ct);
+            if (tokenDoc is null) return;
+
+            tokenDoc.RevokedAt = DateTime.UtcNow;
+            await RefreshTokens.ReplaceOneAsync(x => x.Id == tokenDoc.Id, tokenDoc, cancellationToken: ct);
+        }
+
+        // gọi khi khóa user/đổi roles/unit/reset password...
+        public async Task RevokeUserSessionsAsync(string userId, CancellationToken ct)
+        {
+            await _cache.BumpTokenVersionAsync(userId);
+            await _cache.DeleteMeAsync(userId);
+
+            await RefreshTokens.UpdateManyAsync(
+                x => x.UserId == userId && x.RevokedAt == null,
+                Builders<RefreshTokenDoc>.Update.Set(x => x.RevokedAt, DateTime.UtcNow),
+                cancellationToken: ct
+            );
+        }
+
+        private async Task<(AuthResponse resp, string refreshRaw)> IssueTokensAsync(AppUser user, CancellationToken ct)
+        {
+            if (!user.IsActive) throw new InvalidOperationException("Tài khoản đang bị khóa.");
+
+            // create refresh
             var refreshRaw = _jwt.CreateRefreshTokenRaw();
-            var refreshHash = TokenHashing.Sha256(refreshRaw);
+            var refreshHash = _jwt.Sha256(refreshRaw);
 
             var rt = new RefreshTokenDoc
             {
                 UserId = user.Id,
                 TokenHash = refreshHash,
-                ExpiresAt = DateTime.UtcNow.AddDays(_jwtOpt.RefreshTokenDays),
+                CreatedAt = DateTime.UtcNow,
+                ExpiresAt = DateTime.UtcNow.AddDays(_jwt.RefreshTokenDays())
             };
-            await _db.RefreshTokens.InsertOneAsync(rt, cancellationToken: ct);
 
-            // cache user by id 30 phút (để phục vụ middleware/service khác)
-            await _cache.SetAsync(CacheKeys.UserById(user.Id), new
-            {
-                user.Id,
-                user.FullName,
-                user.JobTitle,
-                user.UnitId,
-                user.UnitName,
-                user.Roles
-            }, TimeSpan.FromMinutes(30), ct);
+            await RefreshTokens.InsertOneAsync(rt, cancellationToken: ct);
 
-            return new TokenResponse(accessToken, refreshRaw);
+            // tv + access token
+            await _cache.EnsureTokenVersionAsync(user.Id);
+            var tv = await _cache.GetTokenVersionAsync(user.Id);
+
+            var access = _jwt.CreateAccessToken(user, tv);
+
+            // cache me
+            var me = ToMeResponse(user);
+            await _cache.SetMeAsync(me);
+
+            var resp = new AuthResponse(
+                AccessToken: access.token,
+                ExpiresInSeconds: _jwt.AccessTokenExpiresInSeconds(),
+                User: me
+            );
+
+            return (resp, refreshRaw);
         }
 
-        // (Tuỳ chọn) refresh rotate chuẩn
-        public async Task<TokenResponse> RefreshAsync(RefreshRequest req, CancellationToken ct)
+        private static MeResponse ToMeResponse(AppUser u)
         {
-            if (string.IsNullOrWhiteSpace(req.RefreshToken))
-                throw AppException.BadRequest("Thiếu refreshToken.");
-
-            var oldHash = TokenHashing.Sha256(req.RefreshToken);
-
-            var old = await _db.RefreshTokens
-                .Find(x => x.TokenHash == oldHash && x.RevokedAt == null && x.ExpiresAt > DateTime.UtcNow)
-                .FirstOrDefaultAsync(ct);
-
-            if (old is null) throw AppException.Unauthorized("Refresh token không hợp lệ/hết hạn.");
-
-            var user = await _db.Users.Find(x => x.Id == old.UserId).FirstOrDefaultAsync(ct);
-            if (user is null || !user.IsActive) throw AppException.Unauthorized("User không hợp lệ.");
-
-            // rotate
-            var newRaw = _jwt.CreateRefreshTokenRaw();
-            var newHash = TokenHashing.Sha256(newRaw);
-
-            var now = DateTime.UtcNow;
-            var updateOld = Builders<RefreshTokenDoc>.Update
-                .Set(x => x.RevokedAt, now)
-                .Set(x => x.ReplacedByTokenHash, newHash);
-
-            await _db.RefreshTokens.UpdateOneAsync(x => x.Id == old.Id, updateOld, cancellationToken: ct);
-
-            await _db.RefreshTokens.InsertOneAsync(new RefreshTokenDoc
-            {
-                UserId = user.Id,
-                TokenHash = newHash,
-                ExpiresAt = now.AddDays(_jwtOpt.RefreshTokenDays),
-                CreatedAt = now
-            }, cancellationToken: ct);
-
-            var access = _jwt.CreateAccessToken(user);
-            return new TokenResponse(access, newRaw);
+            return new MeResponse(
+                id: u.Id,
+                username: u.Username ?? "",
+                fullName: u.FullName ?? "",
+                unitTypeId: u.UnitTypeId ?? new List<string>(),
+                unitId: u.UnitId ?? "",
+                unitName: u.UnitName ?? "",
+                roles: u.Roles ?? new List<string>(),
+                isActive: u.IsActive
+            );
         }
     }
 }

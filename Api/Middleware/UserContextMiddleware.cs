@@ -1,6 +1,7 @@
 ﻿//Middleware/UserContextMiddleware.cs
 using System.Security.Claims;
 using tdtd_be.Common;
+using tdtd_be.DTOs.Auth;
 namespace tdtd_be.Middleware
 {
     public sealed class UserContextMiddleware : IMiddleware
@@ -10,17 +11,14 @@ namespace tdtd_be.Middleware
 
         public async Task InvokeAsync(HttpContext context, RequestDelegate next)
         {
-            var user = context.User;
-            if (user?.Identity?.IsAuthenticated == true)
+            if (context.Items.TryGetValue("me", out var obj) && obj is MeResponse me)
             {
-                _ctx.UserId = user.FindFirstValue(ClaimTypes.NameIdentifier) ?? user.FindFirstValue("sub");
-                _ctx.FullName = user.FindFirstValue("name") ?? user.FindFirstValue(ClaimTypes.Name);
-
-                _ctx.JobTitle = user.FindFirstValue(AppClaimTypes.JobTitle);
-                _ctx.UnitId = user.FindFirstValue(AppClaimTypes.UnitId);
-                _ctx.UnitName = user.FindFirstValue(AppClaimTypes.UnitName);
-
-                _ctx.Roles = user.FindAll(ClaimTypes.Role).Select(x => x.Value).Distinct().ToList();
+                _ctx.UserId = me.Id;
+                _ctx.FullName = me.FullName;
+                _ctx.UnitId = me.UnitId;
+                _ctx.UnitName = me.UnitName;
+                _ctx.UnitTypeId = me.UnitTypeId;
+                _ctx.Roles = me.Roles ?? new List<string>();
             }
 
             await next(context);

@@ -3,22 +3,36 @@ namespace tdtd_be.Models
 {
     using MongoDB.Bson;
     using MongoDB.Bson.Serialization.Attributes;
+    using tdtd_be.Data.Infrastructure;
 
-    public sealed class RefreshTokenDoc
+    [BsonCollection("refresh_token")]
+    public class RefreshTokenDoc
     {
-        [BsonId, BsonRepresentation(BsonType.ObjectId)]
-        public string Id { get; set; } = null!;
-
+        [BsonId]
         [BsonRepresentation(BsonType.ObjectId)]
-        public string UserId { get; set; } = null!;
+        public string Id { get; set; } = default!;
 
-        public string TokenHash { get; set; } = null!;
+        [BsonElement("userId")]
+        [BsonRepresentation(BsonType.ObjectId)]
+        public string UserId { get; set; } = default!;
+
+        [BsonElement("tokenHash")]
+        public string TokenHash { get; set; } = default!;
+
+        [BsonElement("createdAt")]
+        public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+
+        [BsonElement("expiresAt")]
         public DateTime ExpiresAt { get; set; }
 
-        public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+        [BsonElement("revokedAt")]
         public DateTime? RevokedAt { get; set; }
 
-        public string? ReplacedByTokenHash { get; set; } // rotate
+        [BsonElement("replacedByTokenHash")]
+        public string? ReplacedByTokenHash { get; set; }
+
+        [BsonIgnore]
+        public bool IsActive => RevokedAt is null && DateTime.UtcNow < ExpiresAt;
     }
 
 }

@@ -1,8 +1,10 @@
 ﻿//Models/AppUser.cs
 using MongoDB.Bson;
 using MongoDB.Bson.Serialization.Attributes;
+using tdtd_be.Data.Infrastructure;
 namespace tdtd_be.Models
 {
+    [BsonCollection("users")]
     public sealed class AppUser
     {
         [BsonId, BsonRepresentation(BsonType.ObjectId)]
@@ -12,8 +14,7 @@ namespace tdtd_be.Models
         public string PasswordHash { get; set; } = null!;
 
         public string FullName { get; set; } = null!;
-        public string JobTitle { get; set; } = null!;
-
+        public List<String> UnitTypeId { get; set; } = new()!;
         public string UnitId { get; set; } = null!;
         public string UnitName { get; set; } = null!;
 

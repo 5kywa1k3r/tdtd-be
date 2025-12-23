@@ -9,12 +9,12 @@ namespace tdtd_be.Middleware
         public async Task InvokeAsync(HttpContext context, RequestDelegate next)
         {
             try { await next(context); }
-            catch (AppException ex)
+            catch (ApiException ex)
             {
                 context.Response.StatusCode = ex.StatusCode;
                 context.Response.ContentType = "application/json";
 
-                var payload = new { code = ex.Code, message = ex.Message };
+                var payload = new { code = ex.StatusCode, message = ex.Message };
                 await context.Response.WriteAsync(JsonSerializer.Serialize(payload));
             }
             catch (Exception ex)
