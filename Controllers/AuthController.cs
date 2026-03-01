@@ -51,15 +51,6 @@ namespace tdtd_be.Controllers
             return v;
         }
 
-        [HttpPost("signup")]
-        [AllowAnonymous]
-        public async Task<ActionResult<AuthResponse>> Signup([FromBody] SignUpRequest req, CancellationToken ct)
-        {
-            var (resp, refreshRaw) = await _svc.SignUpAsync(req, ct);
-            SetRefreshCookie(refreshRaw, _jwt.RefreshTokenDays());
-            return Ok(resp);
-        }
-
         [HttpPost("login")]
         [AllowAnonymous]
         public async Task<ActionResult<AuthResponse>> Login([FromBody] LoginRequest req, CancellationToken ct)

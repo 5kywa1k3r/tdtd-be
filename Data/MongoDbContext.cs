@@ -11,25 +11,22 @@ namespace tdtd_be.Data
         public IMongoDatabase Db { get; }
         public IMongoCollection<AppUser> Users { get; }
         public IMongoCollection<RefreshTokenDoc> RefreshTokens { get; }
+        public IMongoCollection<Unit> Units { get; }
+        public IMongoCollection<UnitType> UnitTypes { get; }
+        public IMongoCollection<UnitVersionHistory> UnitHistories { get; }
+        public IMongoCollection<FileDoc> Files { get; }
 
         public MongoDbContext(IOptions<MongoOptions> opt)
         {
-            var client = new MongoClient(opt.Value.ConnectionString);
-            Db = client.GetDatabase(opt.Value.Database);
-            Users = Db.GetCollection<AppUser>(opt.Value.UserCollection);
-            RefreshTokens = Db.GetCollection<RefreshTokenDoc>(opt.Value.RefreshTokenCollection);
+            var o = opt.Value;
+            var client = new MongoClient(o.ConnectionString);
+            Db = client.GetDatabase(o.Database);
+            Users = Db.GetCollection<AppUser>(o.UserCollection);
+            RefreshTokens = Db.GetCollection<RefreshTokenDoc>(o.RefreshTokenCollection);
+            Units = Db.GetCollection<Unit>(o.UnitCollection);
+            UnitTypes = Db.GetCollection<UnitType>(o.UnitTypeCollection);
+            UnitHistories = Db.GetCollection<UnitVersionHistory>(o.UnitHistoryCollection);
+            Files = Db.GetCollection<FileDoc>(o.FileDocCollection);
         }
-
-        public IMongoCollection<Unit> Units(IOptions<MongoOptions> opt) =>
-            Db.GetCollection<Unit>(opt.Value.UnitCollection);
-
-        public IMongoCollection<UnitReportRelation> UnitReportRelations(IOptions<MongoOptions> opt) =>
-            Db.GetCollection<UnitReportRelation>(opt.Value.UnitReportRelationCollection);
-
-        public IMongoCollection<Models.Tag> Tags(IOptions<MongoOptions> opt) =>
-            Db.GetCollection<Models.Tag>(opt.Value.TagCollection);
-
-        public IMongoCollection<TagLink> TagLinks(IOptions<MongoOptions> opt) =>
-            Db.GetCollection<TagLink>(opt.Value.TagLinkCollection);
     }
 }

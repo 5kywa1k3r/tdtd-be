@@ -1,0 +1,53 @@
+﻿using System.ComponentModel.DataAnnotations;
+
+namespace tdtd_be.DTOs.Users.Admin;
+
+public sealed class CreateUserRequest
+{
+    [Required, MinLength(3), MaxLength(64)]
+    public string Username { get; set; } = default!;
+
+    [Required, MinLength(6), MaxLength(128)]
+    public string Password { get; set; } = default!;
+
+    [Required, MinLength(1), MaxLength(128)]
+    public string FullName { get; set; } = default!;
+
+    [Required]
+    public string UnitId { get; set; } = default!;
+
+    public List<string> Roles { get; set; } = new();
+    public string PositionCode { get; set; } = default!;
+}
+
+public sealed class UpdateUserRequest
+{
+    [MinLength(3), MaxLength(64)]
+    public string? Username { get; set; }
+    [Required, MinLength(1), MaxLength(128)]
+    public string? FullName { get; set; } = default!;
+    public List<string>? Roles { get; set; }
+    public string? Note { get; set; }
+    public string PositionCode { get; set; } = default!;
+}
+
+public sealed class ResetPasswordRequest
+{
+    [Required, MinLength(6), MaxLength(128)]
+    public string NewPassword { get; set; } = default!;
+}
+
+public sealed record UserResponse(
+    string Id,
+    string Username,
+    string FullName,
+    string? UnitId,
+    string ? UnitSymbol,
+    string? UnitName,
+    string? UnitCode,
+    List<string> Roles,
+    bool IsDeleted,
+    DateTime CreatedAtUtc,
+    DateTime UpdatedAtUtc,
+    string? PositionCode
+);

@@ -1,26 +1,31 @@
-﻿//Models/AppUser.cs
-using MongoDB.Bson;
+﻿using MongoDB.Bson;
 using MongoDB.Bson.Serialization.Attributes;
-using tdtd_be.Data.Infrastructure;
-namespace tdtd_be.Models
+
+namespace tdtd_be.Models;
+
+[BsonIgnoreExtraElements]
+public sealed class AppUser : BaseEntity
 {
-    [BsonCollection("users")]
-    public sealed class AppUser
-    {
-        [BsonId, BsonRepresentation(BsonType.ObjectId)]
-        public string Id { get; set; } = null!;
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string Id { get; set; } = default!;
 
-        public string Username { get; set; } = null!;
-        public string PasswordHash { get; set; } = null!;
+    [BsonElement("username")]
+    public string Username { get; set; } = default!; // lowercase
 
-        public string FullName { get; set; } = null!;
-        public List<String> UnitTypeId { get; set; } = new()!;
-        public string UnitId { get; set; } = null!;
-        public string UnitName { get; set; } = null!;
+    [BsonElement("passwordHash")]
+    public string PasswordHash { get; set; } = default!;
 
-        public List<string> Roles { get; set; } = new();
-        public bool IsActive { get; set; } = true;
+    [BsonElement("fullName")]
+    public string FullName { get; set; } = default!;
 
-        public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
-    }
+    [BsonElement("unitId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? UnitId { get; set; }
+
+    [BsonElement("positionCode")]
+    public string? PositionCode { get; set; }
+
+    [BsonElement("roles")]
+    public List<string> Roles { get; set; } = new();
 }

@@ -1,7 +1,7 @@
 ﻿//Controllers/MeController.cs
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
-using tdtd_be.Middleware;
+using tdtd_be.Common.Middleware;
 
 namespace tdtd_be.Controllers
 {

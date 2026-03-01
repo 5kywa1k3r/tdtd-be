@@ -4,10 +4,8 @@ using MongoDB.Driver;
 using tdtd_be.Common.Cache;
 using tdtd_be.Data;
 using tdtd_be.Data.Infrastructure;
-using tdtd_be.DTOs;
 using tdtd_be.DTOs.Auth;
 using tdtd_be.Models;
-using tdtd_be.Options;
 
 namespace tdtd_be.Services
 {
@@ -17,14 +15,15 @@ namespace tdtd_be.Services
         private readonly IOptions<MongoOptions> _opt;
         private readonly JwtService _jwt;
         private readonly RedisUserCache _cache;
+
+        // Khuyến nghị: inject IPasswordHasher<AppUser> thay vì new, nhưng giữ như bệ hạ đang dùng cũng chạy
         private readonly PasswordHasher<AppUser> _hasher = new();
 
         public AuthService(
             MongoDbContext ctx,
             IOptions<MongoOptions> opt,
             JwtService jwt,
-            RedisUserCache cache
-        )
+            RedisUserCache cache)
         {
             _ctx = ctx;
             _opt = opt;
@@ -35,56 +34,54 @@ namespace tdtd_be.Services
         private IMongoCollection<AppUser> Users => _ctx.Users;
         private IMongoCollection<RefreshTokenDoc> RefreshTokens => _ctx.RefreshTokens;
 
-        public async Task<(AuthResponse resp, string refreshRaw)> SignUpAsync(SignUpRequest req, CancellationToken ct)
+        private static string NormalizeUsername(string? input)
         {
-            var username = req.Username?.Trim();
-            if (string.IsNullOrWhiteSpace(username))
-                throw new InvalidOperationException("Username không hợp lệ.");
+            var u = input?.Trim();
+            if (string.IsNullOrWhiteSpace(u))
+                throw new InvalidOperationException("Sai tài khoản hoặc mật khẩu.");
+            return u.ToLowerInvariant();
+        }
 
-            // friendly check (unique index vẫn là tuyến cuối)
-            var exists = await Users.Find(x => x.Username == username).AnyAsync(ct);
-            if (exists) throw new InvalidOperationException("Username đã tồn tại.");
+        /// <summary>
+        /// Resolve info từ Unit: UnitCode + UnitTypeCodes
+        /// </summary>
+        private async Task<(string unitSymbol, string unitName, string unitCode, List<string> unitTypeCodes)> ResolveUnitInfoAsync(AppUser u, CancellationToken ct)
+        {
+            if (string.IsNullOrWhiteSpace(u.UnitId))
+                return ("", "", "", new List<string>());
 
-            var user = new AppUser
-            {
-                Username = username,
-                FullName = string.IsNullOrWhiteSpace(req.FullName) ? username : req.FullName.Trim(),
-                UnitTypeId = new List<string>(),
-                UnitId = "",
-                UnitName = "",
-                Roles = new List<string>(),
-                IsActive = true,
-                CreatedAt = DateTime.UtcNow
-            };
+            var unit = await _ctx.Units
+                .Find(x => x.Id == u.UnitId)
+                .Project(x => new { x.Symbol, x.ShortName, x.Code, x.UnitTypeCodes })
+                .FirstOrDefaultAsync(ct);
 
-            user.PasswordHash = _hasher.HashPassword(user, req.Password);
+            var unitCode = unit?.Code ?? "";
+            var unitName = unit?.ShortName ?? "";
+            var unitSymbol = unit?.Symbol ?? "";
 
-            try
-            {
-                await Users.InsertOneAsync(user, cancellationToken: ct);
-            }
-            catch (MongoWriteException ex) when (ex.WriteError.Category == ServerErrorCategory.DuplicateKey)
-            {
-                throw new InvalidOperationException("Username đã tồn tại.");
-            }
+            if (unit?.UnitTypeCodes is not { Count: > 0 })
+                return (unitSymbol, unitName, unitCode, new List<string>());
 
-            return await IssueTokensAsync(user, ct);
+            var codes = await _ctx.UnitTypes
+                .Find(t => unit.UnitTypeCodes.Contains(t.Code) && !t.IsDeleted)
+                .Project(t => t.Code)
+                .ToListAsync(ct);
+
+            return (unitSymbol, unitName, unitCode, codes);
         }
 
         public async Task<(AuthResponse resp, string refreshRaw)> LoginAsync(LoginRequest req, CancellationToken ct)
         {
-            var key = req.Username?.Trim();
-            if (string.IsNullOrWhiteSpace(key))
-                throw new InvalidOperationException("Sai tài khoản hoặc mật khẩu.");
+            var key = NormalizeUsername(req.Username);
 
-            var user = await Users.Find(x => x.Username == key).FirstOrDefaultAsync(ct);
+            var user = await Users.Find(x => x.Username == key && !x.IsDeleted).FirstOrDefaultAsync(ct);
             if (user is null) throw new InvalidOperationException("Sai tài khoản hoặc mật khẩu.");
 
             var vr = _hasher.VerifyHashedPassword(user, user.PasswordHash, req.Password);
             if (vr == PasswordVerificationResult.Failed)
                 throw new InvalidOperationException("Sai tài khoản hoặc mật khẩu.");
 
-            if (!user.IsActive)
+            if (user.IsDeleted)
                 throw new InvalidOperationException("Tài khoản đang bị khóa.");
 
             return await IssueTokensAsync(user, ct);
@@ -103,7 +100,7 @@ namespace tdtd_be.Services
 
             var user = await Users.Find(x => x.Id == tokenDoc.UserId).FirstOrDefaultAsync(ct);
             if (user is null) throw new InvalidOperationException("User không tồn tại.");
-            if (!user.IsActive) throw new InvalidOperationException("Tài khoản đang bị khóa.");
+            if (user.IsDeleted) throw new InvalidOperationException("Tài khoản đang bị khóa.");
 
             // rotation: revoke old + issue new
             var newRefreshRaw = _jwt.CreateRefreshTokenRaw();
@@ -122,13 +119,16 @@ namespace tdtd_be.Services
             };
             await RefreshTokens.InsertOneAsync(newDoc, cancellationToken: ct);
 
-            // tv + cache me
+            // tv + resolve unit info
             await _cache.EnsureTokenVersionAsync(user.Id);
             var tv = await _cache.GetTokenVersionAsync(user.Id);
 
-            var access = _jwt.CreateAccessToken(user, tv);
-            var me = ToMeResponse(user);
+            var (unitSymbol, unitname, unitCode, unitTypeCodes) = await ResolveUnitInfoAsync(user, ct);
 
+            // ✅ cần sửa JwtService để nhận unitCode (bên dưới)
+            var access = _jwt.CreateAccessToken(user, tv, unitTypeCodes, unitSymbol, unitname, unitCode);
+
+            var me = ToMeResponse(user, unitTypeCodes, unitSymbol, unitname, unitCode);
             await _cache.SetMeAsync(me);
 
             var resp = new AuthResponse(
@@ -153,7 +153,6 @@ namespace tdtd_be.Services
             await RefreshTokens.ReplaceOneAsync(x => x.Id == tokenDoc.Id, tokenDoc, cancellationToken: ct);
         }
 
-        // gọi khi khóa user/đổi roles/unit/reset password...
         public async Task RevokeUserSessionsAsync(string userId, CancellationToken ct)
         {
             await _cache.BumpTokenVersionAsync(userId);
@@ -168,7 +167,7 @@ namespace tdtd_be.Services
 
         private async Task<(AuthResponse resp, string refreshRaw)> IssueTokensAsync(AppUser user, CancellationToken ct)
         {
-            if (!user.IsActive) throw new InvalidOperationException("Tài khoản đang bị khóa.");
+            if (user.IsDeleted) throw new InvalidOperationException("Tài khoản đang bị khóa.");
 
             // create refresh
             var refreshRaw = _jwt.CreateRefreshTokenRaw();
@@ -184,14 +183,17 @@ namespace tdtd_be.Services
 
             await RefreshTokens.InsertOneAsync(rt, cancellationToken: ct);
 
-            // tv + access token
+            // tv + resolve unit info
             await _cache.EnsureTokenVersionAsync(user.Id);
             var tv = await _cache.GetTokenVersionAsync(user.Id);
 
-            var access = _jwt.CreateAccessToken(user, tv);
+            var (unitSymbol, unitName, unitCode, unitTypeCodes) = await ResolveUnitInfoAsync(user, ct);
+
+            // ✅ cần sửa JwtService để nhận unitCode (bên dưới)
+            var access = _jwt.CreateAccessToken(user, tv, unitTypeCodes, unitSymbol, unitName, unitCode);
 
             // cache me
-            var me = ToMeResponse(user);
+            var me = ToMeResponse(user, unitTypeCodes, unitSymbol, unitName, unitCode);
             await _cache.SetMeAsync(me);
 
             var resp = new AuthResponse(
@@ -203,17 +205,20 @@ namespace tdtd_be.Services
             return (resp, refreshRaw);
         }
 
-        private static MeResponse ToMeResponse(AppUser u)
+        private static MeResponse ToMeResponse(AppUser u, List<string> unitTypeCodes,string unitSymbol, string unitName, string unitCode)
         {
             return new MeResponse(
                 id: u.Id,
                 username: u.Username ?? "",
                 fullName: u.FullName ?? "",
-                unitTypeId: u.UnitTypeId ?? new List<string>(),
+                unitTypeCodes: unitTypeCodes ?? new List<string>(),
                 unitId: u.UnitId ?? "",
-                unitName: u.UnitName ?? "",
+                unitSymbol: unitSymbol ?? "",
+                unitName: unitName ?? "",
+                unitCode: unitCode ?? "",     
                 roles: u.Roles ?? new List<string>(),
-                isActive: u.IsActive
+                positionCode: u.PositionCode ?? "",
+                isDeleted: u.IsDeleted
             );
         }
     }

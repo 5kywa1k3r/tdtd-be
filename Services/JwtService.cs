@@ -27,12 +27,12 @@ namespace tdtd_be.Services
             _creds = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
         }
 
-        public (string token, DateTime expiresAtUtc) CreateAccessToken(AppUser u, long tokenVersion)
+        public (string token, DateTime expiresAtUtc) CreateAccessToken(AppUser u, long tokenVersion, List<string> unitTypeCodes, String unitSymbol, String unitName, String unitCode)
         {
             var now = DateTime.UtcNow;
             var exp = now.AddMinutes(_opt.AccessTokenMinutes);
 
-            // ===== Claims chuẩn theo bệ hạ =====
+            // ===== Claims =====
             var claims = new List<Claim>
             {
                 new(JwtRegisteredClaimNames.Sub, u.Id),
@@ -41,11 +41,14 @@ namespace tdtd_be.Services
                 new("fullName", u.FullName ?? ""),
 
                 // CSV
-                new("unitTypeId", (u.UnitTypeId is { Count: > 0 }) ? string.Join(",", u.UnitTypeId) : ""),
+                new("unitTypeCodes", (unitTypeCodes is { Count: > 0 }) ? string.Join(",", unitTypeCodes) : ""),
                 new("unitId", u.UnitId ?? ""),
-                new("unitName", u.UnitName ?? ""),
+                new("unitSymbol", unitSymbol ?? ""),
+                new("unitName", unitName ?? ""),
+                new("unitCode", unitCode ?? ""),
+                new("positionCode", u.PositionCode ?? ""),
 
-                new("isActive", u.IsActive ? "true" : "false"),
+                new("isDeleted", u.IsDeleted ? "true" : "false"),
 
                 // roles CSV (middleware parse)
                 new("roles", (u.Roles is { Count: > 0 }) ? string.Join(",", u.Roles) : ""),

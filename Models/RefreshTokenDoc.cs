@@ -5,7 +5,7 @@ namespace tdtd_be.Models
     using MongoDB.Bson.Serialization.Attributes;
     using tdtd_be.Data.Infrastructure;
 
-    [BsonCollection("refresh_token")]
+    [BsonCollection("refresh_tokens")]
     public class RefreshTokenDoc
     {
         [BsonId]
@@ -32,6 +32,7 @@ namespace tdtd_be.Models
         public string? ReplacedByTokenHash { get; set; }
 
         [BsonIgnore]
+        [BsonElement("isActive")]
         public bool IsActive => RevokedAt is null && DateTime.UtcNow < ExpiresAt;
     }
 
