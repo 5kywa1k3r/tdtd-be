@@ -80,6 +80,7 @@ builder.Services.AddScoped<tdtd_be.Common.Auth.UnitTreeHelper>();
 builder.Services.AddScoped<IUnitTypeAdminService, UnitTypeAdminService>();
 builder.Services.AddScoped<IUnitService, UnitService>();
 builder.Services.AddScoped<IUserAdminService, UserAdminService>();
+builder.Services.AddScoped<IDynamicExcelService, DynamicExcelService>();
 
 // ================== redis (cache) ==================
 // appsettings.json:

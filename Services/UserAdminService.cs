@@ -281,7 +281,6 @@ public sealed class UserAdminService : IUserAdminService
         {
             // Admin được search/view, và CHỈ tạo SystemAdmin
             // (unit ROOT có còn bắt buộc không? bệ hạ không nhắc lại -> bỏ ràng buộc ROOT)
-            // Nếu vẫn muốn ROOT bắt buộc thì thêm check targetUnit.Code == "ROOT" tại đây.
         }
         else if (RoleGuard.IsSystemAdmin(me))
         {

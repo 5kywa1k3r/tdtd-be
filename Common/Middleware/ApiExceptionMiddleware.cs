@@ -54,7 +54,7 @@ public sealed class ApiExceptionMiddleware : IMiddleware
         if (ex is ArgumentException)
             return (StatusCodes.Status400BadRequest, ex.Message);
 
-        // ✅ Auth-related nếu bệ hạ có throw loại này
+        // ✅ Auth-related
         if (ex is UnauthorizedAccessException)
             return (StatusCodes.Status401Unauthorized, "Bạn không có quyền thực hiện thao tác này.");
 

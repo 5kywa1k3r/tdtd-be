@@ -25,8 +25,6 @@ namespace tdtd_be.Common.Middleware
         private readonly IMongoCollection<AppUser> _users;
         private readonly IMongoCollection<Unit> _units;
         private readonly IMongoCollection<UnitType> _unitTypes;
-
-        // Optional: nếu vẫn muốn inject UserContext ở controller
         private readonly UserContext? _userContext;
 
         public MeContextRedisMiddleware(
@@ -105,7 +103,7 @@ namespace tdtd_be.Common.Middleware
             {
                 me = BuildMeFromClaims(context.User, userId);
 
-                // claims fallback chỉ nên cache nếu bệ hạ muốn tối ưu,
+                // claims fallback chỉ nên cache nếu muốn tối ưu,
                 // nhưng đây là "last resort" nên vẫn cache để giảm hit.
                 await _cache.SetMeAsync(me);
             }
@@ -212,7 +210,7 @@ namespace tdtd_be.Common.Middleware
 
         private static MeResponse BuildMeFromClaims(ClaimsPrincipal user, string userId)
         {
-            // ✅ NEW: claim "unitTypeCodes" (CSV). Nếu không có => empty (last resort)
+            // ✅ claim "unitTypeCodes" (CSV). Nếu không có => empty (last resort)
             var unitTypeCsv = user.FindFirstValue("unitTypeCodes") ?? "";
             var unitTypeCodes = string.IsNullOrWhiteSpace(unitTypeCsv)
                 ? new List<string>()

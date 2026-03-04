@@ -30,7 +30,7 @@ public sealed class FileDoc: BaseEntity
     [BsonElement("etag")]
     public string? ETag { get; set; }
 
-    // nếu muốn hash mạnh sau này
+    // optional hash 
     [BsonElement("sha256")]
     public string? Sha256 { get; set; }
 

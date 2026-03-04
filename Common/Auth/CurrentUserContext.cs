@@ -4,7 +4,7 @@ namespace tdtd_be.Common.Authentication
 {
     public sealed class CurrentUserContext : ICurrentUserContext
     {
-        public const string MeItemKey = "me"; // <<< nếu middleware dùng key khác, sửa tại đây
+        public const string MeItemKey = "me";
 
         private readonly IHttpContextAccessor _http;
 

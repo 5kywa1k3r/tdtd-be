@@ -13,29 +13,33 @@
     {
         public static async Task EnsureAsync(IMongoDatabase db, MongoOptions opt, CancellationToken ct = default)
         {
-            // USERS
+            // USERS (soft delete)
             var users = db.GetCollection<AppUser>(opt.UserCollection);
             await EnsureUsersAsync(users, ct);
 
-            // REFRESH TOKENS
+            // REFRESH TOKENS (TTL, typically no soft delete)
             var rts = db.GetCollection<RefreshTokenDoc>(opt.RefreshTokenCollection);
             await EnsureRefreshTokensAsync(rts, ct);
 
-            // UNITS
+            // UNITS (soft delete)
             var units = db.GetCollection<Unit>(opt.UnitCollection);
             await EnsureUnitsAsync(units, ct);
 
-            // UNIT TYPES
+            // UNIT TYPES (soft delete)
             var unitTypes = db.GetCollection<UnitType>(opt.UnitTypeCollection);
             await EnsureUnitTypesAsync(unitTypes, ct);
 
-            // UNIT HISTORIES
+            // UNIT HISTORIES (usually immutable, no soft delete required)
             var unitHistories = db.GetCollection<UnitVersionHistory>(opt.UnitHistoryCollection);
             await EnsureUnitHistoriesAsync(unitHistories, ct);
 
-            // files
+            // FILES (soft delete)
             var files = db.GetCollection<FileDoc>(opt.FileDocCollection);
             await EnsureFilesAsync(files, ct);
+
+            // DYNAMIC EXCEL (soft delete)s
+            var dx = db.GetCollection<DynamicExcelTemplate>(opt.DynamicExcelTemplateCollection);
+            await EnsureDynamicExcelAsync(dx, ct);
         }
 
         // ================= USERS =================
@@ -56,7 +60,11 @@
             ), ct);
 
             // common query
-            await EnsureBySpecAsync(col, new IndexSpec("ix_users_unitId", new BsonDocument("unitId", 1)), ct);
+            // NOTE: include isDeleted to speed active search
+            await EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_users_unitId_isDeleted",
+                key: new BsonDocument { { "unitId", 1 }, { "isDeleted", 1 } }
+            ), ct);
         }
 
         // ================= REFRESH TOKENS =================
@@ -79,13 +87,24 @@
 
             await EnsureBySpecAsync(col, new IndexSpec("ix_units_isDeleted", new BsonDocument("isDeleted", 1)), ct);
 
-            await EnsureBySpecAsync(col, new IndexSpec("ix_units_parentUnitId", new BsonDocument("parentUnitId", 1)), ct);
+            // include isDeleted for active children listing
+            await EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_units_parentUnitId_isDeleted",
+                key: new BsonDocument { { "parentUnitId", 1 }, { "isDeleted", 1 } }
+            ), ct);
 
             await EnsureBySpecAsync(col, new IndexSpec(
                 name: "ux_units_code_active",
                 key: new BsonDocument("code", 1),
                 unique: true,
                 partial: new BsonDocument("isDeleted", false)
+            ), ct);
+
+            // optional: prefix search by code (if you query startswith/regex prefix)
+            // This index helps range/prefix queries if you use regex anchored "^xxx" or similar.
+            await EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_units_code_isDeleted",
+                key: new BsonDocument { { "code", 1 }, { "isDeleted", 1 } }
             ), ct);
         }
 
@@ -114,31 +133,85 @@
         }
 
         // ================= FILES =================
-        private static async Task EnsureFilesAsync(IMongoCollection<FileDoc> col, CancellationToken ct = default)
+        private static async Task EnsureFilesAsync(IMongoCollection<FileDoc> col, CancellationToken ct)
         {
-            var idx = new List<CreateIndexModel<FileDoc>>
-            {
-                new(
-                    Builders<FileDoc>.IndexKeys.Ascending(x => x.CreatedByUserId).Descending(x => x.CreatedAtUtc),
-                    new CreateIndexOptions { Name = "ix_files_owner_createdAt" }),
+            // partition
+            await EnsureBySpecAsync(col, new IndexSpec("ix_files_isDeleted", new BsonDocument("isDeleted", 1)), ct);
 
-                new(
-                    Builders<FileDoc>.IndexKeys.Ascending(x => x.Bucket).Ascending(x => x.ObjectKey),
-                    new CreateIndexOptions { Name = "ux_files_bucket_objectKey", Unique = true }),
+            // owner timeline (active)
+            await EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_files_owner_createdAt_desc_isDeleted",
+                key: new BsonDocument
+                {
+                    { "createdByUserId", 1 },
+                    { "createdAtUtc", -1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
 
-                new(
-                    Builders<FileDoc>.IndexKeys.Ascending(x => x.UploadId).Ascending(x => x.CreatedByUserId),
-                    new CreateIndexOptions { Name = "ix_files_upload_owner" }),
+            // ✅ unique object identity should be unique among active only (soft delete safe)
+            await PrecheckDuplicateActiveCompositeAsync(
+                col,
+                fields: new[] { "bucket", "objectKey" },
+                ct);
 
-                new(
-                    Builders<FileDoc>.IndexKeys.Ascending(x => x.IsDeleted),
-                    new CreateIndexOptions { Name = "ix_files_isDeleted" })
-            };
+            await EnsureBySpecAsync(col, new IndexSpec(
+                name: "ux_files_bucket_objectKey_active",
+                key: new BsonDocument { { "bucket", 1 }, { "objectKey", 1 } },
+                unique: true,
+                partial: new BsonDocument("isDeleted", false)
+            ), ct);
 
-            await col.Indexes.CreateManyAsync(idx, ct);
+            // uploadId + owner for lookups (usually active)
+            await EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_files_upload_owner_isDeleted",
+                key: new BsonDocument
+                {
+                    { "uploadId", 1 },
+                    { "createdByUserId", 1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
+        }
+        // ================= DYNAMIC EXCEL =================
+        private static async Task EnsureDynamicExcelAsync(IMongoCollection<DynamicExcelTemplate> col, CancellationToken ct)
+        {
+            await EnsureBySpecAsync(col, new IndexSpec("ix_dynamicExcel_isDeleted", new BsonDocument("isDeleted", 1)), ct);
+
+            // precheck unique among active
+            await PrecheckDuplicateActiveAsync(col, field: "code", ct);
+
+            // ✅ unique active code
+            await EnsureBySpecAsync(col, new IndexSpec(
+                name: "ux_dynamicExcel_code_active",
+                key: new BsonDocument("code", 1),
+                unique: true,
+                partial: new BsonDocument("isDeleted", false)
+            ), ct);
+
+            // search/sort helpers
+            await EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_dynamicExcel_createdAt_desc",
+                key: new BsonDocument { { "createdAtUtc", -1 } }
+            ), ct);
+
+            await EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_dynamicExcel_createdBy_createdAt_desc",
+                key: new BsonDocument { { "createdByUserId", 1 }, { "createdAtUtc", -1 }, { "isDeleted", 1 } }
+            ), ct);
+
+            await EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_dynamicExcel_name_isDeleted",
+                key: new BsonDocument { { "name", 1 }, { "isDeleted", 1 } }
+            ), ct);
+
+            await EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_dynamicExcel_labels_isDeleted",
+                key: new BsonDocument { { "labels", 1 }, { "isDeleted", 1 } }
+            ), ct);
         }
 
-        // ---------- Precheck duplicates (active only) ----------
+        // ---------- Precheck duplicates (active only - single field) ----------
         private static async Task PrecheckDuplicateActiveAsync<T>(
             IMongoCollection<T> col,
             string field,
@@ -170,6 +243,50 @@
             }
         }
 
+        // ---------- Precheck duplicates (active only - composite fields) ----------
+        private static async Task PrecheckDuplicateActiveCompositeAsync<T>(
+            IMongoCollection<T> col,
+            string[] fields,
+            CancellationToken ct)
+        {
+            if (fields is null || fields.Length == 0)
+                throw new ArgumentException("fields required.", nameof(fields));
+
+            var idDoc = new BsonDocument();
+            foreach (var f in fields)
+                idDoc.Add(f, "$" + f);
+
+            var pipeline = new[]
+            {
+                new BsonDocument("$match", new BsonDocument
+                {
+                    { "isDeleted", false }
+                }),
+                new BsonDocument("$group", new BsonDocument
+                {
+                    { "_id", idDoc },
+                    { "c", new BsonDocument("$sum", 1) }
+                }),
+                new BsonDocument("$match", new BsonDocument("c", new BsonDocument("$gt", 1))),
+                new BsonDocument("$limit", 10)
+            };
+
+            var dup = await col.Aggregate<BsonDocument>(pipeline).ToListAsync(ct);
+            if (dup.Count > 0)
+            {
+                var sample = string.Join(", ", dup.Select(x =>
+                {
+                    var id = x["_id"].AsBsonDocument;
+                    var parts = string.Join(";", fields.Select(f => $"{f}={id.GetValue(f, BsonNull.Value)}"));
+                    return $"{parts} (count={x["c"]})";
+                }));
+
+                throw new InvalidOperationException(
+                    $"Duplicate active composite key detected in {col.CollectionNamespace.CollectionName}: {sample}. " +
+                    $"Fix data before creating unique active index on ({string.Join(", ", fields)}) with isDeleted=false.");
+            }
+        }
+
         // ---------- Ensure by spec (Migrate style) ----------
         private static async Task EnsureBySpecAsync<T>(
             IMongoCollection<T> col,
@@ -185,7 +302,7 @@
             if (current != null && !IsSameSpec(current, desired))
                 await col.Indexes.DropOneAsync(desired.Name, ct);
 
-            // 3) create (idempotent-ish; if exists same spec Mongo will just keep)
+            // 3) create (idempotent-ish)
             await CreateIndexByCommandAsync(col, desired, ct);
         }
 
