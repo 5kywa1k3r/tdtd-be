@@ -314,7 +314,7 @@ public sealed class UnitService : IUnitService
         {
             if (string.IsNullOrEmpty(scopeCode) ||
                 !parent.Code.StartsWith(scopeCode, StringComparison.Ordinal))
-                throw new UnauthorizedAccessException("Out of scope.");
+                throw new BadHttpRequestException("Out of scope.");
         }
 
         var parentCode = parent.Code;

@@ -14,9 +14,16 @@ using tdtd_be.Data.Infrastructure;
 using tdtd_be.Models;
 using tdtd_be.Options;
 using tdtd_be.Services;
+using tdtd_be.Services.Common;
+using tdtd_be.Services.WorkAssignmentReports;
+using tdtd_be.Services.WorkAssignments;
+using tdtd_be.Services.WorkAssignments.Domain;
+using tdtd_be.Services.WorkAssignments.Lookups;
+using tdtd_be.Services.Works;
 using tdtd_be.Uploads;
 using tusdotnet.Interfaces;
 using tusdotnet.Stores;
+using static tdtd_be.Services.Works.WorkServices;
 // + middleware/cache namespaces (tạo 2 file này)
 // using tdtd_be.Common.Cache;
 // using tdtd_be.Common.Middleware;
@@ -68,6 +75,8 @@ builder.Services.AddSingleton<IMinioClient>(sp =>
         .WithRegion("us-east-1")
         .Build();
 });
+builder.Services.AddHostedService<MinioFileDocCleanupHostedService>();
+builder.Services.AddSingleton<IMinioObjectDeleter, MinioObjectDeleter>();
 
 // ================== core services ==================
 builder.Services.AddSingleton<PasswordHasher<AppUser>>();
@@ -81,6 +90,21 @@ builder.Services.AddScoped<IUnitTypeAdminService, UnitTypeAdminService>();
 builder.Services.AddScoped<IUnitService, UnitService>();
 builder.Services.AddScoped<IUserAdminService, UserAdminService>();
 builder.Services.AddScoped<IDynamicExcelService, DynamicExcelService>();
+
+builder.Services.AddScoped<IDocRoleService, DocRoleService>();
+
+builder.Services.AddScoped<IWorkCodeGenerator, WorkCodeGenerator>();
+builder.Services.AddScoped<IWorkService, WorkService>();
+builder.Services.AddScoped<IWorkHistoryService, WorkHistoryService>();
+builder.Services.AddScoped<IWorkPermissionService, WorkPermissionService>();
+
+builder.Services.AddScoped<IWorkAssignmentLookupService, WorkAssignmentLookupService>();
+builder.Services.AddScoped<IDynamicExcelLookupService, DynamicExcelLookupService>();
+builder.Services.AddScoped<IWorkAssignmentDataGuardService, WorkAssignmentDataGuardService>();
+builder.Services.AddScoped<IWorkAssignmentTreeService, WorkAssignmentTreeService>();
+builder.Services.AddScoped<IWorkAssignmentService, WorkAssignmentService>();
+
+builder.Services.AddScoped<IWorkAssignmentReportService, WorkAssignmentReportService>();
 
 // ================== redis (cache) ==================
 // appsettings.json:

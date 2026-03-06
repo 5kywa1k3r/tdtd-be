@@ -101,13 +101,13 @@ public sealed class UserAdminService : IUserAdminService
 
         // không ai được đụng ADMIN
         if (IsAdminUser(target))
-            throw new UnauthorizedAccessException("Cannot manage ADMIN user.");
+            throw new BadHttpRequestException("Cannot manage ADMIN user.");
 
         // ADMIN: chỉ quản SYSTEM_ADMIN
         if (meIsAdmin)
         {
             if (!IsSystemAdminUser(target))
-                throw new UnauthorizedAccessException("ADMIN can only manage SYSTEM_ADMIN.");
+                throw new BadHttpRequestException("ADMIN can only manage SYSTEM_ADMIN.");
             return;
         }
 
@@ -115,7 +115,7 @@ public sealed class UserAdminService : IUserAdminService
         if (meIsSys)
         {
             if (IsSystemAdminUser(target) && target.Id != me.Id)
-                throw new UnauthorizedAccessException("SYSTEM_ADMIN cannot manage other SYSTEM_ADMIN.");
+                throw new BadHttpRequestException("SYSTEM_ADMIN cannot manage other SYSTEM_ADMIN.");
             return;
         }
 
@@ -123,7 +123,7 @@ public sealed class UserAdminService : IUserAdminService
         if (meIsMgrUnit)
         {
             if (IsSystemAdminUser(target))
-                throw new UnauthorizedAccessException("Cannot manage SYSTEM_ADMIN.");
+                throw new BadHttpRequestException("Cannot manage SYSTEM_ADMIN.");
             return;
         }
 
@@ -131,11 +131,11 @@ public sealed class UserAdminService : IUserAdminService
         if (meIsMgrLevel)
         {
             if (IsSystemAdminUser(target))
-                throw new UnauthorizedAccessException("Cannot manage SYSTEM_ADMIN.");
+                throw new BadHttpRequestException("Cannot manage SYSTEM_ADMIN.");
             return;
         }
 
-        throw new UnauthorizedAccessException("Not allowed.");
+        throw new BadHttpRequestException("Not allowed.");
     }
 
     // scope cho manager (unit/subtree). SYS/ADMIN coi như full scope
@@ -147,7 +147,7 @@ public sealed class UserAdminService : IUserAdminService
         if (RoleGuard.TryGetManagerUnit(me, out var managedUnitId))
         {
             if (!string.Equals(targetUser.UnitId, managedUnitId, StringComparison.Ordinal))
-                throw new UnauthorizedAccessException("MANAGER_UNIT scope.");
+                throw new BadHttpRequestException("MANAGER_UNIT scope.");
             return;
         }
 
@@ -159,7 +159,7 @@ public sealed class UserAdminService : IUserAdminService
             return;
         }
 
-        throw new UnauthorizedAccessException("Not allowed.");
+        throw new BadHttpRequestException("Not allowed.");
     }
 
     /// <summary>
@@ -177,7 +177,7 @@ public sealed class UserAdminService : IUserAdminService
 
         if (RoleGuard.IsAdmin(me))
         {
-            if (!isCreate) throw new UnauthorizedAccessException("ADMIN cannot update roles.");
+            if (!isCreate) throw new BadHttpRequestException("ADMIN cannot update roles.");
 
             // ✅ ADMIN chỉ tạo đúng SYSTEM_ADMIN (không kèm role khác)
             var list = (targetRoles ?? Array.Empty<string>())
@@ -186,23 +186,23 @@ public sealed class UserAdminService : IUserAdminService
                 .ToList();
 
             if (list.Count != 1 || !string.Equals(list[0], Roles.SYSTEM_ADMIN, StringComparison.OrdinalIgnoreCase))
-                throw new UnauthorizedAccessException("ADMIN can only create SYSTEM_ADMIN (only).");
+                throw new BadHttpRequestException("ADMIN can only create SYSTEM_ADMIN (only).");
 
-            if (wantManagerRoles) throw new UnauthorizedAccessException("ADMIN cannot assign manager roles.");
+            if (wantManagerRoles) throw new BadHttpRequestException("ADMIN cannot assign manager roles.");
             return;
         }
 
         if (RoleGuard.IsSystemAdmin(me))
         {
             // SYSTEM_ADMIN không được tạo SYSTEM_ADMIN (vì chỉ ADMIN tạo)
-            if (wantSystemAdmin) throw new UnauthorizedAccessException("Only ADMIN can create SYSTEM_ADMIN.");
+            if (wantSystemAdmin) throw new BadHttpRequestException("Only ADMIN can create SYSTEM_ADMIN.");
             // SYSTEM_ADMIN được gán MANAGER_LEVEL / MANAGER_UNIT:* OK
             return;
         }
 
         // Managers:
-        if (wantSystemAdmin) throw new UnauthorizedAccessException("Cannot assign SYSTEM_ADMIN.");
-        if (wantManagerRoles) throw new UnauthorizedAccessException("Only SYSTEM_ADMIN can assign manager roles.");
+        if (wantSystemAdmin) throw new BadHttpRequestException("Cannot assign SYSTEM_ADMIN.");
+        if (wantManagerRoles) throw new BadHttpRequestException("Only SYSTEM_ADMIN can assign manager roles.");
     }
 
     private async Task<Unit> RequireUnitAsync(string unitId, CancellationToken ct)
@@ -220,9 +220,9 @@ public sealed class UserAdminService : IUserAdminService
     private static void EnsureManagerLevelScope((string meCode, int meLevel) me, (string targetCode, int targetLevel) target)
     {
         if (!IsInSubtree(me.meCode, target.targetCode))
-            throw new UnauthorizedAccessException("Outside manager subtree.");
+            throw new BadHttpRequestException("Outside manager subtree.");
         if (target.targetLevel < me.meLevel)
-            throw new UnauthorizedAccessException("Cannot manage upper level.");
+            throw new BadHttpRequestException("Cannot manage upper level.");
     }
     public async Task<UserResponse> GetByIdAsync(string userId, CancellationToken ct)
     {
@@ -241,7 +241,7 @@ public sealed class UserAdminService : IUserAdminService
         if (RoleGuard.TryGetManagerUnit(me, out var managedUnitId))
         {
             if (!string.Equals(u.UnitId, managedUnitId, StringComparison.Ordinal))
-                throw new UnauthorizedAccessException("MANAGER_UNIT scope.");
+                throw new BadHttpRequestException("MANAGER_UNIT scope.");
             return ToResp(u, targetUnit.Symbol, targetUnit.ShortName, targetUnit.Code);
         }
 
@@ -252,15 +252,15 @@ public sealed class UserAdminService : IUserAdminService
                 .FirstOrDefaultAsync(ct) ?? throw new InvalidOperationException("Me unit not found.");
 
             if (!targetUnit.Code.StartsWith(meUnit.Code, StringComparison.Ordinal))
-                throw new UnauthorizedAccessException("Outside manager subtree.");
+                throw new BadHttpRequestException("Outside manager subtree.");
 
             if (targetUnit.Level < meUnit.Level)
-                throw new UnauthorizedAccessException("Cannot manage upper level.");
+                throw new BadHttpRequestException("Cannot manage upper level.");
 
             return ToResp(u, targetUnit.Symbol, targetUnit.ShortName, targetUnit.Code);
         }
 
-        throw new UnauthorizedAccessException("Not allowed.");
+        throw new BadHttpRequestException("Not allowed.");
     }
 
     public async Task<UserResponse> CreateAsync(CreateUserRequest req, CancellationToken ct)
@@ -289,7 +289,7 @@ public sealed class UserAdminService : IUserAdminService
         else if (RoleGuard.TryGetManagerUnit(me, out var managedUnitId))
         {
             if (!string.Equals(req.UnitId, managedUnitId, StringComparison.Ordinal))
-                throw new UnauthorizedAccessException("MANAGER_UNIT can only create users in its own unit.");
+                throw new BadHttpRequestException("MANAGER_UNIT can only create users in its own unit.");
         }
         else if (RoleGuard.IsManagerLevel(me))
         {
@@ -298,7 +298,7 @@ public sealed class UserAdminService : IUserAdminService
         }
         else
         {
-            throw new UnauthorizedAccessException("Not allowed.");
+            throw new BadHttpRequestException("Not allowed.");
         }
 
         // Insert user
@@ -398,7 +398,7 @@ public sealed class UserAdminService : IUserAdminService
         else if (RoleGuard.TryGetManagerUnit(me, out var managedUnitId))
         {
             if (!string.Equals(user.UnitId, managedUnitId, StringComparison.Ordinal))
-                throw new UnauthorizedAccessException("MANAGER_UNIT scope.");
+                throw new BadHttpRequestException("MANAGER_UNIT scope.");
         }
         else if (RoleGuard.IsManagerLevel(me))
         {
@@ -406,7 +406,7 @@ public sealed class UserAdminService : IUserAdminService
             var targetUnit = await RequireUnitAsync(user.UnitId, ct);
             EnsureManagerLevelScope((meUnit.Code, meUnit.Level), (targetUnit.Code, targetUnit.Level));
         }
-        else throw new UnauthorizedAccessException("Not allowed.");
+        else throw new BadHttpRequestException("Not allowed.");
 
         user.PasswordHash = _hasher.HashPassword(user, req.NewPassword);
 
@@ -467,7 +467,7 @@ public sealed class UserAdminService : IUserAdminService
         var isManagerLevel = RoleGuard.IsManagerLevel(me);
 
         if (!isAdmin && !isSys && !isManagerUnit && !isManagerLevel)
-            throw new UnauthorizedAccessException("Not allowed.");
+            throw new BadHttpRequestException("Not allowed.");
 
         if (isManagerUnit)
             userMatch &= Builders<AppUser>.Filter.Eq(x => x.UnitId, managerUnitId);

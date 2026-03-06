@@ -100,7 +100,7 @@ public sealed class UploadsController : ControllerBase
         var ttl = ttlSeconds ?? _opt.PresignTtlSecondsDefault;
         ttl = Math.Clamp(ttl, 30, _opt.PresignTtlSecondsMax);
 
-        // MinIO SDK của bệ hạ: không có ct ở PresignedGetObjectAsync
+        // MinIO SDK: không có ct ở PresignedGetObjectAsync
         var url = await _minio.PresignedGetObjectAsync(
             new PresignedGetObjectArgs()
                 .WithBucket(doc.Bucket)

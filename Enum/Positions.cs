@@ -4,6 +4,34 @@ namespace tdtd_be.Enum;
 
 public static class Positions
 {
+    private static readonly Dictionary<string, string> PositionNameMap =
+    new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["GIAM_DOC_CAT"] = "Giám đốc CAT",
+        ["PHO_GIAM_DOC_CAT"] = "Phó Giám đốc CAT",
+
+        ["TRUONG_PHONG"] = "Trưởng phòng",
+        ["PHO_TRUONG_PHONG_PHU_TRACH"] = "Phó Trưởng phòng (Phụ trách)",
+        ["PHO_TRUONG_PHONG"] = "Phó Trưởng phòng",
+
+        ["DOI_TRUONG"] = "Đội trưởng",
+        ["PHO_DOI_TRUONG_PHU_TRACH"] = "Phó Đội trưởng (Phụ trách)",
+        ["PHO_DOI_TRUONG"] = "Phó Đội trưởng",
+
+        ["TRUONG_CONG_AN_PHUONG"] = "Trưởng Công an phường",
+        ["TRUONG_CONG_AN_XA"] = "Trưởng Công an xã",
+        ["PHO_TRUONG_CONG_AN_PHUONG_PHU_TRACH"] = "Phó Trưởng Công an phường (Phụ trách)",
+        ["PHO_TRUONG_CONG_AN_XA_PHU_TRACH"] = "Phó Trưởng Công an xã (Phụ trách)",
+        ["PHO_TRUONG_CONG_AN_PHUONG"] = "Phó Trưởng Công an phường",
+        ["PHO_TRUONG_CONG_AN_XA"] = "Phó Trưởng Công an xã",
+    };
+
+    public static string? GetName(string? code)
+    {
+        var c = Normalize(code);
+        if (c is null) return null;
+        return PositionNameMap.TryGetValue(c, out var name) ? name : c; // fallback = code
+    }
     // Order theo chục để chèn giữa dễ.
     // Rank để so sánh quyền hạn (cùng rank = ngang cấp).
     private static readonly Dictionary<string, (int Order, int Rank)> PositionMeta =

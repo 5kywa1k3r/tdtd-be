@@ -22,18 +22,18 @@ public static class RoleGuard
 
     public static void RequireSystemAdmin(MeResponse me)
     {
-        if (!IsSystemAdmin(me)) throw new UnauthorizedAccessException("SYSTEM_ADMIN required.");
+        if (!IsSystemAdmin(me)) throw new BadHttpRequestException("SYSTEM_ADMIN required.");
     }
 
     public static void RequireAdmin(MeResponse me)
     {
-        if (!IsAdmin(me)) throw new UnauthorizedAccessException("ADMIN required.");
+        if (!IsAdmin(me)) throw new BadHttpRequestException("ADMIN required.");
     }
 
     // (optional helper) dùng cho nhiều nơi
     public static void RequireAdminOrSystemAdmin(MeResponse me)
     {
         if (!IsAdmin(me) && !IsSystemAdmin(me))
-            throw new UnauthorizedAccessException("ADMIN or SYSTEM_ADMIN required.");
+            throw new BadHttpRequestException("ADMIN or SYSTEM_ADMIN required.");
     }
 }

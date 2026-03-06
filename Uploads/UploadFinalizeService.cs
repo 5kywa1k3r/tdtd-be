@@ -46,6 +46,9 @@ public sealed class UploadFinalizeService
         var payload = _tokens.Validate(tok!);
         if (payload == null)
             throw new InvalidOperationException("Invalid Upload-Token on finalize");
+        var sourceId = payload.SourceId;
+        if (string.IsNullOrWhiteSpace(sourceId))
+            throw new InvalidOperationException("Upload missing SourceId");
 
         var tusFile = await ctx.GetFileAsync();
         var meta = await tusFile.GetMetadataAsync(ctx.CancellationToken);
@@ -57,7 +60,7 @@ public sealed class UploadFinalizeService
         var safeName = Sanitize(fileName);
 
         // objectKey: không bắt đầu bằng "/" để tránh lỗi lặt vặt
-        var objectKey = $"uploads/{uploadId}/{safeName}".TrimStart('/');
+        var objectKey = $"uploads/{sourceId}/{uploadId}/{safeName}".TrimStart('/');
 
         await EnsureBucketAsync(bucket, ctx.CancellationToken);
 
@@ -108,43 +111,30 @@ public sealed class UploadFinalizeService
                     .WithContentType(string.IsNullOrWhiteSpace(mime) ? "application/octet-stream" : mime),
                 ctx.CancellationToken);
 
-            // 3) Stat object for ETag/ContentType/Size
-            var stat = await _minio.StatObjectAsync(
-                new StatObjectArgs().WithBucket(bucket).WithObject(objectKey),
-                ctx.CancellationToken);
-
-            // 4) Insert FileDoc (bằng chứng)
+            // 3) Insert FileDoc (bằng chứng)
             var doc = new FileDoc
             {
                 Id = ObjectId.GenerateNewId().ToString(),
                 Bucket = bucket,
                 ObjectKey = objectKey,
                 UploadId = uploadId,
-
                 OriginalName = fileName,
-                MimeType = string.IsNullOrWhiteSpace(stat.ContentType) ? mime : stat.ContentType,
-                Size = stat.Size > 0 ? stat.Size : putSize,
-
-                ETag = stat.ETag,
-
+                MimeType = string.IsNullOrWhiteSpace(mime) ? "application/octet-stream" : mime,
+                Size = putSize,
+                // MinIO ETag không bắt buộc → để null
+                ETag = null,
                 CreatedByUserId = payload.UserId,
                 CreatedAtUtc = DateTime.UtcNow,
-
-                SourceType = string.IsNullOrWhiteSpace(payload.SourceType) ? "UPLOAD" : payload.SourceType,
-                SourceId = payload.SourceId,
+                SourceType = payload.SourceType,
+                SourceId = sourceId,
                 IsDeleted = false
             };
 
             try
             {
-                // unique safety: if retry finalize somehow, ensure no duplicate for same uploadId+owner
-                var filter = Builders<FileDoc>.Filter.And(
-                    Builders<FileDoc>.Filter.Eq(x => x.UploadId, uploadId),
-                    Builders<FileDoc>.Filter.Eq(x => x.CreatedByUserId, payload.UserId),
-                    Builders<FileDoc>.Filter.Eq(x => x.IsDeleted, false)
-                );
-
-                var existing = await _ctx.Files.Find(filter).FirstOrDefaultAsync(ctx.CancellationToken);
+                var existing = await _ctx.Files
+                    .Find(x => x.UploadId == uploadId)
+                    .FirstOrDefaultAsync(ctx.CancellationToken);
                 if (existing == null)
                 {
                     await _ctx.Files.InsertOneAsync(doc, cancellationToken: ctx.CancellationToken);
@@ -183,7 +173,7 @@ public sealed class UploadFinalizeService
             // ✅ Log đầy đủ để biết MinIO chết vì gì (bucket/permission/size mismatch/endpoint…)
             _log.LogError(mex,
                 "MinIO Put/Stat failed in Finalize. uploadId={uploadId}, bucket={bucket}, key={key}, fileName={fileName}, mime={mime}, payloadLen={len}, sourceType={st}, sourceId={sid}",
-                uploadId, bucket, objectKey, fileName, mime, payload.Length, payload.SourceType, payload.SourceId);
+                uploadId, bucket, objectKey, fileName, mime, payload.Length, payload.SourceType, sourceId);
 
             throw;
         }

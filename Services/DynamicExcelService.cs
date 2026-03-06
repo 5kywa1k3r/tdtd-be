@@ -3,6 +3,7 @@ using MongoDB.Driver;
 using tdtd_be.Common.Auth;
 using tdtd_be.Data;
 using tdtd_be.DTOs.Auth;
+using tdtd_be.DTOs.Common;
 using tdtd_be.DTOs.DynamicExcel;
 using tdtd_be.Models;
 
@@ -12,7 +13,6 @@ public interface IDynamicExcelService
 {
     Task<PagedResult<DynamicExcelRow>> SearchAsync(DynamicExcelSearchReq req, CancellationToken ct);
     Task<DynamicExcelDetail> GetByIdAsync(string id, CancellationToken ct);
-
     Task<NextCodeResp> GetNextCodeAsync(int? year, CancellationToken ct);
     Task<DynamicExcelDetail> CreateAsync(CreateDynamicExcelReq req, CancellationToken ct);
     Task<DynamicExcelDetail> UpdateAsync(string id, UpdateDynamicExcelReq req, CancellationToken ct);
@@ -36,7 +36,7 @@ public sealed class DynamicExcelService : IDynamicExcelService
         // - ADMIN/SYS full
         // - còn lại: chỉ người tạo được sửa/xóa
         if (!string.Equals(doc.CreatedByUserId, me.Id, StringComparison.Ordinal))
-            throw new UnauthorizedAccessException("Bạn không có quyền sửa/xóa bảng biểu này.");
+            throw new BadHttpRequestException("Bạn không có quyền sửa/xóa bảng biểu này.");
     }
 
     private Task EnsureNotLinkedToWorkAsync(string templateId, CancellationToken ct)

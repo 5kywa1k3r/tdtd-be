@@ -40,6 +40,30 @@
             // DYNAMIC EXCEL (soft delete)s
             var dx = db.GetCollection<DynamicExcelTemplate>(opt.DynamicExcelTemplateCollection);
             await EnsureDynamicExcelAsync(dx, ct);
+
+            // WORKS (soft delete)
+            var works = db.GetCollection<Work>(opt.WorkCollection);
+            await EnsureWorksAsync(works, ct);
+
+            // DocRole (soft delete)
+            var docRole = db.GetCollection<DocRole>(opt.DocRoleCollection);
+            await EnsureDocRolesAsync(docRole, ct);
+
+            // WORK HISTORIES (usually immutable but still BaseEntity has isDeleted => keep)
+            var wh = db.GetCollection<WorkHistory>(opt.WorkHistoryCollection);
+            await EnsureWorkHistoriesAsync(wh, ct);
+
+            // COUNTERS (no soft delete)
+            var counters = db.GetCollection<CounterDoc>(opt.CounterCollection);
+            await EnsureCountersAsync(counters, ct);
+
+            // COUNTERS (no soft delete)
+            var workAssignment = db.GetCollection<WorkAssignment>(opt.WorkAssignmentCollection);
+            await EnsureWorkAssignmentsAsync(workAssignment, ct);
+
+            // WORK ASSIGNMENT REPORTS (soft delete)
+            var workAssignmentReports = db.GetCollection<WorkAssignmentReport>(opt.WorkAssignmentReportCollection);
+            await EnsureWorkAssignmentReportsAsync(workAssignmentReports, ct);
         }
 
         // ================= USERS =================
@@ -208,6 +232,344 @@
             await EnsureBySpecAsync(col, new IndexSpec(
                 name: "ix_dynamicExcel_labels_isDeleted",
                 key: new BsonDocument { { "labels", 1 }, { "isDeleted", 1 } }
+            ), ct);
+        }
+
+        // ================= WORKS =================
+        private static async Task EnsureWorksAsync(IMongoCollection<Work> col, CancellationToken ct)
+        {
+            // partition / base soft-delete
+            await EnsureBySpecAsync(col,
+                new IndexSpec("ix_works_isDeleted", new BsonDocument("isDeleted", 1)),
+                ct);
+
+            // precheck unique among active for autoCode
+            await PrecheckDuplicateActiveAsync(col, field: "autoCode", ct);
+
+            // unique active autoCode
+            await EnsureBySpecAsync(col, new IndexSpec(
+                name: "ux_works_autoCode_active",
+                key: new BsonDocument("autoCode", 1),
+                unique: true,
+                partial: new BsonDocument("isDeleted", false)
+            ), ct);
+
+            // search helpers
+            await EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_works_name_isDeleted",
+                key: new BsonDocument
+                {
+            { "name", 1 },
+            { "isDeleted", 1 }
+                }
+            ), ct);
+
+            await EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_works_status_isDeleted",
+                key: new BsonDocument
+                {
+            { "status", 1 },
+            { "isDeleted", 1 }
+                }
+            ), ct);
+
+            await EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_works_type_createdAt_desc_isDeleted",
+                key: new BsonDocument
+                {
+            { "type", 1 },
+            { "createdAtUtc", -1 },
+            { "isDeleted", 1 }
+                }
+            ), ct);
+
+            await EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_works_type_priority_createdAt_desc_isDeleted",
+                key: new BsonDocument
+                {
+            { "type", 1 },
+            { "priority", 1 },
+            { "createdAtUtc", -1 },
+            { "isDeleted", 1 }
+                }
+            ), ct);
+
+            await EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_works_leaderDirective_isDeleted",
+                key: new BsonDocument
+                {
+            { "leaderDirectiveUserId", 1 },
+            { "isDeleted", 1 }
+                }
+            ), ct);
+
+            await EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_works_dueDate_isDeleted",
+                key: new BsonDocument
+                {
+            { "dueDate", 1 },
+            { "isDeleted", 1 }
+                }
+            ), ct);
+
+            // optional: code unique active nếu cho phép người dùng nhập code riêng và muốn không trùng
+            // await PrecheckDuplicateActiveAsync(col, field: "code", ct);
+            // await EnsureBySpecAsync(col, new IndexSpec(
+            //     name: "ux_works_code_active",
+            //     key: new BsonDocument("code", 1),
+            //     unique: true,
+            //     partial: new BsonDocument("isDeleted", false)
+            // ), ct);
+        }
+
+        // ================= DOC ROLES =================
+        private static async Task EnsureDocRolesAsync(IMongoCollection<DocRole> col, CancellationToken ct)
+        {
+            await EnsureBySpecAsync(col,
+                new IndexSpec("ix_docRoles_isDeleted", new BsonDocument("isDeleted", 1)),
+                ct);
+
+            // precheck unique active theo (docType, docId, userId, role)
+            await PrecheckDuplicateActiveByFieldsAsync(
+                col,
+                fields: new[] { "docType", "docId", "userId", "role" },
+                ct: ct);
+
+            // unique active: 1 user - 1 role - 1 doc chỉ có 1 dòng
+            await EnsureBySpecAsync(col, new IndexSpec(
+                name: "ux_docRoles_docType_docId_userId_role_active",
+                key: new BsonDocument
+                {
+            { "docType", 1 },
+            { "docId", 1 },
+            { "userId", 1 },
+            { "role", 1 }
+                },
+                unique: true,
+                partial: new BsonDocument("isDeleted", false)
+            ), ct);
+
+            // query user xem được doc nào
+            await EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_docRoles_docType_userId_isDeleted",
+                key: new BsonDocument
+                {
+            { "docType", 1 },
+            { "userId", 1 },
+            { "isDeleted", 1 }
+                }
+            ), ct);
+
+            // query 1 doc có những ai
+            await EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_docRoles_docType_docId_isDeleted",
+                key: new BsonDocument
+                {
+            { "docType", 1 },
+            { "docId", 1 },
+            { "isDeleted", 1 }
+                }
+            ), ct);
+
+            // query role cụ thể trong 1 doc
+            await EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_docRoles_docType_docId_role_isDeleted",
+                key: new BsonDocument
+                {
+            { "docType", 1 },
+            { "docId", 1 },
+            { "role", 1 },
+            { "isDeleted", 1 }
+                }
+            ), ct);
+        }
+
+        // ================= WORK HISTORIES =================
+        private static async Task EnsureWorkHistoriesAsync(IMongoCollection<WorkHistory> col, CancellationToken ct)
+        {
+            await EnsureBySpecAsync(col, new IndexSpec("ix_workHist_isDeleted", new BsonDocument("isDeleted", 1)), ct);
+
+            await EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_workHist_workId_at_desc",
+                key: new BsonDocument { { "workId", 1 }, { "atUtc", -1 } }
+            ), ct);
+        }
+
+        // ================= COUNTERS =================
+        private static async Task EnsureCountersAsync(IMongoCollection<CounterDoc> col, CancellationToken ct)
+        {
+            // unique key
+            await EnsureBySpecAsync(col, new IndexSpec(
+                name: "ux_counters_key",
+                key: new BsonDocument("key", 1),
+                unique: true
+            ), ct);
+        }
+
+        // ================= WORKASSIGNMENT =================
+        private static async Task EnsureWorkAssignmentsAsync(IMongoCollection<WorkAssignment> col, CancellationToken ct)
+        {
+            // partition
+            await EnsureBySpecAsync(col, new IndexSpec(
+                "ix_workAssignments_isDeleted",
+                new BsonDocument("isDeleted", 1)
+            ), ct);
+
+            await EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_workAssignments_work_createdAt_desc_isDeleted",
+                key: new BsonDocument
+                {
+                    { "workId", 1 },
+                    { "createdAtUtc", -1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
+
+            await EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_workAssignments_work_dynamicExcel_isDeleted",
+                key: new BsonDocument
+                {
+                    { "workId", 1 },
+                    { "dynamicExcelId", 1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
+
+            await EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_workAssignments_assignmentType_isDeleted",
+                key: new BsonDocument
+                {
+                    { "assignmentType", 1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
+
+            await EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_workAssignments_aggregationType_isDeleted",
+                key: new BsonDocument
+                {
+                    { "aggregationType", 1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
+
+            await EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_workAssignments_assignees_userId_isDeleted",
+                key: new BsonDocument
+                {
+                    { "assignees.userId", 1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
+
+            await EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_workAssignments_updatedAt_desc_isDeleted",
+                key: new BsonDocument
+                {
+                    { "updatedAtUtc", -1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
+
+            await EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_workAssignments_isActive_isDeleted",
+                key: new BsonDocument
+                {
+                    { "isActive", 1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
+        }
+
+        // ================= WORK ASSIGNMENT REPORTS =================
+        private static async Task EnsureWorkAssignmentReportsAsync(
+            IMongoCollection<WorkAssignmentReport> col,
+            CancellationToken ct)
+        {
+            // partition index cho soft delete
+            await EnsureBySpecAsync(col, new IndexSpec(
+                "ix_workAssignmentReports_isDeleted",
+                new BsonDocument("isDeleted", 1)
+            ), ct);
+
+            // unique version trong cùng 1 assignment + kỳ, chỉ áp dụng với bản active
+            await EnsureBySpecAsync(col, new IndexSpec(
+                name: "ux_workAssignmentReports_assignment_period_version_active",
+                key: new BsonDocument
+                {
+                { "workAssignmentId", 1 },
+                { "periodKey", 1 },
+                { "versionNo", 1 }
+                },
+                unique: true,
+                partial: new BsonDocument("isDeleted", false)
+            ), ct);
+
+            // query lấy bản current của 1 assignment + kỳ
+            await EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_workAssignmentReports_assignment_period_current_isDeleted",
+                key: new BsonDocument
+                {
+                { "workAssignmentId", 1 },
+                { "periodKey", 1 },
+                { "isCurrent", 1 },
+                { "isDeleted", 1 }
+                }
+            ), ct);
+
+            // query list theo assignment, sort updated mới nhất
+            await EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_workAssignmentReports_assignment_isDeleted_updatedAtUtc",
+                key: new BsonDocument
+                {
+                { "workAssignmentId", 1 },
+                { "isDeleted", 1 },
+                { "updatedAtUtc", -1 }
+                }
+            ), ct);
+
+            // query list theo work root
+            await EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_workAssignmentReports_work_isDeleted_updatedAtUtc",
+                key: new BsonDocument
+                {
+                { "workId", 1 },
+                { "isDeleted", 1 },
+                { "updatedAtUtc", -1 }
+                }
+            ), ct);
+
+            // filter theo status
+            await EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_workAssignmentReports_status_isDeleted_updatedAtUtc",
+                key: new BsonDocument
+                {
+                { "status", 1 },
+                { "isDeleted", 1 },
+                { "updatedAtUtc", -1 }
+                }
+            ), ct);
+
+            // filter/search theo template
+            await EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_workAssignmentReports_template_isDeleted_updatedAtUtc",
+                key: new BsonDocument
+                {
+                { "dynamicExcelTemplateId", 1 },
+                { "isDeleted", 1 },
+                { "updatedAtUtc", -1 }
+                }
+            ), ct);
+
+            // query theo kỳ nếu cần thống kê / lọc nhanh
+            await EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_workAssignmentReports_period_isDeleted_updatedAtUtc",
+                key: new BsonDocument
+                {
+                { "periodKey", 1 },
+                { "isDeleted", 1 },
+                { "updatedAtUtc", -1 }
+                }
             ), ct);
         }
 
@@ -392,6 +754,39 @@
             await col.Database.RunCommandAsync<BsonDocument>(cmd, cancellationToken: ct);
         }
 
+        private static async Task PrecheckDuplicateActiveByFieldsAsync<T>(
+            IMongoCollection<T> col,
+            string[] fields,
+            CancellationToken ct)
+        {
+            if (fields == null || fields.Length == 0)
+                throw new ArgumentException("fields is required", nameof(fields));
+
+            var match = new BsonDocument("$match", new BsonDocument("isDeleted", false));
+
+            var groupId = new BsonDocument();
+            foreach (var f in fields)
+                groupId.Add(f, $"${f}");
+
+            var group = new BsonDocument("$group", new BsonDocument
+            {
+                { "_id", groupId },
+                { "count", new BsonDocument("$sum", 1) }
+            });
+
+            var matchDup = new BsonDocument("$match", new BsonDocument("count", new BsonDocument("$gt", 1)));
+            var limit = new BsonDocument("$limit", 1);
+
+            var pipeline = new[] { match, group, matchDup, limit };
+
+            var dup = await col.Aggregate<BsonDocument>(pipeline).FirstOrDefaultAsync(ct);
+            if (dup != null)
+            {
+                var keyText = string.Join(", ", fields);
+                throw new InvalidOperationException($"Duplicate active documents detected for unique key: {keyText}");
+            }
+        }
+
         private sealed class IndexSpec
         {
             public IndexSpec(string name, BsonDocument key, bool unique = false, BsonDocument? partial = null, int? expireAfterSeconds = null)
@@ -410,4 +805,5 @@
             public int? ExpireAfterSeconds { get; }
         }
     }
+
 }

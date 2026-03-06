@@ -4,7 +4,7 @@ using tdtd_be.Data.Infrastructure;
 
 namespace tdtd_be.Models;
 
-[BsonCollection("file_docs")]
+[BsonCollection("file_doc")]
 public sealed class FileDoc: BaseEntity
 {
     [BsonId]

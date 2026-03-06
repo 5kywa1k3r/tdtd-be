@@ -43,7 +43,7 @@ public sealed class UploadSessionsController : ControllerBase
 
         var me = _me.RequireMe();
 
-        // ✅ issue upload token (đúng logic bệ hạ đã có)
+        // ✅ issue upload token (đúng logic đã có)
         var uploadToken = _uploadTokenSvc.Issue(
             userId: me.Id,
             fileName: req.FileName,

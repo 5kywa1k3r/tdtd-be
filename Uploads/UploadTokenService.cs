@@ -11,7 +11,6 @@ public sealed class UploadTokenService
 
     public UploadTokenService(IConfiguration cfg)
     {
-        // dùng chung Jwt:Key cho gọn (bệ hạ có thể tách riêng Upload:Key sau)
         var jwtKey = cfg["Jwt:Key"] ?? throw new Exception("Jwt:Key missing");
         _key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtKey));
     }
@@ -49,6 +48,17 @@ public sealed class UploadTokenService
 
         return new JwtSecurityTokenHandler().WriteToken(token);
     }
+
+    // ✅ wrapper cho controller dùng cho gọn
+    public string CreateToken(UploadTokenPayload p, int ttlSeconds = 900)
+        => Issue(
+            userId: p.UserId,
+            fileName: p.FileName,
+            mime: p.Mime,
+            size: p.Length,
+            sourceType: p.SourceType,
+            sourceId: p.SourceId,
+            ttlSeconds: ttlSeconds);
 
     public UploadTokenPayload? Validate(string token)
     {

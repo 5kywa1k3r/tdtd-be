@@ -60,6 +60,4 @@ public sealed record DynamicExcelSearchReq(
     string? SortDirection = "desc"
 );
 
-public sealed record PagedResult<T>(IReadOnlyList<T> Items, long Total, int Page, int PageSize);
-
 public sealed record NextCodeResp(string Prefix, int Year, int NextSeq, string NextCode);

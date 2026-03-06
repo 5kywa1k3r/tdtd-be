@@ -16,6 +16,12 @@ namespace tdtd_be.Data
         public IMongoCollection<UnitVersionHistory> UnitHistories { get; }
         public IMongoCollection<FileDoc> Files { get; }
         public IMongoCollection<DynamicExcelTemplate> DynamicExcelTemplates { get; }
+        public IMongoCollection<Work> Works { get; }
+        public IMongoCollection<WorkHistory> WorkHistories { get; }
+        public IMongoCollection<CounterDoc> Counters { get; }
+        public IMongoCollection<WorkAssignment> WorkAssignments { get; }
+        public IMongoCollection<DocRole> DocRoles { get; }
+        public IMongoCollection<WorkAssignmentReport> WorkAssignmentReports { get; }
 
         public MongoDbContext(IOptions<MongoOptions> opt)
         {
@@ -30,6 +36,12 @@ namespace tdtd_be.Data
             UnitHistories = Db.GetCollection<UnitVersionHistory>(o.UnitHistoryCollection);
             Files = Db.GetCollection<FileDoc>(o.FileDocCollection);
             DynamicExcelTemplates = Db.GetCollection<DynamicExcelTemplate>(o.DynamicExcelTemplateCollection);
+            Works = Db.GetCollection<Work>(o.WorkCollection);
+            WorkHistories = Db.GetCollection<WorkHistory>(o.WorkHistoryCollection);
+            Counters = Db.GetCollection<CounterDoc>(o.CounterCollection);
+            WorkAssignments = Db.GetCollection<WorkAssignment>(o.WorkAssignmentCollection);
+            DocRoles = Db.GetCollection<DocRole>(o.DocRoleCollection);
+            WorkAssignmentReports = Db.GetCollection<WorkAssignmentReport>(o.WorkAssignmentReportCollection);
         }
     }
 }
