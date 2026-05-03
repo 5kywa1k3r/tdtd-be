@@ -9,19 +9,42 @@ internal static class WorkAssignmentScheduleHelper
 {
     public static SaveWorkAssignmentRequest NormalizeRequest(SaveWorkAssignmentRequest req)
     {
+        var assignmentType = req.AssignmentType?.Trim() ?? string.Empty;
+
+        var normalizedDueAtUtc = req.DueAtUtc;
+
+        var normalizedSchedule = assignmentType == WorkAssignmentTypes.Once
+            ? null
+            : NormalizeScheduleDto(req.Schedule);
+
         return new SaveWorkAssignmentRequest
         {
             ParentAssignmentId = string.IsNullOrWhiteSpace(req.ParentAssignmentId)
                 ? null
                 : req.ParentAssignmentId.Trim(),
 
-            DynamicExcelId = req.DynamicExcelId?.Trim() ?? string.Empty,
-            AssignmentType = req.AssignmentType?.Trim() ?? string.Empty,
+            DynamicFormTemplateId = string.IsNullOrWhiteSpace(req.DynamicFormTemplateId)
+                ? null
+                : req.DynamicFormTemplateId.Trim(),
+            DynamicExcelId = string.IsNullOrWhiteSpace(req.DynamicExcelId)
+                ? null
+                : req.DynamicExcelId.Trim(),
+            AssignmentType = assignmentType,
             AggregationType = req.AggregationType?.Trim() ?? string.Empty,
 
-            Schedule = NormalizeScheduleDto(req.Schedule),
+            DueAtUtc = assignmentType == WorkAssignmentTypes.Once
+                ? normalizedDueAtUtc
+                : null,
+
+            Schedule = normalizedSchedule,
 
             AssigneeUserIds = (req.AssigneeUserIds ?? new List<string>())
+                .Where(x => !string.IsNullOrWhiteSpace(x))
+                .Select(x => x.Trim())
+                .Distinct(StringComparer.Ordinal)
+                .ToList(),
+
+            AssigneeUnitIds = (req.AssigneeUnitIds ?? new List<string>())
                 .Where(x => !string.IsNullOrWhiteSpace(x))
                 .Select(x => x.Trim())
                 .Distinct(StringComparer.Ordinal)
@@ -37,14 +60,16 @@ internal static class WorkAssignmentScheduleHelper
                 ? null
                 : req.Description.Trim(),
 
-            IsActive = req.IsActive
+            IsActive = req.IsActive,
+            AllowUserCreatedReports = req.AllowUserCreatedReports
         };
     }
 
     public static void ValidateRequest(SaveWorkAssignmentRequest req, Work work)
     {
-        if (string.IsNullOrWhiteSpace(req.DynamicExcelId))
-            throw new InvalidOperationException("Thiếu biểu mẫu/bảng động.");
+        if (string.IsNullOrWhiteSpace(req.DynamicFormTemplateId) &&
+            string.IsNullOrWhiteSpace(req.DynamicExcelId))
+            throw new InvalidOperationException("Thiếu Dynamic Form template.");
 
         if (!WorkAssignmentTypes.All.Contains(req.AssignmentType))
             throw new InvalidOperationException("Loại giao không hợp lệ.");
@@ -56,7 +81,16 @@ internal static class WorkAssignmentScheduleHelper
             throw new InvalidOperationException("Phải chọn ít nhất 1 người được giao.");
 
         if (req.AssignmentType == WorkAssignmentTypes.Once)
+        {
+            if (!req.DueAtUtc.HasValue)
+                throw new InvalidOperationException("Giao một lần bắt buộc phải có hạn nộp.");
+
+            if (req.Schedule is not null)
+                throw new InvalidOperationException("Giao một lần không được có cấu hình lịch định kỳ.");
+
+            ValidateOnceDueAt(req.DueAtUtc.Value, work);
             return;
+        }
 
         if (req.AssignmentType == WorkAssignmentTypes.PeriodicReport)
         {
@@ -67,6 +101,16 @@ internal static class WorkAssignmentScheduleHelper
         throw new InvalidOperationException("Loại giao không được hỗ trợ.");
     }
 
+    private static void ValidateOnceDueAt(DateTime dueAtUtc, Work work)
+    {
+        var dueDate = dueAtUtc.Date;
+
+        if (work.StartDate.HasValue && dueDate < work.StartDate.Value.Date)
+            throw new InvalidOperationException("Hạn nộp của giao một lần không được nhỏ hơn ngày bắt đầu công việc.");
+
+        if (work.EndDate.HasValue && dueDate > work.EndDate.Value.Date)
+            throw new InvalidOperationException("Hạn nộp của giao một lần không được lớn hơn ngày kết thúc công việc.");
+    }
     public static AssignmentSchedule? MapSchedule(
         AssignmentScheduleDto? dto,
         string assignmentType)

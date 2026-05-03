@@ -1,46 +1,109 @@
-﻿using Microsoft.AspNetCore.Authentication.JwtBearer;
+﻿using Hangfire;
+using Hangfire.Dashboard;
+using Hangfire.Mongo;
+using Hangfire.Mongo.Migration.Strategies;
+using Hangfire.Mongo.Migration.Strategies.Backup;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.IdentityModel.Tokens;
 using Microsoft.OpenApi.Models;
 using Minio;
 using Minio.DataModel.Args;
+using MongoDB.Driver;
 using StackExchange.Redis;
+using System.Net;
 using System.Text;
 using tdtd_be.Common.Cache;
 using tdtd_be.Common.Middleware;
+using tdtd_be.DashboardModel.Services;
 using tdtd_be.Data;
 using tdtd_be.Data.Indexes;
 using tdtd_be.Data.Infrastructure;
+using tdtd_be.Jobs;
 using tdtd_be.Models;
 using tdtd_be.Options;
 using tdtd_be.Services;
 using tdtd_be.Services.Common;
+using tdtd_be.Services.EvaluationTemplates;
 using tdtd_be.Services.WorkAssignmentReports;
+using tdtd_be.Services.WorkAssignmentReports.Statistics;
 using tdtd_be.Services.WorkAssignments;
+using tdtd_be.Services.WorkAssignments.Aggregate;
 using tdtd_be.Services.WorkAssignments.Domain;
 using tdtd_be.Services.WorkAssignments.Lookups;
+using tdtd_be.Services.WorkAssignments.Progress;
+using tdtd_be.Services.WorkAssignments.Queue;
+using tdtd_be.Services.WorkAssignments.Review;
+using tdtd_be.Services.WorkAssignments.Runtime;
 using tdtd_be.Services.Works;
 using tdtd_be.Uploads;
 using tusdotnet.Interfaces;
 using tusdotnet.Stores;
 using static tdtd_be.Services.Works.WorkServices;
-// + middleware/cache namespaces (tạo 2 file này)
-// using tdtd_be.Common.Cache;
-// using tdtd_be.Common.Middleware;
 
 var builder = WebApplication.CreateBuilder(args);
 
 // ================== config ==================
 builder.Services.Configure<MongoOptions>(builder.Configuration.GetSection("Mongo"));
 builder.Services.Configure<JwtOptions>(builder.Configuration.GetSection("Jwt"));
+builder.Services.Configure<UploadOptions>(builder.Configuration.GetSection("Uploads"));
 
 // ================== mongo ==================
 builder.Services.AddSingleton<MongoDbContext>();
 
+// ================== Hangfire ==================
+var mongoConnectionString = builder.Configuration["Mongo:ConnectionString"]
+    ?? throw new Exception("Mongo:ConnectionString is missing");
+var mongoDatabaseName = builder.Configuration["Mongo:Database"]
+    ?? throw new Exception("Mongo:Database is missing");
+
+var hangfirePrefix = builder.Configuration["Hangfire:Prefix"] ?? "hangfire";
+var schedulePollingSeconds = Math.Clamp(
+    builder.Configuration.GetValue<int?>("Hangfire:SchedulePollingSeconds") ?? 15,
+    5,
+    300);
+var invisibilityMinutes = Math.Clamp(
+    builder.Configuration.GetValue<int?>("Hangfire:InvisibilityTimeoutMinutes") ?? 5,
+    1,
+    120);
+var queuedJobsStrategyRaw = builder.Configuration["Hangfire:CheckQueuedJobsStrategy"] ?? "Poll";
+
+if (!Enum.TryParse<CheckQueuedJobsStrategy>(queuedJobsStrategyRaw, true, out var queuedJobsStrategy))
+    queuedJobsStrategy = CheckQueuedJobsStrategy.Poll;
+
+var mongoUrlBuilder = new MongoUrlBuilder(mongoConnectionString) { DatabaseName = mongoDatabaseName };
+var hangfireMongoClient = new MongoClient(mongoUrlBuilder.ToMongoUrl());
+
+var migrationOptions = new MongoMigrationOptions
+{
+    MigrationStrategy = new MigrateMongoMigrationStrategy(),
+    BackupStrategy = new CollectionMongoBackupStrategy()
+};
+
+var storageOptions = new MongoStorageOptions
+{
+    Prefix = hangfirePrefix,
+    CheckQueuedJobsStrategy = queuedJobsStrategy,
+    SlidingInvisibilityTimeout = TimeSpan.FromMinutes(invisibilityMinutes),
+    MigrationOptions = migrationOptions
+};
+
+builder.Services.AddHangfire(cfg => cfg
+    .SetDataCompatibilityLevel(CompatibilityLevel.Version_180)
+    .UseSimpleAssemblyNameTypeSerializer()
+    .UseRecommendedSerializerSettings()
+    .UseMongoStorage(hangfireMongoClient, mongoDatabaseName, storageOptions));
+
+builder.Services.AddHangfireServer(options =>
+{
+    options.ServerName = $"tdtd-be:{Environment.MachineName}";
+    options.WorkerCount = Math.Max(1, Environment.ProcessorCount);
+    options.Queues = new[] { "default" };
+    options.SchedulePollingInterval = TimeSpan.FromSeconds(schedulePollingSeconds);
+});
+
 // ================== MinIO client + TUS ==================
 builder.Services.AddScoped<UploadFinalizeService>();
-builder.Services.AddHostedService<TusTempCleanupHostedService>();
-builder.Services.Configure<UploadOptions>(builder.Configuration.GetSection("Uploads"));
 builder.Services.AddSingleton<UploadTokenService>();
 builder.Services.AddSingleton<IMinioClient>(sp =>
 {
@@ -51,7 +114,6 @@ builder.Services.AddSingleton<IMinioClient>(sp =>
     var secretKey = cfg.GetValue<string>("Minio:SecretKey") ?? throw new Exception("Minio:SecretKey missing");
     var secure = cfg.GetValue<bool>("Minio:Secure");
 
-    // normalize endpoint: bỏ scheme, bỏ path
     var ep = rawEndpoint.Trim()
         .Replace("http://", "", StringComparison.OrdinalIgnoreCase)
         .Replace("https://", "", StringComparison.OrdinalIgnoreCase);
@@ -62,11 +124,7 @@ builder.Services.AddSingleton<IMinioClient>(sp =>
     var host = parts[0];
     var port = (parts.Length == 2 && int.TryParse(parts[1], out var p)) ? p : (secure ? 443 : 80);
 
-    // LOG để chắc chắn app đang dùng đúng config
     Console.WriteLine($"[MinIO] endpoint={host}:{port} secure={secure} accessKey={accessKey} secretLen={secretKey.Length}");
-
-    // Bật trace để nhìn request thật sự (rất hữu ích)
-    var traceWriter = TextWriter.Synchronized(Console.Out);
 
     return new MinioClient()
         .WithEndpoint(host, port)
@@ -75,8 +133,9 @@ builder.Services.AddSingleton<IMinioClient>(sp =>
         .WithRegion("us-east-1")
         .Build();
 });
-builder.Services.AddHostedService<MinioFileDocCleanupHostedService>();
 builder.Services.AddSingleton<IMinioObjectDeleter, MinioObjectDeleter>();
+builder.Services.AddScoped<IMinioFileDocCleanupJob, MinioFileDocCleanupJob>();
+builder.Services.AddScoped<ITusTempCleanupJob, TusTempCleanupJob>();
 
 // ================== core services ==================
 builder.Services.AddSingleton<PasswordHasher<AppUser>>();
@@ -86,11 +145,22 @@ builder.Services.AddScoped<UserContext>();
 builder.Services.AddHttpContextAccessor();
 builder.Services.AddScoped<tdtd_be.Common.Auth.MeAccessor>();
 builder.Services.AddScoped<tdtd_be.Common.Auth.UnitTreeHelper>();
+builder.Services.AddSingleton<ManagementAccountConvention>();
+builder.Services.AddScoped<IManagementAccountProvisioner, ManagementAccountProvisioner>();
 builder.Services.AddScoped<IUnitTypeAdminService, UnitTypeAdminService>();
+builder.Services.AddScoped<IPositionAdminService, PositionAdminService>();
+builder.Services.AddScoped<IUnitSelectionService, UnitSelectionService>();
 builder.Services.AddScoped<IUnitService, UnitService>();
 builder.Services.AddScoped<IUserAdminService, UserAdminService>();
+builder.Services.AddScoped<IAdminImportService, AdminImportService>();
 builder.Services.AddScoped<IDynamicExcelService, DynamicExcelService>();
+builder.Services.AddScoped<IDynamicFormService, DynamicFormService>();
+builder.Services.AddScoped<ILabelService, LabelService>();
 
+builder.Services.AddScoped<IDocRoleReadModelProjectionService, DocRoleReadModelProjectionService>();
+builder.Services.AddScoped<IDocRoleReadModelFreshnessService, DocRoleReadModelFreshnessService>();
+builder.Services.AddScoped<IDocRoleReadModelRepairService, DocRoleReadModelRepairService>();
+builder.Services.AddScoped<IWorkStatusOperationLogService, WorkStatusOperationLogService>();
 builder.Services.AddScoped<IDocRoleService, DocRoleService>();
 
 builder.Services.AddScoped<IWorkCodeGenerator, WorkCodeGenerator>();
@@ -100,15 +170,36 @@ builder.Services.AddScoped<IWorkPermissionService, WorkPermissionService>();
 
 builder.Services.AddScoped<IWorkAssignmentLookupService, WorkAssignmentLookupService>();
 builder.Services.AddScoped<IDynamicExcelLookupService, DynamicExcelLookupService>();
+builder.Services.AddScoped<IWorkAssignmentTemplateResolver, WorkAssignmentTemplateResolver>();
 builder.Services.AddScoped<IWorkAssignmentDataGuardService, WorkAssignmentDataGuardService>();
 builder.Services.AddScoped<IWorkAssignmentTreeService, WorkAssignmentTreeService>();
+builder.Services.AddScoped<IWorkTemplateAssigneeBindingService, WorkTemplateAssigneeBindingService>();
 builder.Services.AddScoped<IWorkAssignmentService, WorkAssignmentService>();
 
 builder.Services.AddScoped<IWorkAssignmentReportService, WorkAssignmentReportService>();
+builder.Services.AddScoped<IWorkReportLabelStatisticsService, WorkReportLabelStatisticsService>();
+builder.Services.AddScoped<IWorkReportTableStatisticsService, WorkReportTableStatisticsService>();
+builder.Services.AddScoped<IWorkReportFieldStatisticsService, WorkReportFieldStatisticsService>();
+
+builder.Services.AddScoped<IWorkAssignmentProgressService, WorkAssignmentProgressService>();
+builder.Services.AddScoped<IWorkAssignmentReviewService, WorkAssignmentReviewService>();
+builder.Services.AddScoped<IWorkAssignmentAggregateService, WorkAssignmentAggregateService>();
+builder.Services.AddScoped<IReportTemplateRuntimeTypeResolver, ReportTemplateRuntimeTypeResolver>();
+builder.Services.AddScoped<IAggregateTableService, AggregateTableService>();
+
+builder.Services.AddScoped<IWorkAssignmentRuntimeMaterializeService, WorkAssignmentRuntimeMaterializeService>();
+builder.Services.AddScoped<IWorkAssignmentQueueService, WorkAssignmentQueueService>();
+builder.Services.AddScoped<IWorkAssignmentQueueJobService, WorkAssignmentQueueJobService>();
+builder.Services.AddScoped<IWorkAssignmentStatusSyncService, WorkAssignmentStatusSyncService>();
+builder.Services.AddScoped<IWorkAssignmentStatusRepairService, WorkAssignmentStatusRepairService>();
+
+builder.Services.AddScoped<IWorkAssignmentMaterializeJobService, WorkAssignmentMaterializeJobService>();
+builder.Services.AddScoped<IEvaluationTemplateService, EvaluationTemplateService>();
+builder.Services.AddScoped<IDashboardQueryService, DashboardQueryService>();
+builder.Services.AddScoped<IDashboardOverviewService, DashboardOverviewService>();
+builder.Services.AddScoped<IDashboardMindMapQueryService, DashboardMindMapQueryService>();
 
 // ================== redis (cache) ==================
-// appsettings.json:
-// "Redis": { "ConnectionString": "localhost:6379", "MeTtlMinutes": 720 }
 var redisEnabled = builder.Configuration.GetValue<bool>("Redis:Enabled");
 
 if (redisEnabled)
@@ -121,8 +212,8 @@ if (redisEnabled)
         ConnectionMultiplexer.Connect($"{cs},abortConnect=false")
     );
 
-    // only register cache + middleware when redis is enabled
     builder.Services.AddSingleton<RedisUserCache>();
+    builder.Services.AddSingleton<RedisDashboardCache>();
 }
 builder.Services.AddTransient<MeContextRedisMiddleware>();
 
@@ -130,14 +221,12 @@ builder.Services.AddTransient<MeContextRedisMiddleware>();
 builder.Services.AddScoped<ApiExceptionMiddleware>();
 
 builder.Services.AddControllers();
-// ✅ Tus temp path
+
+// ================== Tus temp path ==================
 var tusTempPath = builder.Configuration["Tus:TempPath"] ?? "App_Data/tus";
 Directory.CreateDirectory(tusTempPath);
 
-// ✅ One TusDiskStore instance
 builder.Services.AddSingleton<TusDiskStore>(_ => new TusDiskStore(tusTempPath));
-
-// ✅ Map store interfaces (đúng version)
 builder.Services.AddSingleton<ITusStore>(sp => sp.GetRequiredService<TusDiskStore>());
 builder.Services.AddSingleton<ITusTerminationStore>(sp => sp.GetRequiredService<TusDiskStore>());
 
@@ -146,7 +235,7 @@ builder.Services.AddCors(opt =>
 {
     opt.AddPolicy("fe", p =>
     {
-        p.WithOrigins("http://localhost:5173") // sửa đúng FE origin
+        p.WithOrigins("http://localhost:5173")
          .AllowAnyHeader()
          .AllowAnyMethod()
          .AllowCredentials()
@@ -155,7 +244,7 @@ builder.Services.AddCors(opt =>
             "Upload-Offset",
             "Tus-Resumable",
             "Upload-Length"
-         ); ;
+         );
     });
 });
 
@@ -216,6 +305,7 @@ if (app.Environment.IsDevelopment())
 {
     app.UseSwagger();
     app.UseSwaggerUI();
+
     using var scope = app.Services.CreateScope();
     var minio = scope.ServiceProvider.GetRequiredService<IMinioClient>();
     var cfg = scope.ServiceProvider.GetRequiredService<IConfiguration>();
@@ -233,23 +323,49 @@ if (app.Environment.IsDevelopment())
 }
 
 app.UseAuthentication();
-
-// ✅ Middleware cache: set HttpContext.Items["me"] từ Redis/claims + check tokenVersion (tv)
-// IMPORTANT: đặt SAU UseAuthentication và TRƯỚC UseAuthorization
 app.UseMiddleware<MeContextRedisMiddleware>();
 app.UseMiddleware<ApiExceptionMiddleware>();
 app.UseAuthorization();
+
+app.UseHangfireDashboard("/hangfire", new DashboardOptions
+{
+    Authorization = new[] { new LocalRequestsOnlyAuthorizationFilter() },
+    DisplayStorageConnectionString = false,
+    DashboardTitle = "TDTD Hangfire"
+});
+
 app.MapControllers();
 app.MapTusUploads();
 
-// ================== bootstrap indexes ==================
 using (var scope = app.Services.CreateScope())
 {
     var ctx = scope.ServiceProvider.GetRequiredService<MongoDbContext>();
     var mongoOpt = scope.ServiceProvider
         .GetRequiredService<Microsoft.Extensions.Options.IOptions<MongoOptions>>().Value;
     await MongoIndexInitializer.EnsureAsync(ctx.Db, mongoOpt);
+
+    HangfireRecurringJobRegistrar.Register(scope.ServiceProvider.GetRequiredService<IConfiguration>());
 }
 
 app.Run();
-    
+
+public sealed class LocalRequestsOnlyAuthorizationFilter : IDashboardAuthorizationFilter
+{
+    public bool Authorize(DashboardContext context)
+    {
+        var httpContext = context.GetHttpContext();
+        var remoteIp = httpContext.Connection.RemoteIpAddress;
+        var localIp = httpContext.Connection.LocalIpAddress;
+
+        if (remoteIp is null)
+            return false;
+
+        if (IPAddress.IsLoopback(remoteIp))
+            return true;
+
+        if (localIp is not null && remoteIp.Equals(localIp))
+            return true;
+
+        return remoteIp.ToString() is "::1" or "127.0.0.1";
+    }
+}

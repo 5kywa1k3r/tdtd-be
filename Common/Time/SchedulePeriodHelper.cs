@@ -6,17 +6,18 @@ public static class SchedulePeriodHelper
 {
     public static string GetPeriodKey(string? cycleType, DateTime date)
     {
-        var type = NormalizeCycleType(cycleType);
+        //var type = NormalizeCycleType(cycleType);
 
-        return type switch
-        {
-            ReportCycleTypes.Daily => date.ToString("yyyy-MM-dd"),
-            ReportCycleTypes.Weekly => ScheduleWeekHelper.GetWeekPeriodKey(date),
-            ReportCycleTypes.Monthly => $"{date:yyyy-MM}",
-            ReportCycleTypes.Quarterly => $"{date.Year}-Q{GetQuarter(date)}",
-            ReportCycleTypes.SemiAnnual => $"{date.Year}-H{GetHalf(date)}",
-            _ => date.ToString("yyyy-MM-dd")
-        };
+        //return type switch
+        //{
+        //    ReportCycleTypes.Daily => date.ToString("yyyy-MM-dd"),
+        //    ReportCycleTypes.Weekly => ScheduleWeekHelper.GetWeekPeriodKey(date),
+        //    ReportCycleTypes.Monthly => $"{date:yyyy-MM}",
+        //    ReportCycleTypes.Quarterly => $"{date.Year}-Q{GetQuarter(date)}",
+        //    ReportCycleTypes.SemiAnnual => $"{date.Year}-H{GetHalf(date)}",
+        //    _ => date.ToString("yyyy-MM-dd")
+        //};
+        return date.Date.ToString("yyyyMMdd");
     }
 
     public static (DateTime start, DateTime end) GetPeriodRange(string? cycleType, DateTime date)

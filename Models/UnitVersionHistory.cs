@@ -24,7 +24,7 @@ public sealed class UnitVersionHistory : BaseEntity
     public string Code { get; set; } = default!;
 
     [BsonElement("symbol")]
-    public string Symbol { get; set; } = default!;
+    public string? Symbol { get; set; }
 
     [BsonElement("shortName")]
     public string? ShortName { get; set; }
@@ -38,4 +38,10 @@ public sealed class UnitVersionHistory : BaseEntity
 
     [BsonElement("unitTypeCodes")]
     public List<string> UnitTypeCodes { get; set; } = new();
+
+    [BsonElement("primaryUnitTypeCode")]
+    public string? PrimaryUnitTypeCode { get; set; }
+
+    [BsonElement("isVirtual")]
+    public bool IsVirtual { get; set; } = false;
 }

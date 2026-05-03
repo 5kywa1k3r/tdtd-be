@@ -1,5 +1,6 @@
 ﻿using MongoDB.Bson;
 using MongoDB.Driver;
+using Microsoft.Extensions.Logging;
 using tdtd_be.Common.Auth;
 using tdtd_be.Data;
 using tdtd_be.DTOs.Common;
@@ -29,7 +30,10 @@ namespace tdtd_be.Services.Works
             private readonly IWorkCodeGenerator _codeGen;
             private readonly IWorkHistoryService _history;
             private readonly IDocRoleService _docRole;
+            private readonly IDocRoleReadModelProjectionService _docRoleReadModelProjection;
+            private readonly IDocRoleReadModelFreshnessService _docRoleReadModelFreshness;
             private readonly IWorkPermissionService _permission;
+            private readonly ILogger<WorkService> _log;
 
             public WorkService(
                 MongoDbContext ctx,
@@ -37,100 +41,25 @@ namespace tdtd_be.Services.Works
                 IWorkCodeGenerator codeGen,
                 IWorkHistoryService history,
                 IDocRoleService docRole,
-                IWorkPermissionService permission)
+                IDocRoleReadModelProjectionService docRoleReadModelProjection,
+                IDocRoleReadModelFreshnessService docRoleReadModelFreshness,
+                IWorkPermissionService permission,
+                ILogger<WorkService> log)
             {
                 _ctx = ctx;
                 _me = me;
                 _codeGen = codeGen;
                 _history = history;
                 _docRole = docRole;
+                _docRoleReadModelProjection = docRoleReadModelProjection;
+                _docRoleReadModelFreshness = docRoleReadModelFreshness;
                 _permission = permission;
+                _log = log;
             }
 
             // ===============================
             // Snapshot helpers
             // ===============================
-
-            private sealed record UnitLite(
-                string Id,
-                string? Symbol,
-                string? ShortName,
-                string? Name
-            );
-
-            private async Task<Dictionary<string, UnitLite>> LoadUnitLiteMapAsync(
-                IEnumerable<string> unitIds,
-                CancellationToken ct)
-            {
-                var list = unitIds
-                    .Where(x => !string.IsNullOrWhiteSpace(x))
-                    .Distinct(StringComparer.Ordinal)
-                    .ToList();
-
-                if (list.Count == 0)
-                    return new Dictionary<string, UnitLite>(StringComparer.Ordinal);
-
-                var rows = await _ctx.Units
-                    .Find(u => list.Contains(u.Id) && !u.IsDeleted)
-                    .Project(u => new UnitLite(u.Id, u.Symbol, u.ShortName, u.FullName))
-                    .ToListAsync(ct);
-
-                return rows.ToDictionary(x => x.Id, x => x, StringComparer.Ordinal);
-            }
-
-            private UserRef ToUserRef(AppUser u, Dictionary<string, UnitLite> unitMap)
-            {
-                unitMap.TryGetValue(u.UnitId ?? string.Empty, out var unit);
-
-                return new UserRef
-                {
-                    UserId = u.Id,
-                    Username = u.Username,
-                    FullName = u.FullName,
-                    UnitId = u.UnitId,
-                    UnitSymbol = unit?.Symbol,
-                    UnitShortName = unit?.ShortName,
-                    UnitName = unit?.Name,
-                    PositionCode = Positions.Normalize(u.PositionCode),
-                    PositionName = Positions.GetName(u.PositionCode),
-                };
-            }
-
-            private async Task<Dictionary<string, UserRef>> LoadUserRefMapAsync(
-                IEnumerable<string> userIds,
-                CancellationToken ct)
-            {
-                var ids = userIds
-                    .Where(x => !string.IsNullOrWhiteSpace(x))
-                    .Distinct(StringComparer.Ordinal)
-                    .ToList();
-
-                if (ids.Count == 0)
-                    return new Dictionary<string, UserRef>(StringComparer.Ordinal);
-
-                var users = await _ctx.Users
-                    .Find(u => ids.Contains(u.Id) && !u.IsDeleted)
-                    .ToListAsync(ct);
-
-                var unitIds = users
-                    .Select(u => u.UnitId)
-                    .Where(x => !string.IsNullOrWhiteSpace(x))
-                    .Distinct(StringComparer.Ordinal)
-                    .ToList();
-
-                var unitMap = await LoadUnitLiteMapAsync(unitIds!, ct);
-
-                var map = new Dictionary<string, UserRef>(StringComparer.Ordinal);
-                foreach (var u in users)
-                    map[u.Id] = ToUserRef(u, unitMap);
-
-                return map;
-            }
-
-            private static UserRef NewEmptyUserRef(string userId) => new()
-            {
-                UserId = userId
-            };
 
             private async Task RebuildRootSnapshotAsync(Work doc, CancellationToken ct)
             {
@@ -145,25 +74,28 @@ namespace tdtd_be.Services.Works
                 if (doc.LeaderWatchUserIds is { Count: > 0 })
                     ids.AddRange(doc.LeaderWatchUserIds);
 
-                var map = await LoadUserRefMapAsync(ids, ct);
+                var map = await UserRefSnapshotHelper.LoadUserRefMapAsync(_ctx, ids, ct);
 
                 doc.Owner =
                     !string.IsNullOrWhiteSpace(doc.CreatedByUserId) &&
                     map.TryGetValue(doc.CreatedByUserId, out var owner)
                         ? owner
                         : (!string.IsNullOrWhiteSpace(doc.CreatedByUserId)
-                            ? NewEmptyUserRef(doc.CreatedByUserId)
+                            ? UserRefSnapshotHelper.NewEmptyUserRef(doc.CreatedByUserId)
                             : null);
 
                 doc.LeaderDirective =
+                    !string.IsNullOrWhiteSpace(doc.LeaderDirectiveUserId) &&
                     map.TryGetValue(doc.LeaderDirectiveUserId, out var leader)
                         ? leader
-                        : NewEmptyUserRef(doc.LeaderDirectiveUserId);
+                        : (!string.IsNullOrWhiteSpace(doc.LeaderDirectiveUserId)
+                            ? UserRefSnapshotHelper.NewEmptyUserRef(doc.LeaderDirectiveUserId)
+                            : null);
 
                 doc.LeaderWatch = (doc.LeaderWatchUserIds ?? new List<string>())
                     .Where(x => !string.IsNullOrWhiteSpace(x))
                     .Distinct(StringComparer.Ordinal)
-                    .Select(id => map.TryGetValue(id, out var r) ? r : NewEmptyUserRef(id))
+                    .Select(id => map.TryGetValue(id, out var r) ? r : UserRefSnapshotHelper.NewEmptyUserRef(id))
                     .ToList();
             }
 
@@ -201,6 +133,18 @@ namespace tdtd_be.Services.Works
                 await _docRole.UpsertWorkRootRolesAsync(doc, ct);
             }
 
+
+            private async Task<EvaluationTemplate?> ResolveEvaluationTemplateAsync(string? evaluationTemplateId, CancellationToken ct)
+            {
+                if (string.IsNullOrWhiteSpace(evaluationTemplateId))
+                    return null;
+
+                return await _ctx.EvaluationTemplates
+                    .Find(x => x.Id == evaluationTemplateId.Trim() && !x.IsDeleted && x.IsActive)
+                    .FirstOrDefaultAsync(ct)
+                    ?? throw new InvalidOperationException("Không tìm thấy bộ mã đánh giá.");
+            }
+
             // ===============================
             // Service methods
             // ===============================
@@ -213,8 +157,6 @@ namespace tdtd_be.Services.Works
                 if (string.IsNullOrWhiteSpace(req.Name))
                     throw new InvalidOperationException("Name is required.");
 
-                if (string.IsNullOrWhiteSpace(req.LeaderDirectiveUserId))
-                    throw new InvalidOperationException("LeaderDirectiveUserId is required.");
 
                 var now = DateTime.UtcNow;
                 var year = now.Year;
@@ -224,6 +166,8 @@ namespace tdtd_be.Services.Works
                     .Where(x => !string.IsNullOrWhiteSpace(x))
                     .Distinct(StringComparer.Ordinal)
                     .ToList();
+
+                var evaluationTemplate = await ResolveEvaluationTemplateAsync(req.EvaluationTemplateId, ct);
 
                 var doc = new Work
                 {
@@ -235,8 +179,12 @@ namespace tdtd_be.Services.Works
                     Status = WorkStatus.S1,
                     Type = req.Type,
 
-                    LeaderDirectiveUserId = req.LeaderDirectiveUserId,
+                    LeaderDirectiveUserId = string.IsNullOrWhiteSpace(req.LeaderDirectiveUserId) ? null : req.LeaderDirectiveUserId.Trim(),
                     LeaderWatchUserIds = leaderWatchUserIds,
+
+                    EvaluationTemplateId = evaluationTemplate?.Id,
+                    EvaluationTemplateCode = evaluationTemplate?.RepresentativeCode,
+                    EvaluationTemplateLabel = evaluationTemplate?.RepresentativeLabel,
 
                     StartDate = req.StartDate,
                     EndDate = req.EndDate,
@@ -287,6 +235,8 @@ namespace tdtd_be.Services.Works
                 if (await NeedsBackfillSnapshotAsync(doc, ct))
                     await BackfillRootSnapshotAndRolesAsync(doc, me.Id, ct);
 
+                await _docRoleReadModelFreshness.EnsureWorkFreshAsync(doc, me.Id, ct);
+
                 return ToResponse(doc);
             }
 
@@ -297,18 +247,13 @@ namespace tdtd_be.Services.Works
                 var page = req.Page < 0 ? 0 : req.Page;
                 var pageSize = req.PageSize <= 0 ? 10 : Math.Min(req.PageSize, 200);
 
-                var accessibleWorkIds = await _docRole.GetAccessibleDocIdsAsync(DocType.WORK, me.Id, ct);
-                accessibleWorkIds = accessibleWorkIds
-                    .Where(x => !string.IsNullOrWhiteSpace(x))
-                    .Distinct(StringComparer.Ordinal)
-                    .ToList();
-
-                if (accessibleWorkIds.Count == 0)
+                if (!await EnsureWorkListDocRolesForUserAsync(me.Id, ct))
                     return new PagedResult<WorkListRow>(new List<WorkListRow>(), 0, page, pageSize);
 
-                var fb = Builders<Work>.Filter;
+                var fb = Builders<WorkListDocRole>.Filter;
                 var f = fb.Eq(x => x.IsDeleted, false) &
-                        fb.In(x => x.Id, accessibleWorkIds) &
+                        fb.Eq(x => x.DocType, DocType.WORK) &
+                        fb.Eq(x => x.UserId, me.Id) &
                         fb.Eq(x => x.Type, req.Type);
 
                 if (!string.IsNullOrWhiteSpace(req.Q))
@@ -332,32 +277,61 @@ namespace tdtd_be.Services.Works
                 if (!string.IsNullOrWhiteSpace(req.LeaderDirectiveUserId))
                     f &= fb.Eq(x => x.LeaderDirectiveUserId, req.LeaderDirectiveUserId);
 
-                var sort = BuildSort(req.SortField, req.SortDirection);
+                var sort = BuildDocRoleSort(req.SortField, req.SortDirection);
 
-                var total = await _ctx.Works.CountDocumentsAsync(f, cancellationToken: ct);
+                var total = await _ctx.WorkListDocRoles.CountDocumentsAsync(f, cancellationToken: ct);
 
-                var rows = await _ctx.Works.Find(f)
+                var rows = await _ctx.WorkListDocRoles.Find(f)
                     .Sort(sort)
                     .Skip(page * pageSize)
                     .Limit(pageSize)
                     .Project(x => new WorkListRow(
-                        x.Id,
+                        x.WorkId,
                         x.AutoCode,
                         x.Code,
                         x.Name,
                         x.Status,
                         x.Priority,
                         x.Type,
-                        x.CreatedByUserId,
-                        x.Owner != null ? x.Owner.FullName : null,
+                        x.WorkCreatedByUserId,
+                        x.OwnerName,
                         x.LeaderDirectiveUserId,
-                        x.LeaderWatchUserIds.Count,
+                        x.LeaderWatchCount,
+                        x.EvaluationTemplateId,
+                        x.EvaluationTemplateCode,
+                        x.EvaluationTemplateLabel,
+                        x.HasManualEvaluations,
+                        x.EvaluatedAssignmentCount,
+                        x.WorstEvaluationCode,
+                        x.WorstEvaluationLabel,
                         x.DueDate,
-                        x.CreatedAtUtc
+                        x.WorkCreatedAtUtc
                     ))
                     .ToListAsync(ct);
 
                 return new PagedResult<WorkListRow>(rows, total, page, pageSize);
+            }
+
+            private async Task<bool> EnsureWorkListDocRolesForUserAsync(string userId, CancellationToken ct)
+            {
+                if (string.IsNullOrWhiteSpace(userId))
+                    return false;
+
+                var hasProjectedRows = await _ctx.WorkListDocRoles
+                    .Find(x =>
+                        x.UserId == userId &&
+                        x.DocType == DocType.WORK &&
+                        !x.IsDeleted)
+                    .AnyAsync(ct);
+
+                if (hasProjectedRows)
+                    return true;
+
+                _log.LogWarning(
+                    "Work list projection missing. userId={userId}. Returning current projection only; run internal DocRole repair/backfill if source data exists.",
+                    userId);
+
+                return false;
             }
 
             public async Task<WorkResponse> UpdateAsync(string id, WorkUpdateRequest req, CancellationToken ct)
@@ -387,12 +361,19 @@ namespace tdtd_be.Services.Works
 
                 var needRebuildRoot = false;
 
+                if (req.EvaluationTemplateId != null)
+                {
+                    var evaluationTemplate = await ResolveEvaluationTemplateAsync(req.EvaluationTemplateId, ct);
+                    doc.EvaluationTemplateId = evaluationTemplate?.Id;
+                    doc.EvaluationTemplateCode = evaluationTemplate?.RepresentativeCode;
+                    doc.EvaluationTemplateLabel = evaluationTemplate?.RepresentativeLabel;
+                }
+
                 if (req.LeaderDirectiveUserId != null)
                 {
-                    if (string.IsNullOrWhiteSpace(req.LeaderDirectiveUserId))
-                        throw new InvalidOperationException("LeaderDirectiveUserId is required.");
-
-                    doc.LeaderDirectiveUserId = req.LeaderDirectiveUserId;
+                    doc.LeaderDirectiveUserId = string.IsNullOrWhiteSpace(req.LeaderDirectiveUserId)
+                        ? null
+                        : req.LeaderDirectiveUserId.Trim();
                     needRebuildRoot = true;
                 }
 
@@ -508,6 +489,24 @@ namespace tdtd_be.Services.Works
                 };
             }
 
+            private static SortDefinition<WorkListDocRole> BuildDocRoleSort(string? sortField, string? sortDirection)
+            {
+                var desc = string.Equals(sortDirection, "desc", StringComparison.OrdinalIgnoreCase);
+                sortField = string.IsNullOrWhiteSpace(sortField) ? "createdAtUtc" : sortField;
+
+                var sb = Builders<WorkListDocRole>.Sort;
+
+                return sortField switch
+                {
+                    "createdAtUtc" => desc ? sb.Descending(x => x.WorkCreatedAtUtc) : sb.Ascending(x => x.WorkCreatedAtUtc),
+                    "dueDate" => desc ? sb.Descending(x => x.DueDate) : sb.Ascending(x => x.DueDate),
+                    "autoCode" => desc ? sb.Descending(x => x.AutoCode) : sb.Ascending(x => x.AutoCode),
+                    "name" => desc ? sb.Descending(x => x.Name) : sb.Ascending(x => x.Name),
+                    "priority" => desc ? sb.Descending(x => x.Priority) : sb.Ascending(x => x.Priority),
+                    _ => desc ? sb.Descending(x => x.WorkCreatedAtUtc) : sb.Ascending(x => x.WorkCreatedAtUtc),
+                };
+            }
+
             private static WorkResponse ToResponse(Work x) => new(
                 x.Id,
                 x.AutoCode,
@@ -519,6 +518,13 @@ namespace tdtd_be.Services.Works
                 x.CreatedByUserId,
                 x.LeaderDirectiveUserId,
                 x.LeaderWatchUserIds,
+                x.EvaluationTemplateId,
+                x.EvaluationTemplateCode,
+                x.EvaluationTemplateLabel,
+                x.HasManualEvaluations,
+                x.EvaluatedAssignmentCount,
+                x.WorstEvaluationCode,
+                x.WorstEvaluationLabel,
                 x.StartDate,
                 x.EndDate,
                 x.DueDate,

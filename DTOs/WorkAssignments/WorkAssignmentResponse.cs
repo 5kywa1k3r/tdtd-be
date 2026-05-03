@@ -6,10 +6,12 @@ public class WorkAssignmentResponse
 {
     public string Id { get; set; } = default!;
     public string WorkId { get; set; } = default!;
-
     public string DynamicExcelId { get; set; } = default!;
     public string DynamicExcelCode { get; set; } = string.Empty;
     public string DynamicExcelName { get; set; } = string.Empty;
+    public string? DynamicFormTemplateId { get; set; }
+    public string? DynamicFormTemplateCode { get; set; }
+    public string? DynamicFormTemplateName { get; set; }
 
     public string WorkType { get; set; } = string.Empty;
     public string AssignmentType { get; set; } = string.Empty;
@@ -23,9 +25,17 @@ public class WorkAssignmentResponse
 
     public string? Description { get; set; }
     public bool IsActive { get; set; }
+    public bool AllowUserCreatedReports { get; set; }
 
     public bool HasData { get; set; }
     public bool TemplateLocked { get; set; }
+
+    public int ProgressStatus { get; set; }
+    public DateTime? ProgressStatusUpdatedAtUtc { get; set; }
+    public string? LatestPeriodKey { get; set; }
+    public DateTime? LatestDueAtUtc { get; set; }
+    public bool HasAnyDuePeriod { get; set; }
+    public bool HasOverduePeriod { get; set; }
 
     public DateTime CreatedAtUtc { get; set; }
     public DateTime UpdatedAtUtc { get; set; }
@@ -35,4 +45,20 @@ public class WorkAssignmentResponse
     public int Level { get; set; }
     public string Code { get; set; } = default!;
     public string Path { get; set; } = default!;
+    public string? EvaluationCode { get; set; }
+    public string? EvaluationLabel { get; set; }
+    public string? EvaluationTemplateId { get; set; }
+    public string? EvaluationTemplateCode { get; set; }
+    public string? EvaluationTemplateLabel { get; set; }
+    public string? EvaluationNote { get; set; }
+    public DateTime? EvaluatedAtUtc { get; set; }
+    public string? EvaluatedByUserId { get; set; }
+    public int? WorstPeriodStatus { get; set; }
+    public string? WorstOverdueReasonCode { get; set; }
+    public string? WorstOverdueReasonLabel { get; set; }
+    public bool HasManualEvaluations { get; set; }
+    public int EvaluatedAssignmentCount { get; set; }
+    public string? WorstEvaluationCode { get; set; }
+    public string? WorstEvaluationLabel { get; set; }
+    public DateTime? DueAtUtc { get; set; }
 }

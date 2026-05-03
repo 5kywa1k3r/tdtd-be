@@ -17,6 +17,8 @@ public sealed class CreateUserRequest
     public string UnitId { get; set; } = default!;
 
     public List<string> Roles { get; set; } = new();
+
+    [Required, MinLength(1), MaxLength(80)]
     public string PositionCode { get; set; } = default!;
 }
 
@@ -28,6 +30,8 @@ public sealed class UpdateUserRequest
     public string? FullName { get; set; } = default!;
     public List<string>? Roles { get; set; }
     public string? Note { get; set; }
+
+    [Required, MinLength(1), MaxLength(80)]
     public string PositionCode { get; set; } = default!;
 }
 
@@ -49,5 +53,7 @@ public sealed record UserResponse(
     bool IsDeleted,
     DateTime CreatedAtUtc,
     DateTime UpdatedAtUtc,
-    string? PositionCode
+    string? PositionCode,
+    string? PositionName = null,
+    string? AccountKind = null
 );

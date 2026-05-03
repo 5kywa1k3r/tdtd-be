@@ -9,8 +9,9 @@ namespace tdtd_be.Models;
 /// Dữ liệu báo cáo thực tế của một WorkAssignment tại một kỳ cụ thể.
 /// 
 /// Hiểu ngắn gọn:
-/// - WorkAssignment = yêu cầu báo cáo hiện hành
-/// - WorkAssignmentReport = một lần nhập/nộp báo cáo theo kỳ
+/// - WorkTemplateAssignee = binding runtime hiện hành
+/// - WorkReportPeriod = 1 kỳ phải báo cáo
+/// - WorkAssignmentReport = 1 bản dữ liệu thực tế của kỳ đó
 /// 
 /// Report luôn snapshot lại template + schedule tại thời điểm phát sinh,
 /// để sau này assignment đổi template/schedule thì report cũ vẫn giữ nguyên lịch sử.
@@ -19,204 +20,168 @@ namespace tdtd_be.Models;
 [BsonCollection("work_assignment_report")]
 public sealed class WorkAssignmentReport : BaseEntity
 {
-    /// <summary>
-    /// Id của report.
-    /// </summary>
     [BsonId]
     [BsonRepresentation(BsonType.ObjectId)]
     public string Id { get; set; } = default!;
 
-    /// <summary>
-    /// Id của Work gốc để query nhanh theo root work.
-    /// </summary>
     [BsonElement("workId")]
     [BsonRepresentation(BsonType.ObjectId)]
     public string WorkId { get; set; } = default!;
 
-    /// <summary>
-    /// Id của WorkAssignment sinh ra report này.
-    /// Đây là khóa nghiệp vụ chính.
-    /// </summary>
     [BsonElement("workAssignmentId")]
     [BsonRepresentation(BsonType.ObjectId)]
     public string WorkAssignmentId { get; set; } = default!;
 
-    /// <summary>
-    /// Kỳ báo cáo thực tế của report.
-    /// Ví dụ:
-    /// - 2026-03
-    /// - 2026-Q1
-    /// - 2026-W10
-    /// - ONCE
-    /// 
-    /// Lưu tách riêng để report cũ không phụ thuộc schedule hiện tại của assignment.
-    /// </summary>
+    [BsonElement("workReportPeriodId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string WorkReportPeriodId { get; set; } = default!;
+
+    [BsonElement("dynamicFormTemplateId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? DynamicFormTemplateId { get; set; }
+
+    [BsonElement("dynamicFormTemplateCode")]
+    public string? DynamicFormTemplateCode { get; set; }
+
+    [BsonElement("dynamicFormTemplateName")]
+    public string? DynamicFormTemplateName { get; set; }
+
+    [BsonElement("assigneeUserId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string AssigneeUserId { get; set; } = default!;
+
     [BsonElement("periodKey")]
     public string PeriodKey { get; set; } = default!;
 
-    /// <summary>
-    /// Thời gian bắt đầu của kỳ báo cáo.
-    /// Có thể null nếu một số loại kỳ chỉ dùng periodKey mà không cần range cụ thể.
-    /// </summary>
+    [BsonElement("periodInstanceKey")]
+    public string PeriodInstanceKey { get; set; } = default!;
+
+    [BsonElement("periodKind")]
+    public string PeriodKind { get; set; } = WorkReportPeriodKind.Scheduled;
+
+    [BsonElement("reportTitle")]
+    public string? ReportTitle { get; set; }
+
+    [BsonElement("reportDate")]
+    public DateTime? ReportDate { get; set; }
+
+    [BsonElement("linkedScheduledPeriodId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? LinkedScheduledPeriodId { get; set; }
+
     [BsonElement("periodStart")]
     public DateTime? PeriodStart { get; set; }
 
-    /// <summary>
-    /// Thời gian kết thúc của kỳ báo cáo.
-    /// Có thể null nếu không cần.
-    /// </summary>
     [BsonElement("periodEnd")]
     public DateTime? PeriodEnd { get; set; }
 
-    /// <summary>
-    /// Trạng thái hiện tại của report.
-    /// Phase 1 chủ yếu dùng Draft.
-    /// </summary>
+    [BsonElement("dueAtUtc")]
+    public DateTime? DueAtUtc { get; set; }
+
     [BsonElement("status")]
     public WorkAssignmentReportStatus Status { get; set; } = WorkAssignmentReportStatus.Draft;
 
-    /// <summary>
-    /// Snapshot template tại thời điểm khởi tạo report.
-    /// Nên chứa các thông tin tối thiểu như:
-    /// - templateId
-    /// - code
-    /// - name
-    /// - specJson
-    /// - dataRect
-    /// - workbook gốc
-    /// 
-    /// Lưu JSON string để đỡ cứng schema và giữ lịch sử chính xác.
-    /// </summary>
-    [BsonElement("templateSnapshotJson")]
-    public string TemplateSnapshotJson { get; set; } = default!;
+    [BsonElement("submittedAtUtc")]
+    public DateTime? SubmittedAtUtc { get; set; }
 
-    /// <summary>
-    /// Snapshot schedule của assignment tại thời điểm khởi tạo report.
-    /// Dùng để lưu lịch sử cấu hình kỳ báo cáo lúc bản này được tạo.
-    /// </summary>
+    [BsonElement("approvedAtUtc")]
+    public DateTime? ApprovedAtUtc { get; set; }
+
+    [BsonElement("approvedByUserId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string ApprovedByUserId { get; set; }
+
+    [BsonElement("data")]
+    public object? Data { get; set; }
+
     [BsonElement("scheduleSnapshotJson")]
     public string ScheduleSnapshotJson { get; set; } = default!;
 
-    /// <summary>
-    /// Id template đang được dùng tại thời điểm tạo report.
-    /// Lưu riêng để search/filter nhanh, không phải parse templateSnapshotJson.
-    /// </summary>
     [BsonElement("dynamicExcelTemplateId")]
     [BsonRepresentation(BsonType.ObjectId)]
     public string DynamicExcelTemplateId { get; set; } = default!;
 
-    /// <summary>
-    /// Code template để hiển thị nhanh ngoài list.
-    /// </summary>
     [BsonElement("dynamicExcelTemplateCode")]
     public string DynamicExcelTemplateCode { get; set; } = default!;
 
-    /// <summary>
-    /// Tên template để hiển thị nhanh ngoài list.
-    /// </summary>
     [BsonElement("dynamicExcelTemplateName")]
     public string DynamicExcelTemplateName { get; set; } = default!;
 
-    /// <summary>
-    /// FortuneSheet workbook JSON của bản report này sau khi user nhập dữ liệu.
-    /// Đây là dữ liệu UI để mở lại đúng giao diện đã nhập.
-    /// </summary>
-    [BsonElement("rawWorkbookDataJson")]
-    public string RawWorkbookDataJson { get; set; } = default!;
-
-    /// <summary>
-    /// Spec JSON của template/report.
-    /// Lưu riêng để render/validate mà không phải parse snapshot lớn.
-    /// </summary>
     [BsonElement("specJson")]
     public string SpecJson { get; set; } = default!;
 
-    /// <summary>
-    /// Góc trên-trái của vùng dữ liệu trong workbook.
-    /// </summary>
     [BsonElement("dataRectR0")]
     public int DataRectR0 { get; set; }
 
-    /// <summary>
-    /// Cột bắt đầu của vùng dữ liệu trong workbook.
-    /// </summary>
     [BsonElement("dataRectC0")]
     public int DataRectC0 { get; set; }
 
-    /// <summary>
-    /// Hàng kết thúc của vùng dữ liệu trong workbook.
-    /// </summary>
     [BsonElement("dataRectR1")]
     public int DataRectR1 { get; set; }
 
-    /// <summary>
-    /// Cột kết thúc của vùng dữ liệu trong workbook.
-    /// </summary>
     [BsonElement("dataRectC1")]
     public int DataRectC1 { get; set; }
 
-    /// <summary>
-    /// Số cột của vùng dữ liệu.
-    /// Dùng validate values1D.Length == W * H
-    /// </summary>
     [BsonElement("w")]
     public int W { get; set; }
 
-    /// <summary>
-    /// Số hàng của vùng dữ liệu.
-    /// Dùng validate values1D.Length == W * H
-    /// </summary>
     [BsonElement("h")]
     public int H { get; set; }
 
-    /// <summary>
-    /// Dữ liệu 1D đã trải phẳng từ dataRect.
-    /// Đây là dữ liệu chuẩn hóa để tổng hợp/so sánh/query nhanh.
-    /// 
-    /// Khuyến nghị lưu theo thứ tự row-major:
-    /// đi từ trái sang phải, từ trên xuống dưới.
-    /// </summary>
     [BsonElement("values1DJson")]
     public string Values1DJson { get; set; } = default!;
 
-    /// <summary>
-    /// Thời điểm report được submit.
-    /// Null nếu vẫn đang draft.
-    /// </summary>
-    [BsonElement("submittedAtUtc")]
-    public DateTime? SubmittedAtUtc { get; set; }
+    [BsonElement("fieldValuesJson")]
+    public string? FieldValuesJson { get; set; }
+
+    [BsonElement("tableValuesJson")]
+    public string? TableValuesJson { get; set; }
 
     /// <summary>
-    /// User thực hiện submit report.
+    /// Các trường trải phẳng mà lãnh đạo quan tâm.
+    /// Không nhốt riêng trong workbook.
     /// </summary>
+    [BsonElement("currentProgressStatus")]
+    public string? CurrentProgressStatus { get; set; }
+
+    [BsonElement("reportReason")]
+    public string? ReportReason { get; set; }
+
+    [BsonElement("difficulties")]
+    public string? Difficulties { get; set; }
+
+    [BsonElement("proposedSolution")]
+    public string? ProposedSolution { get; set; }
+
+    [BsonElement("isLateSubmission")]
+    public bool IsLateSubmission { get; set; }
+
+    [BsonElement("lateReason")]
+    public string? LateReason { get; set; }
+
+    [BsonElement("reviewerComment")]
+    public string? ReviewerComment { get; set; }
+
+    [BsonElement("reviewerEvaluation")]
+    public string? ReviewerEvaluation { get; set; }
+
+    [BsonElement("returnReason")]
+    public string? ReturnReason { get; set; }
+
     [BsonElement("submittedByUserId")]
     [BsonRepresentation(BsonType.ObjectId)]
     public string? SubmittedByUserId { get; set; }
 
-    /// <summary>
-    /// Thời điểm report được approve.
-    /// </summary>
-    [BsonElement("approvedAtUtc")]
-    public DateTime? ApprovedAtUtc { get; set; }
+    [BsonElement("returnedAtUtc")]
+    public DateTime? ReturnedAtUtc { get; set; }
 
-    /// <summary>
-    /// User thực hiện approve report.
-    /// </summary>
-    [BsonElement("approvedByUserId")]
+    [BsonElement("returnedByUserId")]
     [BsonRepresentation(BsonType.ObjectId)]
-    public string? ApprovedByUserId { get; set; }
+    public string? ReturnedByUserId { get; set; }
 
-    /// <summary>
-    /// Số phiên bản trong cùng 1 kỳ.
-    /// Phase 1 có thể luôn là 1, nhưng nên có từ đầu để không phải migrate.
-    /// </summary>
     [BsonElement("versionNo")]
     public int VersionNo { get; set; } = 1;
 
-    /// <summary>
-    /// Đánh dấu đây có phải bản hiện hành của cùng kỳ hay không.
-    /// Dùng cho lịch sử version sau này.
-    /// </summary>
     [BsonElement("isCurrent")]
     public bool IsCurrent { get; set; } = true;
 }

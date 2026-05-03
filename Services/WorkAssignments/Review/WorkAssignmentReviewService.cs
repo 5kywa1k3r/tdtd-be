@@ -1,0 +1,1580 @@
+using MongoDB.Bson;
+using MongoDB.Driver;
+using Microsoft.Extensions.Logging;
+using System.Text.Json;
+using tdtd_be.Common.Auth;
+using tdtd_be.Data;
+using tdtd_be.DTOs.Common;
+using tdtd_be.DTOs.WorkAssignments.Review;
+using tdtd_be.Enum;
+using tdtd_be.Models;
+using tdtd_be.Models.Enums;
+using tdtd_be.Services.Common;
+using tdtd_be.Services.WorkAssignmentReports.Statistics;
+using tdtd_be.Services.WorkAssignments.Internal;
+using tdtd_be.Services.WorkAssignments.Queue;
+using tdtd_be.Services.WorkAssignments.Runtime;
+
+namespace tdtd_be.Services.WorkAssignments.Review;
+
+public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
+{
+    private readonly MongoDbContext _ctx;
+    private readonly IWorkAssignmentQueueService _queueService;
+    private readonly IWorkAssignmentStatusSyncService _statusSync;
+    private readonly IDocRoleReadModelProjectionService _docRoleReadModelProjection;
+    private readonly IWorkStatusOperationLogService _statusLog;
+    private readonly IWorkReportLabelStatisticsService _labelStatistics;
+    private readonly IWorkReportTableStatisticsService _tableStatistics;
+    private readonly IWorkReportFieldStatisticsService _fieldStatistics;
+    private readonly MeAccessor _me;
+    private readonly ILogger<WorkAssignmentReviewService> _log;
+
+    public WorkAssignmentReviewService(
+        MongoDbContext ctx,
+        IWorkAssignmentQueueService queueService,
+        IWorkAssignmentStatusSyncService statusSync,
+        IDocRoleReadModelProjectionService docRoleReadModelProjection,
+        IWorkStatusOperationLogService statusLog,
+        IWorkReportLabelStatisticsService labelStatistics,
+        IWorkReportTableStatisticsService tableStatistics,
+        IWorkReportFieldStatisticsService fieldStatistics,
+        MeAccessor me,
+        ILogger<WorkAssignmentReviewService> log)
+    {
+        _ctx = ctx;
+        _queueService = queueService;
+        _statusSync = statusSync;
+        _docRoleReadModelProjection = docRoleReadModelProjection;
+        _statusLog = statusLog;
+        _labelStatistics = labelStatistics;
+        _tableStatistics = tableStatistics;
+        _fieldStatistics = fieldStatistics;
+        _me = me;
+        _log = log;
+    }
+
+    public async Task<PagedResult<ReviewChildRowDto>> SearchChildrenForReviewAsync(
+        ReviewChildSearchRequest req,
+        CancellationToken ct)
+    {
+        var me = _me.RequireMe();
+
+        var page = req.Page < 0 ? 0 : req.Page;
+        var pageSize = req.PageSize <= 0 ? 20 : req.PageSize;
+
+        var parent = await LoadParentForReviewAsync(req.ParentAssignmentId, me.Id, ct);
+        await EnsureReviewChildAssignmentListDocRolesAsync(parent.Id, me.Id, ct);
+        await EnsureReviewReportListDocRolesForUserWorkAsync(parent.WorkId, me.Id, ct);
+
+        var fb = Builders<AssignmentListDocRole>.Filter;
+        var filter = fb.Eq(x => x.UserId, me.Id)
+                     & fb.Eq(x => x.WorkId, parent.WorkId)
+                     & fb.Eq(x => x.ParentAssignmentId, parent.Id)
+                     & fb.Eq(x => x.IsDeleted, false);
+
+        if (!string.IsNullOrWhiteSpace(req.Q))
+            filter &= BuildReviewChildListTextFilter(req.Q, fb);
+
+        if (req.ProgressStatus.HasValue)
+            filter &= fb.Eq(x => x.ProgressStatus, req.ProgressStatus.Value);
+
+        if (req.HasOverdueOnly == true)
+            filter &= fb.Eq(x => x.HasOverduePeriod, true);
+
+        var total = await _ctx.AssignmentListDocRoles.CountDocumentsAsync(filter, cancellationToken: ct);
+
+        var children = await _ctx.AssignmentListDocRoles.Find(filter)
+            .SortBy(x => x.FirstAssigneeUnitName)
+            .ThenBy(x => x.FirstAssigneeName)
+            .ThenBy(x => x.DynamicExcelCode)
+            .Skip(page * pageSize)
+            .Limit(pageSize)
+            .ToListAsync(ct);
+
+        var childIds = children.Select(x => x.AssignmentId).ToList();
+        var periodKeys = children
+            .Where(x => !string.IsNullOrWhiteSpace(x.LatestPeriodKey))
+            .Select(x => x.LatestPeriodKey!)
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+
+        var reports = (childIds.Count == 0 || periodKeys.Count == 0)
+            ? new List<ReviewReportListDocRole>()
+            : await _ctx.ReviewReportListDocRoles
+                .Find(x =>
+                    x.ReviewerUserId == me.Id &&
+                    childIds.Contains(x.AssignmentId) &&
+                    periodKeys.Contains(x.PeriodKey) &&
+                    !x.IsDeleted)
+                .ToListAsync(ct);
+
+        var latestReportMap = reports
+            .GroupBy(x => new { x.AssignmentId, x.PeriodKey })
+            .ToDictionary(
+                g => $"{g.Key.AssignmentId}__{g.Key.PeriodKey}",
+                g => g.OrderByDescending(x => x.SortUpdatedAtUtc).First(),
+                StringComparer.Ordinal);
+
+        var rows = children
+            .Select(x => new
+            {
+                Assignment = x,
+                FirstAssignee = x.Assignees?.FirstOrDefault()
+            })
+            .OrderBy(x => x.FirstAssignee?.UnitShortName ?? string.Empty)
+            .ThenBy(x => x.FirstAssignee?.FullName ?? string.Empty)
+            .Select(x =>
+            {
+                var assignment = x.Assignment;
+                var firstAssignee = x.FirstAssignee;
+
+                ReviewReportListDocRole? currentReport = null;
+                if (!string.IsNullOrWhiteSpace(assignment.LatestPeriodKey))
+                {
+                    latestReportMap.TryGetValue(
+                        $"{assignment.AssignmentId}__{assignment.LatestPeriodKey}",
+                        out currentReport);
+                }
+
+                return new ReviewChildRowDto
+                {
+                    WorkAssignmentId = assignment.AssignmentId,
+                    ParentId = assignment.ParentAssignmentId ?? string.Empty,
+
+                    DynamicExcelId = assignment.DynamicExcelId,
+                    DynamicExcelCode = assignment.DynamicExcelCode,
+                    DynamicExcelName = assignment.DynamicExcelName,
+
+                    AssigneeUserId = firstAssignee?.UserId ?? string.Empty,
+                    AssigneeName = firstAssignee?.FullName ?? string.Empty,
+                    UnitId = firstAssignee?.UnitId,
+                    UnitName = firstAssignee?.UnitName,
+
+                    ProgressStatus = assignment.ProgressStatus,
+                    ProgressStatusText = ToProgressStatusText(assignment.ProgressStatus),
+
+                    HasAnyDuePeriod = assignment.HasAnyDuePeriod,
+                    HasOverduePeriod = assignment.HasOverduePeriod,
+                    LatestPeriodKey = assignment.LatestPeriodKey,
+                    LatestDueAtUtc = assignment.LatestDueAtUtc,
+
+                    EvaluationCode = null,
+                    EvaluationLabel = null,
+                    WorstPeriodStatus = assignment.WorstPeriodStatus,
+                    WorstOverdueReasonCode = assignment.WorstOverdueReasonCode,
+                    WorstOverdueReasonLabel = assignment.WorstOverdueReasonLabel,
+
+                    CurrentReportId = currentReport?.CurrentReportId,
+                    CurrentReportStatus = currentReport?.ReportStatus == null ? null : (int?)currentReport.ReportStatus.Value,
+                    CurrentSubmittedAtUtc = currentReport?.SubmittedAtUtc,
+                    CurrentApprovedAtUtc = currentReport?.ApprovedAtUtc
+                };
+            })
+            .ToList();
+
+        return new PagedResult<ReviewChildRowDto>(rows, total, page, pageSize);
+    }
+
+    private async Task EnsureReviewChildAssignmentListDocRolesAsync(
+        string parentAssignmentId,
+        string reviewerUserId,
+        CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(parentAssignmentId) || string.IsNullOrWhiteSpace(reviewerUserId))
+            return;
+
+        var hasProjectedRows = await _ctx.AssignmentListDocRoles
+            .Find(x =>
+                x.ParentAssignmentId == parentAssignmentId &&
+                x.UserId == reviewerUserId &&
+                !x.IsDeleted)
+            .AnyAsync(ct);
+
+        if (hasProjectedRows)
+            return;
+
+        _log.LogWarning(
+            "Review child assignment projection missing. parentAssignmentId={parentAssignmentId} reviewerUserId={reviewerUserId}. Returning current projection only; run internal DocRole repair/backfill if source data exists.",
+            parentAssignmentId,
+            reviewerUserId);
+    }
+
+    private static FilterDefinition<AssignmentListDocRole> BuildReviewChildListTextFilter(
+        string q,
+        FilterDefinitionBuilder<AssignmentListDocRole> fb)
+    {
+        var qRegex = new BsonRegularExpression(q.Trim(), "i");
+
+        return fb.Or(
+            fb.Regex(x => x.DynamicExcelCode, qRegex),
+            fb.Regex(x => x.DynamicExcelName, qRegex),
+            fb.Regex("assignees.fullName", qRegex),
+            fb.Regex("assignees.unitName", qRegex),
+            fb.Regex("assignees.unitShortName", qRegex),
+            fb.Regex("assignees.userId", qRegex));
+    }
+
+    public async Task ApproveReportAsync(string reportId, ApproveReportRequest req, CancellationToken ct)
+    {
+        var me = _me.RequireMe();
+
+        var report = await _ctx.WorkAssignmentReports
+            .Find(x => x.Id == reportId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct)
+            ?? throw new InvalidOperationException("Không tìm thấy báo cáo.");
+
+        if (report.Status != WorkAssignmentReportStatus.Submitted)
+            throw new InvalidOperationException("Chỉ báo cáo đã nộp mới được duyệt.");
+
+        var assignment = await _ctx.WorkAssignments
+            .Find(x => x.Id == report.WorkAssignmentId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct)
+            ?? throw new InvalidOperationException("Không tìm thấy assignment của báo cáo.");
+
+        await EnsureCanReviewReportAsync(assignment, me.Id, ct);
+
+        var now = DateTime.UtcNow;
+
+        await _ctx.WorkAssignmentReports.UpdateOneAsync(
+            x => x.Id == report.Id,
+            Builders<WorkAssignmentReport>.Update
+                .Set(x => x.Status, WorkAssignmentReportStatus.Approved)
+                .Set(x => x.ReviewerComment, req.Comment)
+                .Set(x => x.ApprovedAtUtc, now)
+                .Set(x => x.ApprovedByUserId, me.Id)
+                .Set(x => x.UpdatedAtUtc, now)
+                .Set(x => x.UpdatedByUserId, me.Id),
+            cancellationToken: ct);
+
+        report.Status = WorkAssignmentReportStatus.Approved;
+        report.ReviewerComment = req.Comment;
+        report.ApprovedAtUtc = now;
+        report.ApprovedByUserId = me.Id;
+        report.UpdatedAtUtc = now;
+        report.UpdatedByUserId = me.Id;
+
+        var period = await _ctx.WorkReportPeriods
+            .Find(x => x.Id == report.WorkReportPeriodId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct);
+
+        if (period is not null)
+        {
+            var nextPeriodStatus = ResolveApprovedPeriodStatus(period, report, now);
+
+            await _ctx.WorkReportPeriods.UpdateOneAsync(
+                x => x.Id == period.Id && !x.IsDeleted,
+                Builders<WorkReportPeriod>.Update
+                    .Set(x => x.Status, nextPeriodStatus)
+                    .Set(x => x.IsOverdue, WorkReportPeriodStatusHelper.IsOverdue(nextPeriodStatus))
+                    .Set(x => x.LastReviewedAtUtc, now)
+                    .Set(x => x.ReviewerComment, req.Comment)
+                    .Set(x => x.UpdatedAtUtc, now)
+                    .Set(x => x.UpdatedByUserId, me.Id),
+                cancellationToken: ct);
+
+            period.Status = nextPeriodStatus;
+            period.IsOverdue = WorkReportPeriodStatusHelper.IsOverdue(nextPeriodStatus);
+            period.LastReviewedAtUtc = now;
+            period.ReviewerComment = req.Comment;
+            period.UpdatedAtUtc = now;
+            period.UpdatedByUserId = me.Id;
+
+            await FinalizeReviewReportStatusOperationAsync(
+                "REVIEW_APPROVE",
+                report,
+                period,
+                WorkAssignmentReportStatus.Submitted.ToString(),
+                WorkAssignmentReportStatus.Approved.ToString(),
+                me.Id,
+                upsertQueue: false,
+                disableQueue: true,
+                ct);
+        }
+
+        await InsertReportLogAsync(
+            report.WorkId,
+            report.WorkAssignmentId,
+            report.WorkReportPeriodId,
+            report.Id,
+            "Duyệt",
+            WorkAssignmentReportStatus.Submitted.ToString(),
+            WorkAssignmentReportStatus.Approved.ToString(),
+            me.Id,
+            null,
+            req.Comment,
+            ct);
+
+        WorkAssignmentReportLogHelper.AppendApproveLog(report, me.Id, me.FullName ?? string.Empty);
+    }
+
+    public async Task ReturnReportAsync(string reportId, ReturnReportRequest req, CancellationToken ct)
+    {
+        var me = _me.RequireMe();
+
+        if (string.IsNullOrWhiteSpace(req.Comment))
+            throw new InvalidOperationException("Phải nhập lý do trả lại.");
+
+        var report = await _ctx.WorkAssignmentReports
+            .Find(x => x.Id == reportId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct)
+            ?? throw new InvalidOperationException("Không tìm thấy báo cáo.");
+
+        if (report.Status != WorkAssignmentReportStatus.Submitted)
+            throw new InvalidOperationException("Chỉ báo cáo đã nộp mới được trả lại.");
+
+        var assignment = await _ctx.WorkAssignments
+            .Find(x => x.Id == report.WorkAssignmentId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct)
+            ?? throw new InvalidOperationException("Không tìm thấy assignment của báo cáo.");
+
+        await EnsureCanReviewReportAsync(assignment, me.Id, ct);
+
+        var now = DateTime.UtcNow;
+
+        await _ctx.WorkAssignmentReports.UpdateOneAsync(
+            x => x.Id == report.Id,
+            Builders<WorkAssignmentReport>.Update
+                .Set(x => x.Status, WorkAssignmentReportStatus.Draft)
+                .Set(x => x.ReturnReason, req.Comment)
+                .Set(x => x.ReturnedAtUtc, now)
+                .Set(x => x.ReturnedByUserId, me.Id)
+                .Set(x => x.ApprovedAtUtc, (DateTime?)null)
+                .Set(x => x.ApprovedByUserId, (string?)null)
+                .Set(x => x.UpdatedAtUtc, now)
+                .Set(x => x.UpdatedByUserId, me.Id),
+            cancellationToken: ct);
+
+        report.Status = WorkAssignmentReportStatus.Draft;
+        report.ReturnReason = req.Comment;
+        report.ReturnedAtUtc = now;
+        report.ReturnedByUserId = me.Id;
+        report.ApprovedAtUtc = null;
+        report.ApprovedByUserId = null;
+        report.UpdatedAtUtc = now;
+        report.UpdatedByUserId = me.Id;
+
+        var period = await _ctx.WorkReportPeriods
+            .Find(x => x.Id == report.WorkReportPeriodId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct);
+
+        if (period is not null)
+        {
+            var periodStatus = WorkReportPeriodStatusHelper.ResolveDraftStatus(period.DueAtUtc, now);
+
+            await _ctx.WorkReportPeriods.UpdateOneAsync(
+                x => x.Id == period.Id && !x.IsDeleted,
+                Builders<WorkReportPeriod>.Update
+                    .Set(x => x.Status, periodStatus)
+                    .Set(x => x.IsOverdue, WorkReportPeriodStatusHelper.IsOverdue(periodStatus))
+                    .Set(x => x.LastReviewedAtUtc, now)
+                    .Set(x => x.ReturnReason, req.Comment)
+                    .Set(x => x.ReviewerComment, req.Comment)
+                    .Set(x => x.UpdatedAtUtc, now)
+                    .Set(x => x.UpdatedByUserId, me.Id),
+                cancellationToken: ct);
+
+            period.Status = periodStatus;
+            period.IsOverdue = WorkReportPeriodStatusHelper.IsOverdue(periodStatus);
+            period.LastReviewedAtUtc = now;
+            period.ReturnReason = req.Comment;
+            period.ReviewerComment = req.Comment;
+            period.UpdatedAtUtc = now;
+            period.UpdatedByUserId = me.Id;
+
+            await FinalizeReviewReportStatusOperationAsync(
+                "REVIEW_RETURN",
+                report,
+                period,
+                WorkAssignmentReportStatus.Submitted.ToString(),
+                WorkAssignmentReportStatus.Draft.ToString(),
+                me.Id,
+                upsertQueue: true,
+                disableQueue: false,
+                ct);
+        }
+
+        await InsertReportLogAsync(
+            report.WorkId,
+            report.WorkAssignmentId,
+            report.WorkReportPeriodId,
+            report.Id,
+            "Trả lại",
+            WorkAssignmentReportStatus.Submitted.ToString(),
+            WorkAssignmentReportStatus.Draft.ToString(),
+            me.Id,
+            req.Comment,
+            req.Comment,
+            ct);
+
+        WorkAssignmentReportLogHelper.AppendReturnLog(report, me.Id, me.FullName ?? string.Empty, req.Comment);
+    }
+
+    public async Task RecallApprovedReportAsync(string reportId, ReturnReportRequest req, CancellationToken ct)
+    {
+        var me = _me.RequireMe();
+
+        if (string.IsNullOrWhiteSpace(req.Comment))
+            throw new InvalidOperationException("Phải nhập lý do thu hồi duyệt.");
+
+        var report = await _ctx.WorkAssignmentReports
+            .Find(x => x.Id == reportId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct)
+            ?? throw new InvalidOperationException("Không tìm thấy báo cáo.");
+
+        if (report.Status != WorkAssignmentReportStatus.Approved)
+            throw new InvalidOperationException("Chỉ báo cáo đã duyệt mới được thu hồi duyệt.");
+
+        var assignment = await _ctx.WorkAssignments
+            .Find(x => x.Id == report.WorkAssignmentId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct)
+            ?? throw new InvalidOperationException("Không tìm thấy assignment của báo cáo.");
+
+        await EnsureCanReviewReportAsync(assignment, me.Id, ct);
+
+        var now = DateTime.UtcNow;
+        var nextPeriodStatus = WorkReportPeriodStatusHelper.ResolveSubmittedStatus(report.DueAtUtc, now);
+
+        await _ctx.WorkAssignmentReports.UpdateOneAsync(
+            x => x.Id == report.Id,
+            Builders<WorkAssignmentReport>.Update
+                .Set(x => x.Status, WorkAssignmentReportStatus.Submitted)
+                .Set(x => x.ReturnReason, req.Comment)
+                .Set(x => x.ReviewerComment, req.Comment)
+                .Set(x => x.ApprovedAtUtc, (DateTime?)null)
+                .Set(x => x.ApprovedByUserId, (string?)null)
+                .Set(x => x.UpdatedAtUtc, now)
+                .Set(x => x.UpdatedByUserId, me.Id),
+            cancellationToken: ct);
+
+        report.Status = WorkAssignmentReportStatus.Submitted;
+        report.ReturnReason = req.Comment;
+        report.ReviewerComment = req.Comment;
+        report.ApprovedAtUtc = null;
+        report.ApprovedByUserId = null;
+        report.UpdatedAtUtc = now;
+        report.UpdatedByUserId = me.Id;
+
+        var period = await _ctx.WorkReportPeriods
+            .Find(x => x.Id == report.WorkReportPeriodId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct);
+
+        if (period is not null)
+        {
+            await _ctx.WorkReportPeriods.UpdateOneAsync(
+                x => x.Id == period.Id && !x.IsDeleted,
+                Builders<WorkReportPeriod>.Update
+                    .Set(x => x.Status, nextPeriodStatus)
+                    .Set(x => x.IsOverdue, WorkReportPeriodStatusHelper.IsOverdue(nextPeriodStatus))
+                    .Set(x => x.LastReviewedAtUtc, now)
+                    .Set(x => x.ReturnReason, req.Comment)
+                    .Set(x => x.ReviewerComment, req.Comment)
+                    .Set(x => x.UpdatedAtUtc, now)
+                    .Set(x => x.UpdatedByUserId, me.Id),
+                cancellationToken: ct);
+
+            period.Status = nextPeriodStatus;
+            period.IsOverdue = WorkReportPeriodStatusHelper.IsOverdue(nextPeriodStatus);
+            period.LastReviewedAtUtc = now;
+            period.ReturnReason = req.Comment;
+            period.ReviewerComment = req.Comment;
+            period.UpdatedAtUtc = now;
+            period.UpdatedByUserId = me.Id;
+
+            await FinalizeReviewReportStatusOperationAsync(
+                "REVIEW_RECALL_APPROVED",
+                report,
+                period,
+                WorkAssignmentReportStatus.Approved.ToString(),
+                WorkAssignmentReportStatus.Submitted.ToString(),
+                me.Id,
+                upsertQueue: true,
+                disableQueue: false,
+                ct);
+        }
+
+        await InsertReportLogAsync(
+            report.WorkId,
+            report.WorkAssignmentId,
+            report.WorkReportPeriodId,
+            report.Id,
+            "Thu hồi duyệt",
+            WorkAssignmentReportStatus.Approved.ToString(),
+            WorkAssignmentReportStatus.Submitted.ToString(),
+            me.Id,
+            req.Comment,
+            req.Comment,
+            ct);
+    }
+
+    public async Task<PagedResult<ReviewReportFlatRowDto>> SearchReportsForReviewAsync(
+        ReviewReportFlatSearchRequest req,
+        CancellationToken ct)
+    {
+        var me = _me.RequireMe();
+
+        if (string.IsNullOrWhiteSpace(req.WorkId))
+            throw new InvalidOperationException("Thiếu WorkId.");
+
+        var page = req.Page < 0 ? 0 : req.Page;
+        var pageSize = req.PageSize <= 0 ? 20 : req.PageSize;
+
+        await EnsureReviewReportListDocRolesForUserWorkAsync(req.WorkId, me.Id, ct);
+
+        var reqAssigneeUserIds = GetAssigneeUserIds(req);
+        var reqAssigneeUnitIds = GetAssigneeUnitIds(req);
+        var fb = Builders<ReviewReportListDocRole>.Filter;
+        var filter = fb.Eq(x => x.ReviewerUserId, me.Id)
+                     & fb.Eq(x => x.WorkId, req.WorkId)
+                     & fb.Eq(x => x.IsDeleted, false);
+
+        if (!string.IsNullOrWhiteSpace(req.AssignmentId))
+            filter &= fb.Eq(x => x.AssignmentId, req.AssignmentId.Trim());
+
+        if (!string.IsNullOrWhiteSpace(req.DynamicExcelId))
+            filter &= fb.Eq(x => x.DynamicExcelId, req.DynamicExcelId.Trim());
+
+        if (!string.IsNullOrWhiteSpace(req.PeriodKey))
+            filter &= fb.Eq(x => x.PeriodKey, req.PeriodKey.Trim());
+
+        if (reqAssigneeUserIds.Count > 0)
+            filter &= fb.In(x => x.AssigneeUserId, reqAssigneeUserIds);
+
+        if (reqAssigneeUnitIds.Count > 0)
+            filter &= fb.In(x => x.AssigneeUnitId, reqAssigneeUnitIds);
+
+        if (!string.IsNullOrWhiteSpace(req.Q))
+            filter &= BuildReviewReportListTextFilter(req.Q, fb);
+
+        var userTypeFilter = GetUserTypeFilter(req);
+        if (!string.IsNullOrWhiteSpace(userTypeFilter))
+            filter &= BuildReviewReportUserTypeFilter(userTypeFilter, fb);
+
+        if (req.WaitingReviewOnly == true)
+        {
+            filter &= fb.Eq(x => x.WaitingReview, true);
+        }
+        else if (WorkReportPeriodStatusHelper.ShouldFilterReviewBucket(req.ReviewStatusBucket))
+        {
+            filter &= fb.Eq(
+                x => x.ReviewStatusBucket,
+                WorkReportPeriodStatusHelper.NormalizeReviewBucket(req.ReviewStatusBucket));
+        }
+        else if (req.ReportStatus.HasValue)
+        {
+            filter &= fb.Eq(x => x.ReportStatus, (WorkAssignmentReportStatus)req.ReportStatus.Value);
+        }
+
+        var total = await _ctx.ReviewReportListDocRoles.CountDocumentsAsync(filter, cancellationToken: ct);
+
+        var rows = await _ctx.ReviewReportListDocRoles.Find(filter)
+            .SortBy(x => x.SortDueAtUtc)
+            .ThenBy(x => x.PeriodKey)
+            .ThenBy(x => x.AssigneeUnitShortName)
+            .ThenBy(x => x.AssigneeFullName)
+            .Skip(page * pageSize)
+            .Limit(pageSize)
+            .Project(MapToReviewReportFlatRowProjection())
+            .ToListAsync(ct);
+
+        return new PagedResult<ReviewReportFlatRowDto>(rows, total, page, pageSize);
+    }
+
+    private async Task EnsureReviewReportListDocRolesForUserWorkAsync(
+        string workId,
+        string reviewerUserId,
+        CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(workId) || string.IsNullOrWhiteSpace(reviewerUserId))
+            return;
+
+        var hasProjectedRows = await _ctx.ReviewReportListDocRoles
+            .Find(x =>
+                x.WorkId == workId &&
+                x.ReviewerUserId == reviewerUserId &&
+                !x.IsDeleted)
+            .AnyAsync(ct);
+
+        if (hasProjectedRows)
+            return;
+
+        _log.LogWarning(
+            "Review report list projection missing. workId={workId} reviewerUserId={reviewerUserId}. Returning current projection only; run internal DocRole repair/backfill if source data exists.",
+            workId,
+            reviewerUserId);
+    }
+
+    private static FilterDefinition<ReviewReportListDocRole> BuildReviewReportListTextFilter(
+        string q,
+        FilterDefinitionBuilder<ReviewReportListDocRole> fb)
+    {
+        var qRegex = new BsonRegularExpression(q.Trim(), "i");
+
+        return fb.Or(
+            fb.Regex(x => x.DynamicExcelCode, qRegex),
+            fb.Regex(x => x.DynamicExcelName, qRegex),
+            fb.Regex(x => x.AssigneeUserName, qRegex),
+            fb.Regex(x => x.AssigneeFullName, qRegex),
+            fb.Regex(x => x.AssigneeUnitName, qRegex),
+            fb.Regex(x => x.AssigneeUnitShortName, qRegex),
+            fb.Regex(x => x.PeriodKey, qRegex));
+    }
+
+    private static FilterDefinition<ReviewReportListDocRole> BuildReviewReportUserTypeFilter(
+        string userTypeFilter,
+        FilterDefinitionBuilder<ReviewReportListDocRole> fb)
+    {
+        var normalized = (userTypeFilter ?? string.Empty).Trim().ToUpperInvariant();
+        if (string.IsNullOrWhiteSpace(normalized) || normalized == "ALL")
+            return FilterDefinition<ReviewReportListDocRole>.Empty;
+
+        var privilegedRegex = new BsonRegularExpression("^(mu_|ml_)", "i");
+        var privilegedFilter = fb.Regex(x => x.AssigneeUserName, privilegedRegex);
+
+        return normalized switch
+        {
+            "UNIT_ACCOUNT" or "PRIVILEGED" or "MU" or "ML" => privilegedFilter,
+            "NORMAL_USER" or "REGULAR" or "USER" => fb.Not(privilegedFilter),
+            _ => FilterDefinition<ReviewReportListDocRole>.Empty
+        };
+    }
+
+    private static System.Linq.Expressions.Expression<Func<ReviewReportListDocRole, ReviewReportFlatRowDto>>
+        MapToReviewReportFlatRowProjection()
+        => x => new ReviewReportFlatRowDto
+        {
+            AssignmentId = x.AssignmentId,
+            WorkId = x.WorkId,
+
+            DynamicExcelId = x.DynamicExcelId,
+            DynamicExcelCode = x.DynamicExcelCode,
+            DynamicExcelName = x.DynamicExcelName,
+
+            AssigneeUserId = x.AssigneeUserId,
+            AssigneeUserName = x.AssigneeUserName,
+            AssigneeFullName = x.AssigneeFullName,
+            AssigneeUnitId = x.AssigneeUnitId,
+            AssigneeUnitName = x.AssigneeUnitName,
+            AssigneeUnitShortName = x.AssigneeUnitShortName,
+
+            WorkReportPeriodId = x.WorkReportPeriodId,
+
+            PeriodKey = x.PeriodKey,
+            PeriodStart = x.PeriodStart,
+            PeriodEnd = x.PeriodEnd,
+            DueAtUtc = x.DueAtUtc,
+            PeriodStatus = (int)x.PeriodStatus,
+
+            ReportId = x.CurrentReportId,
+            ReportStatus = x.ReportStatus.HasValue ? (int)x.ReportStatus.Value : null,
+            SubmittedAtUtc = x.SubmittedAtUtc,
+            ApprovedAtUtc = x.ApprovedAtUtc,
+            ReturnedAtUtc = x.ReturnedAtUtc,
+            ReturnReason = x.ReturnReason,
+            ReviewerComment = x.ReviewerComment,
+
+            ProgressStatus = x.ProgressStatus,
+            ProgressStatusUpdatedAtUtc = x.ProgressStatusUpdatedAtUtc,
+            HasAnyDuePeriod = x.HasAnyDuePeriod,
+            HasOverduePeriod = x.HasOverduePeriod,
+
+            EvaluationCode = null,
+            EvaluationLabel = null,
+            WorstPeriodStatus = x.WorstPeriodStatus,
+            WorstOverdueReasonCode = x.WorstOverdueReasonCode,
+            WorstOverdueReasonLabel = x.WorstOverdueReasonLabel
+        };
+
+    private async Task<List<WorkAssignment>> LoadVisibleReviewAssignmentsAsync(
+        string workId,
+        string actorUserId,
+        CancellationToken ct)
+    {
+        var ownedAssignments = await _ctx.WorkAssignments
+            .Find(x =>
+                x.WorkId == workId &&
+                x.CreatedByUserId == actorUserId &&
+                !x.IsDeleted)
+            .ToListAsync(ct);
+
+        var assignmentById = ownedAssignments
+            .Where(x => !string.IsNullOrWhiteSpace(x.Id))
+            .ToDictionary(x => x.Id, x => x, StringComparer.Ordinal);
+
+        var bindingAssignmentIds = await _ctx.WorkTemplateAssignees
+            .Find(x =>
+                x.WorkId == workId &&
+                x.CreatedByUserId == actorUserId &&
+                !x.IsDeleted)
+            .Project(x => x.WorkAssignmentId)
+            .ToListAsync(ct);
+
+        var missingAssignmentIds = bindingAssignmentIds
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Distinct(StringComparer.Ordinal)
+            .Where(x => !assignmentById.ContainsKey(x))
+            .ToList();
+
+        if (missingAssignmentIds.Count > 0)
+        {
+            var bindingOwnedAssignments = await _ctx.WorkAssignments
+                .Find(x =>
+                    x.WorkId == workId &&
+                    missingAssignmentIds.Contains(x.Id) &&
+                    !x.IsDeleted)
+                .ToListAsync(ct);
+
+            foreach (var assignment in bindingOwnedAssignments)
+            {
+                if (!string.IsNullOrWhiteSpace(assignment.Id))
+                    assignmentById[assignment.Id] = assignment;
+            }
+        }
+
+        return assignmentById.Values
+            .OrderBy(x => x.Path ?? string.Empty)
+            .ThenByDescending(x => x.UpdatedAtUtc)
+            .ToList();
+    }
+
+    public async Task<PagedResult<ReviewSummaryRowDto>> SearchSummaryForReviewAsync(
+        ReviewSummarySearchRequest req,
+        CancellationToken ct)
+    {
+        var me = _me.RequireMe();
+
+        if (string.IsNullOrWhiteSpace(req.WorkId))
+            throw new InvalidOperationException("Thiếu WorkId.");
+
+        var page = req.Page < 0 ? 0 : req.Page;
+        var pageSize = req.PageSize <= 0 ? 20 : req.PageSize;
+
+        await EnsureReviewReportListDocRolesForUserWorkAsync(req.WorkId, me.Id, ct);
+
+        var reqAssigneeUserIds = GetAssigneeUserIds(req);
+        var reqAssigneeUnitIds = GetAssigneeUnitIds(req);
+        var fb = Builders<ReviewReportListDocRole>.Filter;
+        var filter = fb.Eq(x => x.ReviewerUserId, me.Id)
+                     & fb.Eq(x => x.WorkId, req.WorkId)
+                     & fb.Eq(x => x.IsDeleted, false);
+
+        if (!string.IsNullOrWhiteSpace(req.DynamicExcelId))
+            filter &= fb.Eq(x => x.DynamicExcelId, req.DynamicExcelId.Trim());
+
+        if (!string.IsNullOrWhiteSpace(req.PeriodKey))
+            filter &= fb.Eq(x => x.PeriodKey, req.PeriodKey.Trim());
+
+        if (reqAssigneeUserIds.Count > 0)
+            filter &= fb.In(x => x.AssigneeUserId, reqAssigneeUserIds);
+
+        if (reqAssigneeUnitIds.Count > 0)
+            filter &= fb.In(x => x.AssigneeUnitId, reqAssigneeUnitIds);
+
+        if (req.WaitingReviewOnly == true)
+        {
+            filter &= fb.Eq(x => x.WaitingReview, true);
+        }
+        else if (WorkReportPeriodStatusHelper.ShouldFilterReviewBucket(req.ReviewStatusBucket))
+        {
+            filter &= fb.Eq(
+                x => x.ReviewStatusBucket,
+                WorkReportPeriodStatusHelper.NormalizeReviewBucket(req.ReviewStatusBucket));
+        }
+
+        if (!string.IsNullOrWhiteSpace(req.Q))
+            filter &= BuildReviewReportListTextFilter(req.Q, fb);
+
+        var readRows = await _ctx.ReviewReportListDocRoles
+            .Find(filter)
+            .SortBy(x => x.AssignmentId)
+            .ThenByDescending(x => x.SortDueAtUtc)
+            .ThenByDescending(x => x.SortUpdatedAtUtc)
+            .ToListAsync(ct);
+
+        var rows = readRows
+            .GroupBy(x => x.AssignmentId, StringComparer.Ordinal)
+            .Select(g =>
+            {
+                var groupRows = g.ToList();
+                var latestPeriod = groupRows
+                    .OrderByDescending(p => p.DueAtUtc ?? p.SortUpdatedAtUtc)
+                    .ThenByDescending(p => p.SortUpdatedAtUtc)
+                    .FirstOrDefault();
+
+                var worstPeriod = groupRows
+                    .OrderByDescending(p => p.ReviewRank)
+                    .ThenByDescending(p => p.DueAtUtc ?? p.SortUpdatedAtUtc)
+                    .FirstOrDefault();
+
+                var assignees = groupRows
+                    .Where(a => !string.IsNullOrWhiteSpace(a.AssigneeUserId))
+                    .Select(a => new ReviewSummaryAssigneeDto
+                    {
+                        UserId = a.AssigneeUserId,
+                        UserName = a.AssigneeUserName,
+                        FullName = a.AssigneeFullName,
+                        UnitId = a.AssigneeUnitId,
+                        UnitName = a.AssigneeUnitName,
+                        UnitShortName = a.AssigneeUnitShortName,
+                    })
+                    .GroupBy(
+                        a => a.UserId,
+                        StringComparer.Ordinal)
+                    .Select(g => g.First())
+                    .OrderBy(a => a.UnitShortName ?? string.Empty)
+                    .ThenBy(a => a.FullName ?? string.Empty)
+                    .ThenBy(a => a.UserName ?? string.Empty)
+                    .ToList();
+
+                return new ReviewSummaryRowDto
+                {
+                    AssignmentId = g.Key,
+                    WorkId = latestPeriod?.WorkId ?? req.WorkId,
+
+                    DynamicExcelId = latestPeriod?.DynamicExcelId ?? string.Empty,
+                    DynamicExcelCode = latestPeriod?.DynamicExcelCode ?? string.Empty,
+                    DynamicExcelName = latestPeriod?.DynamicExcelName ?? string.Empty,
+
+                    Assignees = assignees,
+
+                    ProgressStatus = latestPeriod?.ProgressStatus ?? 0,
+                    ProgressStatusUpdatedAtUtc = latestPeriod?.ProgressStatusUpdatedAtUtc,
+
+                    LatestPeriodKey = latestPeriod?.PeriodKey,
+                    LatestPeriodStatus = latestPeriod is null ? null : (int)latestPeriod.PeriodStatus,
+                    LatestDueAtUtc = latestPeriod?.DueAtUtc,
+                    HasAnyDuePeriod = groupRows.Count > 0,
+                    HasOverduePeriod = groupRows.Any(p => p.IsOverdue),
+
+                    EvaluationCode = null,
+                    EvaluationLabel = null,
+
+                    WorstPeriodStatus = worstPeriod is null ? null : (int)worstPeriod.PeriodStatus,
+                    WorstOverdueReasonCode = latestPeriod?.WorstOverdueReasonCode,
+                    WorstOverdueReasonLabel = latestPeriod?.WorstOverdueReasonLabel
+                };
+            })
+            .ToList();
+
+        var total = rows.Count;
+
+        var paged = rows
+            .OrderByDescending(x => x.HasOverduePeriod)
+            .ThenByDescending(x => x.LatestDueAtUtc)
+            .ThenBy(x => x.Assignees.FirstOrDefault()?.UnitShortName ?? string.Empty)
+            .ThenBy(x => x.Assignees.FirstOrDefault()?.FullName ?? string.Empty)
+            .Skip(page * pageSize)
+            .Take(pageSize)
+            .ToList();
+
+        return new PagedResult<ReviewSummaryRowDto>(paged, total, page, pageSize);
+    }
+
+    private static WorkReportPeriodStatus ResolveApprovedPeriodStatus(
+        WorkReportPeriod period,
+        WorkAssignmentReport report,
+        DateTime now)
+    {
+        return WorkReportPeriodStatusHelper.ResolveApprovedStatus(
+            period.Status,
+            period.DueAtUtc,
+            report.IsLateSubmission,
+            now);
+    }
+
+    private static bool MatchUserTypeFilter(string? username, string? filter)
+    {
+        var normalized = (filter ?? string.Empty).Trim().ToUpperInvariant();
+        if (string.IsNullOrWhiteSpace(normalized) || normalized == "ALL")
+            return true;
+
+        var isPrivileged = IsPrivilegedUsername(username);
+
+        return normalized switch
+        {
+            "UNIT_ACCOUNT" or "PRIVILEGED" or "MU" or "ML" => isPrivileged,
+            "NORMAL_USER" or "REGULAR" or "USER" => !isPrivileged,
+            _ => true,
+        };
+    }
+
+    private static bool IsPrivilegedUsername(string? username)
+    {
+        var value = (username ?? string.Empty).Trim();
+        return value.StartsWith("mu_", StringComparison.OrdinalIgnoreCase) ||
+               value.StartsWith("ml_", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string? GetUserTypeFilter(object req)
+    {
+        var type = req.GetType();
+        foreach (var propName in new[] { "UserTypeFilter", "AccountTypeFilter", "AccountKind" })
+        {
+            var prop = type.GetProperty(propName);
+            if (prop?.GetValue(req) is string value && !string.IsNullOrWhiteSpace(value))
+                return value.Trim();
+        }
+
+        return null;
+    }
+
+    private static HashSet<string> GetAssigneeUserIds(object req)
+    {
+        var result = new HashSet<string>(StringComparer.Ordinal);
+        var type = req.GetType();
+
+        var listProp = type.GetProperty("AssigneeUserIds");
+        if (listProp?.GetValue(req) is IEnumerable<string> ids)
+        {
+            foreach (var id in ids)
+            {
+                if (!string.IsNullOrWhiteSpace(id))
+                    result.Add(id.Trim());
+            }
+        }
+
+        var singleProp = type.GetProperty("AssigneeUserId");
+        if (singleProp?.GetValue(req) is string singleId && !string.IsNullOrWhiteSpace(singleId))
+        {
+            result.Add(singleId.Trim());
+        }
+
+        return result;
+    }
+
+    private static HashSet<string> GetAssigneeUnitIds(object req)
+    {
+        var result = new HashSet<string>(StringComparer.Ordinal);
+        var type = req.GetType();
+
+        var listProp = type.GetProperty("AssigneeUnitIds");
+        if (listProp?.GetValue(req) is IEnumerable<string> ids)
+        {
+            foreach (var id in ids)
+            {
+                if (!string.IsNullOrWhiteSpace(id))
+                    result.Add(id.Trim());
+            }
+        }
+
+        var singleProp = type.GetProperty("AssigneeUnitId");
+        if (singleProp?.GetValue(req) is string singleId && !string.IsNullOrWhiteSpace(singleId))
+        {
+            result.Add(singleId.Trim());
+        }
+
+        return result;
+    }
+
+    private async Task AppendEvaluationLogAsync(
+        WorkAssignment assignment,
+        string action,
+        string? fromCode,
+        string? fromLabel,
+        string? toCode,
+        string? toLabel,
+        string? comment,
+        string? reason,
+        string actorUserId,
+        CancellationToken ct)
+    {
+        var now = DateTime.UtcNow;
+
+        var snapshot = new
+        {
+            assignmentId = assignment.Id,
+            progressStatus = assignment.ProgressStatus,
+            worstPeriodStatus = assignment.WorstPeriodStatus,
+            worstOverdueReasonCode = assignment.WorstOverdueReasonCode,
+            worstOverdueReasonLabel = assignment.WorstOverdueReasonLabel,
+            evaluationTemplateId = assignment.EvaluationTemplateId,
+            evaluationTemplateCode = assignment.EvaluationTemplateCode,
+            evaluationTemplateLabel = assignment.EvaluationTemplateLabel,
+            evaluationCode = toCode,
+            evaluationLabel = toLabel,
+            evaluationNote = comment,
+            worstEvaluationCode = assignment.WorstEvaluationCode,
+            worstEvaluationLabel = assignment.WorstEvaluationLabel,
+            evaluatedAssignmentCount = assignment.EvaluatedAssignmentCount,
+            hasManualEvaluations = assignment.HasManualEvaluations
+        };
+
+        var doc = new WorkAssignmentEvaluationLog
+        {
+            WorkId = assignment.WorkId,
+            WorkAssignmentId = assignment.Id,
+            Action = action,
+            FromEvaluationCode = fromCode,
+            FromEvaluationLabel = fromLabel,
+            ToEvaluationCode = toCode,
+            ToEvaluationLabel = toLabel,
+            Comment = string.IsNullOrWhiteSpace(comment) ? null : comment.Trim(),
+            Reason = string.IsNullOrWhiteSpace(reason) ? null : reason.Trim(),
+            ActionByUserId = actorUserId,
+            ActionAtUtc = now,
+            SnapshotJson = JsonSerializer.Serialize(snapshot),
+            IsDeleted = false,
+            CreatedAtUtc = now,
+            UpdatedAtUtc = now,
+            CreatedByUserId = actorUserId,
+            UpdatedByUserId = actorUserId
+        };
+
+        await _ctx.WorkAssignmentEvaluationLogs.InsertOneAsync(doc, cancellationToken: ct);
+    }
+
+    public async Task<bool> EvaluateAssignmentAsync(
+        string assignmentId,
+        EvaluateAssignmentRequest req,
+        CancellationToken ct)
+    {
+        var me = _me.RequireMe();
+
+        if (string.IsNullOrWhiteSpace(assignmentId))
+            throw new InvalidOperationException("Thiếu assignmentId.");
+
+        if (string.IsNullOrWhiteSpace(req.EvaluationCode))
+            throw new InvalidOperationException("Thiếu EvaluationCode.");
+
+        var assignment = await _ctx.WorkAssignments
+            .Find(x => x.Id == assignmentId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct)
+            ?? throw new InvalidOperationException("Không tìm thấy assignment.");
+
+        EnsureCanEvaluateAssignment(assignment, me.Id);
+
+        var fb = Builders<WorkReportPeriod>.Filter;
+        var terminalFilter =
+            fb.Eq(x => x.WorkAssignmentId, assignment.Id) &
+            fb.Eq(x => x.IsActive, true) &
+            fb.Eq(x => x.IsDeleted, false) &
+            fb.In(x => x.Status, WorkReportPeriodStatusHelper.TerminalStatuses);
+
+        var hasApprovedPeriod = await _ctx.WorkReportPeriods
+            .Find(terminalFilter)
+            .AnyAsync(ct);
+
+        if (!hasApprovedPeriod)
+            throw new InvalidOperationException("Chỉ được đánh giá khi assignment đã có ít nhất một kỳ được approve.");
+
+        if (string.IsNullOrWhiteSpace(assignment.EvaluationTemplateId))
+            throw new InvalidOperationException("Assignment chưa được cấu hình bộ đánh giá.");
+
+        var template = await _ctx.EvaluationTemplates
+            .Find(x => x.Id == assignment.EvaluationTemplateId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct)
+            ?? throw new InvalidOperationException("Không tìm thấy bộ đánh giá của assignment.");
+
+        var option = (template.Items ?? new List<EvaluationTemplateItem>())
+            .FirstOrDefault(x => string.Equals(x.Code, req.EvaluationCode.Trim(), StringComparison.OrdinalIgnoreCase));
+
+        if (option is null)
+            throw new InvalidOperationException("EvaluationCode không hợp lệ trong bộ đánh giá của assignment.");
+
+        var oldCode = assignment.EvaluationCode;
+        var oldLabel = assignment.EvaluationLabel;
+        var newCode = option.Code;
+        var newLabel = option.Label;
+
+        var action = string.IsNullOrWhiteSpace(oldCode) ? "EVALUATE" : "UPDATE_EVALUATION";
+        var now = DateTime.UtcNow;
+
+        var rs = await _ctx.WorkAssignments.UpdateOneAsync(
+            x => x.Id == assignment.Id && !x.IsDeleted,
+            Builders<WorkAssignment>.Update
+                .Set(x => x.EvaluationCode, newCode)
+                .Set(x => x.EvaluationLabel, newLabel)
+                .Set(x => x.EvaluationNote, string.IsNullOrWhiteSpace(req.Comment) ? null : req.Comment.Trim())
+                .Set(x => x.EvaluatedAtUtc, now)
+                .Set(x => x.EvaluatedByUserId, me.Id)
+                .Set(x => x.UpdatedAtUtc, now)
+                .Set(x => x.UpdatedByUserId, me.Id),
+            cancellationToken: ct);
+
+        if (rs.ModifiedCount == 0)
+            return false;
+
+        assignment.EvaluationCode = newCode;
+        assignment.EvaluationLabel = newLabel;
+        assignment.EvaluationNote = string.IsNullOrWhiteSpace(req.Comment) ? null : req.Comment.Trim();
+        assignment.EvaluatedAtUtc = now;
+        assignment.EvaluatedByUserId = me.Id;
+        assignment.UpdatedAtUtc = now;
+        assignment.UpdatedByUserId = me.Id;
+
+        await RebuildManualEvaluationTreeAsync(assignment.WorkId, me.Id, ct);
+
+        var refreshed = await _ctx.WorkAssignments
+            .Find(x => x.Id == assignment.Id && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct) ?? assignment;
+
+        await AppendEvaluationLogAsync(
+            refreshed,
+            action,
+            oldCode,
+            oldLabel,
+            newCode,
+            newLabel,
+            req.Comment,
+            req.Reason,
+            me.Id,
+            ct);
+
+        return true;
+    }
+
+    public async Task<PagedResult<WorkAssignmentEvaluationLogRow>> GetEvaluationLogsAsync(
+        string assignmentId,
+        int page,
+        int pageSize,
+        CancellationToken ct)
+    {
+        var me = _me.RequireMe();
+
+        if (string.IsNullOrWhiteSpace(assignmentId))
+            throw new InvalidOperationException("Thiếu assignmentId.");
+
+        var assignment = await _ctx.WorkAssignments
+            .Find(x => x.Id == assignmentId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct)
+            ?? throw new InvalidOperationException("Không tìm thấy assignment.");
+
+        EnsureCanEvaluateAssignment(assignment, me.Id);
+
+        page = page < 0 ? 0 : page;
+        pageSize = pageSize <= 0 ? 20 : Math.Min(pageSize, 100);
+
+        var filter = Builders<WorkAssignmentEvaluationLog>.Filter.And(
+            Builders<WorkAssignmentEvaluationLog>.Filter.Eq(x => x.WorkAssignmentId, assignmentId),
+            Builders<WorkAssignmentEvaluationLog>.Filter.Eq(x => x.IsDeleted, false));
+
+        var total = await _ctx.WorkAssignmentEvaluationLogs.CountDocumentsAsync(filter, cancellationToken: ct);
+
+        var rows = await _ctx.WorkAssignmentEvaluationLogs.Find(filter)
+            .SortByDescending(x => x.ActionAtUtc)
+            .Skip(page * pageSize)
+            .Limit(pageSize)
+            .Project(x => new WorkAssignmentEvaluationLogRow(
+                x.Id,
+                x.WorkId,
+                x.WorkAssignmentId,
+                x.Action,
+                x.FromEvaluationCode,
+                x.FromEvaluationLabel,
+                x.ToEvaluationCode,
+                x.ToEvaluationLabel,
+                x.Comment,
+                x.Reason,
+                x.ActionByUserId,
+                x.ActionAtUtc))
+            .ToListAsync(ct);
+
+        return new PagedResult<WorkAssignmentEvaluationLogRow>(rows, total, page, pageSize);
+    }
+
+    private async Task InsertReportLogAsync(
+        string workId,
+        string workAssignmentId,
+        string workReportPeriodId,
+        string workAssignmentReportId,
+        string action,
+        string fromStatus,
+        string toStatus,
+        string actionByUserId,
+        string? reason,
+        string? comment,
+        CancellationToken ct)
+    {
+        var now = DateTime.UtcNow;
+
+        var log = new WorkAssignmentReportLog
+        {
+            WorkId = workId,
+            WorkAssignmentId = workAssignmentId,
+            WorkReportPeriodId = workReportPeriodId,
+            WorkAssignmentReportId = workAssignmentReportId,
+            Action = action,
+            FromStatus = fromStatus,
+            ToStatus = toStatus,
+            ActionByUserId = actionByUserId,
+            ActionAtUtc = now,
+            Reason = reason,
+            Comment = comment,
+            CreatedAtUtc = now,
+            UpdatedAtUtc = now,
+            CreatedByUserId = actionByUserId,
+            UpdatedByUserId = actionByUserId,
+            IsDeleted = false
+        };
+
+        await _ctx.WorkAssignmentReportLogs.InsertOneAsync(log, cancellationToken: ct);
+    }
+
+    private async Task FinalizeReviewReportStatusOperationAsync(
+        string operation,
+        WorkAssignmentReport report,
+        WorkReportPeriod period,
+        string fromStatus,
+        string toStatus,
+        string actorUserId,
+        bool upsertQueue,
+        bool disableQueue,
+        CancellationToken ct)
+    {
+        var startedAtUtc = DateTime.UtcNow;
+        var periodStatus = period.Status.ToString();
+
+        try
+        {
+            if (disableQueue)
+                await _queueService.DisableByPeriodAsync(period.WorkAssignmentId, period.AssigneeUserId, period.PeriodKey, actorUserId, ct);
+            else if (upsertQueue)
+                await _queueService.UpsertPeriodAsync(period, actorUserId, ct);
+
+            await _docRoleReadModelProjection.RebuildReportPeriodAsync(period.Id, actorUserId, ct);
+            await _statusSync.SyncFromAssignmentAsync(report.WorkAssignmentId, ct);
+            await _labelStatistics.RebuildForReportAsync(report.Id, actorUserId, ct);
+            await _tableStatistics.RebuildForReportAsync(report.Id, actorUserId, ct);
+            await _fieldStatistics.RebuildForReportAsync(report.Id, actorUserId, ct);
+
+            _log.LogInformation(
+                "WorkAssignment review report status operation completed. operation={operation} reportId={reportId} periodId={periodId} assignmentId={assignmentId} workId={workId} fromStatus={fromStatus} toStatus={toStatus}",
+                operation,
+                report.Id,
+                report.WorkReportPeriodId,
+                report.WorkAssignmentId,
+                report.WorkId,
+                fromStatus,
+                toStatus);
+
+            await WriteStatusOperationLogAsync(new WorkStatusOperationLog
+            {
+                Operation = operation,
+                Scope = "review-report",
+                Result = "SUCCESS",
+                WorkId = report.WorkId,
+                WorkAssignmentId = report.WorkAssignmentId,
+                WorkReportPeriodId = report.WorkReportPeriodId,
+                WorkAssignmentReportId = report.Id,
+                ActorUserId = actorUserId,
+                FromStatus = fromStatus,
+                ToStatus = toStatus,
+                PeriodToStatus = periodStatus,
+                Summary = $"upsertQueue={upsertQueue};disableQueue={disableQueue};rebuildProjection=true;syncAssignment=true",
+                StartedAtUtc = startedAtUtc
+            }, startedAtUtc, ct);
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(
+                ex,
+                "WorkAssignment review report status operation failed. operation={operation} reportId={reportId} periodId={periodId} assignmentId={assignmentId} workId={workId} actorUserId={actorUserId} fromStatus={fromStatus} toStatus={toStatus} periodStatus={periodStatus} upsertQueue={upsertQueue} disableQueue={disableQueue}",
+                operation,
+                report.Id,
+                report.WorkReportPeriodId,
+                report.WorkAssignmentId,
+                report.WorkId,
+                actorUserId,
+                fromStatus,
+                toStatus,
+                periodStatus,
+                upsertQueue,
+                disableQueue);
+
+            await WriteStatusOperationLogAsync(new WorkStatusOperationLog
+            {
+                Operation = operation,
+                Scope = "review-report",
+                Result = "FAILED",
+                WorkId = report.WorkId,
+                WorkAssignmentId = report.WorkAssignmentId,
+                WorkReportPeriodId = report.WorkReportPeriodId,
+                WorkAssignmentReportId = report.Id,
+                ActorUserId = actorUserId,
+                FromStatus = fromStatus,
+                ToStatus = toStatus,
+                PeriodToStatus = periodStatus,
+                Summary = $"upsertQueue={upsertQueue};disableQueue={disableQueue};rebuildProjection=true;syncAssignment=true",
+                ErrorType = ex.GetType().FullName,
+                ErrorMessage = ex.Message,
+                ErrorStackTrace = ex.ToString(),
+                StartedAtUtc = startedAtUtc
+            }, startedAtUtc, ct);
+
+            throw;
+        }
+    }
+
+    private async Task WriteStatusOperationLogAsync(
+        WorkStatusOperationLog log,
+        DateTime startedAtUtc,
+        CancellationToken ct)
+    {
+        var completedAtUtc = DateTime.UtcNow;
+        log.CompletedAtUtc = completedAtUtc;
+        log.DurationMs = (long)(completedAtUtc - startedAtUtc).TotalMilliseconds;
+        await _statusLog.WriteAsync(log, ct);
+    }
+
+    private async Task<WorkAssignment> EnsureCanReviewReportAsync(
+        WorkAssignment assignment,
+        string reviewerUserId,
+        CancellationToken ct)
+    {
+        if (string.Equals(assignment.CreatedByUserId, reviewerUserId, StringComparison.Ordinal))
+            return assignment;
+
+        var canReviewByRuntimeBinding = await _ctx.WorkTemplateAssignees
+            .Find(x =>
+                x.WorkAssignmentId == assignment.Id &&
+                x.CreatedByUserId == reviewerUserId &&
+                !x.IsDeleted)
+            .AnyAsync(ct);
+
+        if (canReviewByRuntimeBinding)
+            return assignment;
+
+        WorkAssignmentReviewPermissionHelper.EnsureCanReviewOnNode(assignment, reviewerUserId);
+        return assignment;
+    }
+
+    private static void EnsureCanEvaluateAssignment(WorkAssignment assignment, string actorUserId)
+    {
+        if (!string.Equals(assignment.CreatedByUserId, actorUserId, StringComparison.Ordinal))
+            throw new UnauthorizedAccessException("Chỉ owner của assignment mới được đánh giá tay.");
+    }
+
+    private async Task<WorkAssignment> LoadParentForReviewAsync(
+        string? parentAssignmentId,
+        string reviewerUserId,
+        CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(parentAssignmentId))
+            throw new InvalidOperationException("Thiếu ParentAssignmentId.");
+
+        var parent = await _ctx.WorkAssignments
+            .Find(x => x.Id == parentAssignmentId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct)
+            ?? throw new InvalidOperationException("Không tìm thấy node cha.");
+
+        await EnsureCanReviewReportAsync(parent, reviewerUserId, ct);
+        return parent;
+    }
+
+    private async Task RebuildManualEvaluationTreeAsync(string workId, string byUserId, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(workId))
+            return;
+
+        var assignments = await _ctx.WorkAssignments
+            .Find(x => x.WorkId == workId && x.IsActive && !x.IsDeleted)
+            .SortByDescending(x => x.Level)
+            .ThenBy(x => x.Path)
+            .ToListAsync(ct);
+
+        if (assignments.Count == 0)
+        {
+            await RebuildWorkManualEvaluationAggregateAsync(workId, byUserId, ct);
+            return;
+        }
+
+        var templateOrderMap = await BuildTemplateOrderMapAsync(assignments, ct);
+
+        foreach (var assignment in assignments)
+        {
+            var children = assignments
+                .Where(x => string.Equals(x.ParentAssignmentId, assignment.Id, StringComparison.Ordinal))
+                .ToList();
+
+            var aggregate = BuildAssignmentManualAggregate(assignment, children, templateOrderMap);
+
+            await _ctx.WorkAssignments.UpdateOneAsync(
+                x => x.Id == assignment.Id && !x.IsDeleted,
+                Builders<WorkAssignment>.Update
+                    .Set(x => x.HasManualEvaluations, aggregate.HasManualEvaluations)
+                    .Set(x => x.EvaluatedAssignmentCount, aggregate.EvaluatedAssignmentCount)
+                    .Set(x => x.WorstEvaluationCode, aggregate.WorstEvaluationCode)
+                    .Set(x => x.WorstEvaluationLabel, aggregate.WorstEvaluationLabel),
+                cancellationToken: ct);
+
+            assignment.HasManualEvaluations = aggregate.HasManualEvaluations;
+            assignment.EvaluatedAssignmentCount = aggregate.EvaluatedAssignmentCount;
+            assignment.WorstEvaluationCode = aggregate.WorstEvaluationCode;
+            assignment.WorstEvaluationLabel = aggregate.WorstEvaluationLabel;
+
+            await _docRoleReadModelProjection.RebuildAssignmentAsync(assignment.Id, byUserId, ct);
+        }
+
+        await RebuildWorkManualEvaluationAggregateAsync(workId, byUserId, ct, assignments);
+    }
+
+    private async Task<Dictionary<string, Dictionary<string, int>>> BuildTemplateOrderMapAsync(
+        List<WorkAssignment> assignments,
+        CancellationToken ct)
+    {
+        var templateIds = assignments
+            .Select(x => x.EvaluationTemplateId)
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+
+        if (templateIds.Count == 0)
+            return new Dictionary<string, Dictionary<string, int>>(StringComparer.Ordinal);
+
+        var templates = await _ctx.EvaluationTemplates
+            .Find(x => templateIds.Contains(x.Id) && !x.IsDeleted)
+            .ToListAsync(ct);
+
+        return templates.ToDictionary(
+            t => t.Id,
+            t => (t.Items ?? new List<EvaluationTemplateItem>())
+                .Where(i => !string.IsNullOrWhiteSpace(i.Code))
+                .ToDictionary(
+                    i => i.Code,
+                    i => i.Order,
+                    StringComparer.OrdinalIgnoreCase),
+            StringComparer.Ordinal);
+    }
+
+    private ManualEvaluationAggregate BuildAssignmentManualAggregate(
+        WorkAssignment assignment,
+        List<WorkAssignment> children,
+        Dictionary<string, Dictionary<string, int>> templateOrderMap)
+    {
+        if (children.Count == 0)
+        {
+            var hasOwn = !string.IsNullOrWhiteSpace(assignment.EvaluationCode);
+
+            return new ManualEvaluationAggregate
+            {
+                HasManualEvaluations = hasOwn,
+                EvaluatedAssignmentCount = hasOwn ? 1 : 0,
+                WorstEvaluationCode = hasOwn ? assignment.EvaluationCode : null,
+                WorstEvaluationLabel = hasOwn ? assignment.EvaluationLabel : null
+            };
+        }
+
+        var evaluatedCount = children.Sum(x => x.EvaluatedAssignmentCount);
+        var hasManual = evaluatedCount > 0 || children.Any(x => x.HasManualEvaluations);
+
+        var options = children
+            .Where(x => !string.IsNullOrWhiteSpace(x.WorstEvaluationCode))
+            .Select(x => new ManualEvaluationChoice(
+                x.WorstEvaluationCode!,
+                x.WorstEvaluationLabel,
+                ResolveEvaluationOrder(x.EvaluationTemplateId, x.WorstEvaluationCode!, templateOrderMap)))
+            .OrderBy(x => x.Order)
+            .ThenBy(x => x.Code, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        var worst = options.FirstOrDefault();
+
+        return new ManualEvaluationAggregate
+        {
+            HasManualEvaluations = hasManual,
+            EvaluatedAssignmentCount = evaluatedCount,
+            WorstEvaluationCode = worst?.Code,
+            WorstEvaluationLabel = worst?.Label
+        };
+    }
+
+    private async Task RebuildWorkManualEvaluationAggregateAsync(
+        string workId,
+        string byUserId,
+        CancellationToken ct,
+        List<WorkAssignment>? preloadedAssignments = null)
+    {
+        var work = await _ctx.Works
+            .Find(x => x.Id == workId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct);
+
+        if (work is null)
+            return;
+
+        var assignments = preloadedAssignments ?? await _ctx.WorkAssignments
+            .Find(x => x.WorkId == workId && x.IsActive && !x.IsDeleted)
+            .ToListAsync(ct);
+
+        var roots = assignments
+            .Where(x => string.IsNullOrWhiteSpace(x.ParentAssignmentId))
+            .ToList();
+
+        var evaluatedCount = roots.Sum(x => x.EvaluatedAssignmentCount);
+        var hasManual = evaluatedCount > 0 || roots.Any(x => x.HasManualEvaluations);
+
+        Dictionary<string, int> orderMap = new(StringComparer.OrdinalIgnoreCase);
+        if (!string.IsNullOrWhiteSpace(work.EvaluationTemplateId))
+        {
+            var template = await _ctx.EvaluationTemplates
+                .Find(x => x.Id == work.EvaluationTemplateId && !x.IsDeleted)
+                .FirstOrDefaultAsync(ct);
+
+            if (template is not null)
+            {
+                orderMap = (template.Items ?? new List<EvaluationTemplateItem>())
+                    .Where(i => !string.IsNullOrWhiteSpace(i.Code))
+                    .ToDictionary(i => i.Code, i => i.Order, StringComparer.OrdinalIgnoreCase);
+            }
+        }
+
+        var worst = roots
+            .Where(x => !string.IsNullOrWhiteSpace(x.WorstEvaluationCode))
+            .Select(x => new ManualEvaluationChoice(
+                x.WorstEvaluationCode!,
+                x.WorstEvaluationLabel,
+                ResolveEvaluationOrder(work.EvaluationTemplateId, x.WorstEvaluationCode!, new Dictionary<string, Dictionary<string, int>>
+                {
+                    [work.EvaluationTemplateId ?? string.Empty] = orderMap
+                })))
+            .OrderBy(x => x.Order)
+            .ThenBy(x => x.Code, StringComparer.OrdinalIgnoreCase)
+            .FirstOrDefault();
+
+        await _ctx.Works.UpdateOneAsync(
+            x => x.Id == workId && !x.IsDeleted,
+            Builders<Work>.Update
+                .Set(x => x.HasManualEvaluations, hasManual)
+                .Set(x => x.EvaluatedAssignmentCount, evaluatedCount)
+                .Set(x => x.WorstEvaluationCode, worst?.Code)
+                .Set(x => x.WorstEvaluationLabel, worst?.Label),
+            cancellationToken: ct);
+
+        await _docRoleReadModelProjection.RebuildWorkAsync(workId, byUserId, ct);
+    }
+
+    private static int ResolveEvaluationOrder(
+        string? templateId,
+        string code,
+        Dictionary<string, Dictionary<string, int>> templateOrderMap)
+    {
+        if (!string.IsNullOrWhiteSpace(templateId) &&
+            templateOrderMap.TryGetValue(templateId, out var orderMap) &&
+            orderMap.TryGetValue(code, out var order))
+            return order;
+
+        return int.MaxValue;
+    }
+
+    private static string ToProgressStatusText(int status)
+    {
+        return status switch
+        {
+            (int)WorkAssignmentProgressStatus.NotStarted => "Chưa thực hiện",
+            (int)WorkAssignmentProgressStatus.InProgress => "Đang thực hiện",
+            (int)WorkAssignmentProgressStatus.Completed => "Đã hoàn thành",
+            (int)WorkAssignmentProgressStatus.AtRiskOverdue => "Có nguy cơ chậm muộn",
+            (int)WorkAssignmentProgressStatus.Overdue => "Chậm muộn",
+            _ => "Không xác định"
+        };
+    }
+
+    private sealed class ManualEvaluationAggregate
+    {
+        public bool HasManualEvaluations { get; set; }
+        public int EvaluatedAssignmentCount { get; set; }
+        public string? WorstEvaluationCode { get; set; }
+        public string? WorstEvaluationLabel { get; set; }
+    }
+
+    private sealed record ManualEvaluationChoice(string Code, string? Label, int Order);
+}

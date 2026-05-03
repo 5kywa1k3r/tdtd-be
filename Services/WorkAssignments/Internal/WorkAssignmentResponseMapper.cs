@@ -22,6 +22,9 @@ internal static class WorkAssignmentResponseMapper
             DynamicExcelId = entity.DynamicExcelId,
             DynamicExcelCode = entity.DynamicExcelCode,
             DynamicExcelName = entity.DynamicExcelName,
+            DynamicFormTemplateId = entity.DynamicFormTemplateId,
+            DynamicFormTemplateCode = entity.DynamicFormTemplateCode,
+            DynamicFormTemplateName = entity.DynamicFormTemplateName,
 
             WorkType = entity.WorkType,
             AssignmentType = entity.AssignmentType,
@@ -39,12 +42,23 @@ internal static class WorkAssignmentResponseMapper
 
             Description = entity.Description,
             IsActive = entity.IsActive,
+            AllowUserCreatedReports = entity.AllowUserCreatedReports,
 
             HasData = hasData,
             TemplateLocked = hasData,
 
             CreatedAtUtc = entity.CreatedAtUtc,
-            UpdatedAtUtc = entity.UpdatedAtUtc
+            UpdatedAtUtc = entity.UpdatedAtUtc,
+
+            EvaluationCode = entity.EvaluationCode,
+            EvaluationLabel = entity.EvaluationLabel,
+            EvaluationNote = entity.EvaluationNote,
+            EvaluatedAtUtc = entity.EvaluatedAtUtc,
+            EvaluatedByUserId = entity.EvaluatedByUserId,
+
+            WorstPeriodStatus = entity.WorstPeriodStatus,
+            WorstOverdueReasonCode = entity.WorstOverdueReasonCode,
+            WorstOverdueReasonLabel = entity.WorstOverdueReasonLabel,
         };
     }
 

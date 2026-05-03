@@ -5,6 +5,8 @@ using MongoDB.Driver;
 using tdtd_be.Common.Auth;
 using tdtd_be.Data;
 using tdtd_be.Models;
+using tdtd_be.Services.Common;
+using tdtd_be.Services.Works;
 using tdtd_be.Uploads;
 
 namespace tdtd_be.Controllers;
@@ -20,34 +22,35 @@ public sealed class WorksFilesController : ControllerBase
     private readonly MongoDbContext _ctx;
     private readonly MeAccessor _me;
     private readonly UploadOptions _opt;
+    private readonly WorkServices.IWorkService _workService; // không bắt buộc dùng
+    private readonly IWorkPermissionService _permission;
 
     public WorksFilesController(
         UploadTokenService tokens,
         MongoDbContext ctx,
         MeAccessor me,
-        IOptions<UploadOptions> opt)
+        IOptions<UploadOptions> opt,
+        IWorkPermissionService permission)
     {
         _tokens = tokens;
         _ctx = ctx;
         _me = me;
         _opt = opt.Value;
+        _permission = permission;
     }
-    private async Task<Work> RequireWorkAsync(string workId, CancellationToken ct)
-    {
-        var me = _me.RequireMe();
-        WorkRoleGuard.RequireCanManageWork(me);
 
+    private async Task<Work> RequireWorkExistsAsync(string workId, CancellationToken ct)
+    {
         var work = await _ctx.Works
             .Find(x => x.Id == workId && !x.IsDeleted)
             .FirstOrDefaultAsync(ct);
 
-        if (work is null) throw new InvalidOperationException("Work not found.");
+        if (work is null)
+            throw new KeyNotFoundException("Work not found.");
+
         return work;
     }
 
-    // ===============================
-    // GET: list files by workId
-    // ===============================
     public sealed record WorkFileRow(
         string Id,
         string OriginalName,
@@ -61,7 +64,10 @@ public sealed class WorksFilesController : ControllerBase
         [FromRoute] string workId,
         CancellationToken ct)
     {
-        await RequireWorkAsync(workId, ct);
+        var me = _me.RequireMe();
+
+        await RequireWorkExistsAsync(workId, ct);
+        await _permission.EnsureCanReadAsync(workId, me.Id, ct);
 
         var rows = await _ctx.Files.Find(x =>
                 !x.IsDeleted &&
@@ -80,9 +86,6 @@ public sealed class WorksFilesController : ControllerBase
         return Ok(rows);
     }
 
-    // ===============================
-    // POST: create upload session for this work
-    // ===============================
     [HttpPost("upload-session")]
     public async Task<IActionResult> CreateSession(
         [FromRoute] string workId,
@@ -90,14 +93,16 @@ public sealed class WorksFilesController : ControllerBase
         CancellationToken ct)
     {
         var me = _me.RequireMe();
-        await RequireWorkAsync(workId, ct);
+
+        await RequireWorkExistsAsync(workId, ct);
+        await _permission.EnsureCanUpdateRootAsync(workId, me.Id, ct);
 
         if (string.IsNullOrWhiteSpace(req.FileName))
             return BadRequest("FileName is required.");
+
         if (req.Size <= 0)
             return BadRequest("Size is invalid.");
 
-        // ✅ server ép sourceType/sourceId, FE không được override
         var uploadToken = _tokens.Issue(
             userId: me.Id,
             fileName: req.FileName,
@@ -107,24 +112,19 @@ public sealed class WorksFilesController : ControllerBase
             sourceId: workId,
             ttlSeconds: _opt.UploadTokenTtlSeconds
         );
+
         var apiBase = $"{Request.Scheme}://{Request.Host}";
         var endpoint = $"{apiBase}/api/uploads";
-        var chunkSize = _opt.ChunkSizeBytes;
-        var maxBytes = _opt.MaxUploadBytes;
 
-        // ✅ trả contract chuẩn cho FE
         return Ok(new
         {
             endpoint,
             uploadToken,
-            chunkSize,
-            maxSize = maxBytes
+            chunkSize = _opt.ChunkSizeBytes,
+            maxSize = _opt.MaxUploadBytes
         });
     }
 
-    // ===============================
-    // DELETE: soft delete 1 file của work
-    // ===============================
     [HttpDelete("{fileId}")]
     public async Task<IActionResult> DeleteFile(
         [FromRoute] string workId,
@@ -132,7 +132,9 @@ public sealed class WorksFilesController : ControllerBase
         CancellationToken ct)
     {
         var me = _me.RequireMe();
-        await RequireWorkAsync(workId, ct);
+
+        await RequireWorkExistsAsync(workId, ct);
+        await _permission.EnsureCanUpdateRootAsync(workId, me.Id, ct);
 
         if (string.IsNullOrWhiteSpace(fileId))
             return BadRequest("fileId is required.");

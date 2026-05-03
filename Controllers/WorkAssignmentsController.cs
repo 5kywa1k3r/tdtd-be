@@ -19,14 +19,83 @@ public sealed class WorkAssignmentsController : ControllerBase
     }
 
     [HttpGet("works/{workId}/assignments")]
-    public async Task<ActionResult<List<WorkAssignmentResponse>>> GetByWorkId(
+    public async Task<ActionResult<List<WorkAssignmentListResponse>>> GetByWorkId(
         [FromRoute] string workId,
         CancellationToken ct)
     {
         try
         {
-            var rs = await _service.GetByWorkIdAsync(workId, ct);
+            var actorUserId = GetActorUserId();
+            var rs = await _service.GetByWorkIdAsync(workId, actorUserId, ct);
             return Ok(rs);
+        }
+        catch (UnauthorizedAccessException ex)
+        {
+            return ForbidWithMessage(ex.Message);
+        }
+        catch (InvalidOperationException ex)
+        {
+            return BadRequest(new { message = ex.Message });
+        }
+    }
+
+
+    [HttpGet("works/{workId}/my-report-assignments")]
+    public async Task<ActionResult<List<WorkAssignmentListResponse>>> GetMyReportAssignments(
+        [FromRoute] string workId,
+        CancellationToken ct)
+    {
+        try
+        {
+            var actorUserId = GetActorUserId();
+            var rs = await _service.GetMyReportAssignmentsAsync(workId, actorUserId, ct);
+            return Ok(rs);
+        }
+        catch (UnauthorizedAccessException ex)
+        {
+            return ForbidWithMessage(ex.Message);
+        }
+        catch (InvalidOperationException ex)
+        {
+            return BadRequest(new { message = ex.Message });
+        }
+    }
+
+    [HttpGet("works/{workId}/my-review-parent-assignments")]
+    public async Task<ActionResult<List<WorkAssignmentListResponse>>> GetMyReviewParentAssignments(
+        [FromRoute] string workId,
+        CancellationToken ct)
+    {
+        try
+        {
+            var actorUserId = GetActorUserId();
+            var rs = await _service.GetMyReviewParentAssignmentsAsync(workId, actorUserId, ct);
+            return Ok(rs);
+        }
+        catch (UnauthorizedAccessException ex)
+        {
+            return ForbidWithMessage(ex.Message);
+        }
+        catch (InvalidOperationException ex)
+        {
+            return BadRequest(new { message = ex.Message });
+        }
+    }
+
+    [HttpGet("works/{workId}/assignment-parent-candidates")]
+    public async Task<ActionResult<List<WorkAssignmentListResponse>>> GetMyParentCandidates(
+        [FromRoute] string workId,
+        CancellationToken ct)
+    {
+        try
+        {
+            var actorUserId = GetActorUserId();
+            var rs = await _service.GetMyParentCandidatesAsync(workId, actorUserId, ct);
+            return Ok(rs);
+        }
+        catch (UnauthorizedAccessException ex)
+        {
+            return ForbidWithMessage(ex.Message);
         }
         catch (InvalidOperationException ex)
         {
@@ -41,26 +110,14 @@ public sealed class WorkAssignmentsController : ControllerBase
     {
         try
         {
-            var rs = await _service.GetByIdAsync(id, ct);
+            var actorUserId = GetActorUserId();
+            var rs = await _service.GetByIdAsync(id, actorUserId, ct);
             if (rs is null) return NotFound();
             return Ok(rs);
         }
-        catch (InvalidOperationException ex)
+        catch (UnauthorizedAccessException ex)
         {
-            return BadRequest(new { message = ex.Message });
-        }
-    }
-
-    [HttpGet("works/{workId}/assignments/by-dynamic-excel/{dynamicExcelId}")]
-    public async Task<ActionResult<List<WorkAssignmentResponse>>> GetByDynamicExcel(
-        [FromRoute] string workId,
-        [FromRoute] string dynamicExcelId,
-        CancellationToken ct)
-    {
-        try
-        {
-            var rs = await _service.GetByDynamicExcelAsync(workId, dynamicExcelId, ct);
-            return Ok(rs);
+            return ForbidWithMessage(ex.Message);
         }
         catch (InvalidOperationException ex)
         {
@@ -69,31 +126,19 @@ public sealed class WorkAssignmentsController : ControllerBase
     }
 
     [HttpGet("work-assignments/{parentAssignmentId}/children")]
-    public async Task<ActionResult<List<WorkAssignmentResponse>>> GetChildren(
+    public async Task<ActionResult<List<WorkAssignmentListResponse>>> GetChildren(
         [FromRoute] string parentAssignmentId,
         CancellationToken ct)
     {
         try
         {
-            var rs = await _service.GetChildrenAsync(parentAssignmentId, ct);
+            var actorUserId = GetActorUserId();
+            var rs = await _service.GetChildrenAsync(parentAssignmentId, actorUserId, ct);
             return Ok(rs);
         }
-        catch (InvalidOperationException ex)
+        catch (UnauthorizedAccessException ex)
         {
-            return BadRequest(new { message = ex.Message });
-        }
-    }
-
-    [HttpGet("work-assignments/{parentAssignmentId}/children/by-dynamic-excel/{dynamicExcelId}")]
-    public async Task<ActionResult<List<WorkAssignmentResponse>>> GetChildrenByDynamicExcel(
-        [FromRoute] string parentAssignmentId,
-        [FromRoute] string dynamicExcelId,
-        CancellationToken ct)
-    {
-        try
-        {
-            var rs = await _service.GetChildrenByDynamicExcelAsync(parentAssignmentId, dynamicExcelId, ct);
-            return Ok(rs);
+            return ForbidWithMessage(ex.Message);
         }
         catch (InvalidOperationException ex)
         {
@@ -115,7 +160,7 @@ public sealed class WorkAssignmentsController : ControllerBase
         }
         catch (UnauthorizedAccessException ex)
         {
-            return Unauthorized(new { message = ex.Message });
+            return ForbidWithMessage(ex.Message);
         }
         catch (InvalidOperationException ex)
         {
@@ -123,43 +168,43 @@ public sealed class WorkAssignmentsController : ControllerBase
         }
     }
 
-    [HttpPut("work-assignments/{id}")]
-    public async Task<ActionResult<WorkAssignmentResponse>> Update(
-        [FromRoute] string id,
-        [FromBody] SaveWorkAssignmentRequest req,
-        CancellationToken ct)
-    {
-        try
-        {
-            var actorUserId = GetActorUserId();
-            var rs = await _service.UpdateAsync(id, req, actorUserId, ct);
-            return Ok(rs);
-        }
-        catch (UnauthorizedAccessException ex)
-        {
-            return Unauthorized(new { message = ex.Message });
-        }
-        catch (InvalidOperationException ex)
-        {
-            return BadRequest(new { message = ex.Message });
-        }
-    }
-
-    [HttpDelete("work-assignments/{id}")]
-    public async Task<ActionResult> SoftDelete(
+    [HttpPost("work-assignments/{id}/deactivate")]
+    public async Task<ActionResult> Deactivate(
         [FromRoute] string id,
         CancellationToken ct)
     {
         try
         {
             var actorUserId = GetActorUserId();
-            var ok = await _service.SoftDeleteAsync(id, actorUserId, ct);
+            var ok = await _service.DeactivateAsync(id, actorUserId, ct);
             if (!ok) return NotFound();
             return NoContent();
         }
         catch (UnauthorizedAccessException ex)
         {
-            return Unauthorized(new { message = ex.Message });
+            return ForbidWithMessage(ex.Message);
+        }
+        catch (InvalidOperationException ex)
+        {
+            return BadRequest(new { message = ex.Message });
+        }
+    }
+
+    [HttpPost("work-assignments/{id}/activate")]
+    public async Task<ActionResult> Activate(
+        [FromRoute] string id,
+        CancellationToken ct)
+    {
+        try
+        {
+            var actorUserId = GetActorUserId();
+            var ok = await _service.ActivateAsync(id, actorUserId, ct);
+            if (!ok) return NotFound();
+            return NoContent();
+        }
+        catch (UnauthorizedAccessException ex)
+        {
+            return ForbidWithMessage(ex.Message);
         }
         catch (InvalidOperationException ex)
         {
@@ -172,5 +217,10 @@ public sealed class WorkAssignmentsController : ControllerBase
         return User.FindFirstValue(ClaimTypes.NameIdentifier)
                ?? User.FindFirstValue("sub")
                ?? throw new UnauthorizedAccessException("Không xác định được người dùng.");
+    }
+
+    private ActionResult ForbidWithMessage(string message)
+    {
+        return StatusCode(StatusCodes.Status403Forbidden, new { message });
     }
 }

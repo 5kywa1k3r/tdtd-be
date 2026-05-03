@@ -23,10 +23,14 @@ namespace tdtd_be.Services.Common
     public sealed class DocRoleService : IDocRoleService
     {
         private readonly MongoDbContext _ctx;
+        private readonly IDocRoleReadModelProjectionService _readModelProjection;
 
-        public DocRoleService(MongoDbContext ctx)
+        public DocRoleService(
+            MongoDbContext ctx,
+            IDocRoleReadModelProjectionService readModelProjection)
         {
             _ctx = ctx;
+            _readModelProjection = readModelProjection;
         }
 
         public async Task UpsertWorkRootRolesAsync(Work work, CancellationToken ct)
@@ -107,6 +111,8 @@ namespace tdtd_be.Services.Common
                 desired: desired,
                 byUserId: byUserId,
                 ct: ct);
+
+            await _readModelProjection.RebuildWorkAsync(work.Id, byUserId, ct);
         }
 
         public async Task UpsertWorkAssignmentRolesAsync(WorkAssignment assignment, CancellationToken ct)
@@ -185,6 +191,8 @@ namespace tdtd_be.Services.Common
                 desired: desired,
                 byUserId: byUserId,
                 ct: ct);
+
+            await _readModelProjection.RebuildAssignmentAsync(assignment.Id!, byUserId, ct);
         }
 
         public async Task RebuildWorkParticipantRolesFromAssignmentsAsync(
@@ -233,6 +241,8 @@ namespace tdtd_be.Services.Common
                 desired: desired,
                 byUserId: byUserId,
                 ct: ct);
+
+            await _readModelProjection.RebuildWorkAsync(workId, byUserId, ct);
         }
 
         public async Task<bool> HasAnyRoleAsync(DocType docType, string docId, string userId, CancellationToken ct)
@@ -301,6 +311,7 @@ namespace tdtd_be.Services.Common
                 .Set(x => x.UpdatedByUserId, byUserId);
 
             await _ctx.DocRoles.UpdateManyAsync(filter, update, cancellationToken: ct);
+            await _readModelProjection.SoftDeleteByDocAsync(docType, docId, byUserId, ct);
         }
 
         private async Task ReplaceRolesByExactRoleSetAsync(

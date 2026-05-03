@@ -76,7 +76,6 @@ public sealed class Work : BaseEntity
     [BsonElement("priority")]
     public WorkPriority Priority { get; set; } = WorkPriority.MEDIUM;
 
-    // snapshot
     [BsonElement("owner")]
     public UserRef? Owner { get; set; }
 
@@ -85,4 +84,31 @@ public sealed class Work : BaseEntity
 
     [BsonElement("leaderWatch")]
     public List<UserRef> LeaderWatch { get; set; } = new();
+
+    // Phase 5: aggregate histogram của root assignments active
+    [BsonElement("activeRootAssignmentCount")]
+    public int ActiveRootAssignmentCount { get; set; }
+
+    [BsonElement("rootAssignmentProgressCounts")]
+    public WorkProgressCountSnapshot RootAssignmentProgressCounts { get; set; } = new();
+
+    [BsonElement("evaluationTemplateCode")]
+    public string? EvaluationTemplateCode { get; set; }
+    [BsonElement("evaluationTemplateId")]
+    public string? EvaluationTemplateId { get; set; }
+    [BsonElement("evaluationTemplateLabel")]
+    public string? EvaluationTemplateLabel { get; set; }
+
+    [BsonElement("hasManualEvaluations")]
+    public bool HasManualEvaluations { get; set; }
+
+    [BsonElement("evaluatedAssignmentCount")]
+    public int EvaluatedAssignmentCount { get; set; }
+
+    [BsonElement("worstEvaluationCode")]
+    public string? WorstEvaluationCode { get; set; }
+
+    [BsonElement("worstEvaluationLabel")]
+    public string? WorstEvaluationLabel { get; set; }
+
 }

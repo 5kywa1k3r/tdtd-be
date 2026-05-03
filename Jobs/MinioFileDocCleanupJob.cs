@@ -1,32 +1,26 @@
-﻿using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Logging;
 using MongoDB.Driver;
 using System;
-using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
 using tdtd_be.Data;
 using tdtd_be.Models;
+using tdtd_be.Uploads;
 
-namespace tdtd_be.Uploads;
+namespace tdtd_be.Jobs;
 
-public interface IMinioObjectDeleter
-{
-    Task RemoveAsync(string bucket, string objectKey, CancellationToken ct);
-}
-
-public sealed class MinioFileDocCleanupHostedService : BackgroundService
+public sealed class MinioFileDocCleanupJob : IMinioFileDocCleanupJob
 {
     private readonly IConfiguration _cfg;
-    private readonly ILogger<MinioFileDocCleanupHostedService> _log;
+    private readonly ILogger<MinioFileDocCleanupJob> _log;
     private readonly MongoDbContext _ctx;
     private readonly IMinioObjectDeleter _minio;
     private readonly TimeZoneInfo _tz;
 
-    public MinioFileDocCleanupHostedService(
+    public MinioFileDocCleanupJob(
         IConfiguration cfg,
-        ILogger<MinioFileDocCleanupHostedService> log,
+        ILogger<MinioFileDocCleanupJob> log,
         MongoDbContext ctx,
         IMinioObjectDeleter minio)
     {
@@ -34,35 +28,27 @@ public sealed class MinioFileDocCleanupHostedService : BackgroundService
         _log = log;
         _ctx = ctx;
         _minio = minio;
-
-        _tz = TryGetTimeZone("SE Asia Standard Time") ?? TryGetTimeZone("Asia/Bangkok") ?? TimeZoneInfo.Utc;
+        _tz = HangfireJobTimeHelper.ResolveBangkokTimeZone();
     }
 
-    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    public async Task RunAsync(CancellationToken cancellationToken = default)
     {
         var enabled = bool.TryParse(_cfg["UploadCleanup:Enabled"], out var e) ? e : true;
         var minioEnabled = bool.TryParse(_cfg["UploadCleanup:MinioCleanupEnabled"], out var m) ? m : true;
-        if (!enabled || !minioEnabled) return;
-
-        while (!stoppingToken.IsCancellationRequested)
+        if (!enabled || !minioEnabled)
         {
-            var nowUtc = DateTime.UtcNow;
-            var nextUtc = NextLastSundayRunUtc(nowUtc);
-            _log.LogInformation("MinioFileDocCleanup next run at {nextUtc} UTC", nextUtc);
-
-            var delay = nextUtc - nowUtc;
-            if (delay < TimeSpan.FromSeconds(1)) delay = TimeSpan.FromSeconds(1);
-            await Task.Delay(delay, stoppingToken);
-
-            try
-            {
-                await RunCleanupAsync(stoppingToken);
-            }
-            catch (Exception ex)
-            {
-                _log.LogError(ex, "MinioFileDocCleanup failed");
-            }
+            _log.LogInformation("MinioFileDocCleanup skipped because feature is disabled.");
+            return;
         }
+
+        // Chạy recurring theo mỗi Chủ nhật, nhưng chỉ thực thi thật ở Chủ nhật cuối tháng
+        if (!HangfireJobTimeHelper.IsLastSundayOfMonth(DateTime.UtcNow, _tz))
+        {
+            _log.LogInformation("MinioFileDocCleanup skipped because today is not the last Sunday of the month in {timeZone}.", _tz.Id);
+            return;
+        }
+
+        await RunCleanupAsync(cancellationToken);
     }
 
     private async Task RunCleanupAsync(CancellationToken ct)
@@ -82,7 +68,6 @@ public sealed class MinioFileDocCleanupHostedService : BackgroundService
             "MinioFileDocCleanup start. CutoffUtc={cutoffUtc} BatchSize={batchSize} MaxPerRun={maxPerRun}",
             cutoffUtc, batchSize, maxPerRun);
 
-        // ========= Nhóm A: FileDoc đã soft-delete (work đã bỏ) =========
         var aFilter = Builders<FileDoc>.Filter.And(
             Builders<FileDoc>.Filter.Eq(x => x.IsDeleted, true),
             Builders<FileDoc>.Filter.Lt(x => x.UpdatedAtUtc, cutoffUtc),
@@ -91,7 +76,6 @@ public sealed class MinioFileDocCleanupHostedService : BackgroundService
             Builders<FileDoc>.Filter.Ne(x => x.ObjectKey, "")
         );
 
-        // ========= Nhóm B: FileDoc chưa committed (SourceId null) =========
         var bFilter = Builders<FileDoc>.Filter.And(
             Builders<FileDoc>.Filter.Eq(x => x.IsDeleted, false),
             Builders<FileDoc>.Filter.Or(
@@ -125,19 +109,16 @@ public sealed class MinioFileDocCleanupHostedService : BackgroundService
 
             deletedOk++;
 
-            // Group A: đã isDeleted=true => không cần update gì
             if (!isGroupB) return;
 
-            // Group B: chưa committed => soft delete để khỏi quét lại
             var upd = Builders<FileDoc>.Update
                 .Set(x => x.IsDeleted, true)
                 .Set(x => x.UpdatedAtUtc, DateTime.UtcNow)
-                .Set(x => x.UpdatedByUserId, "system:cleanup");
+                .Set(x => x.UpdatedByUserId, null);
 
             await _ctx.Files.UpdateOneAsync(x => x.Id == f.Id, upd, cancellationToken: ct);
         }
 
-        // ====== A: batch loop ======
         while (pickedA + pickedB < maxPerRun)
         {
             var remain = maxPerRun - (pickedA + pickedB);
@@ -151,7 +132,6 @@ public sealed class MinioFileDocCleanupHostedService : BackgroundService
             if (docs.Count == 0) break;
 
             pickedA += docs.Count;
-
             foreach (var f in docs)
                 await ProcessAsync(f, isGroupB: false);
 
@@ -159,10 +139,9 @@ public sealed class MinioFileDocCleanupHostedService : BackgroundService
                 "MinioFileDocCleanup progress A: pickedA={pickedA} deletedOk={deletedOk} deletedFail={deletedFail}",
                 pickedA, deletedOk, deletedFail);
 
-            if (docs.Count < take) break; // hết
+            if (docs.Count < take) break;
         }
 
-        // ====== B: batch loop (nếu còn quota) ======
         while (pickedA + pickedB < maxPerRun)
         {
             var remain = maxPerRun - (pickedA + pickedB);
@@ -176,7 +155,6 @@ public sealed class MinioFileDocCleanupHostedService : BackgroundService
             if (docs.Count == 0) break;
 
             pickedB += docs.Count;
-
             foreach (var f in docs)
                 await ProcessAsync(f, isGroupB: true);
 
@@ -184,7 +162,7 @@ public sealed class MinioFileDocCleanupHostedService : BackgroundService
                 "MinioFileDocCleanup progress B: pickedB={pickedB} deletedOk={deletedOk} deletedFail={deletedFail}",
                 pickedB, deletedOk, deletedFail);
 
-            if (docs.Count < take) break; // hết
+            if (docs.Count < take) break;
         }
 
         if (pickedA + pickedB == 0)
@@ -219,40 +197,5 @@ public sealed class MinioFileDocCleanupHostedService : BackgroundService
 
         _log.LogWarning(last, "MinioFileDocCleanup remove failed bucket={bucket} objectKey={objectKey}", bucket, objectKey);
         return false;
-    }
-
-    private DateTime NextLastSundayRunUtc(DateTime fromUtc)
-    {
-        var local = TimeZoneInfo.ConvertTimeFromUtc(fromUtc, _tz);
-
-        var hour = int.TryParse(_cfg["UploadCleanup:LocalHour"], out var h) ? h : 21;
-        var minute = int.TryParse(_cfg["UploadCleanup:LocalMinute"], out var m) ? m : 0;
-        hour = Math.Clamp(hour, 0, 23);
-        minute = Math.Clamp(minute, 0, 59);
-
-        var candidateLocal = LastSundayOfMonth(local.Year, local.Month).Date
-            .AddHours(hour).AddMinutes(minute);
-
-        if (candidateLocal <= local)
-        {
-            var next = local.AddMonths(1);
-            candidateLocal = LastSundayOfMonth(next.Year, next.Month).Date
-                .AddHours(hour).AddMinutes(minute);
-        }
-
-        return TimeZoneInfo.ConvertTimeToUtc(candidateLocal, _tz);
-    }
-
-    private static DateTime LastSundayOfMonth(int year, int month)
-    {
-        var d = new DateTime(year, month, DateTime.DaysInMonth(year, month));
-        while (d.DayOfWeek != DayOfWeek.Sunday) d = d.AddDays(-1);
-        return d;
-    }
-
-    private static TimeZoneInfo? TryGetTimeZone(string id)
-    {
-        try { return TimeZoneInfo.FindSystemTimeZoneById(id); }
-        catch { return null; }
     }
 }

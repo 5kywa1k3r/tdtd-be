@@ -2,6 +2,10 @@
 
 /// <summary>
 /// Request khởi tạo một report draft mới cho một WorkAssignment theo kỳ.
+///
+/// Lưu ý:
+/// - DTO này giữ lại để tương thích với luồng cũ nếu cần.
+/// - Luồng mới ưu tiên đi qua WorkReportPeriod.
 /// </summary>
 public sealed class InitWorkAssignmentReportRequest
 {
@@ -18,7 +22,6 @@ public sealed class InitWorkAssignmentReportRequest
     /// <summary>
     /// Thời gian bắt đầu của kỳ báo cáo.
     /// Có thể FE truyền lên hoặc BE tự suy từ schedule.
-    /// Phase 1 cho phép nullable để linh hoạt.
     /// </summary>
     public DateTime? PeriodStart { get; set; }
 
@@ -26,6 +29,12 @@ public sealed class InitWorkAssignmentReportRequest
     /// Thời gian kết thúc của kỳ báo cáo.
     /// </summary>
     public DateTime? PeriodEnd { get; set; }
+
+    /// <summary>
+    /// Hạn cuối nộp của kỳ.
+    /// Nếu null thì BE có thể tự tính theo periodEnd/schedule.
+    /// </summary>
+    public DateTime? DueAtUtc { get; set; }
 
     /// <summary>
     /// Ghi chú khi khởi tạo report nếu cần.

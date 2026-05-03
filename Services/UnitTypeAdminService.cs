@@ -31,9 +31,9 @@ public sealed class UnitTypeAdminService : IUnitTypeAdminService
     public async Task<UnitTypeResponse> CreateAsync(CreateUnitTypeRequest req, CancellationToken ct)
     {
         var me = _me.RequireMe();
-        RoleGuard.RequireAdmin(me);
+        RoleGuard.RequireAdminOrSystemAdmin(me);
 
-        var code = req.Code.Trim();
+        var code = req.Code.Trim().ToUpperInvariant();
         var exists = await _ctx.UnitTypes
             .Find(x => x.Code == code && !x.IsDeleted)
             .AnyAsync(ct);
@@ -58,7 +58,7 @@ public sealed class UnitTypeAdminService : IUnitTypeAdminService
     public async Task<UnitTypeResponse> UpdateAsync(string id, UpdateUnitTypeRequest req, CancellationToken ct)
     {
         var me = _me.RequireMe();
-        RoleGuard.RequireAdmin(me);
+        RoleGuard.RequireAdminOrSystemAdmin(me);
 
         var now = DateTime.UtcNow;
 
@@ -82,12 +82,41 @@ public sealed class UnitTypeAdminService : IUnitTypeAdminService
     public async Task DeleteAsync(string id, CancellationToken ct)
     {
         var me = _me.RequireMe();
-        RoleGuard.RequireAdmin(me);
+        RoleGuard.RequireAdminOrSystemAdmin(me);
 
+        var unitType = await _ctx.UnitTypes
+            .Find(x => x.Id == id && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct);
+
+        if (unitType is null)
+            throw new InvalidOperationException("UnitType not found.");
+
+        var isUsedByUnits = await _ctx.Units
+            .Find(x =>
+                !x.IsDeleted &&
+                (x.PrimaryUnitTypeCode == unitType.Code || x.UnitTypeCodes.Contains(unitType.Code)))
+            .Limit(1)
+            .AnyAsync(ct);
+
+        if (isUsedByUnits)
+            throw new InvalidOperationException("Cannot delete unit type because it is used by active units.");
+
+        var isUsedByPositions = await _ctx.Positions
+            .Find(x => !x.IsDeleted && x.UnitTypeCodes.Contains(unitType.Code))
+            .Limit(1)
+            .AnyAsync(ct);
+
+        if (isUsedByPositions)
+            throw new InvalidOperationException("Cannot delete unit type because it is used by active positions.");
+
+        var now = DateTime.UtcNow;
         var update = Builders<UnitType>.Update
             .Set(x => x.IsDeleted, true)
-            .Set(x => x.DeletedAtUtc, DateTime.UtcNow)
-            .Set(x => x.DeletedByUserId, me.Id);
+            .Set(x => x.DeletedAtUtc, now)
+            .Set(x => x.DeletedByUserId, me.Id)
+            .Set(x => x.UpdatedAtUtc, now)
+            .Set(x => x.UpdatedByUserId, me.Id)
+            .Inc(x => x.Version, 1);
 
         var rs = await _ctx.UnitTypes.UpdateOneAsync(
             x => x.Id == id && !x.IsDeleted,
@@ -101,7 +130,7 @@ public sealed class UnitTypeAdminService : IUnitTypeAdminService
     public async Task<IReadOnlyList<UnitTypeResponse>> ListAsync(bool? isDeleted, CancellationToken ct)
     {
         var me = _me.RequireMe();
-        RoleGuard.RequireAdmin(me);
+        RoleGuard.RequireAdminOrSystemAdmin(me);
 
         var filter = Builders<UnitType>.Filter.Empty;
         if (isDeleted.HasValue)

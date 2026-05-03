@@ -2,6 +2,11 @@
 
 public interface IWorkAssignmentDataGuardService
 {
-    Task<bool> HasAssignmentDataAsync(string assignmentId, CancellationToken ct = default);
-    Task<HashSet<string>> GetAssignmentIdsHavingDataAsync(List<string> assignmentIds, CancellationToken ct = default);
+    Task<bool> HasAssignmentDataAsync(
+        string workAssignmentId,
+        CancellationToken ct = default);
+
+    Task<HashSet<string>> GetAssignmentIdsHavingDataAsync(
+        IEnumerable<string> workAssignmentIds,
+        CancellationToken ct = default);
 }

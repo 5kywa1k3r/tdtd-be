@@ -3,7 +3,7 @@
 namespace tdtd_be.DTOs.WorkAssignmentReports;
 
 /// <summary>
-/// DTO chi tiết của một report.
+/// Response chi tiết một report.
 /// FE dùng để mở màn editor hoặc màn xem report.
 /// </summary>
 public sealed class WorkAssignmentReportResponse
@@ -24,129 +24,91 @@ public sealed class WorkAssignmentReportResponse
     public string WorkAssignmentId { get; set; } = string.Empty;
 
     /// <summary>
+    /// Id kỳ runtime mà report này thuộc về.
+    /// </summary>
+    public string WorkReportPeriodId { get; set; } = string.Empty;
+
+    /// <summary>
+    /// User được giao phải báo cáo.
+    /// </summary>
+    public string AssigneeUserId { get; set; } = string.Empty;
+
+    /// <summary>
     /// Kỳ báo cáo của bản này.
     /// </summary>
     public string PeriodKey { get; set; } = string.Empty;
 
-    /// <summary>
-    /// Thời gian bắt đầu kỳ.
-    /// </summary>
+    public string PeriodInstanceKey { get; set; } = string.Empty;
+    public string PeriodKind { get; set; } = string.Empty;
+    public string? ReportTitle { get; set; }
+    public DateTime? ReportDate { get; set; }
+    public string? LinkedScheduledPeriodId { get; set; }
+
     public DateTime? PeriodStart { get; set; }
-
-    /// <summary>
-    /// Thời gian kết thúc kỳ.
-    /// </summary>
     public DateTime? PeriodEnd { get; set; }
+    public DateTime? DueAtUtc { get; set; }
 
     /// <summary>
-    /// Trạng thái hiện tại của report.
+    /// Trạng thái hiện tại của report record.
     /// </summary>
     public WorkAssignmentReportStatus Status { get; set; }
 
     /// <summary>
-    /// Snapshot template để FE/debug có thể dùng nếu cần.
-    /// Thường FE không cần parse nếu các field rời đã đủ.
+    /// Trạng thái ngoài cùng của kỳ.
     /// </summary>
-    public string TemplateSnapshotJson { get; set; } = string.Empty;
+    public WorkReportPeriodStatus? PeriodStatus { get; set; }
 
-    /// <summary>
-    /// Snapshot schedule tại thời điểm khởi tạo report.
-    /// </summary>
+    public string TemplateSnapshotJson { get; set; } = string.Empty;
     public string ScheduleSnapshotJson { get; set; } = string.Empty;
 
-    /// <summary>
-    /// Id template dùng lúc tạo report.
-    /// </summary>
     public string DynamicExcelTemplateId { get; set; } = string.Empty;
-
-    /// <summary>
-    /// Code template dùng lúc tạo report.
-    /// </summary>
     public string DynamicExcelTemplateCode { get; set; } = string.Empty;
-
-    /// <summary>
-    /// Tên template dùng lúc tạo report.
-    /// </summary>
     public string DynamicExcelTemplateName { get; set; } = string.Empty;
-
-    /// <summary>
-    /// Workbook JSON để FE mở Fortune Sheet.
-    /// </summary>
-    public string RawWorkbookDataJson { get; set; } = string.Empty;
-
-    /// <summary>
-    /// Spec JSON để FE render đúng vùng header/data.
-    /// </summary>
+    public string? DynamicFormTemplateId { get; set; }
+    public string? DynamicFormTemplateCode { get; set; }
+    public string? DynamicFormTemplateName { get; set; }
     public string SpecJson { get; set; } = string.Empty;
 
-    /// <summary>
-    /// Hàng bắt đầu của dataRect.
-    /// </summary>
     public int DataRectR0 { get; set; }
-
-    /// <summary>
-    /// Cột bắt đầu của dataRect.
-    /// </summary>
     public int DataRectC0 { get; set; }
-
-    /// <summary>
-    /// Hàng kết thúc của dataRect.
-    /// </summary>
     public int DataRectR1 { get; set; }
-
-    /// <summary>
-    /// Cột kết thúc của dataRect.
-    /// </summary>
     public int DataRectC1 { get; set; }
-
-    /// <summary>
-    /// Số cột vùng dữ liệu.
-    /// </summary>
     public int W { get; set; }
-
-    /// <summary>
-    /// Số hàng vùng dữ liệu.
-    /// </summary>
     public int H { get; set; }
 
-    /// <summary>
-    /// Dữ liệu 1D đã trải phẳng.
-    /// FE Phase 1 có thể chưa dùng nhiều, nhưng trả ra để debug/verify rất tiện.
-    /// </summary>
     public string Values1DJson { get; set; } = string.Empty;
+    public string? FieldValuesJson { get; set; }
+    public string? TableValuesJson { get; set; }
 
     /// <summary>
-    /// Ghi chú report.
+    /// Bộ field trải phẳng mà lãnh đạo quan tâm.
     /// </summary>
-    public string? Note { get; set; }
+    public string? CurrentProgressStatus { get; set; }
+    public string? ReportReason { get; set; }
+    public string? Difficulties { get; set; }
+    public string? ProposedSolution { get; set; }
 
-    /// <summary>
-    /// Số phiên bản của report trong cùng kỳ.
-    /// </summary>
+    public bool IsLateSubmission { get; set; }
+    public string? LateReason { get; set; }
+
+    public string? ReviewerComment { get; set; }
+    public string? ReviewerEvaluation { get; set; }
+    public string? ReturnReason { get; set; }
+
     public int VersionNo { get; set; }
-
-    /// <summary>
-    /// Có phải bản hiện hành không.
-    /// </summary>
     public bool IsCurrent { get; set; }
 
-    /// <summary>
-    /// Thời điểm submit nếu có.
-    /// </summary>
     public DateTime? SubmittedAtUtc { get; set; }
-
-    /// <summary>
-    /// User submit nếu có.
-    /// </summary>
     public string? SubmittedByUserId { get; set; }
 
-    /// <summary>
-    /// Thời điểm tạo bản ghi.
-    /// </summary>
-    public DateTime CreatedAtUtc { get; set; }
+    public DateTime? ReturnedAtUtc { get; set; }
+    public string? ReturnedByUserId { get; set; }
 
-    /// <summary>
-    /// Thời điểm cập nhật cuối.
-    /// </summary>
+    public DateTime? ApprovedAtUtc { get; set; }
+    public string? ApprovedByUserId { get; set; }
+
+    public string? Note { get; set; }
+
+    public DateTime CreatedAtUtc { get; set; }
     public DateTime UpdatedAtUtc { get; set; }
 }

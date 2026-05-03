@@ -1,69 +1,56 @@
-﻿using tdtd_be.Models.Enums;
-
-namespace tdtd_be.DTOs.WorkAssignmentReports;
+﻿namespace tdtd_be.DTOs.WorkAssignmentReports;
 
 /// <summary>
-/// Dòng dữ liệu gọn để render danh sách report của một assignment.
+/// Dòng dữ liệu danh sách report.
+/// Dùng cho các màn list theo assignment / search chung / history.
 /// </summary>
 public sealed class WorkAssignmentReportListRow
 {
-    /// <summary>
-    /// Id report.
-    /// </summary>
     public string Id { get; set; } = string.Empty;
-
-    /// <summary>
-    /// Id work gốc.
-    /// </summary>
     public string WorkId { get; set; } = string.Empty;
-
-    /// <summary>
-    /// Id assignment gốc.
-    /// </summary>
     public string WorkAssignmentId { get; set; } = string.Empty;
+    public string WorkReportPeriodId { get; set; } = string.Empty;
+    public string AssigneeUserId { get; set; } = string.Empty;
 
-    /// <summary>
-    /// Kỳ báo cáo.
-    /// </summary>
     public string PeriodKey { get; set; } = string.Empty;
+    public string PeriodInstanceKey { get; set; } = string.Empty;
+    public string PeriodKind { get; set; } = string.Empty;
+    public string? ReportTitle { get; set; }
+    public DateTime? ReportDate { get; set; }
+    public string? LinkedScheduledPeriodId { get; set; }
+    public DateTime? PeriodStart { get; set; }
+    public DateTime? PeriodEnd { get; set; }
+    public DateTime? DueAtUtc { get; set; }
 
-    /// <summary>
-    /// Trạng thái report.
-    /// </summary>
-    public WorkAssignmentReportStatus Status { get; set; }
+    public int Status { get; set; }
+    public int? ReportStatus { get; set; }
+    public int? PeriodStatus { get; set; }
+    public bool IsLateSubmission { get; set; }
+    public string? LateReason { get; set; }
 
-    /// <summary>
-    /// Số phiên bản của report trong cùng kỳ.
-    /// </summary>
+    public string DynamicExcelTemplateId { get; set; } = string.Empty;
+    public string DynamicExcelTemplateCode { get; set; } = string.Empty;
+    public string DynamicExcelTemplateName { get; set; } = string.Empty;
+    public string? DynamicFormTemplateId { get; set; }
+    public string? DynamicFormTemplateCode { get; set; }
+    public string? DynamicFormTemplateName { get; set; }
+
+    public string? CurrentProgressStatus { get; set; }
+    public string? ReportReason { get; set; }
+    public string? Difficulties { get; set; }
+    public string? ProposedSolution { get; set; }
+
     public int VersionNo { get; set; }
-
-    /// <summary>
-    /// Có phải bản hiện hành hay không.
-    /// </summary>
     public bool IsCurrent { get; set; }
 
-    /// <summary>
-    /// Id template đang dùng lúc tạo report.
-    /// </summary>
-    public string DynamicExcelTemplateId { get; set; } = string.Empty;
-
-    /// <summary>
-    /// Code template để hiển thị nhanh.
-    /// </summary>
-    public string DynamicExcelTemplateCode { get; set; } = string.Empty;
-
-    /// <summary>
-    /// Tên template để hiển thị nhanh.
-    /// </summary>
-    public string DynamicExcelTemplateName { get; set; } = string.Empty;
-
-    /// <summary>
-    /// Thời điểm submit nếu đã submit.
-    /// </summary>
     public DateTime? SubmittedAtUtc { get; set; }
+    public string? SubmittedByUserId { get; set; }
+    public DateTime? ReturnedAtUtc { get; set; }
+    public string? ReturnedByUserId { get; set; }
+    public string? ReturnReason { get; set; }
+    public DateTime? ApprovedAtUtc { get; set; }
+    public string? ApprovedByUserId { get; set; }
 
-    /// <summary>
-    /// Thời điểm update cuối.
-    /// </summary>
+    public DateTime CreatedAtUtc { get; set; }
     public DateTime UpdatedAtUtc { get; set; }
 }

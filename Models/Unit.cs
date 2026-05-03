@@ -31,6 +31,12 @@ public sealed class Unit : BaseEntity
     [BsonElement("unitTypeCodes")]
     public List<string> UnitTypeCodes { get; set; } = new();
 
+    [BsonElement("primaryUnitTypeCode")]
+    public string? PrimaryUnitTypeCode { get; set; }
+
+    [BsonElement("isVirtual")]
+    public bool IsVirtual { get; set; } = false;
+
     [BsonElement("parentUnitId")]
     [BsonRepresentation(BsonType.ObjectId)]
     public string? ParentUnitId { get; set; }

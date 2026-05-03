@@ -22,10 +22,10 @@ public sealed class MyReportTemplateSearchRequest
     public string? Q { get; set; }
 
     /// <summary>
-    /// Chỉ lấy assignment active hay không.
-    /// null = tất cả.
+    /// Legacy field giữ để tương thích request cũ.
+    /// Report list không lọc active tại binding/template/period; active chỉ thuộc Work/WorkAssignment.
     /// </summary>
-    public bool? IsActive { get; set; } = true;
+    public bool? IsActive { get; set; }
 
     /// <summary>
     /// Chỉ lấy nhóm đã có report hay chưa có report.
@@ -36,12 +36,18 @@ public sealed class MyReportTemplateSearchRequest
     public bool? HasReport { get; set; }
 
     /// <summary>
+    /// Chỉ lấy nhóm có kỳ quá hạn.
+    /// </summary>
+    public bool? HasOverduePeriod { get; set; }
+
+    /// <summary>
     /// Trường sắp xếp.
     /// Hỗ trợ:
     /// - dynamicExcelCode
     /// - dynamicExcelName
-    /// - assignmentCount
     /// - latestUpdatedAtUtc
+    /// - latestDueAtUtc
+    /// - periodCount
     /// </summary>
     public string? SortField { get; set; } = "latestUpdatedAtUtc";
 

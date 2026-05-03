@@ -8,7 +8,6 @@ using tdtd_be.DTOs.Auth;
 using tdtd_be.DTOs.Common;
 using tdtd_be.DTOs.Users.Admin;
 using tdtd_be.Models;
-using tdtd_be.Enum;
 
 namespace tdtd_be.Services;
 
@@ -38,20 +37,22 @@ public sealed class UserAdminService : IUserAdminService
     private readonly UnitTreeHelper _tree;
     private readonly AuthService _auth;
     private readonly PasswordHasher<AppUser> _hasher;
+    private readonly IPositionAdminService _positions;
 
     public UserAdminService(
         MongoDbContext ctx,
         MeAccessor me,
         UnitTreeHelper tree,
         AuthService auth,
-        PasswordHasher<AppUser> hasher)
+        PasswordHasher<AppUser> hasher,
+        IPositionAdminService positions)
     {
-        _ctx = ctx; _me = me; _tree = tree; _auth = auth; _hasher = hasher;
+        _ctx = ctx; _me = me; _tree = tree; _auth = auth; _hasher = hasher; _positions = positions;
     }
 
     private static string NormalizeUsername(string s) => (s ?? "").Trim().ToLowerInvariant();
 
-    private static UserResponse ToResp(AppUser u, string unitSymbol, string unitName, string unitCode) => new(
+    private static UserResponse ToResp(AppUser u, string unitSymbol, string unitName, string unitCode, string? positionName = null) => new(
         u.Id,
         u.Username,
         u.FullName,
@@ -63,7 +64,9 @@ public sealed class UserAdminService : IUserAdminService
         u.IsDeleted,
         u.CreatedAtUtc,
         u.UpdatedAtUtc,
-        u.PositionCode
+        u.PositionCode,
+        positionName,
+        u.AccountKind
     );
 
     private static void PreventAssignAdmin(IEnumerable<string>? roles)
@@ -153,9 +156,9 @@ public sealed class UserAdminService : IUserAdminService
 
         if (RoleGuard.IsManagerLevel(me))
         {
-            var meUnit = await RequireUnitAsync(me.UnitId, ct);
+            var meUnit = await ResolveManagerLevelScopeAsync(me, ct);
             var targetUnit = await RequireUnitAsync(targetUser.UnitId, ct);
-            EnsureManagerLevelScope((meUnit.Code, meUnit.Level), (targetUnit.Code, targetUnit.Level));
+            EnsureManagerLevelScope(meUnit, (targetUnit.Code, targetUnit.Level));
             return;
         }
 
@@ -212,10 +215,58 @@ public sealed class UserAdminService : IUserAdminService
         return u;
     }
 
+    private static void EnsureUserBearingUnit(Unit unit)
+    {
+        if (unit.IsVirtual)
+            throw new InvalidOperationException("Cannot create or manage a user inside a virtual unit.");
+    }
+
+    private static void EnsureUnitUsableForNewUser(Unit unit)
+    {
+        if (unit.IsDeleted)
+            throw new InvalidOperationException("Cannot create a user inside a deleted unit.");
+        EnsureUserBearingUnit(unit);
+    }
+
     private static bool IsInSubtree(string meCode, string targetCode)
         => !string.IsNullOrWhiteSpace(meCode)
            && !string.IsNullOrWhiteSpace(targetCode)
            && targetCode.StartsWith(meCode, StringComparison.Ordinal);
+
+    private sealed record ManagerLevelScope(string? UnitCode, int Level, bool IsLevelWide);
+
+    private static bool TryParseGeneratedLevelManager(MeResponse me, out int level)
+    {
+        level = 0;
+        var username = NormalizeUsername(me.Username ?? string.Empty);
+        var prefix = ManagementAccountConvention.LevelManagerPrefix;
+        if (!username.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        var raw = username[prefix.Length..].Trim();
+        return int.TryParse(raw, out level) && level >= 0;
+    }
+
+    private async Task<ManagerLevelScope> ResolveManagerLevelScopeAsync(MeResponse me, CancellationToken ct)
+    {
+        if (!RoleGuard.IsManagerLevel(me))
+            throw new BadHttpRequestException("MANAGER_LEVEL required.");
+
+        if (!string.IsNullOrWhiteSpace(me.UnitId))
+        {
+            var meUnit = await _ctx.Units.Find(x => x.Id == me.UnitId)
+                .Project(x => new { x.Code, x.Level })
+                .FirstOrDefaultAsync(ct);
+
+            if (meUnit is not null)
+                return new ManagerLevelScope(meUnit.Code, meUnit.Level, IsLevelWide: false);
+        }
+
+        if (TryParseGeneratedLevelManager(me, out var generatedLevel))
+            return new ManagerLevelScope(UnitCode: null, Level: generatedLevel, IsLevelWide: true);
+
+        throw new InvalidOperationException("Me unit not found.");
+    }
 
     private static void EnsureManagerLevelScope((string meCode, int meLevel) me, (string targetCode, int targetLevel) target)
     {
@@ -224,6 +275,18 @@ public sealed class UserAdminService : IUserAdminService
         if (target.targetLevel < me.meLevel)
             throw new BadHttpRequestException("Cannot manage upper level.");
     }
+
+    private static void EnsureManagerLevelScope(ManagerLevelScope scope, (string targetCode, int targetLevel) target)
+    {
+        if (scope.IsLevelWide)
+        {
+            if (target.targetLevel < scope.Level)
+                throw new BadHttpRequestException("Cannot manage upper level.");
+            return;
+        }
+
+        EnsureManagerLevelScope((scope.UnitCode ?? string.Empty, scope.Level), target);
+    }
     public async Task<UserResponse> GetByIdAsync(string userId, CancellationToken ct)
     {
         var me = _me.RequireMe();
@@ -231,33 +294,28 @@ public sealed class UserAdminService : IUserAdminService
         var u = await _ctx.Users.Find(x => x.Id == userId && !x.IsDeleted).FirstOrDefaultAsync(ct);
         if (u is null) throw new InvalidOperationException("User not found.");
         var targetUnit = await _ctx.Units.Find(x => x.Id == u.UnitId)
-            .Project(x => new { x.Symbol, x.ShortName, x.Code, x.Level })
+            .Project(x => new { x.Symbol, x.ShortName, x.Code, x.Level, x.PrimaryUnitTypeCode })
             .FirstOrDefaultAsync(ct) ?? throw new InvalidOperationException("Target unit not found.");
+
+        var positionName = await GetPositionNameAsync(u.PositionCode, ct);
 
         // Allowed: ADMIN, SYSTEM_ADMIN, MANAGER_UNIT, MANAGER_LEVEL
         if (RoleGuard.IsAdmin(me) || RoleGuard.IsSystemAdmin(me))
-            return ToResp(u, targetUnit.Symbol, targetUnit.ShortName, targetUnit.Code);
+            return ToResp(u, targetUnit.Symbol, targetUnit.ShortName, targetUnit.Code, positionName);
 
         if (RoleGuard.TryGetManagerUnit(me, out var managedUnitId))
         {
             if (!string.Equals(u.UnitId, managedUnitId, StringComparison.Ordinal))
                 throw new BadHttpRequestException("MANAGER_UNIT scope.");
-            return ToResp(u, targetUnit.Symbol, targetUnit.ShortName, targetUnit.Code);
+            return ToResp(u, targetUnit.Symbol, targetUnit.ShortName, targetUnit.Code, positionName);
         }
 
         if (RoleGuard.IsManagerLevel(me))
         {
-            var meUnit = await _ctx.Units.Find(x => x.Id == me.UnitId)
-                .Project(x => new { x.Code, x.Level })
-                .FirstOrDefaultAsync(ct) ?? throw new InvalidOperationException("Me unit not found.");
+            var meUnit = await ResolveManagerLevelScopeAsync(me, ct);
+            EnsureManagerLevelScope(meUnit, (targetUnit.Code, targetUnit.Level));
 
-            if (!targetUnit.Code.StartsWith(meUnit.Code, StringComparison.Ordinal))
-                throw new BadHttpRequestException("Outside manager subtree.");
-
-            if (targetUnit.Level < meUnit.Level)
-                throw new BadHttpRequestException("Cannot manage upper level.");
-
-            return ToResp(u, targetUnit.Symbol, targetUnit.ShortName, targetUnit.Code);
+            return ToResp(u, targetUnit.Symbol, targetUnit.ShortName, targetUnit.Code, positionName);
         }
 
         throw new BadHttpRequestException("Not allowed.");
@@ -272,6 +330,7 @@ public sealed class UserAdminService : IUserAdminService
             throw new InvalidOperationException("Username exists.");
 
         var targetUnit = await RequireUnitAsync(req.UnitId, ct);
+        EnsureUnitUsableForNewUser(targetUnit);
 
         // enforce role assignment
         EnforceRoleAssignmentPolicy(me, req.Roles, isCreate: true);
@@ -293,19 +352,19 @@ public sealed class UserAdminService : IUserAdminService
         }
         else if (RoleGuard.IsManagerLevel(me))
         {
-            var meUnit = await RequireUnitAsync(me.UnitId, ct);
-            EnsureManagerLevelScope((meUnit.Code, meUnit.Level), (targetUnit.Code, targetUnit.Level));
+            var meUnit = await ResolveManagerLevelScopeAsync(me, ct);
+            EnsureManagerLevelScope(meUnit, (targetUnit.Code, targetUnit.Level));
         }
         else
         {
             throw new BadHttpRequestException("Not allowed.");
         }
 
+        var pc = PositionAdminService.NormalizeOptionalCode(req.PositionCode);
+        await _positions.ValidatePositionForUnitTypeAsync(pc, targetUnit.PrimaryUnitTypeCode, ct);
+
         // Insert user
         var now = DateTime.UtcNow;
-        var pc = Positions.Normalize(req.PositionCode);
-        if (!string.IsNullOrWhiteSpace(pc) && !Positions.IsValid(pc))
-            throw new InvalidOperationException("Invalid positionCode.");
         var u = new AppUser
         {
             Username = username,
@@ -322,7 +381,8 @@ public sealed class UserAdminService : IUserAdminService
         u.PasswordHash = _hasher.HashPassword(u, req.Password);
 
         await _ctx.Users.InsertOneAsync(u, cancellationToken: ct);
-        return ToResp(u, targetUnit.Symbol, targetUnit.ShortName, targetUnit.Code);
+        var positionName = await GetPositionNameAsync(pc, ct);
+        return ToResp(u, targetUnit.Symbol, targetUnit.ShortName, targetUnit.Code, positionName);
     }
 
     public async Task<UserResponse> UpdateAsync(string userId, UpdateUserRequest req, CancellationToken ct)
@@ -335,13 +395,14 @@ public sealed class UserAdminService : IUserAdminService
 
         // ✅ guard target: ADMIN được manage SYSTEM_ADMIN (nhưng không đụng ADMIN, không đụng SYS ngang cấp nếu sysadmin,...)
         RequireCanManageUser(me, targetUser);
+        await EnsureScopeForTargetAsync(me, targetUser, ct);
 
         var targetUnit = await RequireUnitAsync(targetUser.UnitId, ct);
+        EnsureUserBearingUnit(targetUnit);
 
         var now = DateTime.UtcNow;
-        var pc = Positions.Normalize(req.PositionCode);
-        if (!string.IsNullOrWhiteSpace(pc) && !Positions.IsValid(pc))
-            throw new InvalidOperationException("Invalid positionCode.");
+        var pc = PositionAdminService.NormalizeOptionalCode(req.PositionCode);
+        await _positions.ValidatePositionForUnitTypeAsync(pc, targetUnit.PrimaryUnitTypeCode, ct);
         var update = Builders<AppUser>.Update
             .Set(x => x.FullName, req.FullName.Trim())
             .Set(x => x.Note, string.IsNullOrWhiteSpace(req.Note) ? null : req.Note.Trim())
@@ -375,7 +436,8 @@ public sealed class UserAdminService : IUserAdminService
         if (after is null) throw new InvalidOperationException("User not found.");
 
         await _auth.RevokeUserSessionsAsync(userId, ct);
-        return ToResp(after, targetUnit.Symbol, targetUnit.ShortName, targetUnit.Code);
+        var positionName = await GetPositionNameAsync(pc, ct);
+        return ToResp(after, targetUnit.Symbol, targetUnit.ShortName, targetUnit.Code, positionName);
     }
 
     public async Task ResetPasswordAsync(string userId, ResetPasswordRequest req, CancellationToken ct)
@@ -384,6 +446,9 @@ public sealed class UserAdminService : IUserAdminService
 
         var user = await _ctx.Users.Find(x => x.Id == userId).FirstOrDefaultAsync(ct)
             ?? throw new InvalidOperationException("User not found.");
+
+        if (user.IsDeleted)
+            throw new InvalidOperationException("Cannot reset password for a deleted user.");
 
         // ✅ guard target role theo rule mới
         RequireCanManageUser(me, user);
@@ -402,9 +467,7 @@ public sealed class UserAdminService : IUserAdminService
         }
         else if (RoleGuard.IsManagerLevel(me))
         {
-            var meUnit = await RequireUnitAsync(me.UnitId, ct);
-            var targetUnit = await RequireUnitAsync(user.UnitId, ct);
-            EnsureManagerLevelScope((meUnit.Code, meUnit.Level), (targetUnit.Code, targetUnit.Level));
+            // Scope was checked by EnsureScopeForTargetAsync above.
         }
         else throw new BadHttpRequestException("Not allowed.");
 
@@ -416,7 +479,14 @@ public sealed class UserAdminService : IUserAdminService
             .Set(x => x.UpdatedByUserId, me.Id)
             .Set(x => x.UpdatedAtUtc, now);
 
-        await _ctx.Users.UpdateOneAsync(x => x.Id == userId, update, cancellationToken: ct);
+        var rs = await _ctx.Users.UpdateOneAsync(
+            x => x.Id == userId && !x.IsDeleted,
+            update,
+            cancellationToken: ct);
+
+        if (rs.MatchedCount == 0)
+            throw new InvalidOperationException("User not found.");
+
         await _auth.RevokeUserSessionsAsync(userId, ct);
     }
     public async Task<PagedResult<UserSearchRow>> SearchUsersAsync(
@@ -451,8 +521,9 @@ public sealed class UserAdminService : IUserAdminService
         userMatch &= Builders<AppUser>.Filter.Eq(x => x.IsDeleted, isDeleted ?? false);
         if (!string.IsNullOrWhiteSpace(positionCode))
         {
-            var pc = Positions.Normalize(positionCode);
-            if (!string.IsNullOrWhiteSpace(pc) && !Positions.IsValid(pc))
+            var pc = PositionAdminService.NormalizeOptionalCode(positionCode);
+            var exists = await _ctx.Positions.Find(x => x.Code == pc && !x.IsDeleted).AnyAsync(ct);
+            if (!exists)
                 throw new InvalidOperationException("Invalid positionCode.");
 
             userMatch &= Builders<AppUser>.Filter.Eq(x => x.PositionCode, pc);
@@ -472,20 +543,12 @@ public sealed class UserAdminService : IUserAdminService
         if (isManagerUnit)
             userMatch &= Builders<AppUser>.Filter.Eq(x => x.UnitId, managerUnitId);
 
-        // ====== if MANAGER_LEVEL: need meUnit code/level ======
-        string? meUnitCode = null;
-        int? meUnitLevel = null;
+        // ====== MANAGER_LEVEL scope ======
+        ManagerLevelScope? managerLevelScope = null;
 
         if (isManagerLevel)
         {
-            var meUnit = await _ctx.Units.Find(x => x.Id == me.UnitId)
-                .Project(x => new { x.Code, x.Level })
-                .FirstOrDefaultAsync(ct);
-
-            if (meUnit is null) throw new InvalidOperationException("Me unit not found.");
-
-            meUnitCode = meUnit.Code;
-            meUnitLevel = meUnit.Level;
+            managerLevelScope = await ResolveManagerLevelScopeAsync(me, ct);
         }
 
         // ====== build sort (whitelist) ======
@@ -493,6 +556,7 @@ public sealed class UserAdminService : IUserAdminService
 
         // ====== aggregate with lookup + facet ======
         var unitsCol = _ctx.Units.CollectionNamespace.CollectionName;
+        var positionsCol = _ctx.Positions.CollectionNamespace.CollectionName;
 
         var lookupStage = new BsonDocument("$lookup", new BsonDocument
         {
@@ -501,17 +565,11 @@ public sealed class UserAdminService : IUserAdminService
             { "pipeline", new BsonArray
                 {
                     new BsonDocument("$match", new BsonDocument("$expr",
-                        new BsonDocument("$and", new BsonArray
+                        // Keep historical unit labels for old/deactivated data. New-data flows still reject deleted units.
+                        new BsonDocument("$eq", new BsonArray
                         {
-                            // ✅ unit._id == ObjectId(user.unitId)
-                            new BsonDocument("$eq", new BsonArray
-                            {
-                                "$_id",
-                                new BsonDocument("$toObjectId", "$$uid")
-                            }),
-
-                            // ✅ bỏ units đã xóa mềm
-                            new BsonDocument("$eq", new BsonArray { "$isDeleted", false })
+                            "$_id",
+                            new BsonDocument("$toObjectId", "$$uid")
                         })
                     )),
                     new BsonDocument("$project", new BsonDocument
@@ -532,10 +590,42 @@ public sealed class UserAdminService : IUserAdminService
             { "preserveNullAndEmptyArrays", true }
         });
 
+        var positionLookupStage = new BsonDocument("$lookup", new BsonDocument
+        {
+            { "from", positionsCol },
+            { "let", new BsonDocument("pc", "$positionCode") },
+            { "pipeline", new BsonArray
+                {
+                    new BsonDocument("$match", new BsonDocument("$expr",
+                        new BsonDocument("$and", new BsonArray
+                        {
+                            new BsonDocument("$eq", new BsonArray { "$code", "$$pc" }),
+                            new BsonDocument("$eq", new BsonArray { "$isDeleted", false })
+                        })
+                    )),
+                    new BsonDocument("$project", new BsonDocument
+                    {
+                        { "name", 1 },
+                        { "order", 1 },
+                        { "rank", 1 }
+                    })
+                }
+            },
+            { "as", "position" }
+        });
+
+        var unwindPositionStage = new BsonDocument("$unwind", new BsonDocument
+        {
+            { "path", "$position" },
+            { "preserveNullAndEmptyArrays", true }
+        });
+
         var pipeline = _ctx.Users.Aggregate()
             .Match(userMatch)
             .AppendStage<BsonDocument>(lookupStage)
-            .AppendStage<BsonDocument>(unwindStage);
+            .AppendStage<BsonDocument>(unwindStage)
+            .AppendStage<BsonDocument>(positionLookupStage)
+            .AppendStage<BsonDocument>(unwindPositionStage);
 
         // ✅ Filter theo unitCodePrefix (UI chọn 1 mã đơn vị cha)
         if (!string.IsNullOrWhiteSpace(unitCodePrefix))
@@ -551,15 +641,20 @@ public sealed class UserAdminService : IUserAdminService
         }
 
         // ✅ MANAGER_LEVEL scope: filter by unit.code prefix & unit.level >= meLevel
-        if (isManagerLevel)
+        if (managerLevelScope is not null)
         {
-            var escaped = Regex.Escape(meUnitCode ?? "");
-            var unitScopeMatch = new BsonDocument("$match", new BsonDocument
-        {
-            // ⚠️ FIX: dùng unit.code + unit.level (camelCase), không phải unit.Code/unit.Level
-            { "unit.code", new BsonDocument("$regex", "^" + escaped) },
-            { "unit.level", new BsonDocument("$gte", meUnitLevel ?? 0) }
-        });
+            var scopeDoc = new BsonDocument
+            {
+                { "unit.level", new BsonDocument("$gte", managerLevelScope.Level) }
+            };
+
+            if (!managerLevelScope.IsLevelWide)
+            {
+                var escaped = Regex.Escape(managerLevelScope.UnitCode ?? "");
+                scopeDoc.Add("unit.code", new BsonDocument("$regex", "^" + escaped));
+            }
+
+            var unitScopeMatch = new BsonDocument("$match", scopeDoc);
 
             pipeline = pipeline.AppendStage<BsonDocument>(unitScopeMatch);
         }
@@ -589,9 +684,10 @@ public sealed class UserAdminService : IUserAdminService
 
             // position
             { "PositionCode", new BsonDocument("$ifNull", new BsonArray { "$positionCode", "" }) },
+            { "PositionName", new BsonDocument("$ifNull", new BsonArray { "$position.name", "" }) },
 
             // computed order for sorting by position
-            { "_posOrder", Positions.BuildMongoSwitchOrder("$positionCode") },
+            { "_posOrder", new BsonDocument("$ifNull", new BsonArray { "$position.order", 9999 }) },
         });
 
         pipeline = pipeline.AppendStage<BsonDocument>(project);
@@ -631,10 +727,16 @@ public sealed class UserAdminService : IUserAdminService
                 UnitId: d.GetValue("UnitId", "").AsString,
                 UnitShortName: d.GetValue("UnitShortName", "").AsString,
                 UnitSymbol: d.GetValue("UnitSymbol", "").AsString,
+                UnitCode: d.GetValue("_unitCode", "").AsString,
                 IsDeleted: d.GetValue("IsDeleted", false).ToBoolean(),
                 PositionCode: d.GetValue("PositionCode", "").AsString,
+                PositionName: d.GetValue("PositionName", "").AsString,
                 Roles: d.TryGetValue("Roles", out var rv) && rv.IsBsonArray
-                    ? rv.AsBsonArray.Select(x => x.IsString ? x.AsString : x.ToString()).ToList()
+                    ? rv.AsBsonArray
+                        .Select(x => x.IsString ? x.AsString : x.ToString())
+                        .Where(x => !string.IsNullOrWhiteSpace(x))
+                        .Select(x => x!)
+                        .ToList()
                     : new List<string>()
             ))
             .ToList();
@@ -680,6 +782,8 @@ public sealed class UserAdminService : IUserAdminService
         var user = await _ctx.Users.Find(x => x.Id == userId).FirstOrDefaultAsync(ct)
             ?? throw new InvalidOperationException("User not found.");
 
+        if (user.IsDeleted) return;
+
         // ✅ guard target role theo rule mới
         RequireCanManageUser(me, user);
 
@@ -708,5 +812,16 @@ public sealed class UserAdminService : IUserAdminService
             throw new InvalidOperationException("User not found.");
 
         await _auth.RevokeUserSessionsAsync(userId, ct);
+    }
+
+    private async Task<string?> GetPositionNameAsync(string? positionCode, CancellationToken ct)
+    {
+        var pc = PositionAdminService.NormalizeOptionalCode(positionCode);
+        if (string.IsNullOrWhiteSpace(pc)) return null;
+
+        return await _ctx.Positions
+            .Find(x => x.Code == pc && !x.IsDeleted)
+            .Project(x => x.Name)
+            .FirstOrDefaultAsync(ct);
     }
 }

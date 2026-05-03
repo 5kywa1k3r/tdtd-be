@@ -19,31 +19,14 @@ public enum DocRoleType
     ASSIGNEE = 10,
     ASSIGNER = 11,
     ASSIGNMENT_LEADER_WATCH = 13,
+    ASSIGNMENT_BRANCH_VIEWER = 14,
 
     WORK_PARTICIPANT = 20
 }
 
 [BsonIgnoreExtraElements]
-public sealed class DocRole : BaseEntity
+public sealed class DocRole : DocRoleBase
 {
-    [BsonId]
-    [BsonRepresentation(BsonType.ObjectId)]
-    public string Id { get; set; } = default!;
-
-    [BsonElement("docType")]
-    public DocType DocType { get; set; }
-
-    [BsonElement("docId")]
-    [BsonRepresentation(BsonType.ObjectId)]
-    public string DocId { get; set; } = default!;
-
-    [BsonElement("userId")]
-    [BsonRepresentation(BsonType.ObjectId)]
-    public string UserId { get; set; } = default!;
-
     [BsonElement("role")]
     public DocRoleType Role { get; set; }
-
-    [BsonElement("user")]
-    public UserRef? User { get; set; }
 }

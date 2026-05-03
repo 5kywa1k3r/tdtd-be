@@ -1,4 +1,5 @@
-﻿using tdtd_be.Data;
+﻿using MongoDB.Driver;
+using tdtd_be.Data;
 
 namespace tdtd_be.Services.WorkAssignments.Lookups;
 
@@ -13,13 +14,13 @@ public sealed class DynamicExcelLookupService : IDynamicExcelLookupService
 
     public async Task<(string Code, string Name)> LoadAsync(string dynamicExcelId, CancellationToken ct = default)
     {
-        // TODO: thay bằng collection thật của bệ hạ
-        await Task.CompletedTask;
+        var entity = await _ctx.DynamicExcelTemplates
+            .Find(x => x.Id == dynamicExcelId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct);
 
-        var found = true;
-        if (!found)
+        if (entity is null)
             throw new InvalidOperationException("Biểu mẫu/bảng động không tồn tại.");
 
-        return ("DYN-001", "Biểu mẫu động");
+        return (entity.Code ?? string.Empty, entity.Name ?? string.Empty);
     }
 }

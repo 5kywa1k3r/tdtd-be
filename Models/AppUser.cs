@@ -26,6 +26,9 @@ public sealed class AppUser : BaseEntity
     [BsonElement("positionCode")]
     public string? PositionCode { get; set; }
 
+    [BsonElement("accountKind")]
+    public string? AccountKind { get; set; }
+
     [BsonElement("roles")]
     public List<string> Roles { get; set; } = new();
 }

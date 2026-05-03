@@ -14,6 +14,11 @@ public sealed class CreateUnitRequest
 
     public string? ParentUnitId { get; set; } // null => create root
 
+    [Required, MinLength(1), MaxLength(50)]
+    public string PrimaryUnitTypeCode { get; set; } = default!;
+
+    public bool IsVirtual { get; set; } = false;
+
     // optional
     public List<string> UnitTypeCodes { get; set; } = new();
 }
@@ -27,6 +32,12 @@ public sealed class UpdateUnitRequest
     public string? ShortName { get; set; }
     [MaxLength(30)]
     public string? Symbol { get; set; }
+
+    [Required, MinLength(1), MaxLength(50)]
+    public string PrimaryUnitTypeCode { get; set; } = default!;
+
+    public bool IsVirtual { get; set; } = false;
+
     public List<string> UnitTypeCodes { get; set; } = new();
 
     public string? Note { get; set; }
@@ -44,7 +55,9 @@ public sealed record UnitResponse(
     int Level,
     int Version,
     string? ParentUnitId,
+    string? PrimaryUnitTypeCode,
     List<string> UnitTypeCodes,
+    bool IsVirtual,
     string? Note,
     DateTime CreatedAtUtc,
     DateTime UpdatedAtUtc,
@@ -62,6 +75,8 @@ public sealed record UnitHistoryResponse(
     string? Symbol,
     int Level,
     string? ParentUnitId,
+    string? PrimaryUnitTypeCode,
     List<string> UnitTypeCodes,
+    bool IsVirtual,
     DateTime CreatedAtUtc
 );

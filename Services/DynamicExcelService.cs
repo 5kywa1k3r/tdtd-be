@@ -32,18 +32,40 @@ public sealed class DynamicExcelService : IDynamicExcelService
 
     private void RequireCanMutate(MeResponse me, DynamicExcelTemplate doc)
     {
-        // ✅ KHUNG: chỉnh theo RoleGuard hiện tại 
-        // - ADMIN/SYS full
-        // - còn lại: chỉ người tạo được sửa/xóa
+        // Dynamic Excel templates are user-owned. Keep mutation rights tied to
+        // the creator unless a separate admin takeover flow is introduced.
         if (!string.Equals(doc.CreatedByUserId, me.Id, StringComparison.Ordinal))
             throw new BadHttpRequestException("Bạn không có quyền sửa/xóa bảng biểu này.");
     }
 
-    private Task EnsureNotLinkedToWorkAsync(string templateId, CancellationToken ct)
+    private async Task EnsureNotLinkedToWorkAsync(string templateId, CancellationToken ct)
     {
-        // ✅ KHUNG: sau này check collection Work/WorkNode/Submission...
-        // if (hasLink) throw new InvalidOperationException("Bảng biểu đã được dùng trong Work, không thể sửa/xóa.");
-        return Task.CompletedTask;
+        if (string.IsNullOrWhiteSpace(templateId))
+            throw new InvalidOperationException("Dynamic excel template id is required.");
+
+        var usedByAssignment = await _ctx.WorkAssignments
+            .Find(x => x.DynamicExcelId == templateId && !x.IsDeleted)
+            .AnyAsync(ct);
+        if (usedByAssignment)
+            throw new InvalidOperationException("Dynamic excel template is already used by an assignment.");
+
+        var usedByBinding = await _ctx.WorkTemplateAssignees
+            .Find(x => x.DynamicExcelId == templateId && !x.IsDeleted)
+            .AnyAsync(ct);
+        if (usedByBinding)
+            throw new InvalidOperationException("Dynamic excel template is already used by assignment bindings.");
+
+        var usedByPeriod = await _ctx.WorkReportPeriods
+            .Find(x => x.DynamicExcelId == templateId && !x.IsDeleted)
+            .AnyAsync(ct);
+        if (usedByPeriod)
+            throw new InvalidOperationException("Dynamic excel template is already used by report periods.");
+
+        var usedByReport = await _ctx.WorkAssignmentReports
+            .Find(x => x.DynamicExcelTemplateId == templateId && !x.IsDeleted)
+            .AnyAsync(ct);
+        if (usedByReport)
+            throw new InvalidOperationException("Dynamic excel template is already used by submitted report data.");
     }
 
     private static string NormalizeSortDir(string? dir)
@@ -282,6 +304,14 @@ public sealed class DynamicExcelService : IDynamicExcelService
     {
         var me = _me.RequireMe();
         var now = DateTime.UtcNow;
+
+        var doc = await _ctx.DynamicExcelTemplates
+            .Find(x => x.Id == id && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct)
+            ?? throw new InvalidOperationException("Dynamic excel template not found.");
+
+        RequireCanMutate(me, doc);
+        await EnsureNotLinkedToWorkAsync(id, ct);
 
         var filter = Builders<DynamicExcelTemplate>.Filter.Where(x => x.Id == id && !x.IsDeleted);
         var update = Builders<DynamicExcelTemplate>.Update

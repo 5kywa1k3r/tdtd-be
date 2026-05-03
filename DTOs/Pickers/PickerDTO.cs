@@ -9,6 +9,7 @@ public sealed class UnitPickRow
     public string? Symbol { get; set; }
     public int Level { get; set; }
     public string? ParentId { get; set; }
+    public bool IsVirtual { get; set; }
 }
 
 public sealed class UserPickRow

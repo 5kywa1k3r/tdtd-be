@@ -55,7 +55,10 @@ public static class AssignmentScheduleTimeHelper
 
     public static string GetPeriodKey(AssignmentSchedule? schedule, DateTime date)
     {
-        return SchedulePeriodHelper.GetPeriodKey(schedule?.CycleType, date);
+        // NOTE:
+        // Tạm thời unify toàn hệ thống theo DayKey.
+        // Mỗi due occurrence có 1 key riêng để tránh collapse nhiều ngày trong cùng tuần/tháng.
+        return date.Date.ToString("yyyyMMdd");
     }
 
     public static string GetCurrentPeriodKey(AssignmentSchedule? schedule, DateTime? now = null)

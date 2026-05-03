@@ -6,6 +6,8 @@
         string Code,
         int Level,
         string? ShortName,
-        string Symbol
+        string Symbol,
+        string? PrimaryUnitTypeCode,
+        bool IsVirtual
     );
 }

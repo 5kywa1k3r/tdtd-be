@@ -7,7 +7,9 @@
         string UnitId,
         string UnitShortName,
         string UnitSymbol,
+        string UnitCode,
         string PositionCode,
+        string PositionName,
         bool IsDeleted,
         IReadOnlyList<string> Roles
     );

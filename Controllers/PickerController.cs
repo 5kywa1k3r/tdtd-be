@@ -26,6 +26,19 @@ public sealed class PickersController : ControllerBase
         _me = me;
     }
 
+    private static FilterDefinition<Unit> ExcludeHiddenRoot(FilterDefinitionBuilder<Unit> fb)
+        => fb.And(
+            fb.Ne(x => x.Code, null),
+            fb.Ne(x => x.Code, ""),
+            fb.Ne(x => x.Code, "ROOT"),
+            fb.Ne(x => x.FullName, "ROOT"),
+            fb.Ne(x => x.FullName, "ROOT UNIT"),
+            fb.Ne(x => x.ShortName, "ROOT"),
+            fb.Ne(x => x.ShortName, "ROOT UNIT"),
+            fb.Ne(x => x.Symbol, "ROOT"),
+            fb.Ne(x => x.Symbol, "ROOT UNIT")
+        );
+
     // =========================
     // UNITS: children (node cha -> node con)
     // =========================
@@ -43,7 +56,7 @@ public sealed class PickersController : ControllerBase
         if (string.Equals(pid, "null", StringComparison.OrdinalIgnoreCase)) pid = "";
 
         var fb = Builders<Unit>.Filter;
-        var filter = fb.Eq(x => x.IsDeleted, false);
+        var filter = fb.And(fb.Eq(x => x.IsDeleted, false), ExcludeHiddenRoot(fb));
 
         if (string.IsNullOrWhiteSpace(pid))
         {
@@ -71,7 +84,8 @@ public sealed class PickersController : ControllerBase
                 ShortName = x.ShortName,
                 Symbol = x.Symbol,
                 Level = x.Level,
-                ParentId = x.ParentUnitId
+                ParentId = x.ParentUnitId,
+                IsVirtual = x.IsVirtual
             })
             .ToListAsync(ct);
 
@@ -96,7 +110,7 @@ public sealed class PickersController : ControllerBase
         pageSize = PickQueryHelper.ClampPageSize(pageSize, 20, 50);
 
         var fb = Builders<Unit>.Filter;
-        var filter = fb.Eq(x => x.IsDeleted, false);
+        var filter = fb.And(fb.Eq(x => x.IsDeleted, false), ExcludeHiddenRoot(fb));
 
         if (!string.IsNullOrWhiteSpace(code))
         {
@@ -119,16 +133,16 @@ public sealed class PickersController : ControllerBase
                 ShortName = x.ShortName,
                 Symbol = x.Symbol,
                 Level = x.Level,
-                ParentId = x.ParentUnitId
+                ParentId = x.ParentUnitId,
+                IsVirtual = x.IsVirtual
             })
             .ToListAsync(ct);
 
-        return Ok(new PagedResult<UnitPickRow>
-        (
-            rows = rows,
-            total = total,
-            page = page,
-            pageSize = pageSize
+        return Ok(new PagedResult<UnitPickRow>(
+            rows: rows,
+            total: total,
+            page: page,
+            pageSize: pageSize
         ));
     }
 
@@ -153,10 +167,12 @@ public sealed class PickersController : ControllerBase
         page = Math.Max(0, page);
         pageSize = PickQueryHelper.ClampPageSize(pageSize, 20, 50);
 
+        var selectedUnitId = unitId.Trim();
+
         var fb = Builders<AppUser>.Filter;
         var filter = fb.And(
             fb.Eq(x => x.IsDeleted, false),
-            fb.Eq(x => x.UnitId, unitId.Trim()),
+            fb.Eq(x => x.UnitId, selectedUnitId),
             fb.In(x => x.PositionCode, Positions.KnownCodes)
         );
 
@@ -211,7 +227,9 @@ public sealed class PickersController : ControllerBase
         );
 
         if (!string.IsNullOrWhiteSpace(unitId))
+        {
             filter = fb.And(filter, fb.Eq(x => x.UnitId, unitId.Trim()));
+        }
 
         var u = await _ctx.Users.Find(filter)
             .Project(x => new UserPickRow
@@ -245,15 +263,16 @@ public sealed class PickersController : ControllerBase
         if (string.IsNullOrWhiteSpace(unitId))
             return BadRequest("unitId is required.");
 
-        // enforce unit.level >= meLevel (check 1 lần)
-        var unit = await _ctx.Units.Find(x => x.Id == unitId.Trim() && !x.IsDeleted)
-            .Project(x => new { x.Level })
-            .FirstOrDefaultAsync(ct);
-
         page = Math.Max(0, page);
         pageSize = PickQueryHelper.ClampPageSize(pageSize, 20, 50);
 
-        if (unit is null || unit.Level < meLevel)
+        var selectedUnitId = unitId.Trim();
+        var allowedUnit = await _ctx.Units
+            .Find(x => x.Id == selectedUnitId && !x.IsDeleted && x.Level >= meLevel)
+            .Project(x => x.Id)
+            .FirstOrDefaultAsync(ct);
+
+        if (string.IsNullOrWhiteSpace(allowedUnit))
         {
             return Ok(new PagedResult<UserPickRow>(
                 rows: new(),
@@ -266,7 +285,7 @@ public sealed class PickersController : ControllerBase
         var fb = Builders<AppUser>.Filter;
         var filter = fb.And(
             fb.Eq(x => x.IsDeleted, false),
-            fb.Eq(x => x.UnitId, unitId.Trim())
+            fb.Eq(x => x.UnitId, selectedUnitId)
         );
 
         if (!string.IsNullOrWhiteSpace(username))
@@ -291,12 +310,11 @@ public sealed class PickersController : ControllerBase
             })
             .ToListAsync(ct);
 
-        return Ok(new PagedResult<UserPickRow>
-        (
-            rows = rows,
-            total = total,
-            page = page,
-            pageSize = pageSize
+        return Ok(new PagedResult<UserPickRow>(
+            rows: rows,
+            total: total,
+            page: page,
+            pageSize: pageSize
         ));
     }
 
@@ -319,7 +337,9 @@ public sealed class PickersController : ControllerBase
         );
 
         if (!string.IsNullOrWhiteSpace(unitId))
+        {
             filter = fb.And(filter, fb.Eq(x => x.UnitId, unitId.Trim()));
+        }
 
         var u = await _ctx.Users.Find(filter).FirstOrDefaultAsync(ct);
         if (u is null || string.IsNullOrWhiteSpace(u.UnitId)) return Ok(null);
