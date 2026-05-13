@@ -6,6 +6,8 @@ public sealed class SaveWorkAssignmentRequest
     public string AssignmentType { get; set; } = default!;
     public string AggregationType { get; set; } = default!;
     public AssignmentScheduleDto? Schedule { get; set; }
+    public DateTime? StartDate { get; set; }
+    public DateTime? CompletedDate { get; set; }
     public List<string> AssigneeUserIds { get; set; } = new();
     public List<string> AssigneeUnitIds { get; set; } = new();
     public List<string>? LeaderWatcherUserIds { get; set; }

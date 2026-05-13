@@ -255,12 +255,21 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
         await EnsurePreviousReportsApprovedAsync(period, ct);
 
         var now = DateTime.UtcNow;
+        var isHistoricalApproval = report.IsHistoricalData;
+
+        if (isHistoricalApproval && !req.ConfirmHistoricalDataApproval)
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_HISTORICAL_APPROVAL_CONFIRMATION_REQUIRED,
+                new { reportId = report.Id, workReportPeriodId = report.WorkReportPeriodId });
 
         await _ctx.WorkAssignmentReports.UpdateOneAsync(
             x => x.Id == report.Id,
             Builders<WorkAssignmentReport>.Update
                 .Set(x => x.Status, WorkAssignmentReportStatus.Approved)
                 .Set(x => x.ReviewerComment, req.Comment)
+                .Set(x => x.HistoricalDataApproved, isHistoricalApproval ? true : report.HistoricalDataApproved)
+                .Set(x => x.HistoricalDataApprovedAtUtc, isHistoricalApproval ? now : report.HistoricalDataApprovedAtUtc)
+                .Set(x => x.HistoricalDataApprovedByUserId, isHistoricalApproval ? me.Id : report.HistoricalDataApprovedByUserId)
                 .Set(x => x.ApprovedAtUtc, now)
                 .Set(x => x.ApprovedByUserId, me.Id)
                 .Set(x => x.UpdatedAtUtc, now)
@@ -269,6 +278,12 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
 
         report.Status = WorkAssignmentReportStatus.Approved;
         report.ReviewerComment = req.Comment;
+        if (isHistoricalApproval)
+        {
+            report.HistoricalDataApproved = true;
+            report.HistoricalDataApprovedAtUtc = now;
+            report.HistoricalDataApprovedByUserId = me.Id;
+        }
         report.ApprovedAtUtc = now;
         report.ApprovedByUserId = me.Id;
         report.UpdatedAtUtc = now;
@@ -285,6 +300,9 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
                     .Set(x => x.IsOverdue, WorkReportPeriodStatusHelper.IsOverdue(nextPeriodStatus))
                     .Set(x => x.LastReviewedAtUtc, now)
                     .Set(x => x.ReviewerComment, req.Comment)
+                    .Set(x => x.HistoricalDataApproved, isHistoricalApproval ? true : period.HistoricalDataApproved)
+                    .Set(x => x.HistoricalDataApprovedAtUtc, isHistoricalApproval ? now : period.HistoricalDataApprovedAtUtc)
+                    .Set(x => x.HistoricalDataApprovedByUserId, isHistoricalApproval ? me.Id : period.HistoricalDataApprovedByUserId)
                     .Set(x => x.UpdatedAtUtc, now)
                     .Set(x => x.UpdatedByUserId, me.Id),
                 cancellationToken: ct);
@@ -1032,6 +1050,12 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
             WorkReportPeriodId = x.WorkReportPeriodId,
 
             PeriodKey = x.PeriodKey,
+            StartedDate = x.StartedDate,
+            CompletedDate = x.CompletedDate,
+            IsHistoricalData = x.IsHistoricalData,
+            HistoricalDataApproved = x.HistoricalDataApproved,
+            HistoricalDataApprovedAtUtc = x.HistoricalDataApprovedAtUtc,
+            HistoricalDataApprovedByUserId = x.HistoricalDataApprovedByUserId,
             PeriodStart = x.PeriodStart,
             PeriodEnd = x.PeriodEnd,
             DueAtUtc = x.DueAtUtc,
@@ -1250,11 +1274,7 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
         WorkAssignmentReport report,
         DateTime now)
     {
-        return WorkReportPeriodStatusHelper.ResolveApprovedStatus(
-            period.Status,
-            period.DueAtUtc,
-            report.IsLateSubmission,
-            now);
+        return WorkAssignmentReportHistoricalDataHelper.ResolveApprovedPeriodStatus(period, report, now);
     }
 
     private static WorkReportPeriodStatus ResolvePeriodStatusFromReport(

@@ -523,11 +523,6 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                 AppErrorCode.WORK_ASSIGNMENT_REPORT_ASSIGNMENT_INACTIVE,
                 new { workAssignmentId, bindingId = binding.Id, actorUserId });
 
-        if (!assignment.AllowUserCreatedReports || !binding.AllowUserCreatedReports)
-            throw AppExceptionFactory.BadRequest(
-                AppErrorCode.WORK_ASSIGNMENT_REPORT_USER_CREATED_NOT_ALLOWED,
-                new { workAssignmentId, bindingId = binding.Id, actorUserId });
-
         WorkReportPeriod? linkedScheduledPeriod = null;
         if (!string.IsNullOrWhiteSpace(req.LinkedScheduledPeriodId))
         {
@@ -554,6 +549,9 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         var periodKey = NormalizeUserCreatedPeriodKey(req.PeriodKey, reportDate);
         var periodStart = req.PeriodStart ?? reportDate;
         var periodEnd = req.PeriodEnd ?? reportDate;
+        var startedDate = NormalizeDate(req.StartedDate ?? periodStart);
+        var completedDate = NormalizeDate(req.CompletedDate);
+        var isHistoricalData = IsHistoricalReportData(reportDate, periodStart, periodEnd, now);
         var periodInstanceKey = $"USER_CREATED:{ObjectId.GenerateNewId()}";
 
         var period = new WorkReportPeriod
@@ -575,6 +573,9 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             ReportTitle = NormalizeOptionalTextOrNull(req.ReportTitle) ?? $"Báo cáo chủ động {periodKey}",
             ReportDate = reportDate,
             LinkedScheduledPeriodId = linkedScheduledPeriod?.Id,
+            StartedDate = startedDate,
+            CompletedDate = completedDate,
+            IsHistoricalData = isHistoricalData,
             PeriodStart = periodStart,
             PeriodEnd = periodEnd,
             DueAtUtc = req.DueAtUtc,
@@ -1297,7 +1298,20 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         entity.AggregateSnapshotRefreshedAtUtc = nextAggregateSnapshotRefreshedAtUtc;
         entity.AggregateRefreshError = null;
 
+        var period = await _ctx.WorkReportPeriods
+            .Find(x => x.Id == entity.WorkReportPeriodId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct);
+
         var isLate = entity.DueAtUtc.HasValue && now > entity.DueAtUtc.Value;
+        var isHistoricalData = IsHistoricalReportData(entity, period, now);
+        var startedDate = NormalizeDate(req.StartedDate) ?? entity.StartedDate ?? entity.PeriodStart ?? entity.ReportDate;
+        var completedDate = NormalizeDate(req.CompletedDate) ?? entity.CompletedDate;
+        if (isHistoricalData && !completedDate.HasValue)
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_HISTORICAL_COMPLETED_DATE_REQUIRED,
+                ReportDetails(entity, actorUserId));
+
+        completedDate ??= now.Date;
         var lateReason = string.IsNullOrWhiteSpace(req.LateReason) ? entity.LateReason : req.LateReason?.Trim();
 
         if (isLate && string.IsNullOrWhiteSpace(lateReason))
@@ -1310,6 +1324,9 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         entity.ReportReason = req.ReportReason ?? entity.ReportReason;
         entity.Difficulties = req.Difficulties ?? entity.Difficulties;
         entity.ProposedSolution = req.ProposedSolution ?? entity.ProposedSolution;
+        entity.StartedDate = startedDate;
+        entity.CompletedDate = completedDate;
+        entity.IsHistoricalData = isHistoricalData;
         entity.IsLateSubmission = isLate;
         entity.LateReason = lateReason;
         entity.SubmittedAtUtc = now;
@@ -1342,6 +1359,9 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                 .Set(x => x.ReportReason, entity.ReportReason)
                 .Set(x => x.Difficulties, entity.Difficulties)
                 .Set(x => x.ProposedSolution, entity.ProposedSolution)
+                .Set(x => x.StartedDate, entity.StartedDate)
+                .Set(x => x.CompletedDate, entity.CompletedDate)
+                .Set(x => x.IsHistoricalData, entity.IsHistoricalData)
                 .Set(x => x.IsLateSubmission, entity.IsLateSubmission)
                 .Set(x => x.LateReason, entity.LateReason)
                 .Set(x => x.SubmittedAtUtc, entity.SubmittedAtUtc)
@@ -1352,10 +1372,6 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                 .Set(x => x.UpdatedAtUtc, entity.UpdatedAtUtc)
                 .Set(x => x.UpdatedByUserId, entity.UpdatedByUserId),
             cancellationToken: ct);
-
-        var period = await _ctx.WorkReportPeriods
-            .Find(x => x.Id == entity.WorkReportPeriodId && !x.IsDeleted)
-            .FirstOrDefaultAsync(ct);
 
         if (period is not null)
         {
@@ -1372,6 +1388,9 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                     .Set(x => x.ReportReason, entity.ReportReason)
                     .Set(x => x.Difficulties, entity.Difficulties)
                     .Set(x => x.ProposedSolution, entity.ProposedSolution)
+                    .Set(x => x.StartedDate, entity.StartedDate)
+                    .Set(x => x.CompletedDate, entity.CompletedDate)
+                    .Set(x => x.IsHistoricalData, entity.IsHistoricalData)
                     .Set(x => x.LateReason, entity.LateReason)
                     .Set(x => x.RequiresLateReason, isLate)
                     .Set(x => x.UpdatedAtUtc, now)
@@ -1386,6 +1405,9 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             period.ReportReason = entity.ReportReason;
             period.Difficulties = entity.Difficulties;
             period.ProposedSolution = entity.ProposedSolution;
+            period.StartedDate = entity.StartedDate;
+            period.CompletedDate = entity.CompletedDate;
+            period.IsHistoricalData = entity.IsHistoricalData;
             period.LateReason = entity.LateReason;
             period.RequiresLateReason = isLate;
             period.UpdatedAtUtc = now;
@@ -1437,7 +1459,8 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             {
                 { "fromStatus", fromStatus.ToString() },
                 { "toStatus", WorkAssignmentReportStatus.Submitted.ToString() },
-                { "isLateSubmission", isLate.ToString() }
+                { "isLateSubmission", isLate.ToString() },
+                { "isHistoricalData", isHistoricalData.ToString() }
             },
             OccurredAtUtc = now
         }, CancellationToken.None);
@@ -1569,11 +1592,28 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         var lateReason = string.IsNullOrWhiteSpace(req.LateReasonOverride)
             ? entity.LateReason
             : req.LateReasonOverride.Trim();
+        var isHistoricalData = IsHistoricalReportData(entity, period, now);
+        if (isHistoricalData && !req.ConfirmHistoricalDataApproval)
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_HISTORICAL_APPROVAL_CONFIRMATION_REQUIRED,
+                ReportDetails(entity, actorUserId));
+
+        var historicalDataApproved = isHistoricalData || entity.HistoricalDataApproved;
+        var historicalDataApprovedAtUtc = historicalDataApproved
+            ? entity.HistoricalDataApprovedAtUtc ?? now
+            : (DateTime?)null;
+        var historicalDataApprovedByUserId = historicalDataApproved
+            ? entity.HistoricalDataApprovedByUserId ?? actorUserId
+            : null;
 
         await _ctx.WorkAssignmentReports.UpdateOneAsync(
             x => x.Id == id && !x.IsDeleted,
             Builders<WorkAssignmentReport>.Update
                 .Set(x => x.Status, WorkAssignmentReportStatus.Approved)
+                .Set(x => x.IsHistoricalData, isHistoricalData)
+                .Set(x => x.HistoricalDataApproved, historicalDataApproved)
+                .Set(x => x.HistoricalDataApprovedAtUtc, historicalDataApprovedAtUtc)
+                .Set(x => x.HistoricalDataApprovedByUserId, historicalDataApprovedByUserId)
                 .Set(x => x.ReviewerComment, req.ReviewerComment)
                 .Set(x => x.LateReason, lateReason)
                 .Set(x => x.ReturnedAtUtc, (DateTime?)null)
@@ -1585,6 +1625,10 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             cancellationToken: ct);
 
         entity.Status = WorkAssignmentReportStatus.Approved;
+        entity.IsHistoricalData = isHistoricalData;
+        entity.HistoricalDataApproved = historicalDataApproved;
+        entity.HistoricalDataApprovedAtUtc = historicalDataApprovedAtUtc;
+        entity.HistoricalDataApprovedByUserId = historicalDataApprovedByUserId;
         entity.ReviewerComment = req.ReviewerComment;
         entity.LateReason = lateReason;
         entity.ReturnedAtUtc = null;
@@ -1603,6 +1647,10 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                 Builders<WorkReportPeriod>.Update
                     .Set(x => x.Status, nextPeriodStatus)
                     .Set(x => x.IsOverdue, WorkReportPeriodStatusHelper.IsOverdue(nextPeriodStatus))
+                    .Set(x => x.IsHistoricalData, isHistoricalData)
+                    .Set(x => x.HistoricalDataApproved, historicalDataApproved)
+                    .Set(x => x.HistoricalDataApprovedAtUtc, historicalDataApprovedAtUtc)
+                    .Set(x => x.HistoricalDataApprovedByUserId, historicalDataApprovedByUserId)
                     .Set(x => x.LastReviewedAtUtc, now)
                     .Set(x => x.ReviewerComment, req.ReviewerComment)
                     .Set(x => x.AcceptedLateReason, lateReason)
@@ -1612,6 +1660,10 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
 
             period.Status = nextPeriodStatus;
             period.IsOverdue = WorkReportPeriodStatusHelper.IsOverdue(nextPeriodStatus);
+            period.IsHistoricalData = isHistoricalData;
+            period.HistoricalDataApproved = historicalDataApproved;
+            period.HistoricalDataApprovedAtUtc = historicalDataApprovedAtUtc;
+            period.HistoricalDataApprovedByUserId = historicalDataApprovedByUserId;
             period.LastReviewedAtUtc = now;
             period.ReviewerComment = req.ReviewerComment;
             period.AcceptedLateReason = lateReason;
@@ -1660,7 +1712,9 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             Data = new Dictionary<string, string>
             {
                 { "fromStatus", WorkAssignmentReportStatus.Submitted.ToString() },
-                { "toStatus", WorkAssignmentReportStatus.Approved.ToString() }
+                { "toStatus", WorkAssignmentReportStatus.Approved.ToString() },
+                { "isHistoricalData", isHistoricalData.ToString() },
+                { "historicalDataApproved", historicalDataApproved.ToString() }
             },
             OccurredAtUtc = now
         }, CancellationToken.None);
@@ -1994,6 +2048,12 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             ReportTitle = period.ReportTitle,
             ReportDate = period.ReportDate,
             LinkedScheduledPeriodId = period.LinkedScheduledPeriodId,
+            StartedDate = period.StartedDate ?? period.PeriodStart ?? period.ReportDate,
+            CompletedDate = period.CompletedDate,
+            IsHistoricalData = period.IsHistoricalData,
+            HistoricalDataApproved = period.HistoricalDataApproved,
+            HistoricalDataApprovedAtUtc = period.HistoricalDataApprovedAtUtc,
+            HistoricalDataApprovedByUserId = period.HistoricalDataApprovedByUserId,
             PeriodStart = period.PeriodStart,
             PeriodEnd = period.PeriodEnd,
             DueAtUtc = period.DueAtUtc,
@@ -2401,6 +2461,12 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             ReportTitle = x.ReportTitle ?? period?.ReportTitle,
             ReportDate = x.ReportDate ?? period?.ReportDate,
             LinkedScheduledPeriodId = x.LinkedScheduledPeriodId ?? period?.LinkedScheduledPeriodId,
+            StartedDate = x.StartedDate ?? period?.StartedDate,
+            CompletedDate = x.CompletedDate ?? period?.CompletedDate,
+            IsHistoricalData = x.IsHistoricalData || period?.IsHistoricalData == true,
+            HistoricalDataApproved = x.HistoricalDataApproved || period?.HistoricalDataApproved == true,
+            HistoricalDataApprovedAtUtc = x.HistoricalDataApprovedAtUtc ?? period?.HistoricalDataApprovedAtUtc,
+            HistoricalDataApprovedByUserId = x.HistoricalDataApprovedByUserId ?? period?.HistoricalDataApprovedByUserId,
             PeriodStart = x.PeriodStart,
             PeriodEnd = x.PeriodEnd,
             DueAtUtc = x.DueAtUtc,
@@ -3303,16 +3369,48 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
     private static WorkReportPeriodStatus ResolveDraftPeriodStatus(DateTime? dueAtUtc, DateTime now)
         => WorkReportPeriodStatusHelper.ResolveDraftStatus(dueAtUtc, now);
 
+    private static DateTime? NormalizeDate(DateTime? value)
+        => WorkAssignmentReportHistoricalDataHelper.NormalizeDate(value);
+
+    private static bool IsHistoricalReportData(
+        WorkAssignmentReport report,
+        WorkReportPeriod? period,
+        DateTime now)
+    {
+        var periodKind = string.IsNullOrWhiteSpace(report.PeriodKind)
+            ? period?.PeriodKind
+            : report.PeriodKind;
+
+        return report.IsHistoricalData ||
+               period?.IsHistoricalData == true ||
+               WorkAssignmentReportHistoricalDataHelper.IsHistoricalUserCreatedData(
+                   periodKind,
+                   report.ReportDate ?? period?.ReportDate,
+                   report.PeriodStart ?? period?.PeriodStart,
+                   report.PeriodEnd ?? period?.PeriodEnd,
+                   now);
+    }
+
+    private static bool IsHistoricalReportData(
+        DateTime? reportDate,
+        DateTime? periodStart,
+        DateTime? periodEnd,
+        DateTime now)
+    {
+        return WorkAssignmentReportHistoricalDataHelper.IsHistoricalUserCreatedData(
+            WorkReportPeriodKind.UserCreated,
+            reportDate,
+            periodStart,
+            periodEnd,
+            now);
+    }
+
     private static WorkReportPeriodStatus ResolveApprovedPeriodStatus(
         WorkReportPeriod period,
         WorkAssignmentReport report,
         DateTime now)
     {
-        return WorkReportPeriodStatusHelper.ResolveApprovedStatus(
-            period.Status,
-            period.DueAtUtc,
-            report.IsLateSubmission,
-            now);
+        return WorkAssignmentReportHistoricalDataHelper.ResolveApprovedPeriodStatus(period, report, now);
     }
 
     private async Task EnsurePreviousReportsApprovedAsync(
@@ -3415,6 +3513,8 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         {
             CycleType = assignment.Schedule?.CycleType ?? string.Empty,
             StartDate = assignment.Schedule?.StartDate,
+            AssignmentStartDate = assignment.StartDate,
+            AssignmentCompletedDate = assignment.CompletedDate,
             WeekDays = assignment.Schedule?.WeekDays?.ToArray() ?? Array.Empty<int>(),
             MonthDays = assignment.Schedule?.MonthDays?.ToArray() ?? Array.Empty<int>(),
             QuarterDays = assignment.Schedule?.QuarterDays?.ToArray() ?? Array.Empty<int>(),
@@ -3453,6 +3553,12 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             ReportTitle = x.ReportTitle,
             ReportDate = x.ReportDate,
             LinkedScheduledPeriodId = x.LinkedScheduledPeriodId,
+            StartedDate = x.StartedDate,
+            CompletedDate = x.CompletedDate,
+            IsHistoricalData = x.IsHistoricalData,
+            HistoricalDataApproved = x.HistoricalDataApproved,
+            HistoricalDataApprovedAtUtc = x.HistoricalDataApprovedAtUtc,
+            HistoricalDataApprovedByUserId = x.HistoricalDataApprovedByUserId,
             PeriodStart = x.PeriodStart,
             PeriodEnd = x.PeriodEnd,
             DueAtUtc = x.DueAtUtc,
@@ -3488,6 +3594,12 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             ReportTitle = x.ReportTitle,
             ReportDate = x.ReportDate,
             LinkedScheduledPeriodId = x.LinkedScheduledPeriodId,
+            StartedDate = x.StartedDate,
+            CompletedDate = x.CompletedDate,
+            IsHistoricalData = x.IsHistoricalData,
+            HistoricalDataApproved = x.HistoricalDataApproved,
+            HistoricalDataApprovedAtUtc = x.HistoricalDataApprovedAtUtc,
+            HistoricalDataApprovedByUserId = x.HistoricalDataApprovedByUserId,
             PeriodStart = x.PeriodStart,
             PeriodEnd = x.PeriodEnd,
             DueAtUtc = x.DueAtUtc,
@@ -3539,6 +3651,12 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             ReportTitle = x.ReportTitle,
             ReportDate = x.ReportDate,
             LinkedScheduledPeriodId = x.LinkedScheduledPeriodId,
+            StartedDate = x.StartedDate,
+            CompletedDate = x.CompletedDate,
+            IsHistoricalData = x.IsHistoricalData,
+            HistoricalDataApproved = x.HistoricalDataApproved,
+            HistoricalDataApprovedAtUtc = x.HistoricalDataApprovedAtUtc,
+            HistoricalDataApprovedByUserId = x.HistoricalDataApprovedByUserId,
             PeriodStart = x.PeriodStart,
             PeriodEnd = x.PeriodEnd,
             DueAtUtc = x.DueAtUtc,

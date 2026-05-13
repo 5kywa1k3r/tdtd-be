@@ -8,6 +8,7 @@ using tdtd_be.Models;
 using tdtd_be.Models.Enums;
 using tdtd_be.Services.Common;
 using tdtd_be.Services.Common.Time;
+using tdtd_be.Services.WorkAssignments.Internal;
 using tdtd_be.Services.WorkAssignments.Progress;
 using tdtd_be.Services.WorkAssignments.Queue;
 
@@ -55,6 +56,8 @@ public sealed class WorkAssignmentRuntimeMaterializeService : IWorkAssignmentRun
             .FirstOrDefaultAsync(ct)
             ?? throw AssignmentWorkNotFound(assignment);
 
+        var parent = await LoadParentAssignmentAsync(assignment, ct);
+
         var bindings = await _ctx.WorkTemplateAssignees
             .Find(x =>
                 x.WorkAssignmentId == assignment.Id &&
@@ -70,8 +73,13 @@ public sealed class WorkAssignmentRuntimeMaterializeService : IWorkAssignmentRun
                 g => g.OrderByDescending(x => x.UpdatedAtUtc).First(),
                 StringComparer.Ordinal);
 
-        var start = assignment.Schedule.StartDate ?? work.StartDate ?? DateTime.UtcNow.Date;
-        var end = work.EndDate ?? assignment.Schedule.StartDate?.AddMonths(6) ?? DateTime.UtcNow.Date.AddMonths(6);
+        var rangeNow = DateTime.UtcNow;
+        var start = WorkAssignmentDatePolicy.ResolveEffectiveStartDate(assignment, rangeNow);
+        if (assignment.Schedule.StartDate.HasValue && assignment.Schedule.StartDate.Value.Date > start)
+            start = assignment.Schedule.StartDate.Value.Date;
+
+        var end = WorkAssignmentDatePolicy.ResolveEffectiveCompletedDate(assignment, work, parent)
+            ?? start.AddMonths(6);
 
         if (end < start)
             end = start;
@@ -231,4 +239,17 @@ public sealed class WorkAssignmentRuntimeMaterializeService : IWorkAssignmentRun
         => AppExceptionFactory.BadRequest(
             AppErrorCode.WORK_ASSIGNMENT_PERIOD_KEY_INVALID,
             new { assignmentId, periodKey });
+
+    private async Task<WorkAssignment?> LoadParentAssignmentAsync(WorkAssignment assignment, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(assignment.ParentAssignmentId))
+            return null;
+
+        return await _ctx.WorkAssignments
+            .Find(x =>
+                x.Id == assignment.ParentAssignmentId &&
+                x.WorkId == assignment.WorkId &&
+                !x.IsDeleted)
+            .FirstOrDefaultAsync(ct);
+    }
 }

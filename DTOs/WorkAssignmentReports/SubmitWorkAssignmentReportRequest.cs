@@ -20,6 +20,8 @@ public sealed class SubmitWorkAssignmentReportRequest
     public string? ReportReason { get; set; }
     public string? Difficulties { get; set; }
     public string? ProposedSolution { get; set; }
+    public DateTime? StartedDate { get; set; }
+    public DateTime? CompletedDate { get; set; }
 
     /// <summary>
     /// Nếu nộp trễ hạn thì bắt buộc phải có lý do.
