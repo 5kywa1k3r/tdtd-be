@@ -18,6 +18,12 @@ public sealed class WorkAssignmentReportListRow
     public string? ReportTitle { get; set; }
     public DateTime? ReportDate { get; set; }
     public string? LinkedScheduledPeriodId { get; set; }
+    public DateTime? StartedDate { get; set; }
+    public DateTime? CompletedDate { get; set; }
+    public bool IsHistoricalData { get; set; }
+    public bool HistoricalDataApproved { get; set; }
+    public DateTime? HistoricalDataApprovedAtUtc { get; set; }
+    public string? HistoricalDataApprovedByUserId { get; set; }
     public DateTime? PeriodStart { get; set; }
     public DateTime? PeriodEnd { get; set; }
     public DateTime? DueAtUtc { get; set; }

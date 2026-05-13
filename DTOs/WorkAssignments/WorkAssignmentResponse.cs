@@ -19,6 +19,8 @@ public class WorkAssignmentResponse
     public string AggregationType { get; set; } = string.Empty;
 
     public AssignmentScheduleDto? Schedule { get; set; }
+    public DateTime? StartDate { get; set; }
+    public DateTime? CompletedDate { get; set; }
 
     public List<UserRefDTO> Assignees { get; set; } = new();
     public List<string> LeaderWatcherUserIds { get; set; } = new();

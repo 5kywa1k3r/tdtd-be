@@ -11,6 +11,7 @@ using tdtd_be.Models;
 using tdtd_be.Models.Enums;
 using tdtd_be.Services.Common;
 using tdtd_be.Services.Common.Time;
+using tdtd_be.Services.WorkAssignments.Internal;
 
 namespace tdtd_be.Services.WorkAssignments.Runtime;
 
@@ -246,6 +247,8 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
             .FirstOrDefaultAsync(ct)
             ?? throw AssignmentWorkNotFound(assignment);
 
+        var parent = await LoadParentAssignmentAsync(assignment, ct);
+
         var bindings = await _ctx.WorkTemplateAssignees
             .Find(x =>
                 x.WorkAssignmentId == assignment.Id &&
@@ -260,10 +263,10 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
             return;
         }
 
-        var dueItems = BuildDueItems(assignment, work);
+        var dueItems = BuildDueItems(assignment, work, parent);
         if (dueItems.Count == 0)
         {
-            if (ShouldContinueRolling(assignment, work, DateTime.UtcNow))
+            if (ShouldContinueRolling(assignment, work, parent, DateTime.UtcNow))
                 await RequeueNextRollingWindowAsync(job.Id!, ct);
             else
                 await CompleteJobAsync(job.Id!, ct);
@@ -314,7 +317,7 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
                 periodDate = periodDate.Date;
 
                 var (periodStart, periodEnd) = isOnceAssignment
-                    ? GetOncePeriodRange(assignment, work, periodDate, item.DueAtUtc)
+                    ? GetOncePeriodRange(assignment, work, parent, item.DueAtUtc)
                     : AssignmentScheduleTimeHelper.GetPeriodRange(assignment.Schedule!, periodDate);
 
                 var now = DateTime.UtcNow;
@@ -470,7 +473,7 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
                 await _sync.SyncFromAssignmentAsync(assignment.Id, ct);
             }
 
-            if (ShouldContinueRolling(assignment, work, DateTime.UtcNow))
+            if (ShouldContinueRolling(assignment, work, parent, DateTime.UtcNow))
                 await RequeueNextRollingWindowAsync(job.Id!, ct);
             else
                 await CompleteJobAsync(job.Id!, ct);
@@ -481,13 +484,16 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
         await RequeueQuickAsync(job.Id!, assigneeIndex, dueIndex, ct);
     }
 
-    private List<AssignmentScheduleDueItem> BuildDueItems(WorkAssignment assignment, Work work)
+    private List<AssignmentScheduleDueItem> BuildDueItems(
+        WorkAssignment assignment,
+        Work work,
+        WorkAssignment? parent)
     {
         if (IsOnceAssignment(assignment))
         {
             return new List<AssignmentScheduleDueItem>
             {
-                BuildOnceDueItem(assignment, work)
+                BuildOnceDueItem(assignment, work, parent)
             };
         }
 
@@ -495,14 +501,18 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
             return new List<AssignmentScheduleDueItem>();
 
         var today = DateTime.UtcNow.Date;
-        var start = today;
-        var scheduleStart = assignment.Schedule.StartDate?.Date ?? work.StartDate?.Date;
+        var start = WorkAssignmentDatePolicy.ResolveEffectiveStartDate(assignment, today);
+        if (start < today)
+            start = today;
+
+        var scheduleStart = assignment.Schedule.StartDate?.Date;
         if (scheduleStart.HasValue && scheduleStart.Value > start)
             start = scheduleStart.Value;
 
         var end = today.AddDays(_rollingWindowDays - 1);
-        if (work.EndDate.HasValue && work.EndDate.Value.Date < end)
-            end = work.EndDate.Value.Date;
+        var effectiveCompletedDate = WorkAssignmentDatePolicy.ResolveEffectiveCompletedDate(assignment, work, parent);
+        if (effectiveCompletedDate.HasValue && effectiveCompletedDate.Value.Date < end)
+            end = effectiveCompletedDate.Value.Date;
 
         if (end < start)
             return new List<AssignmentScheduleDueItem>();
@@ -513,13 +523,18 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
             end);
     }
 
-    private bool ShouldContinueRolling(WorkAssignment assignment, Work work, DateTime nowUtc)
+    private bool ShouldContinueRolling(
+        WorkAssignment assignment,
+        Work work,
+        WorkAssignment? parent,
+        DateTime nowUtc)
     {
         if (IsOnceAssignment(assignment) || assignment.Schedule is null || !assignment.IsActive)
             return false;
 
         var nextWindowStart = nowUtc.Date.AddDays(1);
-        if (work.EndDate.HasValue && work.EndDate.Value.Date < nextWindowStart)
+        var effectiveCompletedDate = WorkAssignmentDatePolicy.ResolveEffectiveCompletedDate(assignment, work, parent);
+        if (effectiveCompletedDate.HasValue && effectiveCompletedDate.Value.Date < nextWindowStart)
             return false;
 
         return true;
@@ -547,9 +562,12 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
     private static bool NullableDateEquals(DateTime? left, DateTime? right)
         => left == right;
 
-    private static AssignmentScheduleDueItem BuildOnceDueItem(WorkAssignment assignment, Work work)
+    private static AssignmentScheduleDueItem BuildOnceDueItem(
+        WorkAssignment assignment,
+        Work work,
+        WorkAssignment? parent)
     {
-        var dueAtUtc = NormalizeOnceDueAtUtc(assignment, work);
+        var dueAtUtc = NormalizeOnceDueAtUtc(assignment, work, parent);
         var periodKey = dueAtUtc.ToString("yyyyMMdd", CultureInfo.InvariantCulture);
 
         return new AssignmentScheduleDueItem
@@ -559,15 +577,17 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
         };
     }
 
-    private static DateTime NormalizeOnceDueAtUtc(WorkAssignment assignment, Work work)
+    private static DateTime NormalizeOnceDueAtUtc(
+        WorkAssignment assignment,
+        Work work,
+        WorkAssignment? parent)
     {
         if (assignment.DueAtUtc.HasValue)
             return assignment.DueAtUtc.Value;
 
         // fallback chỉ để chống dữ liệu cũ, không nên còn được dùng cho create mới
-        var dueDate = work.EndDate?.Date
-            ?? work.StartDate?.Date
-            ?? assignment.CreatedAtUtc.Date;
+        var dueDate = WorkAssignmentDatePolicy.ResolveEffectiveCompletedDate(assignment, work, parent)
+            ?? WorkAssignmentDatePolicy.ResolveEffectiveStartDate(assignment, DateTime.UtcNow);
 
         return dueDate == default
             ? DateTime.UtcNow.Date
@@ -577,17 +597,30 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
     private static (DateTime PeriodStart, DateTime PeriodEnd) GetOncePeriodRange(
         WorkAssignment assignment,
         Work work,
-        DateTime periodDate,
+        WorkAssignment? parent,
         DateTime dueAtUtc)
     {
-        var periodStart = work.StartDate?.Date
-            ?? assignment.CreatedAtUtc.Date;
+        var periodStart = WorkAssignmentDatePolicy.ResolveEffectiveStartDate(assignment, DateTime.UtcNow);
 
-        var periodEnd = dueAtUtc.Date;
+        var periodEnd = WorkAssignmentDatePolicy.ResolveEffectiveCompletedDate(assignment, work, parent)
+            ?? dueAtUtc.Date;
         if (periodEnd < periodStart)
             periodEnd = periodStart;
 
         return (periodStart, periodEnd);
+    }
+
+    private async Task<WorkAssignment?> LoadParentAssignmentAsync(WorkAssignment assignment, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(assignment.ParentAssignmentId))
+            return null;
+
+        return await _ctx.WorkAssignments
+            .Find(x =>
+                x.Id == assignment.ParentAssignmentId &&
+                x.WorkId == assignment.WorkId &&
+                !x.IsDeleted)
+            .FirstOrDefaultAsync(ct);
     }
 
     private static bool IsOnceAssignment(WorkAssignment assignment)

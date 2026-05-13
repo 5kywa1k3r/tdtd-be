@@ -31,6 +31,8 @@ internal static class WorkAssignmentResponseMapper
             AssignmentType = entity.AssignmentType,
             AggregationType = entity.AggregationType,
             Schedule = WorkAssignmentScheduleHelper.ToScheduleDto(entity.Schedule),
+            StartDate = entity.StartDate,
+            CompletedDate = entity.CompletedDate,
 
             Assignees = (entity.Assignees ?? new List<UserRef>())
                 .Select(ToUserRefDto)

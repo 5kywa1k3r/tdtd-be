@@ -17,6 +17,8 @@ public sealed class WorkAssignmentListResponse
 
     public string AssignmentType { get; set; } = string.Empty;
     public string AggregationType { get; set; } = string.Empty;
+    public DateTime? StartDate { get; set; }
+    public DateTime? CompletedDate { get; set; }
 
     public List<UserRefDTO> Assignees { get; set; } = new();
     public List<UserRefDTO> LeaderWatchers { get; set; } = new();

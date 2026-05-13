@@ -7,6 +7,7 @@ using tdtd_be.Models;
 using tdtd_be.Models.Enums;
 using tdtd_be.Services.Common;
 using tdtd_be.Services.Common.Time;
+using tdtd_be.Services.WorkAssignments.Internal;
 
 namespace tdtd_be.Services.WorkAssignments.Progress;
 
@@ -374,11 +375,12 @@ public sealed class WorkAssignmentProgressService : IWorkAssignmentProgressServi
         CancellationToken ct)
     {
         var isOnceAssignment = IsOnceAssignment(assignment);
+        var parent = await LoadParentAssignmentAsync(assignment, ct);
         var facts = new LeafProgressFacts
         {
             NowUtc = nowUtc,
             HasSchedule = assignment.Schedule != null,
-            IsEnded = ResolveAssignmentEndUtc(assignment, work) is { } endUtc && endUtc < nowUtc
+            IsEnded = ResolveAssignmentEndUtc(assignment, work, parent) is { } endUtc && endUtc < nowUtc
         };
 
         var materializedPeriods = await _ctx.WorkReportPeriods
@@ -387,12 +389,12 @@ public sealed class WorkAssignmentProgressService : IWorkAssignmentProgressServi
 
         if (materializedPeriods.Count > 0)
         {
-            ApplyMaterializedPeriodFacts(facts, materializedPeriods, assignment, work, nowUtc);
+            ApplyMaterializedPeriodFacts(facts, materializedPeriods, assignment, work, parent, nowUtc);
             return facts;
         }
 
-        var workStartDate = ResolveAssignmentStartUtc(assignment, work);
-        var workEndDate = work.EndDate;
+        var workStartDate = ResolveAssignmentStartUtc(assignment, nowUtc);
+        var workEndDate = ResolveAssignmentEndUtc(assignment, work, parent);
 
         var rangeTo = nowUtc;
         if (workEndDate.HasValue && workEndDate.Value < nowUtc)
@@ -440,6 +442,7 @@ public sealed class WorkAssignmentProgressService : IWorkAssignmentProgressServi
         List<WorkReportPeriod> periods,
         WorkAssignment assignment,
         Work work,
+        WorkAssignment? parent,
         DateTime nowUtc)
     {
         facts.HasMaterializedPeriods = true;
@@ -464,8 +467,8 @@ public sealed class WorkAssignmentProgressService : IWorkAssignmentProgressServi
         facts.LatestDueAtUtc = latestDue?.DueAtUtc;
         facts.LatestPeriodKey = latestDue?.PeriodKey;
 
-        var startUtc = ResolveAssignmentStartUtc(assignment, work);
-        var endUtc = ResolveAssignmentEndUtc(assignment, work);
+        var startUtc = ResolveAssignmentStartUtc(assignment, nowUtc);
+        var endUtc = ResolveAssignmentEndUtc(assignment, work, parent);
         if (startUtc <= nowUtc && (!endUtc.HasValue || endUtc.Value >= nowUtc))
             facts.HasAnyOpenPeriod = true;
     }
@@ -492,17 +495,35 @@ public sealed class WorkAssignmentProgressService : IWorkAssignmentProgressServi
         };
     }
 
-    private static DateTime ResolveAssignmentStartUtc(WorkAssignment assignment, Work work)
-        => assignment.Schedule?.StartDate
-            ?? work.StartDate
-            ?? assignment.CreatedAtUtc;
-
-    private static DateTime? ResolveAssignmentEndUtc(WorkAssignment assignment, Work work)
+    private static DateTime ResolveAssignmentStartUtc(WorkAssignment assignment, DateTime nowUtc)
     {
-        if (IsOnceAssignment(assignment))
-            return assignment.DueAtUtc;
+        var start = WorkAssignmentDatePolicy.ResolveEffectiveStartDate(assignment, nowUtc);
+        if (assignment.Schedule?.StartDate is { } scheduleStart && scheduleStart.Date > start)
+            start = scheduleStart.Date;
 
-        return work.EndDate;
+        return start;
+    }
+
+    private static DateTime? ResolveAssignmentEndUtc(
+        WorkAssignment assignment,
+        Work work,
+        WorkAssignment? parent)
+    {
+        return WorkAssignmentDatePolicy.ResolveEffectiveCompletedDate(assignment, work, parent)
+               ?? (IsOnceAssignment(assignment) ? assignment.DueAtUtc : null);
+    }
+
+    private async Task<WorkAssignment?> LoadParentAssignmentAsync(WorkAssignment assignment, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(assignment.ParentAssignmentId))
+            return null;
+
+        return await _ctx.WorkAssignments
+            .Find(x =>
+                x.Id == assignment.ParentAssignmentId &&
+                x.WorkId == assignment.WorkId &&
+                !x.IsDeleted)
+            .FirstOrDefaultAsync(ct);
     }
 
     private static bool IsOnceAssignment(WorkAssignment assignment)

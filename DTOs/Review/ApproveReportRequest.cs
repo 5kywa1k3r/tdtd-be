@@ -2,5 +2,6 @@
 
 public sealed class ApproveReportRequest
 {
-    public string? Comment;
+    public string? Comment { get; set; }
+    public bool ConfirmHistoricalDataApproval { get; set; }
 }

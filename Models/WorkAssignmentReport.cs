@@ -69,6 +69,25 @@ public sealed class WorkAssignmentReport : BaseEntity
     [BsonRepresentation(BsonType.ObjectId)]
     public string? LinkedScheduledPeriodId { get; set; }
 
+    [BsonElement("startedDate")]
+    public DateTime? StartedDate { get; set; }
+
+    [BsonElement("completedDate")]
+    public DateTime? CompletedDate { get; set; }
+
+    [BsonElement("isHistoricalData")]
+    public bool IsHistoricalData { get; set; }
+
+    [BsonElement("historicalDataApproved")]
+    public bool HistoricalDataApproved { get; set; }
+
+    [BsonElement("historicalDataApprovedAtUtc")]
+    public DateTime? HistoricalDataApprovedAtUtc { get; set; }
+
+    [BsonElement("historicalDataApprovedByUserId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? HistoricalDataApprovedByUserId { get; set; }
+
     [BsonElement("periodStart")]
     public DateTime? PeriodStart { get; set; }
 

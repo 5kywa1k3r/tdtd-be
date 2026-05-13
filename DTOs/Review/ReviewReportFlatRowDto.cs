@@ -19,6 +19,12 @@ public sealed class ReviewReportFlatRowDto
     public string? WorkReportPeriodId { get; set; }
 
     public string PeriodKey { get; set; } = default!;
+    public DateTime? StartedDate { get; set; }
+    public DateTime? CompletedDate { get; set; }
+    public bool IsHistoricalData { get; set; }
+    public bool HistoricalDataApproved { get; set; }
+    public DateTime? HistoricalDataApprovedAtUtc { get; set; }
+    public string? HistoricalDataApprovedByUserId { get; set; }
     public DateTime? PeriodStart { get; set; }
     public DateTime? PeriodEnd { get; set; }
     public DateTime? DueAtUtc { get; set; }

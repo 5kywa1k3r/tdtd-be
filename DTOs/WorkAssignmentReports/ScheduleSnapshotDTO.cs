@@ -18,6 +18,16 @@ public sealed class ScheduleSnapshotDTO
     public DateTime? StartDate { get; set; }
 
     /// <summary>
+    /// Ngày bắt đầu nhiệm vụ của assignment tại thời điểm report được tạo.
+    /// </summary>
+    public DateTime? AssignmentStartDate { get; set; }
+
+    /// <summary>
+    /// Ngày hoàn thành nhiệm vụ của assignment tại thời điểm report được tạo.
+    /// </summary>
+    public DateTime? AssignmentCompletedDate { get; set; }
+
+    /// <summary>
     /// Danh sách thứ trong tuần nếu dùng chu kỳ tuần.
     /// </summary>
     public int[] WeekDays { get; set; } = Array.Empty<int>();

@@ -319,8 +319,6 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
                 .ToList();
         }
 
-        WorkAssignmentScheduleHelper.ValidateRequest(normalizedReq, work);
-
         WorkAssignment? parent = null;
         var isRootCreate = string.IsNullOrWhiteSpace(normalizedReq.ParentAssignmentId);
 
@@ -337,6 +335,15 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
                     new { workId, parentAssignmentId = normalizedReq.ParentAssignmentId });
 
         }
+
+        var now = DateTime.UtcNow;
+        normalizedReq = WorkAssignmentScheduleHelper.ApplyEffectiveDateDefaults(
+            normalizedReq,
+            work,
+            parent,
+            now);
+
+        WorkAssignmentScheduleHelper.ValidateRequest(normalizedReq, work);
 
         WorkAssignmentCreateScopeGuard.EnsureCanCreateWithinScope(
             work,
@@ -378,7 +385,6 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
             ct: ct);
 
         var code = await _tree.GenerateAssignmentCodeAsync(workId, ct);
-        var now = DateTime.UtcNow;
 
         var entity = new WorkAssignment
         {
@@ -405,6 +411,8 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
             AssignmentType = normalizedReq.AssignmentType,
             AggregationType = normalizedReq.AggregationType,
             Schedule = WorkAssignmentScheduleHelper.MapSchedule(normalizedReq.Schedule, normalizedReq.AssignmentType),
+            StartDate = NormalizeDate(normalizedReq.StartDate),
+            CompletedDate = NormalizeDate(normalizedReq.CompletedDate),
 
             Assignees = assignees,
             LeaderWatcherUserIds = leaderWatchers
@@ -416,7 +424,7 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
 
             Description = normalizedReq.Description,
             IsActive = willBeActive,
-            AllowUserCreatedReports = normalizedReq.AllowUserCreatedReports ?? true,
+            AllowUserCreatedReports = true,
 
             ProgressStatus = 0,
             ProgressStatusUpdatedAtUtc = null,
@@ -837,6 +845,9 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
     private static DateTime? NormalizeDueDateUtc(DateTime? value)
         => value.HasValue ? AppTimeRangeHelper.EndOfUtcDate(value.Value) : null;
 
+    private static DateTime? NormalizeDate(DateTime? value)
+        => value?.Date;
+
     private async Task<bool> EnsureAssignmentListDocRolesForUserWorkAsync(
         string workId,
         string actorUserId,
@@ -1074,6 +1085,8 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
 
             AssignmentType = detail.AssignmentType,
             AggregationType = detail.AggregationType,
+            StartDate = detail.StartDate,
+            CompletedDate = detail.CompletedDate,
 
             Assignees = detail.Assignees ?? new(),
             LeaderWatchers = detail.LeaderWatchers ?? new(),
@@ -1132,6 +1145,8 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
 
             AssignmentType = entity.AssignmentType,
             AggregationType = entity.AggregationType,
+            StartDate = entity.StartDate,
+            CompletedDate = entity.CompletedDate,
 
             Assignees = (entity.Assignees ?? new List<UserRef>()).Select(ToUserRefDto).ToList(),
             LeaderWatchers = (entity.LeaderWatchers ?? new List<UserRef>()).Select(ToUserRefDto).ToList(),
@@ -1193,6 +1208,8 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
         detail.ProgressStatusUpdatedAtUtc = entity.ProgressStatusUpdatedAtUtc;
         detail.LatestPeriodKey = entity.LatestPeriodKey;
         detail.LatestDueAtUtc = entity.LatestDueAtUtc;
+        detail.StartDate = entity.StartDate;
+        detail.CompletedDate = entity.CompletedDate;
         detail.HasAnyDuePeriod = entity.HasAnyDuePeriod;
         detail.HasOverduePeriod = entity.HasOverduePeriod;
         detail.EvaluationTemplateId = entity.EvaluationTemplateId;

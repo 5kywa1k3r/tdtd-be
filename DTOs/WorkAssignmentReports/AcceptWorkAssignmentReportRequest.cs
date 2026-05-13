@@ -12,4 +12,9 @@ public sealed class AcceptWorkAssignmentReportRequest
     /// Cho phép cấp trên nhập/chỉnh lý do trễ hạn nếu cần.
     /// </summary>
     public string? LateReasonOverride { get; set; }
+
+    /// <summary>
+    /// Reviewer xác nhận đây là duyệt dữ liệu từ quá khứ và chịu trách nhiệm nghiệp vụ.
+    /// </summary>
+    public bool ConfirmHistoricalDataApproval { get; set; }
 }

@@ -50,6 +50,12 @@ public sealed class WorkAssignment : BaseEntity
     [BsonElement("schedule")]
     public AssignmentSchedule? Schedule { get; set; }
 
+    [BsonElement("startDate")]
+    public DateTime? StartDate { get; set; }
+
+    [BsonElement("completedDate")]
+    public DateTime? CompletedDate { get; set; }
+
     [BsonElement("allowUserCreatedReports")]
     public bool AllowUserCreatedReports { get; set; } = true;
 

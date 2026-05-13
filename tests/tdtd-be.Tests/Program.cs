@@ -1,7 +1,9 @@
 using tdtd_be.Common.Auth;
 using tdtd_be.Common.Errors;
 using tdtd_be.DTOs.Auth;
+using tdtd_be.DTOs.WorkAssignments;
 using tdtd_be.DTOs.WorkAssignments.AggregateTable;
+using tdtd_be.Enum;
 using tdtd_be.Models;
 using tdtd_be.Models.Enums;
 using tdtd_be.Services;
@@ -18,6 +20,12 @@ var tests = new (string Name, Action Run)[]
     ("direct parent assignee can create a child assignment assigned to themself", AllowsDirectAssigneeSelfAssignment),
     ("unrelated actor cannot create a child assignment even when assigning to themself", BlocksUnrelatedChildSelfAssignment),
     ("blank actor is rejected before scope evaluation", BlocksBlankActor),
+    ("assignment completed date cannot be before start date", BlocksAssignmentCompletedBeforeStart),
+    ("missing assignment start defaults to current date", DefaultsMissingAssignmentStartToCurrentDate),
+    ("root missing assignment completed date defaults to work due date", DefaultsRootCompletedDateToWorkDueDate),
+    ("child missing assignment completed date defaults to parent assignment end", DefaultsChildCompletedDateToParentAssignmentEnd),
+    ("periodic assignment date range caps occurrence validation", ValidatesPeriodicAssignmentDateRange),
+    ("historical data approval resolves as normal approved", ResolvesHistoricalDataApprovalAsNormalApproved),
     ("generated unit manager can create root work", AllowsGeneratedUnitManagerWorkCreate),
     ("generated level manager can create root work", AllowsGeneratedLevelManagerWorkCreate),
     ("management account usernames use unit symbol", ManagementAccountUsernamesUseUnitSymbol),
@@ -146,6 +154,184 @@ static void BlocksBlankActor()
             parent: null,
             actorUserId: " ",
             assigneeUserIds: Array.Empty<string>()));
+}
+
+static void BlocksAssignmentCompletedBeforeStart()
+{
+    var work = WorkWithDateRange(
+        new DateTime(2026, 1, 1),
+        new DateTime(2026, 12, 31));
+
+    var req = new SaveWorkAssignmentRequest
+    {
+        DynamicFormTemplateId = ObjectId(10),
+        AssignmentType = WorkAssignmentTypes.Once,
+        AggregationType = WorkAggregationTypes.Matrix,
+        AssigneeUserIds = new List<string> { UserId(1) },
+        StartDate = new DateTime(2026, 5, 10),
+        CompletedDate = new DateTime(2026, 5, 9),
+        DueAtUtc = new DateTime(2026, 5, 10)
+    };
+
+    AssertThrows(
+        AppErrorCode.WORK_ASSIGNMENT_COMPLETED_BEFORE_START,
+        () => WorkAssignmentScheduleHelper.ValidateRequest(
+            WorkAssignmentScheduleHelper.NormalizeRequest(req),
+            work));
+}
+
+static void DefaultsMissingAssignmentStartToCurrentDate()
+{
+    var now = new DateTime(2026, 5, 13, 8, 0, 0, DateTimeKind.Utc);
+    var work = WorkWithDates(
+        startDate: new DateTime(2026, 1, 1),
+        endDate: null,
+        dueDate: new DateTime(2026, 5, 31));
+
+    var req = new SaveWorkAssignmentRequest
+    {
+        DynamicFormTemplateId = ObjectId(12),
+        AssignmentType = WorkAssignmentTypes.Once,
+        AggregationType = WorkAggregationTypes.Matrix,
+        AssigneeUserIds = new List<string> { UserId(1) },
+        DueAtUtc = new DateTime(2026, 5, 20)
+    };
+
+    var effective = WorkAssignmentScheduleHelper.ApplyEffectiveDateDefaults(
+        WorkAssignmentScheduleHelper.NormalizeRequest(req),
+        work,
+        parent: null,
+        now);
+
+    WorkAssignmentScheduleHelper.ValidateRequest(effective, work);
+
+    AssertEqual(now.Date, effective.StartDate, "missing start date should default to current date");
+}
+
+static void DefaultsRootCompletedDateToWorkDueDate()
+{
+    var workDueDate = new DateTime(2026, 5, 31);
+    var work = WorkWithDates(
+        startDate: new DateTime(2026, 1, 1),
+        endDate: null,
+        dueDate: workDueDate);
+
+    var req = new SaveWorkAssignmentRequest
+    {
+        DynamicFormTemplateId = ObjectId(13),
+        AssignmentType = WorkAssignmentTypes.PeriodicReport,
+        AggregationType = WorkAggregationTypes.Matrix,
+        AssigneeUserIds = new List<string> { UserId(2) },
+        StartDate = new DateTime(2026, 5, 1),
+        Schedule = new AssignmentScheduleDto(
+            CycleType: ReportCycleTypes.Weekly,
+            StartDate: null,
+            WeekDays: new List<int> { 2 },
+            MonthDays: null,
+            QuarterDays: null,
+            SemiAnnualDays: null,
+            Note: null)
+    };
+
+    var effective = WorkAssignmentScheduleHelper.ApplyEffectiveDateDefaults(
+        WorkAssignmentScheduleHelper.NormalizeRequest(req),
+        work,
+        parent: null,
+        new DateTime(2026, 5, 13));
+
+    WorkAssignmentScheduleHelper.ValidateRequest(effective, work);
+
+    AssertEqual(workDueDate, effective.CompletedDate, "root completed date should default to work due date");
+    AssertEqual(new DateTime(2026, 5, 1), effective.Schedule?.StartDate, "schedule start should keep assignment start date");
+}
+
+static void DefaultsChildCompletedDateToParentAssignmentEnd()
+{
+    var parentEndDate = new DateTime(2026, 6, 30);
+    var work = WorkWithDates(
+        startDate: new DateTime(2026, 1, 1),
+        endDate: null,
+        dueDate: new DateTime(2026, 12, 31));
+    var parent = ParentAssignment(createdByUserId: UserId(1));
+    parent.CompletedDate = parentEndDate;
+
+    var req = new SaveWorkAssignmentRequest
+    {
+        DynamicFormTemplateId = ObjectId(14),
+        AssignmentType = WorkAssignmentTypes.PeriodicReport,
+        AggregationType = WorkAggregationTypes.Matrix,
+        AssigneeUserIds = new List<string> { UserId(3) },
+        StartDate = new DateTime(2026, 5, 1),
+        Schedule = new AssignmentScheduleDto(
+            CycleType: ReportCycleTypes.Weekly,
+            StartDate: null,
+            WeekDays: new List<int> { 2 },
+            MonthDays: null,
+            QuarterDays: null,
+            SemiAnnualDays: null,
+            Note: null)
+    };
+
+    var effective = WorkAssignmentScheduleHelper.ApplyEffectiveDateDefaults(
+        WorkAssignmentScheduleHelper.NormalizeRequest(req),
+        work,
+        parent,
+        new DateTime(2026, 5, 13));
+
+    WorkAssignmentScheduleHelper.ValidateRequest(effective, work);
+
+    AssertEqual(parentEndDate, effective.CompletedDate, "child completed date should default to parent assignment end");
+}
+
+static void ValidatesPeriodicAssignmentDateRange()
+{
+    var work = WorkWithDateRange(
+        new DateTime(2026, 1, 1),
+        new DateTime(2026, 12, 31));
+
+    var req = new SaveWorkAssignmentRequest
+    {
+        DynamicFormTemplateId = ObjectId(11),
+        AssignmentType = WorkAssignmentTypes.PeriodicReport,
+        AggregationType = WorkAggregationTypes.Matrix,
+        AssigneeUserIds = new List<string> { UserId(2) },
+        StartDate = new DateTime(2026, 5, 1),
+        CompletedDate = new DateTime(2026, 5, 31),
+        Schedule = new AssignmentScheduleDto(
+            CycleType: ReportCycleTypes.Weekly,
+            StartDate: null,
+            WeekDays: new List<int> { 2 },
+            MonthDays: null,
+            QuarterDays: null,
+            SemiAnnualDays: null,
+            Note: null)
+    };
+
+    var normalized = WorkAssignmentScheduleHelper.NormalizeRequest(req);
+    WorkAssignmentScheduleHelper.ValidateRequest(normalized, work);
+
+    AssertEqual(new DateTime(2026, 5, 1), normalized.StartDate, "assignment start date should normalize to date");
+    AssertEqual(new DateTime(2026, 5, 1), normalized.Schedule?.StartDate, "schedule start should default from assignment start date");
+}
+
+static void ResolvesHistoricalDataApprovalAsNormalApproved()
+{
+    var now = new DateTime(2026, 5, 13);
+    var period = new WorkReportPeriod
+    {
+        Status = WorkReportPeriodStatus.OverdueSubmitted,
+        DueAtUtc = new DateTime(2026, 5, 1)
+    };
+    var report = new WorkAssignmentReport
+    {
+        IsHistoricalData = true,
+        HistoricalDataApproved = true,
+        IsLateSubmission = true
+    };
+
+    var status = WorkAssignmentReportHistoricalDataHelper.ResolveApprovedPeriodStatus(period, report, now);
+
+    AssertEqual(WorkReportPeriodStatus.Approved, status, "historical approved report should not remain overdue");
 }
 
 static void AllowsGeneratedUnitManagerWorkCreate()
@@ -586,6 +772,23 @@ static Work WorkOwnedBy(string userId) => new()
 {
     Id = ObjectId(1),
     CreatedByUserId = userId
+};
+
+static Work WorkWithDateRange(DateTime startDate, DateTime endDate) => new()
+{
+    Id = ObjectId(3),
+    CreatedByUserId = UserId(1),
+    StartDate = startDate,
+    EndDate = endDate
+};
+
+static Work WorkWithDates(DateTime? startDate, DateTime? endDate, DateTime? dueDate) => new()
+{
+    Id = ObjectId(3),
+    CreatedByUserId = UserId(1),
+    StartDate = startDate,
+    EndDate = endDate,
+    DueDate = dueDate
 };
 
 static WorkAssignment ParentAssignment(string createdByUserId, IEnumerable<string>? assigneeUserIds = null) => new()

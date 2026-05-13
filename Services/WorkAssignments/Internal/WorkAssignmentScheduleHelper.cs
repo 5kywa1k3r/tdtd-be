@@ -13,10 +13,27 @@ internal static class WorkAssignmentScheduleHelper
         var assignmentType = req.AssignmentType?.Trim() ?? string.Empty;
 
         var normalizedDueAtUtc = req.DueAtUtc;
+        var normalizedStartDate = req.StartDate?.Date;
+        var normalizedCompletedDate = req.CompletedDate?.Date;
 
         var normalizedSchedule = assignmentType == WorkAssignmentTypes.Once
             ? null
             : NormalizeScheduleDto(req.Schedule);
+
+        if (assignmentType == WorkAssignmentTypes.PeriodicReport &&
+            normalizedSchedule is not null &&
+            normalizedStartDate.HasValue &&
+            !normalizedSchedule.StartDate.HasValue)
+        {
+            normalizedSchedule = new AssignmentScheduleDto(
+                CycleType: normalizedSchedule.CycleType,
+                StartDate: normalizedStartDate.Value,
+                WeekDays: normalizedSchedule.WeekDays,
+                MonthDays: normalizedSchedule.MonthDays,
+                QuarterDays: normalizedSchedule.QuarterDays,
+                SemiAnnualDays: normalizedSchedule.SemiAnnualDays,
+                Note: normalizedSchedule.Note);
+        }
 
         return new SaveWorkAssignmentRequest
         {
@@ -33,6 +50,9 @@ internal static class WorkAssignmentScheduleHelper
             DueAtUtc = assignmentType == WorkAssignmentTypes.Once
                 ? normalizedDueAtUtc
                 : null,
+
+            StartDate = normalizedStartDate,
+            CompletedDate = normalizedCompletedDate,
 
             Schedule = normalizedSchedule,
 
@@ -67,6 +87,53 @@ internal static class WorkAssignmentScheduleHelper
         };
     }
 
+    public static SaveWorkAssignmentRequest ApplyEffectiveDateDefaults(
+        SaveWorkAssignmentRequest req,
+        Work work,
+        WorkAssignment? parent,
+        DateTime nowUtc)
+    {
+        var effectiveStartDate = WorkAssignmentDatePolicy.ResolveEffectiveStartDate(req.StartDate, nowUtc);
+        var effectiveCompletedDate = WorkAssignmentDatePolicy.ResolveEffectiveCompletedDate(
+            req.CompletedDate,
+            work,
+            parent);
+
+        var effectiveSchedule = req.Schedule;
+        if (req.AssignmentType == WorkAssignmentTypes.PeriodicReport &&
+            effectiveSchedule is not null &&
+            !effectiveSchedule.StartDate.HasValue)
+        {
+            effectiveSchedule = new AssignmentScheduleDto(
+                CycleType: effectiveSchedule.CycleType,
+                StartDate: effectiveStartDate,
+                WeekDays: effectiveSchedule.WeekDays,
+                MonthDays: effectiveSchedule.MonthDays,
+                QuarterDays: effectiveSchedule.QuarterDays,
+                SemiAnnualDays: effectiveSchedule.SemiAnnualDays,
+                Note: effectiveSchedule.Note);
+        }
+
+        return new SaveWorkAssignmentRequest
+        {
+            ParentAssignmentId = req.ParentAssignmentId,
+            DynamicFormTemplateId = req.DynamicFormTemplateId,
+            AssignmentType = req.AssignmentType,
+            AggregationType = req.AggregationType,
+            DueAtUtc = req.DueAtUtc,
+            StartDate = effectiveStartDate,
+            CompletedDate = effectiveCompletedDate,
+            Schedule = effectiveSchedule,
+            AssigneeUserIds = req.AssigneeUserIds?.ToList() ?? new List<string>(),
+            AssigneeUnitIds = req.AssigneeUnitIds?.ToList() ?? new List<string>(),
+            LeaderWatcherUserIds = req.LeaderWatcherUserIds?.ToList(),
+            DynamicFormDataSourceRulesJson = req.DynamicFormDataSourceRulesJson,
+            Description = req.Description,
+            IsActive = req.IsActive,
+            AllowUserCreatedReports = req.AllowUserCreatedReports
+        };
+    }
+
     public static void ValidateRequest(SaveWorkAssignmentRequest req, Work work)
     {
         if (string.IsNullOrWhiteSpace(req.DynamicFormTemplateId))
@@ -85,6 +152,8 @@ internal static class WorkAssignmentScheduleHelper
         if (req.AssigneeUserIds is null || req.AssigneeUserIds.Count == 0)
             throw AppExceptionFactory.BadRequest(AppErrorCode.WORK_ASSIGNMENT_ASSIGNEE_REQUIRED);
 
+        ValidateAssignmentDates(req, work);
+
         if (req.AssignmentType == WorkAssignmentTypes.Once)
         {
             if (!req.DueAtUtc.HasValue)
@@ -93,13 +162,13 @@ internal static class WorkAssignmentScheduleHelper
             if (req.Schedule is not null)
                 throw AppExceptionFactory.BadRequest(AppErrorCode.WORK_ASSIGNMENT_ONCE_SCHEDULE_NOT_ALLOWED);
 
-            ValidateOnceDueAt(req.DueAtUtc.Value, work);
+            ValidateOnceDueAt(req.DueAtUtc.Value, work, req.StartDate, req.CompletedDate);
             return;
         }
 
         if (req.AssignmentType == WorkAssignmentTypes.PeriodicReport)
         {
-            ValidatePeriodicSchedule(req.Schedule, work);
+            ValidatePeriodicSchedule(req.Schedule, work, req.StartDate, req.CompletedDate);
             return;
         }
 
@@ -108,7 +177,54 @@ internal static class WorkAssignmentScheduleHelper
             new { req.AssignmentType });
     }
 
-    private static void ValidateOnceDueAt(DateTime dueAtUtc, Work work)
+    private static void ValidateAssignmentDates(SaveWorkAssignmentRequest req, Work work)
+    {
+        var startDate = req.StartDate?.Date;
+        var completedDate = req.CompletedDate?.Date;
+
+        if (startDate.HasValue)
+            ValidateDateWithinWorkRange(
+                startDate.Value,
+                work,
+                AppErrorCode.WORK_ASSIGNMENT_START_OUT_OF_RANGE,
+                "startDate");
+
+        if (completedDate.HasValue)
+            ValidateDateWithinWorkRange(
+                completedDate.Value,
+                work,
+                AppErrorCode.WORK_ASSIGNMENT_COMPLETED_OUT_OF_RANGE,
+                "completedDate");
+
+        if (startDate.HasValue && completedDate.HasValue && completedDate.Value < startDate.Value)
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_COMPLETED_BEFORE_START,
+                new { req.StartDate, req.CompletedDate });
+    }
+
+    private static void ValidateDateWithinWorkRange(
+        DateTime date,
+        Work work,
+        AppErrorCode errorCode,
+        string field)
+    {
+        if (work.StartDate.HasValue && date < work.StartDate.Value.Date)
+            throw AppExceptionFactory.BadRequest(
+                errorCode,
+                new { field, value = date, work.StartDate });
+
+        var workEnd = WorkAssignmentDatePolicy.ResolveWorkBoundaryEndDate(work);
+        if (workEnd.HasValue && date > workEnd.Value.Date)
+            throw AppExceptionFactory.BadRequest(
+                errorCode,
+                new { field, value = date, work.EndDate, work.DueDate });
+    }
+
+    private static void ValidateOnceDueAt(
+        DateTime dueAtUtc,
+        Work work,
+        DateTime? startDate,
+        DateTime? completedDate)
     {
         var dueDate = dueAtUtc.Date;
 
@@ -117,10 +233,21 @@ internal static class WorkAssignmentScheduleHelper
                 AppErrorCode.WORK_ASSIGNMENT_ONCE_DUE_BEFORE_WORK_START,
                 new { dueAtUtc, work.StartDate });
 
-        if (work.EndDate.HasValue && dueDate > work.EndDate.Value.Date)
+        var workEnd = WorkAssignmentDatePolicy.ResolveWorkBoundaryEndDate(work);
+        if (workEnd.HasValue && dueDate > workEnd.Value.Date)
             throw AppExceptionFactory.BadRequest(
                 AppErrorCode.WORK_ASSIGNMENT_ONCE_DUE_AFTER_WORK_END,
-                new { dueAtUtc, work.EndDate });
+                new { dueAtUtc, work.EndDate, work.DueDate });
+
+        if (startDate.HasValue && dueDate < startDate.Value.Date)
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_ONCE_DUE_BEFORE_ASSIGNMENT_START,
+                new { dueAtUtc, startDate });
+
+        if (completedDate.HasValue && dueDate > completedDate.Value.Date)
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_ONCE_DUE_AFTER_ASSIGNMENT_COMPLETED,
+                new { dueAtUtc, completedDate });
     }
 
     public static AssignmentSchedule? MapSchedule(
@@ -195,35 +322,63 @@ internal static class WorkAssignmentScheduleHelper
             .ToList();
     }
 
-    private static void ValidatePeriodicSchedule(AssignmentScheduleDto? scheduleDto, Work work)
+    private static void ValidatePeriodicSchedule(
+        AssignmentScheduleDto? scheduleDto,
+        Work work,
+        DateTime? startDate,
+        DateTime? completedDate)
     {
         if (scheduleDto is null)
             throw AppExceptionFactory.BadRequest(AppErrorCode.WORK_ASSIGNMENT_PERIODIC_SCHEDULE_REQUIRED);
 
-        if (!work.StartDate.HasValue || !work.EndDate.HasValue)
+        var workEnd = WorkAssignmentDatePolicy.ResolveWorkBoundaryEndDate(work);
+        if (!workEnd.HasValue && !completedDate.HasValue)
             throw AppExceptionFactory.BadRequest(
                 AppErrorCode.WORK_ASSIGNMENT_PERIODIC_WORK_DATE_RANGE_REQUIRED,
-                new { work.Id, work.StartDate, work.EndDate });
+                new { work.Id, work.StartDate, work.EndDate, work.DueDate });
 
-        var workStart = work.StartDate.Value.Date;
-        var workEnd = work.EndDate.Value.Date;
+        var workStart = work.StartDate?.Date;
+        var assignmentStart = startDate?.Date ?? scheduleDto.StartDate?.Date ?? workStart;
+        var assignmentEnd = completedDate?.Date ?? workEnd?.Date;
 
-        if (workEnd < workStart)
+        if (!assignmentStart.HasValue || !assignmentEnd.HasValue)
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_PERIODIC_WORK_DATE_RANGE_REQUIRED,
+                new { work.Id, work.StartDate, work.EndDate, work.DueDate });
+
+        if (workStart.HasValue && workEnd.HasValue && workEnd.Value < workStart.Value)
             throw AppExceptionFactory.BadRequest(
                 AppErrorCode.WORK_ASSIGNMENT_WORK_DATE_RANGE_INVALID,
-                new { work.Id, work.StartDate, work.EndDate });
+                new { work.Id, work.StartDate, work.EndDate, work.DueDate });
+
+        if ((workStart.HasValue && assignmentStart.Value < workStart.Value) ||
+            (workEnd.HasValue && assignmentStart.Value > workEnd.Value))
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_START_OUT_OF_RANGE,
+                new { startDate = assignmentStart, work.StartDate, work.EndDate, work.DueDate });
+
+        if ((workStart.HasValue && assignmentEnd.Value < workStart.Value) ||
+            (workEnd.HasValue && assignmentEnd.Value > workEnd.Value))
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_COMPLETED_OUT_OF_RANGE,
+                new { completedDate = assignmentEnd, work.StartDate, work.EndDate, work.DueDate });
+
+        if (assignmentEnd.Value < assignmentStart.Value)
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_COMPLETED_BEFORE_START,
+                new { startDate = assignmentStart, completedDate = assignmentEnd });
 
         if (scheduleDto.StartDate.HasValue)
         {
             var scheduleStart = scheduleDto.StartDate.Value.Date;
-            if (scheduleStart < workStart || scheduleStart > workEnd)
+            if (scheduleStart < assignmentStart.Value || scheduleStart > assignmentEnd.Value)
                 throw AppExceptionFactory.BadRequest(
                     AppErrorCode.WORK_ASSIGNMENT_PERIODIC_START_OUT_OF_RANGE,
                     new
                     {
                         scheduleStartDate = scheduleDto.StartDate,
-                        workStartDate = work.StartDate,
-                        workEndDate = work.EndDate
+                        assignmentStartDate = assignmentStart,
+                        assignmentCompletedDate = assignmentEnd
                     });
         }
 
@@ -234,8 +389,8 @@ internal static class WorkAssignmentScheduleHelper
 
         var occurrences = AssignmentScheduleOccurrenceHelper.GenerateOccurrences(
             schedule!,
-            workStart,
-            workEnd);
+            assignmentStart.Value,
+            assignmentEnd.Value);
 
         if (occurrences.Count == 0)
             throw AppExceptionFactory.BadRequest(AppErrorCode.WORK_ASSIGNMENT_PERIODIC_NO_OCCURRENCES);

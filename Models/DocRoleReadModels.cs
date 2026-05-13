@@ -144,6 +144,12 @@ public sealed class AssignmentListDocRole : DocRoleReadModelBase
     [BsonElement("allowUserCreatedReports")]
     public bool AllowUserCreatedReports { get; set; } = true;
 
+    [BsonElement("startDate")]
+    public DateTime? StartDate { get; set; }
+
+    [BsonElement("completedDate")]
+    public DateTime? CompletedDate { get; set; }
+
     [BsonElement("assignmentCreatedByUserId")]
     [BsonRepresentation(BsonType.ObjectId)]
     public string? AssignmentCreatedByUserId { get; set; }
@@ -353,6 +359,25 @@ public sealed class MyReportPeriodListDocRole : DocRoleReadModelBase
     [BsonRepresentation(BsonType.ObjectId)]
     public string? LinkedScheduledPeriodId { get; set; }
 
+    [BsonElement("startedDate")]
+    public DateTime? StartedDate { get; set; }
+
+    [BsonElement("completedDate")]
+    public DateTime? CompletedDate { get; set; }
+
+    [BsonElement("isHistoricalData")]
+    public bool IsHistoricalData { get; set; }
+
+    [BsonElement("historicalDataApproved")]
+    public bool HistoricalDataApproved { get; set; }
+
+    [BsonElement("historicalDataApprovedAtUtc")]
+    public DateTime? HistoricalDataApprovedAtUtc { get; set; }
+
+    [BsonElement("historicalDataApprovedByUserId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? HistoricalDataApprovedByUserId { get; set; }
+
     [BsonElement("periodStart")]
     public DateTime? PeriodStart { get; set; }
 
@@ -486,6 +511,25 @@ public sealed class ReviewReportListDocRole : DocRoleReadModelBase
     [BsonElement("linkedScheduledPeriodId")]
     [BsonRepresentation(BsonType.ObjectId)]
     public string? LinkedScheduledPeriodId { get; set; }
+
+    [BsonElement("startedDate")]
+    public DateTime? StartedDate { get; set; }
+
+    [BsonElement("completedDate")]
+    public DateTime? CompletedDate { get; set; }
+
+    [BsonElement("isHistoricalData")]
+    public bool IsHistoricalData { get; set; }
+
+    [BsonElement("historicalDataApproved")]
+    public bool HistoricalDataApproved { get; set; }
+
+    [BsonElement("historicalDataApprovedAtUtc")]
+    public DateTime? HistoricalDataApprovedAtUtc { get; set; }
+
+    [BsonElement("historicalDataApprovedByUserId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? HistoricalDataApprovedByUserId { get; set; }
 
     [BsonElement("periodStart")]
     public DateTime? PeriodStart { get; set; }
