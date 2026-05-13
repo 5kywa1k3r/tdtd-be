@@ -10,6 +10,7 @@
         string UnitCode,
         string PositionCode,
         string PositionName,
+        string? AccountKind,
         bool IsDeleted,
         IReadOnlyList<string> Roles
     );

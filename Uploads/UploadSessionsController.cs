@@ -1,6 +1,7 @@
 ﻿using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using tdtd_be.Common.Auth;
+using tdtd_be.Common.Errors;
 
 namespace tdtd_be.Uploads;
 
@@ -32,11 +33,14 @@ public sealed class UploadSessionsController : ControllerBase
     [HttpPost]
     public IActionResult Create([FromBody] CreateUploadSessionReq req)
     {
-        if (string.IsNullOrWhiteSpace(req.FileName)) return BadRequest("FileName is required.");
-        if (req.Size <= 0) return BadRequest("Size must be > 0.");
+        if (string.IsNullOrWhiteSpace(req.FileName))
+            throw AppExceptionFactory.BadRequest(AppErrorCode.UPLOAD_FILE_NAME_REQUIRED);
+        if (req.Size <= 0)
+            throw AppExceptionFactory.BadRequest(AppErrorCode.UPLOAD_SIZE_INVALID, new { req.Size });
 
         var maxBytes = long.Parse(_cfg["Tus:MaxUploadBytes"] ?? "524288000");
-        if (req.Size > maxBytes) return BadRequest($"File too large. Max={maxBytes} bytes.");
+        if (req.Size > maxBytes)
+            throw AppExceptionFactory.BadRequest(AppErrorCode.UPLOAD_FILE_TOO_LARGE, new { req.Size, maxBytes });
 
         var ttl = int.Parse(_cfg["Tus:UploadTokenTtlSeconds"] ?? "900"); // 15 phút default
         var chunkSize = long.Parse(_cfg["Tus:ChunkSizeBytes"] ?? (512 * 1024).ToString());

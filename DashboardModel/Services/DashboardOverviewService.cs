@@ -915,6 +915,7 @@ public sealed class DashboardOverviewService : IDashboardOverviewService
         var filter = Builders<WorkAssignmentReport>.Filter.In(x => x.WorkAssignmentId, assignmentIds)
             & Builders<WorkAssignmentReport>.Filter.Eq(x => x.IsDeleted, false)
             & Builders<WorkAssignmentReport>.Filter.Eq(x => x.IsCurrent, true)
+            & Builders<WorkAssignmentReport>.Filter.Ne(x => x.IsActive, false)
             & BuildCurrentReportTimeFilter(range);
 
         return await _ctx.WorkAssignmentReports

@@ -10,7 +10,11 @@ public sealed class MyReportTemplateDetailResponse
 {
     public string WorkId { get; set; } = string.Empty;
 
-    public string DynamicExcelId { get; set; } = string.Empty;
+    public string DynamicFormTemplateId { get; set; } = string.Empty;
+    public string DynamicFormTemplateCode { get; set; } = string.Empty;
+    public string DynamicFormTemplateName { get; set; } = string.Empty;
+
+    public string? DynamicExcelId { get; set; }
     public string DynamicExcelCode { get; set; } = string.Empty;
     public string DynamicExcelName { get; set; } = string.Empty;
 

@@ -1,6 +1,7 @@
 ﻿using MongoDB.Bson;
 using MongoDB.Driver;
 using tdtd_be.Common.Auth;
+using tdtd_be.Common.Errors;
 using tdtd_be.Data;
 using tdtd_be.DTOs.Units;
 using tdtd_be.Models;
@@ -15,7 +16,7 @@ public interface IUnitService
 
     Task<IReadOnlyList<UnitResponse>> ListRootsAsync(CancellationToken ct);
     Task<IReadOnlyList<UnitResponse>> ListChildrenAsync(string parentUnitId, CancellationToken ct);
-    Task<IReadOnlyList<UnitResponse>> SearchByCodePrefixAsync(string codePrefix, CancellationToken ct);
+    Task<IReadOnlyList<UnitResponse>> SearchByCodePrefixAsync(string? codePrefix, CancellationToken ct);
 
     Task<IReadOnlyList<UnitHistoryResponse>> GetHistoryAsync(string unitId, int take, CancellationToken ct);
     Task<IReadOnlyList<UnitPickNodeDTO>> GetChildrenAsync(string? parentId, CancellationToken ct);
@@ -78,7 +79,7 @@ public sealed class UnitService : IUnitService
     public async Task<UnitResponse> CreateAsync(CreateUnitRequest req, CancellationToken ct)
     {
         var me = _me.RequireMe();
-        RoleGuard.RequireSystemAdmin(me);
+        RoleGuard.RequireAdminOrSystemAdmin(me);
 
         var now = DateTime.UtcNow;
         var primaryUnitTypeCode = await RequireUnitTypeCodeAsync(req.PrimaryUnitTypeCode, ct);
@@ -87,6 +88,7 @@ public sealed class UnitService : IUnitService
         string? parentId = string.IsNullOrWhiteSpace(req.ParentUnitId)
             ? null
             : req.ParentUnitId.Trim();
+        parentId ??= (await FindHiddenRootAsync(ct))?.Id;
 
         var symbol = string.IsNullOrWhiteSpace(req.Symbol) ? null : req.Symbol.Trim();
         if (!string.IsNullOrWhiteSpace(symbol))
@@ -95,7 +97,7 @@ public sealed class UnitService : IUnitService
                 .Find(x => x.Symbol == symbol && !x.IsDeleted)
                 .AnyAsync(ct);
             if (symbolExists)
-                throw new InvalidOperationException("Unit symbol already exists.");
+                throw AppExceptionFactory.Create(AppErrorCode.UNIT_SYMBOL_DUPLICATE, new { symbol });
         }
 
         string code;
@@ -109,9 +111,11 @@ public sealed class UnitService : IUnitService
             var parent = await _ctx.Units
                 .Find(x => x.Id == parentId && !x.IsDeleted)
                 .FirstOrDefaultAsync(ct)
-                ?? throw new InvalidOperationException("Parent unit not found or deleted.");
+                ?? throw AppExceptionFactory.NotFound(AppErrorCode.UNIT_PARENT_NOT_FOUND, new { parentId });
 
-            code = await GenerateNextChildCodeAsync(parent.Code, ct);
+            var parentCode = parent.Code
+                ?? throw AppExceptionFactory.Create(AppErrorCode.UNIT_PARENT_CODE_MISSING, new { parentId });
+            code = await GenerateNextChildCodeAsync(parentCode, ct);
         }
 
         var unit = new Unit
@@ -147,12 +151,12 @@ public sealed class UnitService : IUnitService
     public async Task<UnitResponse> UpdateAsync(string unitId, UpdateUnitRequest req, CancellationToken ct)
     {
         var me = _me.RequireMe();
-        RoleGuard.RequireSystemAdmin(me);
+        RoleGuard.RequireAdminOrSystemAdmin(me);
 
         var existing = await _ctx.Units
             .Find(x => x.Id == unitId && !x.IsDeleted)
             .FirstOrDefaultAsync(ct)
-            ?? throw new InvalidOperationException("Unit not found or deleted.");
+            ?? throw UnitNotFound(unitId);
 
         var now = DateTime.UtcNow;
         var primaryUnitTypeCode = await RequireUnitTypeCodeAsync(req.PrimaryUnitTypeCode, ct);
@@ -168,7 +172,7 @@ public sealed class UnitService : IUnitService
                 .Find(x => x.Id != unitId && x.Symbol == symbol && !x.IsDeleted)
                 .AnyAsync(ct);
             if (symbolExists)
-                throw new InvalidOperationException("Unit symbol already exists.");
+                throw AppExceptionFactory.Create(AppErrorCode.UNIT_SYMBOL_DUPLICATE, new { symbol, unitId });
         }
 
         var update = Builders<Unit>.Update
@@ -225,12 +229,12 @@ public sealed class UnitService : IUnitService
     public async Task DeleteAsync(string unitId, CancellationToken ct)
     {
         var me = _me.RequireMe();
-        RoleGuard.RequireSystemAdmin(me);
+        RoleGuard.RequireAdminOrSystemAdmin(me);
 
         var unit = await _ctx.Units
             .Find(x => x.Id == unitId && !x.IsDeleted)
             .FirstOrDefaultAsync(ct)
-            ?? throw new InvalidOperationException("Unit not found.");
+            ?? throw UnitNotFound(unitId);
 
         var prefix = unit.Code;
 
@@ -254,7 +258,7 @@ public sealed class UnitService : IUnitService
             .AnyAsync(ct);
 
         if (hasUsers)
-            throw new InvalidOperationException("Cannot delete subtree because it contains users.");
+            throw AppExceptionFactory.Create(AppErrorCode.UNIT_DELETE_HAS_USERS, new { unitId, subtreeIds });
 
         // 🔹 3. Soft delete subtree
         var now = DateTime.UtcNow;
@@ -332,13 +336,37 @@ public sealed class UnitService : IUnitService
     // =============================
     // SEARCH PREFIX
     // =============================
-    public async Task<IReadOnlyList<UnitResponse>> SearchByCodePrefixAsync(string prefix, CancellationToken ct)
+    public async Task<IReadOnlyList<UnitResponse>> SearchByCodePrefixAsync(string? prefix, CancellationToken ct)
     {
         var me = _me.RequireMe();
+        var canBrowseAllUnits = RoleGuard.IsAdmin(me) || RoleGuard.IsSystemAdmin(me);
+        int? levelWideManagerLevel = null;
+        if (string.IsNullOrWhiteSpace(me.UnitId) &&
+            RoleGuard.TryGetGeneratedLevelManager(me, out var generatedLevel))
+        {
+            levelWideManagerLevel = generatedLevel;
+        }
 
         prefix = (prefix ?? string.Empty).Trim();
         if (string.IsNullOrWhiteSpace(prefix))
-            return new List<UnitResponse>();
+        {
+            if (!canBrowseAllUnits && levelWideManagerLevel is null)
+                return new List<UnitResponse>();
+
+            var filter = Builders<Unit>.Filter.Eq(x => x.IsDeleted, false);
+            if (levelWideManagerLevel is not null)
+                filter &= Builders<Unit>.Filter.Gte(x => x.Level, levelWideManagerLevel.Value);
+
+            var allUnits = await _ctx.Units
+                .Find(filter)
+                .SortBy(x => x.Code)
+                .ToListAsync(ct);
+
+            return allUnits
+                .Where(x => !IsHiddenRootUnit(x))
+                .Select(ToResp)
+                .ToList();
+        }
 
         var units = _ctx.Units;
 
@@ -346,16 +374,16 @@ public sealed class UnitService : IUnitService
         if (RoleGuard.TryGetManagerUnit(me, out var mu) && !string.IsNullOrWhiteSpace(mu))
             scopeUnitId = mu!;
 
-        var browseRoots = await GetBrowseRootUnitsAsync(RoleGuard.IsSystemAdmin(me), scopeUnitId, ct);
+        var browseRoots = await GetBrowseRootUnitsAsync(canBrowseAllUnits, scopeUnitId, levelWideManagerLevel, ct);
 
-        if (!RoleGuard.IsSystemAdmin(me))
+        if (!canBrowseAllUnits)
         {
             var allowed = browseRoots.Any(root =>
                 string.Equals(prefix, root.Code, StringComparison.Ordinal) ||
                 prefix.StartsWith(root.Code, StringComparison.Ordinal));
 
             if (!allowed)
-                throw new BadHttpRequestException("Out of scope.");
+                throw AppExceptionFactory.Forbidden(AppErrorCode.UNIT_SCOPE_FORBIDDEN, new { prefix, scopeUnitId });
         }
 
         var list = await units
@@ -373,12 +401,19 @@ public sealed class UnitService : IUnitService
     {
         var me = _me.RequireMe();
         var units = _ctx.Units;
+        var canBrowseAllUnits = RoleGuard.IsAdmin(me) || RoleGuard.IsSystemAdmin(me);
+        int? levelWideManagerLevel = null;
+        if (string.IsNullOrWhiteSpace(me.UnitId) &&
+            RoleGuard.TryGetGeneratedLevelManager(me, out var generatedLevel))
+        {
+            levelWideManagerLevel = generatedLevel;
+        }
 
         string? scopeUnitId = me.UnitId;
         if (RoleGuard.TryGetManagerUnit(me, out var mu) && !string.IsNullOrWhiteSpace(mu))
             scopeUnitId = mu!;
 
-        var browseRoots = await GetBrowseRootUnitsAsync(RoleGuard.IsSystemAdmin(me), scopeUnitId, ct);
+        var browseRoots = await GetBrowseRootUnitsAsync(canBrowseAllUnits, scopeUnitId, levelWideManagerLevel, ct);
 
         if (string.IsNullOrWhiteSpace(parentId))
         {
@@ -402,16 +437,16 @@ public sealed class UnitService : IUnitService
             .FirstOrDefaultAsync(ct);
 
         if (parent is null)
-            throw new InvalidOperationException("Unit not found.");
+            throw UnitNotFound(parentId);
 
-        if (!RoleGuard.IsSystemAdmin(me))
+        if (!canBrowseAllUnits)
         {
             var allowed = browseRoots.Any(root =>
                 string.Equals(parent.Code, root.Code, StringComparison.Ordinal) ||
                 parent.Code.StartsWith(root.Code, StringComparison.Ordinal));
 
             if (!allowed)
-                throw new BadHttpRequestException("Out of scope.");
+                throw AppExceptionFactory.Forbidden(AppErrorCode.UNIT_SCOPE_FORBIDDEN, new { parentId, parent.Code, scopeUnitId });
         }
 
         return await units.Find(x => x.ParentUnitId == parentId && !x.IsDeleted)
@@ -430,13 +465,14 @@ public sealed class UnitService : IUnitService
     }
 
     private async Task<List<UnitBrowseNode>> GetBrowseRootUnitsAsync(
-        bool isSystemAdmin,
+        bool canBrowseAllUnits,
         string? scopeUnitId,
+        int? levelWideManagerLevel,
         CancellationToken ct)
     {
         var units = _ctx.Units;
 
-        if (isSystemAdmin)
+        if (canBrowseAllUnits)
         {
             var roots = await units.Find(x => x.ParentUnitId == null && !x.IsDeleted)
                 .SortBy(x => x.Code)
@@ -479,8 +515,29 @@ public sealed class UnitService : IUnitService
                 .ToList();
         }
 
+        if (levelWideManagerLevel is not null)
+        {
+            var levelRoots = await units.Find(x => !x.IsDeleted && x.Level == levelWideManagerLevel.Value)
+                .SortBy(x => x.Code)
+                .Project(x => new UnitBrowseNode(
+                    x.Id,
+                    x.FullName,
+                    x.Code,
+                    x.Level,
+                    x.ShortName,
+                    x.Symbol,
+                    x.ParentUnitId,
+                    x.PrimaryUnitTypeCode,
+                    x.IsVirtual))
+                .ToListAsync(ct);
+
+            return levelRoots
+                .Where(x => !IsHiddenRootUnit(x))
+                .ToList();
+        }
+
         if (string.IsNullOrWhiteSpace(scopeUnitId))
-            throw new InvalidOperationException("Scope unit not found.");
+            throw AppExceptionFactory.NotFound(AppErrorCode.UNIT_SCOPE_NOT_FOUND, new { scopeUnitId });
 
         var scope = await units.Find(x => x.Id == scopeUnitId && !x.IsDeleted)
             .Project(x => new UnitBrowseNode(
@@ -496,7 +553,7 @@ public sealed class UnitService : IUnitService
             .FirstOrDefaultAsync(ct);
 
         if (scope is null)
-            throw new InvalidOperationException("Scope unit not found.");
+            throw AppExceptionFactory.NotFound(AppErrorCode.UNIT_SCOPE_NOT_FOUND, new { scopeUnitId });
 
         // Dashboard/assignment picker cần thấy các đơn vị ngang cấp.
         // Tạm thời dùng cùng level (code length bằng nhau) để trả entry nodes.
@@ -574,6 +631,16 @@ public sealed class UnitService : IUnitService
         return next.ToString().PadLeft(SegLen, '0');
     }
 
+    private async Task<Unit?> FindHiddenRootAsync(CancellationToken ct)
+    {
+        var roots = await _ctx.Units
+            .Find(x => x.ParentUnitId == null && !x.IsDeleted)
+            .SortBy(x => x.Code)
+            .ToListAsync(ct);
+
+        return roots.FirstOrDefault(IsHiddenRootUnit);
+    }
+
     private async Task<string> GenerateNextChildCodeAsync(string parentCode, CancellationToken ct)
     {
         var childLevel = LevelFromCode(parentCode) + 1;
@@ -603,14 +670,14 @@ public sealed class UnitService : IUnitService
     {
         var normalized = (code ?? "").Trim().ToUpperInvariant();
         if (string.IsNullOrWhiteSpace(normalized))
-            throw new InvalidOperationException("PrimaryUnitTypeCode is required.");
+            throw AppExceptionFactory.BadRequest(AppErrorCode.UNIT_PRIMARY_TYPE_REQUIRED, new { field = "primaryUnitTypeCode" });
 
         var exists = await _ctx.UnitTypes
             .Find(x => x.Code == normalized && !x.IsDeleted)
             .AnyAsync(ct);
 
         if (!exists)
-            throw new InvalidOperationException("UnitType not found.");
+            throw AppExceptionFactory.NotFound(AppErrorCode.UNIT_TYPE_NOT_FOUND, new { code = normalized });
 
         return normalized;
     }
@@ -639,7 +706,7 @@ public sealed class UnitService : IUnitService
             .AnyAsync(ct);
 
         if (hasDirectUsers)
-            throw new InvalidOperationException("Cannot mark unit as virtual because it contains users.");
+            throw AppExceptionFactory.Create(AppErrorCode.UNIT_VIRTUAL_HAS_USERS, new { unitId });
     }
 
     private async Task InsertHistoryAsync(Unit u, string byUserId, DateTime now, CancellationToken ct)
@@ -665,4 +732,7 @@ public sealed class UnitService : IUnitService
 
         await _ctx.UnitHistories.InsertOneAsync(h, cancellationToken: ct);
     }
+
+    private static AppException UnitNotFound(string? unitId)
+        => AppExceptionFactory.NotFound(AppErrorCode.UNIT_NOT_FOUND, new { unitId });
 }

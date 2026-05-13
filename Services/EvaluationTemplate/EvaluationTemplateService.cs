@@ -1,5 +1,6 @@
 using MongoDB.Driver;
 using tdtd_be.Common.Auth;
+using tdtd_be.Common.Errors;
 using tdtd_be.Data;
 using tdtd_be.DTOs.Auth;
 using tdtd_be.DTOs.EvaluationTemplates;
@@ -54,12 +55,12 @@ public sealed class EvaluationTemplateService : IEvaluationTemplateService
     public async Task<EvaluationTemplateDto> GetByIdAsync(string id, CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(id))
-            throw new InvalidOperationException("Thiếu id bộ mã đánh giá.");
+            throw EvaluationTemplateBadRequest(AppErrorCode.EVALUATION_TEMPLATE_ID_REQUIRED, new { id });
 
         var doc = await _ctx.EvaluationTemplates
             .Find(x => x.Id == id && !x.IsDeleted)
             .FirstOrDefaultAsync(ct)
-            ?? throw new InvalidOperationException("Không tìm thấy bộ mã đánh giá.");
+            ?? throw EvaluationTemplateNotFound(id);
 
         return ToDto(doc);
     }
@@ -71,7 +72,7 @@ public sealed class EvaluationTemplateService : IEvaluationTemplateService
 
         var now = DateTime.UtcNow;
         var representativeCode = NormalizeCode(req.RepresentativeCode);
-        var representativeLabel = NormalizeLabel(req.RepresentativeLabel, "Phải nhập tên bộ mã.");
+        var representativeLabel = NormalizeLabel(req.RepresentativeLabel, "representativeLabel");
         var unitCodeScope = NormalizeScope(req.UnitCodeScope, me);
         var items = NormalizeItems(req.Items);
 
@@ -79,7 +80,7 @@ public sealed class EvaluationTemplateService : IEvaluationTemplateService
             .Find(x => !x.IsDeleted && x.RepresentativeCode == representativeCode)
             .AnyAsync(ct);
         if (duplicateCode)
-            throw new InvalidOperationException("Mã đại diện đã tồn tại.");
+            throw EvaluationTemplateConflict(new { field = "representativeCode", value = representativeCode });
 
         var doc = new EvaluationTemplate
         {
@@ -100,7 +101,7 @@ public sealed class EvaluationTemplateService : IEvaluationTemplateService
     }
 
     public Task<EvaluationTemplateDto> UpdateAsync(string id, UpdateEvaluationTemplateRequest req, CancellationToken ct)
-        => throw new InvalidOperationException("Không hỗ trợ cập nhật bộ mã đánh giá. Hãy ngừng dùng bộ cũ và tạo bộ mới.");
+        => throw EvaluationTemplateBadRequest(AppErrorCode.EVALUATION_TEMPLATE_UPDATE_UNSUPPORTED, new { id });
 
     public async Task DeactivateAsync(string id, CancellationToken ct)
     {
@@ -108,7 +109,7 @@ public sealed class EvaluationTemplateService : IEvaluationTemplateService
         EnsureCanManage(me);
 
         if (string.IsNullOrWhiteSpace(id))
-            throw new InvalidOperationException("Thiếu id bộ mã đánh giá.");
+            throw EvaluationTemplateBadRequest(AppErrorCode.EVALUATION_TEMPLATE_ID_REQUIRED, new { id });
 
         var rs = await _ctx.EvaluationTemplates.UpdateOneAsync(
             x => x.Id == id && !x.IsDeleted,
@@ -119,22 +120,22 @@ public sealed class EvaluationTemplateService : IEvaluationTemplateService
             cancellationToken: ct);
 
         if (rs.MatchedCount == 0)
-            throw new InvalidOperationException("Không tìm thấy bộ mã đánh giá.");
+            throw EvaluationTemplateNotFound(id);
     }
 
     private static string NormalizeCode(string value)
     {
         var code = (value ?? string.Empty).Trim().ToUpperInvariant();
         if (string.IsNullOrWhiteSpace(code))
-            throw new InvalidOperationException("Phải nhập mã đại diện.");
+            throw EvaluationTemplateBadRequest(AppErrorCode.EVALUATION_TEMPLATE_CODE_REQUIRED, new { field = "code" });
         return code;
     }
 
-    private static string NormalizeLabel(string? value, string message)
+    private static string NormalizeLabel(string? value, string field)
     {
         var label = (value ?? string.Empty).Trim();
         if (string.IsNullOrWhiteSpace(label))
-            throw new InvalidOperationException(message);
+            throw EvaluationTemplateBadRequest(AppErrorCode.EVALUATION_TEMPLATE_LABEL_REQUIRED, new { field });
         return label;
     }
 
@@ -161,7 +162,7 @@ public sealed class EvaluationTemplateService : IEvaluationTemplateService
             .Select((x, i) => new EvaluationTemplateItem
             {
                 Code = NormalizeCode(x.Code),
-                Label = NormalizeLabel(x.Label, "Mã con phải có nhãn."),
+                Label = NormalizeLabel(x.Label, "items.label"),
                 Order = x.Order ?? i + 1,
                 IsActive = x.IsActive ?? true,
             })
@@ -170,13 +171,13 @@ public sealed class EvaluationTemplateService : IEvaluationTemplateService
             .ToList();
 
         if (normalized.Count == 0)
-            throw new InvalidOperationException("Phải có ít nhất 1 mã con.");
+            throw EvaluationTemplateBadRequest(AppErrorCode.EVALUATION_TEMPLATE_ITEM_REQUIRED, new { field = "items" });
 
         var duplicate = normalized
             .GroupBy(x => x.Code, StringComparer.OrdinalIgnoreCase)
             .FirstOrDefault(g => g.Count() > 1);
         if (duplicate != null)
-            throw new InvalidOperationException($"Mã con bị trùng: {duplicate.Key}");
+            throw AppExceptionFactory.Create(AppErrorCode.EVALUATION_TEMPLATE_ITEM_DUPLICATE, new { code = duplicate.Key });
 
         return normalized;
     }
@@ -206,14 +207,30 @@ public sealed class EvaluationTemplateService : IEvaluationTemplateService
                 role.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
         );
 
-        var isPv01 = string.Equals(me.UnitCode, EvaluationTemplatePermissionPolicy.AllowedUnitCode, StringComparison.OrdinalIgnoreCase)
-            || string.Equals(me.UnitSymbol, EvaluationTemplatePermissionPolicy.AllowedUnitCode, StringComparison.OrdinalIgnoreCase);
+        var isPv01 = string.Equals(unitCode, EvaluationTemplatePermissionPolicy.AllowedUnitCode, StringComparison.OrdinalIgnoreCase)
+            || string.Equals(unitSymbol, EvaluationTemplatePermissionPolicy.AllowedUnitCode, StringComparison.OrdinalIgnoreCase);
 
         var hasAllowedPosition =
-            !string.IsNullOrWhiteSpace(me.PositionCode) &&
-            EvaluationTemplatePermissionPolicy.AllowedPositionCodes.Contains(me.PositionCode, StringComparer.OrdinalIgnoreCase);
+            !string.IsNullOrWhiteSpace(positionCode) &&
+            EvaluationTemplatePermissionPolicy.AllowedPositionCodes.Contains(positionCode, StringComparer.OrdinalIgnoreCase);
 
         if (!(isPv01 && hasAllowedPosition) && !hasAllowedRole)
-            throw new UnauthorizedAccessException("Bạn không có quyền quản lý bộ mã đánh giá.");
+            throw AppExceptionFactory.Forbidden(AppErrorCode.EVALUATION_TEMPLATE_MANAGE_FORBIDDEN, new
+            {
+                me.Id,
+                unitCode,
+                unitSymbol,
+                positionCode,
+                roles
+            });
     }
+
+    private static AppException EvaluationTemplateBadRequest(AppErrorCode code, object? details = null)
+        => AppExceptionFactory.BadRequest(code, details);
+
+    private static AppException EvaluationTemplateNotFound(string? id)
+        => AppExceptionFactory.NotFound(AppErrorCode.EVALUATION_TEMPLATE_NOT_FOUND, new { id });
+
+    private static AppException EvaluationTemplateConflict(object? details)
+        => AppExceptionFactory.Create(AppErrorCode.EVALUATION_TEMPLATE_CONFLICT, details);
 }

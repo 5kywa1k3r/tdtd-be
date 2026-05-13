@@ -33,9 +33,13 @@
         public int Level { get; set; }
 
         public string Code { get; set; } = string.Empty;
+        public string? DynamicFormTemplateId { get; set; }
+        public string? DynamicFormTemplateCode { get; set; }
+        public string? DynamicFormTemplateName { get; set; }
         public string DynamicExcelCode { get; set; } = string.Empty;
         public string DynamicExcelName { get; set; } = string.Empty;
         public string? Description { get; set; }
+        public string SummaryText { get; set; } = string.Empty;
 
         public bool IsActive { get; set; }
 

@@ -29,6 +29,7 @@ public sealed class LabelStatisticSummaryRow
     public string LabelCode { get; set; } = default!;
     public string? LabelName { get; set; }
     public string? LabelColor { get; set; }
+    public string LabelDataType { get; set; } = "NUMBER";
     public string PeriodKey { get; set; } = default!;
     public string PeriodInstanceKey { get; set; } = default!;
     public string PeriodKind { get; set; } = default!;

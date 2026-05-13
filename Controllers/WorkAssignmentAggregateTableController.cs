@@ -1,3 +1,4 @@
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using tdtd_be.DTOs.WorkAssignments.AggregateTable;
 using tdtd_be.Services.WorkAssignments.Aggregate;
@@ -5,6 +6,7 @@ using tdtd_be.Services.WorkAssignments.Aggregate;
 namespace tdtd_be.Controllers;
 
 [ApiController]
+[Authorize]
 [Route("api/work-assignment-aggregate-table")]
 public sealed class WorkAssignmentAggregateTableController : ControllerBase
 {

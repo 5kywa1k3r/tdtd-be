@@ -33,8 +33,8 @@ public sealed class UnitsController : ControllerBase
 
     [HttpGet("search-by-code-prefix")]
     public async Task<ActionResult<IReadOnlyList<UnitResponse>>> SearchByCodePrefix(
-    [FromQuery] string prefix,
-    CancellationToken ct)
+        [FromQuery] string? prefix,
+        CancellationToken ct)
     {
         var rows = await _svc.SearchByCodePrefixAsync(prefix, ct);
         return Ok(rows);

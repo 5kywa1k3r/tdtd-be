@@ -89,7 +89,7 @@ public sealed class WorkAssignmentReport : BaseEntity
 
     [BsonElement("approvedByUserId")]
     [BsonRepresentation(BsonType.ObjectId)]
-    public string ApprovedByUserId { get; set; }
+    public string? ApprovedByUserId { get; set; }
 
     [BsonElement("data")]
     public object? Data { get; set; }
@@ -106,6 +106,12 @@ public sealed class WorkAssignmentReport : BaseEntity
 
     [BsonElement("dynamicExcelTemplateName")]
     public string DynamicExcelTemplateName { get; set; } = default!;
+
+    [BsonElement("dynamicExcelTableKind")]
+    public string DynamicExcelTableKind { get; set; } = global::tdtd_be.Models.DynamicExcelTableKind.NumericGrid;
+
+    [BsonElement("recordTableSpecJson")]
+    public string? RecordTableSpecJson { get; set; }
 
     [BsonElement("specJson")]
     public string SpecJson { get; set; } = default!;
@@ -136,6 +142,39 @@ public sealed class WorkAssignmentReport : BaseEntity
 
     [BsonElement("tableValuesJson")]
     public string? TableValuesJson { get; set; }
+
+    [BsonElement("dataOrigin")]
+    public string DataOrigin { get; set; } = WorkReportDataOrigin.ManualInput;
+
+    [BsonElement("cumulativeContributionMode")]
+    public string CumulativeContributionMode { get; set; } = WorkReportCumulativeContributionMode.Include;
+
+    [BsonElement("cumulativeContributionPolicyJson")]
+    public string? CumulativeContributionPolicyJson { get; set; }
+
+    [BsonElement("summarySourceJson")]
+    public string? SummarySourceJson { get; set; }
+
+    [BsonElement("aggregateSourceReportIds")]
+    public List<string> AggregateSourceReportIds { get; set; } = new();
+
+    [BsonElement("aggregateSourceAssignmentIds")]
+    public List<string> AggregateSourceAssignmentIds { get; set; } = new();
+
+    [BsonElement("aggregateSourceUpdatedAtUtc")]
+    public DateTime? AggregateSourceUpdatedAtUtc { get; set; }
+
+    [BsonElement("aggregateSnapshotDirty")]
+    public bool AggregateSnapshotDirty { get; set; }
+
+    [BsonElement("aggregateSnapshotDirtyAtUtc")]
+    public DateTime? AggregateSnapshotDirtyAtUtc { get; set; }
+
+    [BsonElement("aggregateSnapshotRefreshedAtUtc")]
+    public DateTime? AggregateSnapshotRefreshedAtUtc { get; set; }
+
+    [BsonElement("aggregateRefreshError")]
+    public string? AggregateRefreshError { get; set; }
 
     /// <summary>
     /// Các trường trải phẳng mà lãnh đạo quan tâm.
@@ -184,4 +223,24 @@ public sealed class WorkAssignmentReport : BaseEntity
 
     [BsonElement("isCurrent")]
     public bool IsCurrent { get; set; } = true;
+
+    [BsonElement("isActive")]
+    public bool IsActive { get; set; } = true;
+
+    [BsonElement("deactivatedAtUtc")]
+    public DateTime? DeactivatedAtUtc { get; set; }
+
+    [BsonElement("deactivatedByUserId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? DeactivatedByUserId { get; set; }
+
+    [BsonElement("deactivationReason")]
+    public string? DeactivationReason { get; set; }
+
+    [BsonElement("reactivatedAtUtc")]
+    public DateTime? ReactivatedAtUtc { get; set; }
+
+    [BsonElement("reactivatedByUserId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? ReactivatedByUserId { get; set; }
 }

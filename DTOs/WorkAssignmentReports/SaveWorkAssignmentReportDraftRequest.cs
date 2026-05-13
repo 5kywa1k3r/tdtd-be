@@ -24,6 +24,27 @@ public sealed class SaveWorkAssignmentReportDraftRequest
     public string? TableValuesJson { get; set; }
 
     /// <summary>
+    /// Nguồn dữ liệu của report: nhập tay, tự tổng hợp, copy tổng hợp, hoặc mapping một phần.
+    /// Nếu đổi nguồn mà không gửi CumulativeContributionMode, BE tự áp default theo nguồn.
+    /// </summary>
+    public string? DataOrigin { get; set; }
+
+    /// <summary>
+    /// INCLUDE: report này được tính vào thống kê/lũy kế; EXCLUDE: bỏ khỏi thống kê/lũy kế.
+    /// </summary>
+    public string? CumulativeContributionMode { get; set; }
+
+    /// <summary>
+    /// JSON policy override theo field/cell/metric cho luồng partial mapping.
+    /// </summary>
+    public string? CumulativeContributionPolicyJson { get; set; }
+
+    /// <summary>
+    /// JSON mô tả nguồn tổng hợp/mapping để audit và mở lại draft.
+    /// </summary>
+    public string? SummarySourceJson { get; set; }
+
+    /// <summary>
     /// Tình trạng hiện tại / trạng thái thực tế của công việc theo góc nhìn nghiệp vụ.
     /// Đây là text nghiệp vụ, không phải enum lifecycle.
     /// </summary>

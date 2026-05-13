@@ -1,4 +1,5 @@
-﻿using MongoDB.Driver;
+using MongoDB.Driver;
+using tdtd_be.Common.Errors;
 using tdtd_be.Data;
 using tdtd_be.Models;
 
@@ -20,7 +21,7 @@ public sealed class WorkAssignmentLookupService : IWorkAssignmentLookupService
             .FirstOrDefaultAsync(ct);
 
         if (work is null)
-            throw new InvalidOperationException("Công việc không tồn tại.");
+            throw AppExceptionFactory.NotFound(AppErrorCode.WORK_NOT_FOUND, new { workId });
 
         return work;
     }
@@ -32,7 +33,7 @@ public sealed class WorkAssignmentLookupService : IWorkAssignmentLookupService
             .FirstOrDefaultAsync(ct);
 
         if (entity is null)
-            throw new InvalidOperationException("Bản ghi giao nhiệm vụ không tồn tại.");
+            throw AppExceptionFactory.NotFound(AppErrorCode.WORK_ASSIGNMENT_NOT_FOUND, new { assignmentId });
 
         return entity;
     }
@@ -50,10 +51,12 @@ public sealed class WorkAssignmentLookupService : IWorkAssignmentLookupService
             .FirstOrDefaultAsync(ct);
 
         if (parent is null)
-            throw new InvalidOperationException("Assignment cha không tồn tại.");
+            throw AppExceptionFactory.NotFound(AppErrorCode.WORK_ASSIGNMENT_PARENT_NOT_FOUND, new { parentAssignmentId });
 
         if (!string.Equals(parent.WorkId, workId, StringComparison.Ordinal))
-            throw new InvalidOperationException("Assignment cha không thuộc cùng công việc.");
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_PARENT_WORK_MISMATCH,
+                new { parentAssignmentId, parent.WorkId, workId });
 
         return parent;
     }
@@ -65,6 +68,6 @@ public sealed class WorkAssignmentLookupService : IWorkAssignmentLookupService
             .FirstOrDefaultAsync(ct);
 
         if (parent is null)
-            throw new InvalidOperationException("Assignment cha không tồn tại.");
+            throw AppExceptionFactory.NotFound(AppErrorCode.WORK_ASSIGNMENT_PARENT_NOT_FOUND, new { parentAssignmentId });
     }
 }

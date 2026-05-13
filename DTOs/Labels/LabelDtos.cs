@@ -7,6 +7,7 @@ public sealed record LabelRow(
     string? Description,
     string? Color,
     string? GroupCode,
+    string DataType,
     string ScopeType,
     string? ScopeId,
     bool IsSystem,
@@ -36,6 +37,7 @@ public sealed record CreateLabelReq(
     string? Description,
     string? Color,
     string? GroupCode,
+    string? DataType,
     string? ScopeType,
     string? ScopeId,
     bool IsActive = true
@@ -46,5 +48,6 @@ public sealed record UpdateLabelReq(
     string? Description,
     string? Color,
     string? GroupCode,
+    string? DataType,
     bool IsActive = true
 );

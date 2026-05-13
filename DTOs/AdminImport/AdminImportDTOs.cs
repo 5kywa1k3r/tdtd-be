@@ -19,4 +19,16 @@ public sealed record ImportResult(
     int ErrorRows,
     IReadOnlyList<ImportRowError> Errors,
     IReadOnlyList<string> CreatedIds
+)
+{
+    public IReadOnlyList<ImportPreviewRow> Rows { get; init; } = Array.Empty<ImportPreviewRow>();
+}
+
+public sealed record ImportPreviewRow(
+    int RowNumber,
+    string? ExternalKey,
+    string? FullName,
+    string? ParentCode,
+    string? GeneratedCode,
+    string? CreatedId = null
 );

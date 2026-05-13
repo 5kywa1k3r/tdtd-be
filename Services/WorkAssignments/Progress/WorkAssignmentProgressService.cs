@@ -1,4 +1,5 @@
 ﻿using MongoDB.Driver;
+using tdtd_be.Common.Errors;
 using tdtd_be.Common.Time;
 using tdtd_be.Data;
 using tdtd_be.Enum;
@@ -31,7 +32,7 @@ public sealed class WorkAssignmentProgressService : IWorkAssignmentProgressServi
             var work = await _ctx.Works
                 .Find(x => x.Id == assignment.WorkId && !x.IsDeleted)
                 .FirstOrDefaultAsync(ct)
-                ?? throw new InvalidOperationException("Không tìm thấy công việc gốc của phân việc.");
+                ?? throw AssignmentWorkNotFound(assignment);
 
             return await ComputeLeafProgressAsync(assignment, work, ct);
         }
@@ -46,7 +47,7 @@ public sealed class WorkAssignmentProgressService : IWorkAssignmentProgressServi
         var work = await _ctx.Works
             .Find(x => x.Id == assignment.WorkId && !x.IsDeleted)
             .FirstOrDefaultAsync(ct)
-            ?? throw new InvalidOperationException("Không tìm thấy công việc gốc của phân việc.");
+            ?? throw AssignmentWorkNotFound(assignment);
 
         return await ComputeLeafProgressAsync(assignment, work, ct);
     }
@@ -165,7 +166,9 @@ public sealed class WorkAssignmentProgressService : IWorkAssignmentProgressServi
         var assignment = await _ctx.WorkAssignments
             .Find(x => x.Id == workAssignmentId && !x.IsDeleted)
             .FirstOrDefaultAsync(ct)
-            ?? throw new InvalidOperationException("Không tìm thấy phân việc.");
+            ?? throw AppExceptionFactory.NotFound(
+                AppErrorCode.WORK_ASSIGNMENT_NOT_FOUND,
+                new { assignmentId = workAssignmentId });
 
         return await RecomputeSingleAsync(assignment, ct);
     }
@@ -273,7 +276,7 @@ public sealed class WorkAssignmentProgressService : IWorkAssignmentProgressServi
             else
             {
                 if (!workMap.TryGetValue(child.WorkId, out var work))
-                    throw new InvalidOperationException("Không tìm thấy công việc gốc của phân việc.");
+                    throw AssignmentWorkNotFound(child);
 
                 computed = await ComputeLeafProgressAsync(child, work, ct);
             }
@@ -593,6 +596,11 @@ public sealed class WorkAssignmentProgressService : IWorkAssignmentProgressServi
             _ => (null, null)
         };
     }
+
+    private static AppException AssignmentWorkNotFound(WorkAssignment assignment)
+        => AppExceptionFactory.NotFound(
+            AppErrorCode.WORK_ASSIGNMENT_WORK_NOT_FOUND,
+            new { assignmentId = assignment.Id, workId = assignment.WorkId });
 
     private sealed class WorstFacts
     {

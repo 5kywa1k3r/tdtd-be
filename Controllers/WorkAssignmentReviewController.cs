@@ -75,6 +75,26 @@ public sealed class WorkAssignmentReviewController : ControllerBase
         return Ok();
     }
 
+    [HttpPost("reports/{reportId}/deactivate")]
+    public async Task<IActionResult> DeactivateReport(
+        [FromRoute] string reportId,
+        [FromBody] ReportActiveRequest req,
+        CancellationToken ct)
+    {
+        await _service.DeactivateReportAsync(reportId, req, ct);
+        return Ok();
+    }
+
+    [HttpPost("reports/{reportId}/reactivate")]
+    public async Task<IActionResult> ReactivateReport(
+        [FromRoute] string reportId,
+        [FromBody] ReportActiveRequest req,
+        CancellationToken ct)
+    {
+        await _service.ReactivateReportAsync(reportId, req, ct);
+        return Ok();
+    }
+
     [HttpPost("assignments/{assignmentId}/evaluate")]
     [Authorize]
     public async Task<IActionResult> EvaluateAssignment(

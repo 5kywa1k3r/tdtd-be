@@ -29,6 +29,24 @@ public sealed class WorkReportFieldStatisticsController : ControllerBase
         return Ok(result);
     }
 
+    [HttpPost("text-concat")]
+    public async Task<ActionResult<FieldTextConcatResponse>> TextConcat(
+        [FromBody] FieldTextConcatRequest req,
+        CancellationToken ct)
+    {
+        var result = await _service.SearchTextConcatAsync(req, ct);
+        return Ok(result);
+    }
+
+    [HttpPost("text-concat/export")]
+    public async Task<IActionResult> ExportTextConcatCsv(
+        [FromBody] FieldTextConcatRequest req,
+        CancellationToken ct)
+    {
+        var file = await _service.ExportTextConcatCsvAsync(req, ct);
+        return File(file.Content, file.ContentType, file.FileName);
+    }
+
     [HttpPost("rebuild")]
     public async Task<ActionResult<RebuildFieldStatisticResponse>> Rebuild(
         [FromBody] RebuildFieldStatisticRequest req,

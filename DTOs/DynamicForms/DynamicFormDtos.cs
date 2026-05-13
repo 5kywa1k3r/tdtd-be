@@ -7,13 +7,17 @@ public sealed record DynamicFormRow(
     string Code,
     string Name,
     string? Description,
-    string[] Labels,
+    string[] TagCodes,
     int SchemaVersion,
     int VersionNo,
     bool IsActive,
     bool IsPublished,
+    string? CreatedByUserId,
     string CreatedByUsername,
-    DateTime CreatedAtUtc
+    DateTime CreatedAtUtc,
+    bool CanMutate,
+    bool CanClone,
+    bool CanViewByCloneGrant
 );
 
 public sealed record DynamicFormDetail(
@@ -21,11 +25,12 @@ public sealed record DynamicFormDetail(
     string Code,
     string Name,
     string? Description,
-    string[] Labels,
+    string[] TagCodes,
     int SchemaVersion,
     int VersionNo,
     bool IsActive,
     bool IsPublished,
+    string? CreatedByUserId,
     string CreatedByUsername,
     DateTime CreatedAtUtc,
     DateTime UpdatedAtUtc,
@@ -33,30 +38,56 @@ public sealed record DynamicFormDetail(
     string SectionsJson,
     string FieldsJson,
     string? ExcelBlockJson,
-    string? ExcelBlockDynamicExcelTemplateId
+    string BlocksJson,
+    string? ExcelBlockDynamicExcelTemplateId,
+    DateTime? StatisticConfigUpdatedAtUtc,
+    string? StatisticConfigUpdatedByUserId,
+    string? StatisticConfigUpdateMonthKey,
+    bool CanMutate,
+    bool CanClone,
+    bool CanViewByCloneGrant
 );
 
 public sealed record CreateDynamicFormReq(
     string? Code,
     string Name,
     string? Description,
-    string[]? Labels,
+    string[]? TagCodes,
     int? SchemaVersion,
     string? SectionsJson,
     string? FieldsJson,
     string? ExcelBlockJson,
+    string? BlocksJson,
     bool IsActive = true
 );
 
 public sealed record UpdateDynamicFormReq(
     string Name,
     string? Description,
-    string[]? Labels,
+    string[]? TagCodes,
     int? SchemaVersion,
     string? SectionsJson,
     string? FieldsJson,
     string? ExcelBlockJson,
+    string? BlocksJson,
     bool IsActive = true
+);
+
+public sealed record UpdateDynamicFormStatisticConfigReq(
+    string? FieldsJson,
+    string? ExcelBlockJson,
+    string? BlocksJson
+);
+
+public sealed record DynamicFormStatisticConfigUpdateResp(
+    DynamicFormDetail Template,
+    string StatisticRebuildJobId,
+    long QueuedReportCount,
+    DateTime? StatisticRebuildScheduledAtUtc,
+    bool StatisticRebuildRunsImmediately,
+    DateTime? StatisticConfigUpdatedAtUtc,
+    string? StatisticConfigUpdatedByUserId,
+    string? StatisticConfigUpdateMonthKey
 );
 
 public sealed record DynamicFormSearchReq(
@@ -66,7 +97,7 @@ public sealed record DynamicFormSearchReq(
     string? CreatedBy,
     DateTime? CreatedFromUtc,
     DateTime? CreatedToUtc,
-    string[]? Labels,
+    string[]? TagCodes,
     bool? IsActive,
     bool? IsPublished,
     int Page = 0,
@@ -85,21 +116,28 @@ public sealed record WrapDynamicExcelAsFormReq(
     string? Code,
     string? Name,
     string? Description,
-    string[]? Labels
+    string[]? TagCodes
+);
+
+public sealed record ImportDynamicExcelBlockReq(
+    string DynamicExcelTemplateId,
+    string? SectionId = null
 );
 
 public sealed record DynamicFormExcelBlockSnapshot(
     string DynamicExcelTemplateId,
     string DynamicExcelCode,
     string DynamicExcelName,
-    string RawWorkbookDataJson,
-    string SpecJson,
     DynamicExcelDataRectDto DataRect,
     int W,
     int H,
     string BlockId = "excel_block",
+    string? SectionId = null,
     string TableMode = "FIXED_GRID",
-    DynamicFormTableIndexMapItem[]? IndexMap = null
+    DynamicFormTableIndexMapItem[]? IndexMap = null,
+    string? ExcelSpecKind = null,
+    string TableKind = "NUMERIC_GRID",
+    string? RecordTableSpecJson = null
 );
 
 public sealed record DynamicFormTableIndexMapItem(

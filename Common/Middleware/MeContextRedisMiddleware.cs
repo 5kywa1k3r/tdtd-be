@@ -94,7 +94,8 @@ namespace tdtd_be.Common.Middleware
                 if (me is not null)
                 {
                     // ✅ chỉ cache khi đã dựng được me chuẩn
-                    await _cache.SetMeAsync(me);
+                    if (_cache is not null)
+                        await _cache.SetMeAsync(me);
                 }
             }
 
@@ -105,7 +106,8 @@ namespace tdtd_be.Common.Middleware
 
                 // claims fallback chỉ nên cache nếu muốn tối ưu,
                 // nhưng đây là "last resort" nên vẫn cache để giảm hit.
-                await _cache.SetMeAsync(me);
+                if (_cache is not null)
+                    await _cache.SetMeAsync(me);
             }
 
             // ===== Active check =====
@@ -134,6 +136,7 @@ namespace tdtd_be.Common.Middleware
                 _userContext.UnitTypeCodes = me.UnitTypeCodes;
                 _userContext.Roles = me.Roles ?? new List<string>();
                 _userContext.PositionCode = me.PositionCode;
+                _userContext.AccountKind = me.AccountKind;
             }
 
             await next(context);
@@ -152,16 +155,20 @@ namespace tdtd_be.Common.Middleware
                     x.UnitId,
                     x.Roles,
                     x.PositionCode,
+                    x.AccountKind,
                     x.IsDeleted
                 })
                 .FirstOrDefaultAsync();
 
             if (entity is null) return null;
-            if (entity.UnitId is null) return null;
 
-            var unit = await _units
-                .Find(u => u.Id == entity.UnitId)
-                .FirstOrDefaultAsync();
+            Unit? unit = null;
+            if (!string.IsNullOrWhiteSpace(entity.UnitId))
+            {
+                unit = await _units
+                    .Find(u => u.Id == entity.UnitId)
+                    .FirstOrDefaultAsync();
+            }
 
             // 2) active check sớm để khỏi resolve thừa
             // (middleware vẫn check lần cuối ở ngoài)
@@ -172,13 +179,14 @@ namespace tdtd_be.Common.Middleware
                     entity.Username,
                     entity.FullName,
                     new List<string>(),
-                    entity.UnitId,
-                    unit?.Symbol,
-                    unit.ShortName,
-                    unit.Code,
+                    entity.UnitId ?? "",
+                    unit?.Symbol ?? "",
+                    unit?.ShortName ?? "",
+                    unit?.Code ?? "",
                     entity.Roles ?? new List<string>(),
-                    entity.PositionCode,
-                    entity.IsDeleted
+                    entity.PositionCode ?? "",
+                    entity.IsDeleted,
+                    entity.AccountKind ?? ""
                 );
             }
 
@@ -198,13 +206,14 @@ namespace tdtd_be.Common.Middleware
                 entity.Username,
                 entity.FullName,
                 unitTypeCodes,
-                entity.UnitId,
-                unit.Symbol,
-                unit.ShortName,
-                unit.Code,
+                entity.UnitId ?? "",
+                unit?.Symbol ?? "",
+                unit?.ShortName ?? "",
+                unit?.Code ?? "",
                 entity.Roles ?? new List<string>(),
-                entity.PositionCode,
-                entity.IsDeleted
+                entity.PositionCode ?? "",
+                entity.IsDeleted,
+                entity.AccountKind ?? ""
             );
         }
 
@@ -235,7 +244,8 @@ namespace tdtd_be.Common.Middleware
                 unitCode: user.FindFirstValue("unitCode") ?? "",
                 positionCode: user.FindFirstValue("positionCode") ?? "",
                 roles: roles,
-                isDeleted: isDeleted
+                isDeleted: isDeleted,
+                accountKind: user.FindFirstValue("accountKind") ?? ""
             );
         }
     }

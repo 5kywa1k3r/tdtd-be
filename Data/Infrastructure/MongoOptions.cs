@@ -26,10 +26,15 @@
         public string MyReportTemplateListDocRoleCollection { get; set; } = "my_report_template_list_doc_roles";
         public string MyReportPeriodListDocRoleCollection { get; set; } = "my_report_period_list_doc_roles";
         public string ReviewReportListDocRoleCollection { get; set; } = "review_report_list_doc_roles";
+        public string DocRoleReadModelProjectionRetryJobCollection { get; set; } = "docrole_read_model_projection_retry_jobs";
         public string WorkAssignmentReportCollection { get; set; } = "work_assignment_report";
         public string WorkReportPeriodCollection { get; set; } = "work_report_periods";
         public string WorkAssignmentReportLogCollection { get; set; } = "work_assignment_report_logs";
+        public string WorkAssignmentHandoverHistoryCollection { get; set; } = "work_assignment_handover_histories";
         public string WorkStatusOperationLogCollection { get; set; } = "work_status_operation_logs";
+        public string DynamicFormCloneRequestCollection { get; set; } = "dynamic_form_clone_requests";
+        public string UserActionLogCollection { get; set; } = "user_action_logs";
+        public string UserActionLogRetryJobCollection { get; set; } = "user_action_log_retry_jobs";
         public string WorkAssignmentQueueCollection { get; set; } = "work_assignment_queue";
         public string WorkAssignmentEvaluationLogCollection { get; set; } = "work_assignment_evaluation_logs";
         public string WorkAssignmentMaterializeJobCollection { get; set; } = "work_assignment_materialize_jobs";
@@ -40,5 +45,7 @@
         public string WorkReportTableStatAggregateCollection { get; set; } = "work_report_table_stat_aggregates";
         public string WorkReportFieldStatValueCollection { get; set; } = "work_report_field_stat_values";
         public string WorkReportFieldStatAggregateCollection { get; set; } = "work_report_field_stat_aggregates";
+        public string WorkReportStatisticRebuildJobCollection { get; set; } = "work_report_statistic_rebuild_jobs";
+        public string NotificationCollection { get; set; } = "notifications";
     }
 }

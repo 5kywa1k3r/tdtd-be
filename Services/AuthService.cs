@@ -2,6 +2,7 @@
 using Microsoft.Extensions.Options;
 using MongoDB.Driver;
 using tdtd_be.Common.Cache;
+using tdtd_be.Common.Errors;
 using tdtd_be.Data;
 using tdtd_be.Data.Infrastructure;
 using tdtd_be.DTOs.Auth;
@@ -15,20 +16,20 @@ namespace tdtd_be.Services
         private readonly IOptions<MongoOptions> _opt;
         private readonly JwtService _jwt;
         private readonly RedisUserCache _cache;
-
-        // Khuyến nghị: inject IPasswordHasher<AppUser> thay vì new, nhưng giữ như bệ hạ đang dùng cũng chạy
-        private readonly PasswordHasher<AppUser> _hasher = new();
+        private readonly IPasswordHasher<AppUser> _hasher;
 
         public AuthService(
             MongoDbContext ctx,
             IOptions<MongoOptions> opt,
             JwtService jwt,
-            RedisUserCache cache)
+            RedisUserCache cache,
+            IPasswordHasher<AppUser> hasher)
         {
             _ctx = ctx;
             _opt = opt;
             _jwt = jwt;
             _cache = cache;
+            _hasher = hasher;
         }
 
         private IMongoCollection<AppUser> Users => _ctx.Users;
@@ -38,7 +39,7 @@ namespace tdtd_be.Services
         {
             var u = input?.Trim();
             if (string.IsNullOrWhiteSpace(u))
-                throw new InvalidOperationException("Sai tài khoản hoặc mật khẩu.");
+                throw AuthInvalidLogin("username");
             return u.ToLowerInvariant();
         }
 
@@ -75,14 +76,15 @@ namespace tdtd_be.Services
             var key = NormalizeUsername(req.Username);
 
             var user = await Users.Find(x => x.Username == key && !x.IsDeleted).FirstOrDefaultAsync(ct);
-            if (user is null) throw new InvalidOperationException("Sai tài khoản hoặc mật khẩu.");
+            if (user is null)
+                throw AuthInvalidLogin("username");
 
             var vr = _hasher.VerifyHashedPassword(user, user.PasswordHash, req.Password);
             if (vr == PasswordVerificationResult.Failed)
-                throw new InvalidOperationException("Sai tài khoản hoặc mật khẩu.");
+                throw AuthInvalidLogin("password");
 
             if (user.IsDeleted)
-                throw new InvalidOperationException("Tài khoản đang bị khóa.");
+                throw AuthLocked(user.Id);
 
             return await IssueTokensAsync(user, ct);
         }
@@ -90,17 +92,19 @@ namespace tdtd_be.Services
         public async Task<(AuthResponse resp, string refreshRaw)> RefreshAsync(string refreshRaw, CancellationToken ct)
         {
             if (string.IsNullOrWhiteSpace(refreshRaw))
-                throw new InvalidOperationException("Refresh token không hợp lệ hoặc đã hết hạn.");
+                throw AuthRefreshTokenInvalid("missing");
 
             var hash = _jwt.Sha256(refreshRaw);
 
             var tokenDoc = await RefreshTokens.Find(x => x.TokenHash == hash).FirstOrDefaultAsync(ct);
             if (tokenDoc is null || !tokenDoc.IsActive)
-                throw new InvalidOperationException("Refresh token không hợp lệ hoặc đã hết hạn.");
+                throw AuthRefreshTokenInvalid(tokenDoc is null ? "notFound" : "inactive");
 
             var user = await Users.Find(x => x.Id == tokenDoc.UserId).FirstOrDefaultAsync(ct);
-            if (user is null) throw new InvalidOperationException("User không tồn tại.");
-            if (user.IsDeleted) throw new InvalidOperationException("Tài khoản đang bị khóa.");
+            if (user is null)
+                throw AppExceptionFactory.NotFound(AppErrorCode.AUTH_USER_NOT_FOUND, new { userId = tokenDoc.UserId });
+            if (user.IsDeleted)
+                throw AuthLocked(user.Id);
 
             // rotation: revoke old + issue new
             var newRefreshRaw = _jwt.CreateRefreshTokenRaw();
@@ -167,7 +171,8 @@ namespace tdtd_be.Services
 
         private async Task<(AuthResponse resp, string refreshRaw)> IssueTokensAsync(AppUser user, CancellationToken ct)
         {
-            if (user.IsDeleted) throw new InvalidOperationException("Tài khoản đang bị khóa.");
+            if (user.IsDeleted)
+                throw AuthLocked(user.Id);
 
             // create refresh
             var refreshRaw = _jwt.CreateRefreshTokenRaw();
@@ -218,8 +223,18 @@ namespace tdtd_be.Services
                 unitCode: unitCode ?? "",     
                 roles: u.Roles ?? new List<string>(),
                 positionCode: u.PositionCode ?? "",
-                isDeleted: u.IsDeleted
+                isDeleted: u.IsDeleted,
+                accountKind: u.AccountKind ?? ""
             );
         }
+
+        private static AppException AuthInvalidLogin(string field)
+            => AppExceptionFactory.Unauthorized(AppErrorCode.AUTH_LOGIN_INVALID, new { field });
+
+        private static AppException AuthRefreshTokenInvalid(string reason)
+            => AppExceptionFactory.Unauthorized(AppErrorCode.AUTH_REFRESH_TOKEN_INVALID, new { reason });
+
+        private static AppException AuthLocked(string? userId)
+            => AppExceptionFactory.Forbidden(AppErrorCode.AUTH_ACCOUNT_LOCKED, new { userId });
     }
 }

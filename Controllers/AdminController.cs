@@ -1,6 +1,8 @@
 ﻿using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.Mvc;
 using MongoDB.Driver;
+using System.Security.Cryptography;
+using System.Text;
 using tdtd_be.Data;
 using tdtd_be.Models;
 
@@ -10,23 +12,57 @@ namespace tdtd_be.Controllers
     [Route("api/system")]
     public class SystemBootstrapController : ControllerBase
     {
+        private const string BootstrapKeyHeaderName = "X-System-Bootstrap-Key";
+
         private readonly MongoDbContext _ctx;
         private readonly IPasswordHasher<AppUser> _hasher;
+        private readonly IConfiguration _cfg;
 
         public SystemBootstrapController(
             MongoDbContext ctx,
-            IPasswordHasher<AppUser> hasher)
+            IPasswordHasher<AppUser> hasher,
+            IConfiguration cfg)
         {
             _ctx = ctx;
             _hasher = hasher;
+            _cfg = cfg;
         }
-        [HttpPost("bootstrap")]
-        public async Task<IActionResult> Bootstrap(CancellationToken ct)
+
+        private IActionResult? ValidateBootstrapKey(string? provided)
         {
+            var expected = _cfg["SystemBootstrap:Key"];
+            if (string.IsNullOrWhiteSpace(expected))
+                return StatusCode(StatusCodes.Status503ServiceUnavailable, new
+                {
+                    message = "System bootstrap key is not configured."
+                });
+
+            if (string.IsNullOrWhiteSpace(provided) || !FixedTimeEquals(provided, expected))
+                return Unauthorized(new { message = "Invalid system bootstrap key." });
+
+            return null;
+        }
+
+        private static bool FixedTimeEquals(string left, string right)
+        {
+            var leftBytes = Encoding.UTF8.GetBytes(left);
+            var rightBytes = Encoding.UTF8.GetBytes(right);
+            return CryptographicOperations.FixedTimeEquals(leftBytes, rightBytes);
+        }
+
+        [HttpPost("bootstrap")]
+        public async Task<IActionResult> Bootstrap(
+            [FromHeader(Name = BootstrapKeyHeaderName)] string? bootstrapKey,
+            CancellationToken ct)
+        {
+            var keyError = ValidateBootstrapKey(bootstrapKey);
+            if (keyError is not null) return keyError;
+
             var now = DateTime.UtcNow;
             const string ROOT_CODE = "100";
             const string TYPE0_CODE = "TYPE0";
             const string ADMIN_USER = "admin";
+            const string ADMIN_FULL_NAME = "Quản trị viên hệ thống";
             const string DEFAULT_ADMIN_PASSWORD = "Admin@123";
 
             bool rootCreated = false;
@@ -111,7 +147,7 @@ namespace tdtd_be.Controllers
             // =========================
             var type0Update = Builders<UnitType>.Update
                 .SetOnInsert(x => x.Code, TYPE0_CODE)
-                .Set(x => x.Name, "System Default (Full Access)")
+                .Set(x => x.Name, "Quản trị hệ thống (toàn quyền)")
                 .Set(x => x.IsDeleted, false)
                 .Set(x => x.UpdatedAtUtc, now)
                 .SetOnInsert(x => x.CreatedAtUtc, now)
@@ -135,10 +171,11 @@ namespace tdtd_be.Controllers
                 admin = new AppUser
                 {
                     Username = ADMIN_USER,
-                    FullName = "System Administrator",
+                    FullName = ADMIN_FULL_NAME,
                     UnitId = root.Id,
                     PositionCode = null,
-                    Roles = new List<string> { "ADMIN" },
+                    Roles = new List<string> { "ADMIN", "SYSTEM_ADMIN" },
+                    AccountKind = "SYSTEM_ADMIN",
                     IsDeleted = false,
                     CreatedAtUtc = now,
                     UpdatedAtUtc = now
@@ -155,12 +192,14 @@ namespace tdtd_be.Controllers
                 // đảm bảo có ADMIN role
                 var roles = admin.Roles ?? new List<string>();
                 if (!roles.Contains("ADMIN")) roles.Add("ADMIN");
+                if (!roles.Contains("SYSTEM_ADMIN")) roles.Add("SYSTEM_ADMIN");
 
                 var adminUpdate = Builders<AppUser>.Update
-                    .Set(x => x.FullName, "System Administrator")
+                    .Set(x => x.FullName, ADMIN_FULL_NAME)
                     .Set(x => x.UnitId, root.Id)
                     .Set(x => x.PositionCode, null)
                     .Set(x => x.Roles, roles)
+                    .Set(x => x.AccountKind, "SYSTEM_ADMIN")
                     .Set(x => x.IsDeleted, false)
                     .Set(x => x.UpdatedAtUtc, now);
 

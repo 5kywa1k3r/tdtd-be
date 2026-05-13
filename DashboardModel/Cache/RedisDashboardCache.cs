@@ -1,5 +1,6 @@
 ﻿using StackExchange.Redis;
 using System.Text.Json;
+using tdtd_be.Common.Errors;
 
 namespace tdtd_be.Common.Cache
 {
@@ -77,9 +78,10 @@ end";
             TimeSpan? ttl = null)
         {
             if (string.IsNullOrWhiteSpace(cacheKey))
-                throw new ArgumentException("cacheKey không được trống.", nameof(cacheKey));
+                throw AppExceptionFactory.BadRequest(AppErrorCode.DASHBOARD_CACHE_KEY_REQUIRED, new { field = "cacheKey" });
 
-            ArgumentNullException.ThrowIfNull(factory);
+            if (factory is null)
+                throw AppExceptionFactory.BadRequest(AppErrorCode.COMMON_VALIDATION_FAILED, new { field = "factory" });
 
             if (!forceRefresh)
             {

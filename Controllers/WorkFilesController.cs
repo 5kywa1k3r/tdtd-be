@@ -3,6 +3,7 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Options;
 using MongoDB.Driver;
 using tdtd_be.Common.Auth;
+using tdtd_be.Common.Errors;
 using tdtd_be.Data;
 using tdtd_be.Models;
 using tdtd_be.Services.Common;
@@ -22,7 +23,6 @@ public sealed class WorksFilesController : ControllerBase
     private readonly MongoDbContext _ctx;
     private readonly MeAccessor _me;
     private readonly UploadOptions _opt;
-    private readonly WorkServices.IWorkService _workService; // không bắt buộc dùng
     private readonly IWorkPermissionService _permission;
 
     public WorksFilesController(
@@ -46,7 +46,7 @@ public sealed class WorksFilesController : ControllerBase
             .FirstOrDefaultAsync(ct);
 
         if (work is null)
-            throw new KeyNotFoundException("Work not found.");
+            throw AppExceptionFactory.NotFound(AppErrorCode.WORK_NOT_FOUND, new { workId });
 
         return work;
     }
@@ -98,10 +98,10 @@ public sealed class WorksFilesController : ControllerBase
         await _permission.EnsureCanUpdateRootAsync(workId, me.Id, ct);
 
         if (string.IsNullOrWhiteSpace(req.FileName))
-            return BadRequest("FileName is required.");
+            throw AppExceptionFactory.BadRequest(AppErrorCode.UPLOAD_FILE_NAME_REQUIRED);
 
         if (req.Size <= 0)
-            return BadRequest("Size is invalid.");
+            throw AppExceptionFactory.BadRequest(AppErrorCode.UPLOAD_SIZE_INVALID, new { req.Size });
 
         var uploadToken = _tokens.Issue(
             userId: me.Id,
@@ -137,7 +137,7 @@ public sealed class WorksFilesController : ControllerBase
         await _permission.EnsureCanUpdateRootAsync(workId, me.Id, ct);
 
         if (string.IsNullOrWhiteSpace(fileId))
-            return BadRequest("fileId is required.");
+            throw AppExceptionFactory.BadRequest(AppErrorCode.UPLOAD_FILE_ID_REQUIRED);
 
         var filter = Builders<FileDoc>.Filter.And(
             Builders<FileDoc>.Filter.Eq(x => x.Id, fileId),
@@ -154,7 +154,7 @@ public sealed class WorksFilesController : ControllerBase
         var res = await _ctx.Files.UpdateOneAsync(filter, update, cancellationToken: ct);
 
         if (res.MatchedCount == 0)
-            return NotFound(new { ok = false, reason = "file-not-found" });
+            throw AppExceptionFactory.NotFound(AppErrorCode.UPLOAD_FILE_NOT_FOUND, new { workId, fileId });
 
         return Ok(new { ok = true });
     }

@@ -1,5 +1,6 @@
 using MongoDB.Driver;
 using tdtd_be.Common.Auth;
+using tdtd_be.Common.Errors;
 using tdtd_be.Data;
 using tdtd_be.DTOs.Positions;
 using tdtd_be.Models;
@@ -12,7 +13,12 @@ public interface IPositionAdminService
     Task<PositionResponse> UpdateAsync(string id, UpdatePositionRequest req, CancellationToken ct);
     Task DeleteAsync(string id, CancellationToken ct);
     Task<IReadOnlyList<PositionResponse>> ListAsync(bool? isDeleted, string? unitTypeCode, CancellationToken ct);
-    Task ValidatePositionForUnitTypeAsync(string? positionCode, string? unitTypeCode, CancellationToken ct);
+    Task ValidatePositionForUnitTypeAsync(
+        string? positionCode,
+        string? unitTypeCode,
+        CancellationToken ct,
+        string? unitId = null,
+        string? excludeUserId = null);
 }
 
 public sealed class PositionAdminService : IPositionAdminService
@@ -40,7 +46,7 @@ public sealed class PositionAdminService : IPositionAdminService
             .AnyAsync(ct);
 
         if (exists)
-            throw new InvalidOperationException("Position code already exists.");
+            throw AppExceptionFactory.Create(AppErrorCode.POSITION_CODE_DUPLICATE, new { code });
 
         var now = DateTime.UtcNow;
         var doc = new Position
@@ -88,7 +94,7 @@ public sealed class PositionAdminService : IPositionAdminService
             ct);
 
         if (after is null)
-            throw new InvalidOperationException("Position not found.");
+            throw PositionNotFound(id);
 
         return ToResp(after);
     }
@@ -112,7 +118,7 @@ public sealed class PositionAdminService : IPositionAdminService
             cancellationToken: ct);
 
         if (rs.MatchedCount == 0)
-            throw new InvalidOperationException("Position not found.");
+            throw PositionNotFound(id);
     }
 
     public async Task<IReadOnlyList<PositionResponse>> ListAsync(bool? isDeleted, string? unitTypeCode, CancellationToken ct)
@@ -135,28 +141,82 @@ public sealed class PositionAdminService : IPositionAdminService
         return list.Select(ToResp).ToList();
     }
 
-    public async Task ValidatePositionForUnitTypeAsync(string? positionCode, string? unitTypeCode, CancellationToken ct)
+    public async Task ValidatePositionForUnitTypeAsync(
+        string? positionCode,
+        string? unitTypeCode,
+        CancellationToken ct,
+        string? unitId = null,
+        string? excludeUserId = null)
     {
         var pc = NormalizeOptionalCode(positionCode);
         if (string.IsNullOrWhiteSpace(pc))
-            throw new InvalidOperationException("PositionCode is required.");
+            throw AppExceptionFactory.BadRequest(AppErrorCode.POSITION_CODE_REQUIRED, new { field = "positionCode" });
 
         var utc = NormalizeOptionalCode(unitTypeCode);
         if (string.IsNullOrWhiteSpace(utc))
-            throw new InvalidOperationException("Target unit has no primaryUnitTypeCode.");
+            throw AppExceptionFactory.BadRequest(AppErrorCode.POSITION_UNIT_TYPE_REQUIRED, new { field = "unitTypeCode", unitId });
+
+        var unitType = await _ctx.UnitTypes
+            .Find(x => x.Code == utc && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct);
+
+        var rules = unitType?.PositionRules ?? new();
+        if (rules.Count > 0)
+        {
+            var rule = rules.FirstOrDefault(x =>
+                x.IsEnabled &&
+                string.Equals(x.PositionCode, pc, StringComparison.OrdinalIgnoreCase));
+
+            if (rule is null)
+                throw InvalidPositionForUnitType(pc, utc, unitId, "ruleMissing");
+
+            var positionExists = await _ctx.Positions
+                .Find(x => x.Code == pc && !x.IsDeleted)
+                .AnyAsync(ct);
+            if (!positionExists)
+                throw InvalidPositionForUnitType(pc, utc, unitId, "positionMissing");
+
+            await EnsurePositionQuotaAsync(pc, unitId, excludeUserId, rule.MaxUsersPerUnit, ct);
+            return;
+        }
 
         var exists = await _ctx.Positions
             .Find(x => x.Code == pc && !x.IsDeleted && x.UnitTypeCodes.Contains(utc))
             .AnyAsync(ct);
 
         if (!exists)
-            throw new InvalidOperationException("PositionCode is invalid for target unit type.");
+            throw InvalidPositionForUnitType(pc, utc, unitId, "notAllowed");
+
+        await EnsurePositionQuotaAsync(pc, unitId, excludeUserId, null, ct);
+    }
+
+    private async Task EnsurePositionQuotaAsync(
+        string positionCode,
+        string? unitId,
+        string? excludeUserId,
+        int? maxUsersPerUnit,
+        CancellationToken ct)
+    {
+        if (!maxUsersPerUnit.HasValue || string.IsNullOrWhiteSpace(unitId))
+            return;
+
+        var fb = Builders<AppUser>.Filter;
+        var filter = fb.Eq(x => x.UnitId, unitId)
+                     & fb.Eq(x => x.PositionCode, positionCode)
+                     & fb.Eq(x => x.IsDeleted, false);
+
+        if (!string.IsNullOrWhiteSpace(excludeUserId))
+            filter &= fb.Ne(x => x.Id, excludeUserId);
+
+        var used = await _ctx.Users.CountDocumentsAsync(filter, cancellationToken: ct);
+        if (used >= maxUsersPerUnit.Value)
+            throw AppExceptionFactory.Create(AppErrorCode.POSITION_QUOTA_EXCEEDED, new { positionCode, unitId, maxUsersPerUnit, used });
     }
 
     private async Task EnsureUnitTypesExistAsync(IReadOnlyList<string> codes, CancellationToken ct)
     {
         if (codes.Count == 0)
-            throw new InvalidOperationException("At least one unitTypeCode is required.");
+            throw AppExceptionFactory.BadRequest(AppErrorCode.POSITION_UNIT_TYPE_CODES_REQUIRED, new { field = "unitTypeCodes" });
 
         var found = await _ctx.UnitTypes
             .Find(x => codes.Contains(x.Code) && !x.IsDeleted)
@@ -165,7 +225,7 @@ public sealed class PositionAdminService : IPositionAdminService
 
         var missing = codes.Except(found, StringComparer.OrdinalIgnoreCase).ToList();
         if (missing.Count > 0)
-            throw new InvalidOperationException($"UnitType not found: {string.Join(", ", missing)}");
+            throw AppExceptionFactory.NotFound(AppErrorCode.UNIT_TYPE_NOT_FOUND, new { codes = missing });
     }
 
     private static PositionResponse ToResp(Position p) => new(
@@ -185,7 +245,7 @@ public sealed class PositionAdminService : IPositionAdminService
     {
         var s = (code ?? "").Trim().ToUpperInvariant();
         if (string.IsNullOrWhiteSpace(s))
-            throw new InvalidOperationException("Code is required.");
+            throw AppExceptionFactory.BadRequest(AppErrorCode.POSITION_CODE_REQUIRED, new { field = "code" });
         return s;
     }
 
@@ -202,4 +262,10 @@ public sealed class PositionAdminService : IPositionAdminService
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .Select(x => x!)
             .ToList();
+
+    private static AppException PositionNotFound(string? id)
+        => AppExceptionFactory.NotFound(AppErrorCode.POSITION_NOT_FOUND, new { id });
+
+    private static AppException InvalidPositionForUnitType(string positionCode, string unitTypeCode, string? unitId, string reason)
+        => AppExceptionFactory.BadRequest(AppErrorCode.POSITION_INVALID_FOR_UNIT_TYPE, new { positionCode, unitTypeCode, unitId, reason });
 }

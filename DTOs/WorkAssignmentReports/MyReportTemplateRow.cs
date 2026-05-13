@@ -2,7 +2,7 @@
 
 /// <summary>
 /// Dòng dữ liệu cho màn danh sách ngoài cùng của user trong 1 Work,
-/// được nhóm theo DynamicExcelId (template runtime hiện hành).
+/// được nhóm theo DynamicFormTemplateId (template runtime hiện hành).
 /// 
 /// Đây KHÔNG phải report record.
 /// Đây là "nhóm biểu mẫu báo cáo" mà user hiện tại đang phải xử lý.
@@ -10,9 +10,14 @@
 public sealed class MyReportTemplateRow
 {
     /// <summary>
-    /// Id template (DynamicExcel).
+    public string DynamicFormTemplateId { get; set; } = string.Empty;
+    public string DynamicFormTemplateCode { get; set; } = string.Empty;
+    public string DynamicFormTemplateName { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Legacy/table-block source id, kept only for old rows and workbook preview fallback.
     /// </summary>
-    public string DynamicExcelId { get; set; } = string.Empty;
+    public string? DynamicExcelId { get; set; }
 
     /// <summary>
     /// Code template.

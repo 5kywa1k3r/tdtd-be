@@ -1,6 +1,7 @@
 ﻿using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using System.Security.Claims;
+using tdtd_be.Common.Errors;
 using tdtd_be.DTOs.WorkAssignmentReports;
 using tdtd_be.Services.WorkAssignmentReports;
 
@@ -26,11 +27,11 @@ public sealed class WorkAssignmentReportsController : ControllerBase
         return Ok(rs);
     }
 
-    [HttpGet("works/{workId}/my-report-templates/{dynamicExcelId}")]
-    public async Task<IActionResult> GetMyReportTemplateDetail([FromRoute] string workId, [FromRoute] string dynamicExcelId, CancellationToken ct)
+    [HttpGet("works/{workId}/my-report-templates/{dynamicFormTemplateId}")]
+    public async Task<IActionResult> GetMyReportTemplateDetail([FromRoute] string workId, [FromRoute] string dynamicFormTemplateId, CancellationToken ct)
     {
         var actorUserId = GetActorUserId();
-        var rs = await _service.GetMyReportTemplateDetailAsync(workId, dynamicExcelId, actorUserId, ct);
+        var rs = await _service.GetMyReportTemplateDetailAsync(workId, dynamicFormTemplateId, actorUserId, ct);
         return Ok(rs);
     }
 
@@ -90,6 +91,14 @@ public sealed class WorkAssignmentReportsController : ControllerBase
         return Ok(rs);
     }
 
+    [HttpPost("work-assignment-reports/{id}/draft/apply-dynamic-form-aggregate")]
+    public async Task<IActionResult> ApplyDynamicFormAggregateDraft([FromRoute] string id, [FromBody] ApplyDynamicFormAggregateDraftRequest req, CancellationToken ct)
+    {
+        var actorUserId = GetActorUserId();
+        var rs = await _service.ApplyDynamicFormAggregateDraftAsync(id, req, actorUserId, ct);
+        return Ok(rs);
+    }
+
     [HttpPost("work-assignment-reports/{id}/submit")]
     public async Task<IActionResult> Submit([FromRoute] string id, [FromBody] SubmitWorkAssignmentReportRequest req, CancellationToken ct)
     {
@@ -123,5 +132,5 @@ public sealed class WorkAssignmentReportsController : ControllerBase
     }
 
     private string GetActorUserId()
-        => User.FindFirstValue("sub") ?? throw new UnauthorizedAccessException("Không xác định được người dùng.");
+        => User.FindFirstValue("sub") ?? throw AppExceptionFactory.Unauthorized();
 }

@@ -27,6 +27,14 @@ public sealed class DynamicExcelTemplate : BaseEntity
     [BsonElement("createdByUsername")]
     public string CreatedByUsername { get; set; } = default!;
 
+    // NUMERIC_GRID: legacy dataRect/values1D decimal grid.
+    // RECORD_TABLE: typed record schema for raw-data consolidation.
+    [BsonElement("tableKind")]
+    public string TableKind { get; set; } = DynamicExcelTableKind.NumericGrid;
+
+    [BsonElement("recordTableSpecJson")]
+    public string? RecordTableSpecJson { get; set; }
+
     // FortuneSheet full JSON
     [BsonElement("rawWorkbookDataJson")]
     public string RawWorkbookDataJson { get; set; } = default!;
@@ -53,4 +61,10 @@ public sealed class DynamicExcelTemplate : BaseEntity
 
     [BsonElement("h")]
     public int H { get; set; }
+}
+
+public static class DynamicExcelTableKind
+{
+    public const string NumericGrid = "NUMERIC_GRID";
+    public const string RecordTable = "RECORD_TABLE";
 }

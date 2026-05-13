@@ -4,6 +4,7 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using System.Globalization;
 using System.Linq;
+using tdtd_be.Common.Errors;
 using tdtd_be.Common.Time;
 using tdtd_be.Data;
 using tdtd_be.Models;
@@ -41,10 +42,12 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
     public async Task EnqueueOrTouchAsync(WorkAssignment assignment, string actorUserId, CancellationToken ct = default)
     {
         if (assignment is null)
-            throw new ArgumentNullException(nameof(assignment));
+            throw AppExceptionFactory.BadRequest(AppErrorCode.WORK_ASSIGNMENT_NODE_INVALID);
 
         if (string.IsNullOrWhiteSpace(assignment.Id))
-            throw new InvalidOperationException("Assignment chưa có Id.");
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_ID_REQUIRED,
+                new { assignment.WorkId });
 
         var now = DateTime.UtcNow;
 
@@ -85,7 +88,9 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
         var assignment = await _ctx.WorkAssignments
             .Find(x => x.Id == workAssignmentId && !x.IsDeleted)
             .FirstOrDefaultAsync(ct)
-            ?? throw new InvalidOperationException("Không tìm thấy assignment.");
+            ?? throw AppExceptionFactory.NotFound(
+                AppErrorCode.WORK_ASSIGNMENT_NOT_FOUND,
+                new { assignmentId = workAssignmentId });
 
         await EnqueueOrTouchAsync(assignment, actorUserId, ct);
     }
@@ -239,7 +244,7 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
         var work = await _ctx.Works
             .Find(x => x.Id == assignment.WorkId && !x.IsDeleted)
             .FirstOrDefaultAsync(ct)
-            ?? throw new InvalidOperationException("Không tìm thấy work của assignment.");
+            ?? throw AssignmentWorkNotFound(assignment);
 
         var bindings = await _ctx.WorkTemplateAssignees
             .Find(x =>
@@ -303,7 +308,7 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
                     DateTimeStyles.None,
                     out var periodDate))
                 {
-                    throw new InvalidOperationException($"PeriodKey không hợp lệ: {item.PeriodKey}");
+                    throw InvalidPeriodKey(item.PeriodKey, assignment.Id);
                 }
 
                 periodDate = periodDate.Date;
@@ -719,4 +724,14 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
         log.DurationMs = (long)(completedAtUtc - startedAtUtc).TotalMilliseconds;
         await _statusLog.WriteAsync(log, ct);
     }
+
+    private static AppException AssignmentWorkNotFound(WorkAssignment assignment)
+        => AppExceptionFactory.NotFound(
+            AppErrorCode.WORK_ASSIGNMENT_WORK_NOT_FOUND,
+            new { assignmentId = assignment.Id, workId = assignment.WorkId });
+
+    private static AppException InvalidPeriodKey(string periodKey, string? assignmentId)
+        => AppExceptionFactory.BadRequest(
+            AppErrorCode.WORK_ASSIGNMENT_PERIOD_KEY_INVALID,
+            new { assignmentId, periodKey });
 }

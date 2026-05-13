@@ -1,4 +1,5 @@
-﻿using MongoDB.Driver;
+using MongoDB.Driver;
+using tdtd_be.Common.Errors;
 using tdtd_be.Data;
 using tdtd_be.Models;
 
@@ -21,9 +22,9 @@ public sealed class WorkCodeGenerator : IWorkCodeGenerator
     public async Task<string> GenerateAsync(string username, int year, CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(username))
-            throw new InvalidOperationException("Username is required for autoCode.");
+            throw AppExceptionFactory.BadRequest(AppErrorCode.WORK_AUTOCODE_USERNAME_REQUIRED);
 
-        var user = username.Trim(); // yêu cầu: không normalize
+        var user = username.Trim();
         var key = $"work_autocode:{user}:{year}";
 
         var update = Builders<CounterDoc>.Update
@@ -44,7 +45,6 @@ public sealed class WorkCodeGenerator : IWorkCodeGenerator
             cancellationToken: ct);
 
         var seq = doc.Seq;
-        // username + year + 000001 (6 digits)
         return $"{user}{year}{seq:000000}";
     }
 }

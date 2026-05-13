@@ -28,9 +28,12 @@ public sealed class DashboardMindMapCursorResult<T>
 public sealed class DashboardMindMapTemplateGroupDto
 {
     public string AssignmentId { get; set; } = string.Empty;
-    public string DynamicExcelId { get; set; } = string.Empty;
-    public string DynamicExcelCode { get; set; } = string.Empty;
-    public string DynamicExcelName { get; set; } = string.Empty;
+    public string DynamicFormTemplateId { get; set; } = string.Empty;
+    public string DynamicFormTemplateCode { get; set; } = string.Empty;
+    public string DynamicFormTemplateName { get; set; } = string.Empty;
+    public string? DynamicExcelId { get; set; }
+    public string? DynamicExcelCode { get; set; }
+    public string? DynamicExcelName { get; set; }
     public int UserCount { get; set; }
     public int ReportCount { get; set; }
     public int OverdueCount { get; set; }
@@ -41,7 +44,10 @@ public sealed class DashboardMindMapTemplateGroupDto
 public sealed class DashboardMindMapTemplateUserDto
 {
     public string AssignmentId { get; set; } = string.Empty;
-    public string DynamicExcelId { get; set; } = string.Empty;
+    public string DynamicFormTemplateId { get; set; } = string.Empty;
+    public string DynamicFormTemplateCode { get; set; } = string.Empty;
+    public string DynamicFormTemplateName { get; set; } = string.Empty;
+    public string? DynamicExcelId { get; set; }
     public string AssigneeUserId { get; set; } = string.Empty;
     public string AssigneeUsername { get; set; } = string.Empty;
     public string AssigneeFullName { get; set; } = string.Empty;
@@ -103,6 +109,17 @@ public sealed class DashboardMindMapFieldMetricReportsSearchRequest : DashboardM
     public string? DynamicFormTemplateId { get; set; }
     public string FieldId { get; set; } = string.Empty;
     public string? BucketKey { get; set; }
+    public int? ReportStatus { get; set; }
+    public int Page { get; set; } = 0;
+    public int PageSize { get; set; } = 20;
+}
+
+public sealed class DashboardMindMapLabelReportsSearchRequest : DashboardMindMapScopeRequest
+{
+    public string? DynamicFormTemplateId { get; set; }
+    public string? DynamicExcelTemplateId { get; set; }
+    public string? BlockId { get; set; }
+    public string LabelCode { get; set; } = string.Empty;
     public int? ReportStatus { get; set; }
     public int Page { get; set; } = 0;
     public int PageSize { get; set; } = 20;
@@ -314,6 +331,36 @@ public sealed class DashboardMindMapFieldMetricReportRowDto
     public long FalseCount { get; set; }
     public DateTime? LatestDateUtc { get; set; }
     public List<string> SourceKeys { get; set; } = new();
+    public DateTime? SubmittedAtUtc { get; set; }
+    public DateTime? ApprovedAtUtc { get; set; }
+}
+
+public sealed class DashboardMindMapLabelReportRowDto
+{
+    public string WorkAssignmentReportId { get; set; } = string.Empty;
+    public string WorkReportPeriodId { get; set; } = string.Empty;
+    public string AssignmentId { get; set; } = string.Empty;
+    public string? AssignmentCode { get; set; }
+    public string AssignmentName { get; set; } = string.Empty;
+    public string? AssigneeUserId { get; set; }
+    public string? AssigneeFullName { get; set; }
+    public string? AssigneeUsername { get; set; }
+    public string? UnitId { get; set; }
+    public string? UnitLabel { get; set; }
+    public string PeriodKey { get; set; } = string.Empty;
+    public string PeriodInstanceKey { get; set; } = string.Empty;
+    public string PeriodKind { get; set; } = string.Empty;
+    public int ReportStatus { get; set; }
+    public string? DynamicFormTemplateId { get; set; }
+    public string? DynamicFormTemplateName { get; set; }
+    public string? DynamicExcelTemplateId { get; set; }
+    public string LabelCode { get; set; } = string.Empty;
+    public string? LabelName { get; set; }
+    public string? LabelColor { get; set; }
+    public long RowCount { get; set; }
+    public List<string> BlockIds { get; set; } = new();
+    public List<string> RowKeys { get; set; } = new();
+    public List<string> Sources { get; set; } = new();
     public DateTime? SubmittedAtUtc { get; set; }
     public DateTime? ApprovedAtUtc { get; set; }
 }

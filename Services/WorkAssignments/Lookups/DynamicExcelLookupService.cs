@@ -1,4 +1,5 @@
-﻿using MongoDB.Driver;
+using MongoDB.Driver;
+using tdtd_be.Common.Errors;
 using tdtd_be.Data;
 
 namespace tdtd_be.Services.WorkAssignments.Lookups;
@@ -19,7 +20,7 @@ public sealed class DynamicExcelLookupService : IDynamicExcelLookupService
             .FirstOrDefaultAsync(ct);
 
         if (entity is null)
-            throw new InvalidOperationException("Biểu mẫu/bảng động không tồn tại.");
+            throw AppExceptionFactory.NotFound(AppErrorCode.DYNAMIC_EXCEL_TEMPLATE_NOT_FOUND, new { dynamicExcelId });
 
         return (entity.Code ?? string.Empty, entity.Name ?? string.Empty);
     }

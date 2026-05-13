@@ -15,10 +15,12 @@ using System.Net;
 using System.Text;
 using tdtd_be.Common.Cache;
 using tdtd_be.Common.Middleware;
+using tdtd_be.Common.Time;
 using tdtd_be.DashboardModel.Services;
 using tdtd_be.Data;
 using tdtd_be.Data.Indexes;
 using tdtd_be.Data.Infrastructure;
+using tdtd_be.Hubs;
 using tdtd_be.Jobs;
 using tdtd_be.Models;
 using tdtd_be.Options;
@@ -30,11 +32,13 @@ using tdtd_be.Services.WorkAssignmentReports.Statistics;
 using tdtd_be.Services.WorkAssignments;
 using tdtd_be.Services.WorkAssignments.Aggregate;
 using tdtd_be.Services.WorkAssignments.Domain;
+using tdtd_be.Services.WorkAssignments.Handover;
 using tdtd_be.Services.WorkAssignments.Lookups;
 using tdtd_be.Services.WorkAssignments.Progress;
 using tdtd_be.Services.WorkAssignments.Queue;
 using tdtd_be.Services.WorkAssignments.Review;
 using tdtd_be.Services.WorkAssignments.Runtime;
+using tdtd_be.Services.Notifications;
 using tdtd_be.Services.Works;
 using tdtd_be.Uploads;
 using tusdotnet.Interfaces;
@@ -43,6 +47,14 @@ using static tdtd_be.Services.Works.WorkServices;
 
 var builder = WebApplication.CreateBuilder(args);
 
+if (OperatingSystem.IsWindows()
+    && !builder.Configuration.GetValue<bool>("Logging:UseWindowsEventLog"))
+{
+    builder.Logging.ClearProviders();
+    builder.Logging.AddConsole();
+    builder.Logging.AddDebug();
+}
+
 // ================== config ==================
 builder.Services.Configure<MongoOptions>(builder.Configuration.GetSection("Mongo"));
 builder.Services.Configure<JwtOptions>(builder.Configuration.GetSection("Jwt"));
@@ -50,6 +62,7 @@ builder.Services.Configure<UploadOptions>(builder.Configuration.GetSection("Uplo
 
 // ================== mongo ==================
 builder.Services.AddSingleton<MongoDbContext>();
+builder.Services.AddSingleton<IAppTimeService, AppTimeService>();
 
 // ================== Hangfire ==================
 var mongoConnectionString = builder.Configuration["Mongo:ConnectionString"]
@@ -87,6 +100,13 @@ var storageOptions = new MongoStorageOptions
     SlidingInvisibilityTimeout = TimeSpan.FromMinutes(invisibilityMinutes),
     MigrationOptions = migrationOptions
 };
+
+var hangfireSucceededExpirationDays = Math.Clamp(
+    builder.Configuration.GetValue<int?>("HangfireHistoryArchive:SucceededExpirationDays") ?? 15,
+    2,
+    60);
+GlobalJobFilters.Filters.Add(
+    new HangfireSucceededJobExpirationFilter(TimeSpan.FromDays(hangfireSucceededExpirationDays)));
 
 builder.Services.AddHangfire(cfg => cfg
     .SetDataCompatibilityLevel(CompatibilityLevel.Version_180)
@@ -136,9 +156,10 @@ builder.Services.AddSingleton<IMinioClient>(sp =>
 builder.Services.AddSingleton<IMinioObjectDeleter, MinioObjectDeleter>();
 builder.Services.AddScoped<IMinioFileDocCleanupJob, MinioFileDocCleanupJob>();
 builder.Services.AddScoped<ITusTempCleanupJob, TusTempCleanupJob>();
+builder.Services.AddScoped<IHangfireHistoryArchiveJob, HangfireHistoryArchiveJob>();
 
 // ================== core services ==================
-builder.Services.AddSingleton<PasswordHasher<AppUser>>();
+builder.Services.AddSingleton<IPasswordHasher<AppUser>, PasswordHasher<AppUser>>();
 builder.Services.AddSingleton<JwtService>();
 builder.Services.AddScoped<AuthService>();
 builder.Services.AddScoped<UserContext>();
@@ -155,13 +176,21 @@ builder.Services.AddScoped<IUserAdminService, UserAdminService>();
 builder.Services.AddScoped<IAdminImportService, AdminImportService>();
 builder.Services.AddScoped<IDynamicExcelService, DynamicExcelService>();
 builder.Services.AddScoped<IDynamicFormService, DynamicFormService>();
+builder.Services.AddScoped<IDynamicFormCloneRequestService, DynamicFormCloneRequestService>();
 builder.Services.AddScoped<ILabelService, LabelService>();
 
-builder.Services.AddScoped<IDocRoleReadModelProjectionService, DocRoleReadModelProjectionService>();
+builder.Services.AddScoped<DocRoleReadModelProjectionService>();
+builder.Services.AddScoped<IDocRoleReadModelProjectionRetryJobService, DocRoleReadModelProjectionRetryJobService>();
+builder.Services.AddScoped<IDocRoleReadModelProjectionService, DocRoleReadModelProjectionResilientService>();
 builder.Services.AddScoped<IDocRoleReadModelFreshnessService, DocRoleReadModelFreshnessService>();
 builder.Services.AddScoped<IDocRoleReadModelRepairService, DocRoleReadModelRepairService>();
+builder.Services.AddScoped<IDocRoleReadModelDriftService, DocRoleReadModelDriftService>();
 builder.Services.AddScoped<IWorkStatusOperationLogService, WorkStatusOperationLogService>();
+builder.Services.AddScoped<IUserActionLogService, UserActionLogService>();
+builder.Services.AddScoped<IJobRunManagementService, JobRunManagementService>();
 builder.Services.AddScoped<IDocRoleService, DocRoleService>();
+builder.Services.AddScoped<INotificationService, NotificationService>();
+builder.Services.AddScoped<INotificationDueScanJobService, NotificationDueScanJobService>();
 
 builder.Services.AddScoped<IWorkCodeGenerator, WorkCodeGenerator>();
 builder.Services.AddScoped<IWorkService, WorkService>();
@@ -175,16 +204,16 @@ builder.Services.AddScoped<IWorkAssignmentDataGuardService, WorkAssignmentDataGu
 builder.Services.AddScoped<IWorkAssignmentTreeService, WorkAssignmentTreeService>();
 builder.Services.AddScoped<IWorkTemplateAssigneeBindingService, WorkTemplateAssigneeBindingService>();
 builder.Services.AddScoped<IWorkAssignmentService, WorkAssignmentService>();
+builder.Services.AddScoped<IWorkAssignmentHandoverService, WorkAssignmentHandoverService>();
 
 builder.Services.AddScoped<IWorkAssignmentReportService, WorkAssignmentReportService>();
 builder.Services.AddScoped<IWorkReportLabelStatisticsService, WorkReportLabelStatisticsService>();
 builder.Services.AddScoped<IWorkReportTableStatisticsService, WorkReportTableStatisticsService>();
 builder.Services.AddScoped<IWorkReportFieldStatisticsService, WorkReportFieldStatisticsService>();
+builder.Services.AddScoped<IWorkReportStatisticRebuildJobService, WorkReportStatisticRebuildJobService>();
 
 builder.Services.AddScoped<IWorkAssignmentProgressService, WorkAssignmentProgressService>();
 builder.Services.AddScoped<IWorkAssignmentReviewService, WorkAssignmentReviewService>();
-builder.Services.AddScoped<IWorkAssignmentAggregateService, WorkAssignmentAggregateService>();
-builder.Services.AddScoped<IReportTemplateRuntimeTypeResolver, ReportTemplateRuntimeTypeResolver>();
 builder.Services.AddScoped<IAggregateTableService, AggregateTableService>();
 
 builder.Services.AddScoped<IWorkAssignmentRuntimeMaterializeService, WorkAssignmentRuntimeMaterializeService>();
@@ -221,6 +250,7 @@ builder.Services.AddTransient<MeContextRedisMiddleware>();
 builder.Services.AddScoped<ApiExceptionMiddleware>();
 
 builder.Services.AddControllers();
+builder.Services.AddSignalR();
 
 // ================== Tus temp path ==================
 var tusTempPath = builder.Configuration["Tus:TempPath"] ?? "App_Data/tus";
@@ -231,11 +261,27 @@ builder.Services.AddSingleton<ITusStore>(sp => sp.GetRequiredService<TusDiskStor
 builder.Services.AddSingleton<ITusTerminationStore>(sp => sp.GetRequiredService<TusDiskStore>());
 
 // ================== CORS ==================
+var corsAllowedOrigins = builder.Configuration
+    .GetSection("Cors:AllowedOrigins")
+    .Get<string[]>()
+    ?? Array.Empty<string>();
+
+if (corsAllowedOrigins.Length == 0)
+{
+    corsAllowedOrigins =
+    [
+        "http://localhost:5173",
+        "https://localhost:5173",
+        "http://127.0.0.1:5173",
+        "https://127.0.0.1:5173"
+    ];
+}
+
 builder.Services.AddCors(opt =>
 {
     opt.AddPolicy("fe", p =>
     {
-        p.WithOrigins("http://localhost:5173")
+        p.WithOrigins(corsAllowedOrigins)
          .AllowAnyHeader()
          .AllowAnyMethod()
          .AllowCredentials()
@@ -266,6 +312,22 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
             IssuerSigningKey = key,
             ValidateLifetime = true,
             ClockSkew = TimeSpan.FromSeconds(10)
+        };
+        o.Events = new JwtBearerEvents
+        {
+            OnMessageReceived = context =>
+            {
+                var accessToken = context.Request.Query["access_token"];
+                var path = context.HttpContext.Request.Path;
+
+                if (!string.IsNullOrEmpty(accessToken) &&
+                    path.StartsWithSegments("/hubs/notifications"))
+                {
+                    context.Token = accessToken;
+                }
+
+                return Task.CompletedTask;
+            }
         };
     });
 
@@ -335,6 +397,7 @@ app.UseHangfireDashboard("/hangfire", new DashboardOptions
 });
 
 app.MapControllers();
+app.MapHub<NotificationsHub>("/hubs/notifications");
 app.MapTusUploads();
 
 using (var scope = app.Services.CreateScope())
@@ -344,7 +407,9 @@ using (var scope = app.Services.CreateScope())
         .GetRequiredService<Microsoft.Extensions.Options.IOptions<MongoOptions>>().Value;
     await MongoIndexInitializer.EnsureAsync(ctx.Db, mongoOpt);
 
-    HangfireRecurringJobRegistrar.Register(scope.ServiceProvider.GetRequiredService<IConfiguration>());
+    HangfireRecurringJobRegistrar.Register(
+        scope.ServiceProvider.GetRequiredService<IConfiguration>(),
+        scope.ServiceProvider.GetRequiredService<IAppTimeService>());
 }
 
 app.Run();

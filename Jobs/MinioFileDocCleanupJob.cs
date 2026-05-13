@@ -4,6 +4,7 @@ using MongoDB.Driver;
 using System;
 using System.Threading;
 using System.Threading.Tasks;
+using tdtd_be.Common.Time;
 using tdtd_be.Data;
 using tdtd_be.Models;
 using tdtd_be.Uploads;
@@ -16,19 +17,20 @@ public sealed class MinioFileDocCleanupJob : IMinioFileDocCleanupJob
     private readonly ILogger<MinioFileDocCleanupJob> _log;
     private readonly MongoDbContext _ctx;
     private readonly IMinioObjectDeleter _minio;
-    private readonly TimeZoneInfo _tz;
+    private readonly IAppTimeService _time;
 
     public MinioFileDocCleanupJob(
         IConfiguration cfg,
         ILogger<MinioFileDocCleanupJob> log,
         MongoDbContext ctx,
-        IMinioObjectDeleter minio)
+        IMinioObjectDeleter minio,
+        IAppTimeService time)
     {
         _cfg = cfg;
         _log = log;
         _ctx = ctx;
         _minio = minio;
-        _tz = HangfireJobTimeHelper.ResolveBangkokTimeZone();
+        _time = time;
     }
 
     public async Task RunAsync(CancellationToken cancellationToken = default)
@@ -42,9 +44,9 @@ public sealed class MinioFileDocCleanupJob : IMinioFileDocCleanupJob
         }
 
         // Chạy recurring theo mỗi Chủ nhật, nhưng chỉ thực thi thật ở Chủ nhật cuối tháng
-        if (!HangfireJobTimeHelper.IsLastSundayOfMonth(DateTime.UtcNow, _tz))
+        if (!_time.IsLastSundayOfMonth(_time.UtcNow))
         {
-            _log.LogInformation("MinioFileDocCleanup skipped because today is not the last Sunday of the month in {timeZone}.", _tz.Id);
+            _log.LogInformation("MinioFileDocCleanup skipped because today is not the last Sunday of the month in {timeZone}.", _time.ApplicationTimeZone.Id);
             return;
         }
 
@@ -56,7 +58,7 @@ public sealed class MinioFileDocCleanupJob : IMinioFileDocCleanupJob
         var olderDays = int.TryParse(_cfg["UploadCleanup:MinioDeleteOlderDays"], out var d) ? d : 7;
         olderDays = Math.Clamp(olderDays, 1, 365);
 
-        var cutoffUtc = DateTime.UtcNow.AddDays(-olderDays);
+        var cutoffUtc = _time.UtcNow.AddDays(-olderDays);
 
         var batchSize = int.TryParse(_cfg["UploadCleanup:MinioBatchSize"], out var bs) ? bs : 300;
         batchSize = Math.Clamp(batchSize, 50, 2000);
@@ -113,7 +115,7 @@ public sealed class MinioFileDocCleanupJob : IMinioFileDocCleanupJob
 
             var upd = Builders<FileDoc>.Update
                 .Set(x => x.IsDeleted, true)
-                .Set(x => x.UpdatedAtUtc, DateTime.UtcNow)
+                .Set(x => x.UpdatedAtUtc, _time.UtcNow)
                 .Set(x => x.UpdatedByUserId, null);
 
             await _ctx.Files.UpdateOneAsync(x => x.Id == f.Id, upd, cancellationToken: ct);

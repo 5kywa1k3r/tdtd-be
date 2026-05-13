@@ -12,6 +12,7 @@ public class WorkAssignmentResponse
     public string? DynamicFormTemplateId { get; set; }
     public string? DynamicFormTemplateCode { get; set; }
     public string? DynamicFormTemplateName { get; set; }
+    public string? DynamicFormDataSourceRulesJson { get; set; }
 
     public string WorkType { get; set; } = string.Empty;
     public string AssignmentType { get; set; } = string.Empty;

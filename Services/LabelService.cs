@@ -2,11 +2,14 @@ using System.Text.RegularExpressions;
 using MongoDB.Bson;
 using MongoDB.Driver;
 using tdtd_be.Common.Auth;
+using tdtd_be.Common.Errors;
 using tdtd_be.Data;
 using tdtd_be.DTOs.Auth;
 using tdtd_be.DTOs.Common;
 using tdtd_be.DTOs.Labels;
+using tdtd_be.Jobs;
 using tdtd_be.Models;
+using tdtd_be.Services.WorkAssignmentReports.Statistics;
 
 namespace tdtd_be.Services;
 
@@ -26,12 +29,64 @@ public sealed class LabelService : ILabelService
 
     private readonly MongoDbContext _ctx;
     private readonly MeAccessor _me;
+    private readonly IWorkReportStatisticRebuildJobService _statisticRebuildJobs;
 
-    public LabelService(MongoDbContext ctx, MeAccessor me)
+    public LabelService(
+        MongoDbContext ctx,
+        MeAccessor me,
+        IWorkReportStatisticRebuildJobService statisticRebuildJobs)
     {
         _ctx = ctx;
         _me = me;
+        _statisticRebuildJobs = statisticRebuildJobs;
     }
+
+    private static AppException LabelRequestRequired(string action)
+        => AppExceptionFactory.BadRequest(
+            AppErrorCode.LABEL_REQUEST_REQUIRED,
+            new { action });
+
+    private static AppException LabelIdRequired(string? id)
+        => AppExceptionFactory.BadRequest(
+            AppErrorCode.LABEL_ID_REQUIRED,
+            new { id });
+
+    private static AppException LabelNotFound(string? id)
+        => AppExceptionFactory.NotFound(
+            AppErrorCode.LABEL_NOT_FOUND,
+            new { id });
+
+    private static object LabelDetails(LabelCatalogItem doc, string? actorUserId = null)
+        => new
+        {
+            labelId = doc.Id,
+            doc.Code,
+            doc.ScopeType,
+            doc.ScopeId,
+            doc.IsSystem,
+            actorUserId
+        };
+
+    private static object UserDetails(MeResponse me)
+        => new
+        {
+            userId = me.Id,
+            me.AccountKind,
+            me.Roles,
+            me.UnitId
+        };
+
+    private static AppException LabelValidation(
+        AppErrorCode code,
+        string reason,
+        object? details = null)
+        => AppExceptionFactory.BadRequest(
+            code,
+            new
+            {
+                reason,
+                details
+            });
 
     public async Task<PagedResult<LabelRow>> SearchAsync(LabelSearchReq req, CancellationToken ct)
     {
@@ -95,7 +150,7 @@ public sealed class LabelService : ILabelService
         var me = _me.RequireMe();
         RequireLabelManager(me);
         if (req is null)
-            throw new ArgumentNullException(nameof(req));
+            throw LabelRequestRequired("create");
 
         var scope = ResolveManagedScope(me, req.ScopeType, req.ScopeId);
         var name = NormalizeName(req.Name);
@@ -108,6 +163,7 @@ public sealed class LabelService : ILabelService
             Description = NormalizeOptionalText(req.Description),
             Color = NormalizeColor(req.Color),
             GroupCode = NormalizeOptionalCode(req.GroupCode),
+            DataType = LabelDataTypes.Normalize(req.DataType),
             ScopeType = scope.scopeType,
             ScopeId = scope.scopeId,
             ManagedByUserId = me.Id,
@@ -126,7 +182,9 @@ public sealed class LabelService : ILabelService
         }
         catch (MongoWriteException ex) when (ex.WriteError?.Category == ServerErrorCategory.DuplicateKey)
         {
-            throw new InvalidOperationException("Mã nhãn đã tồn tại trong phạm vi này.");
+            throw AppExceptionFactory.Create(
+                AppErrorCode.LABEL_DUPLICATE_CODE,
+                new { doc.Code, doc.ScopeType, doc.ScopeId });
         }
 
         return ToRow(doc, me);
@@ -137,14 +195,17 @@ public sealed class LabelService : ILabelService
         var me = _me.RequireMe();
         RequireLabelManager(me);
         if (req is null)
-            throw new ArgumentNullException(nameof(req));
+            throw LabelRequestRequired("update");
 
         var doc = await LoadVisibleAsync(id, me, ct);
         EnsureCanManage(me, doc);
         if (doc.IsSystem)
-            throw new InvalidOperationException("Không được sửa nhãn hệ thống.");
+            throw AppExceptionFactory.Forbidden(
+                AppErrorCode.LABEL_SYSTEM_UPDATE_FORBIDDEN,
+                LabelDetails(doc, me.Id));
 
         var name = NormalizeName(req.Name);
+        var nextDataType = LabelDataTypes.Normalize(req.DataType);
         var now = DateTime.UtcNow;
         var update = Builders<LabelCatalogItem>.Update
             .Set(x => x.Name, name)
@@ -152,11 +213,18 @@ public sealed class LabelService : ILabelService
             .Set(x => x.Description, NormalizeOptionalText(req.Description))
             .Set(x => x.Color, NormalizeColor(req.Color))
             .Set(x => x.GroupCode, NormalizeOptionalCode(req.GroupCode))
+            .Set(x => x.DataType, nextDataType)
             .Set(x => x.IsActive, req.IsActive)
             .Set(x => x.UpdatedAtUtc, now)
             .Set(x => x.UpdatedByUserId, me.Id);
 
         await _ctx.Labels.UpdateOneAsync(x => x.Id == id && !x.IsDeleted, update, cancellationToken: ct);
+        if (doc.IsActive != req.IsActive ||
+            !string.Equals(LabelDataTypes.Normalize(doc.DataType), nextDataType, StringComparison.Ordinal))
+        {
+            await EnqueueLabelStatisticRebuildAsync(doc, me.Id, ct);
+        }
+
         return await GetByIdAsync(id, ct);
     }
 
@@ -168,7 +236,9 @@ public sealed class LabelService : ILabelService
         var doc = await LoadVisibleAsync(id, me, ct);
         EnsureCanManage(me, doc);
         if (doc.IsSystem)
-            throw new InvalidOperationException("Không được xóa nhãn hệ thống.");
+            throw AppExceptionFactory.Forbidden(
+                AppErrorCode.LABEL_SYSTEM_DELETE_FORBIDDEN,
+                LabelDetails(doc, me.Id));
 
         var now = DateTime.UtcNow;
         await _ctx.Labels.UpdateOneAsync(
@@ -181,12 +251,29 @@ public sealed class LabelService : ILabelService
                 .Set(x => x.UpdatedAtUtc, now)
                 .Set(x => x.UpdatedByUserId, me.Id),
             cancellationToken: ct);
+
+        await EnqueueLabelStatisticRebuildAsync(doc, me.Id, ct);
+    }
+
+    private async Task EnqueueLabelStatisticRebuildAsync(
+        LabelCatalogItem label,
+        string actorUserId,
+        CancellationToken ct)
+    {
+        var results = await _statisticRebuildJobs.EnqueueForLabelChangeAsync(
+            label,
+            actorUserId,
+            highPriority: true,
+            ct);
+
+        if (results.Count > 0)
+            HangfireRecurringJobRegistrar.TriggerDynamicFormStatisticRebuildNow();
     }
 
     private async Task<LabelCatalogItem> LoadVisibleAsync(string id, MeResponse me, CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(id))
-            throw new ArgumentException("id không được trống.", nameof(id));
+            throw LabelIdRequired(id);
 
         var filter = Builders<LabelCatalogItem>.Filter.Eq(x => x.Id, id.Trim())
                      & Builders<LabelCatalogItem>.Filter.Eq(x => x.IsDeleted, false)
@@ -194,7 +281,7 @@ public sealed class LabelService : ILabelService
 
         var doc = await _ctx.Labels.Find(filter).FirstOrDefaultAsync(ct);
         if (doc is null)
-            throw new InvalidOperationException("Không tìm thấy nhãn.");
+            throw LabelNotFound(id);
 
         return doc;
     }
@@ -228,7 +315,9 @@ public sealed class LabelService : ILabelService
     private static void RequireLabelManager(MeResponse me)
     {
         if (!IsLabelManager(me))
-            throw new BadHttpRequestException("SYSTEM_ADMIN, MANAGER_LEVEL hoặc MANAGER_UNIT required.");
+            throw AppExceptionFactory.Forbidden(
+                AppErrorCode.LABEL_MANAGER_REQUIRED,
+                UserDetails(me));
     }
 
     private static void EnsureCanManage(MeResponse me, LabelCatalogItem doc)
@@ -246,7 +335,9 @@ public sealed class LabelService : ILabelService
             string.Equals(doc.ScopeId, me.UnitId, StringComparison.Ordinal))
             return;
 
-        throw new BadHttpRequestException("Bạn không có quyền quản lý nhãn này.");
+        throw AppExceptionFactory.Forbidden(
+            AppErrorCode.LABEL_MANAGE_FORBIDDEN,
+            LabelDetails(doc, me.Id));
     }
 
     private static (string scopeType, string? scopeId) ResolveManagedScope(
@@ -272,13 +363,17 @@ public sealed class LabelService : ILabelService
         if (RoleGuard.IsManagerLevel(me))
         {
             if (string.IsNullOrWhiteSpace(me.UnitId))
-                throw new BadHttpRequestException("Không xác định được phạm vi level của tài khoản.");
+                throw AppExceptionFactory.BadRequest(
+                    AppErrorCode.LABEL_SCOPE_LEVEL_UNAVAILABLE,
+                    UserDetails(me));
 
             EnsureRequestedScopeMatches(requestedScopeType, requestedScopeId, LabelScopeTypes.Level, me.UnitId);
             return (LabelScopeTypes.Level, me.UnitId);
         }
 
-        throw new BadHttpRequestException("Không có quyền quản lý nhãn.");
+        throw AppExceptionFactory.Forbidden(
+            AppErrorCode.LABEL_MANAGER_REQUIRED,
+            UserDetails(me));
     }
 
     private static void EnsureRequestedScopeMatches(
@@ -289,11 +384,15 @@ public sealed class LabelService : ILabelService
     {
         if (!string.IsNullOrWhiteSpace(requestedScopeType) &&
             NormalizeScopeType(requestedScopeType) != expectedScopeType)
-            throw new BadHttpRequestException("Phạm vi nhãn không khớp quyền quản lý.");
+            throw AppExceptionFactory.Forbidden(
+                AppErrorCode.LABEL_SCOPE_MISMATCH,
+                new { requestedScopeType, requestedScopeId, expectedScopeType, expectedScopeId });
 
         if (!string.IsNullOrWhiteSpace(requestedScopeId) &&
             !string.Equals(requestedScopeId.Trim(), expectedScopeId, StringComparison.Ordinal))
-            throw new BadHttpRequestException("Phạm vi nhãn không khớp quyền quản lý.");
+            throw AppExceptionFactory.Forbidden(
+                AppErrorCode.LABEL_SCOPE_MISMATCH,
+                new { requestedScopeType, requestedScopeId, expectedScopeType, expectedScopeId });
     }
 
     private static LabelRow ToRow(LabelCatalogItem x, MeResponse me)
@@ -304,6 +403,7 @@ public sealed class LabelService : ILabelService
             x.Description,
             x.Color,
             x.GroupCode,
+            LabelDataTypes.Normalize(x.DataType),
             x.ScopeType,
             x.ScopeId,
             x.IsSystem,
@@ -343,9 +443,12 @@ public sealed class LabelService : ILabelService
     {
         var code = value?.Trim().ToLowerInvariant();
         if (string.IsNullOrWhiteSpace(code))
-            throw new ArgumentException("Mã nhãn không được trống.");
+            throw LabelValidation(AppErrorCode.LABEL_CODE_REQUIRED, "Ma nhan khong duoc trong.");
         if (!CodeRegex.IsMatch(code))
-            throw new ArgumentException("Mã nhãn chỉ gồm chữ thường, số, dấu -, _ hoặc . và tối đa 64 ký tự.");
+            throw LabelValidation(
+                AppErrorCode.LABEL_CODE_INVALID,
+                "Ma nhan chi gom chu thuong, so, dau -, _ hoac . va toi da 64 ky tu.",
+                new { code });
         return code;
     }
 
@@ -354,7 +457,10 @@ public sealed class LabelService : ILabelService
         var code = value?.Trim().ToLowerInvariant();
         if (string.IsNullOrWhiteSpace(code)) return null;
         if (!CodeRegex.IsMatch(code))
-            throw new ArgumentException("Mã nhóm nhãn không hợp lệ.");
+            throw LabelValidation(
+                AppErrorCode.LABEL_GROUP_CODE_INVALID,
+                "Ma nhom nhan khong hop le.",
+                new { groupCode = code });
         return code;
     }
 
@@ -362,9 +468,12 @@ public sealed class LabelService : ILabelService
     {
         var name = value?.Trim();
         if (string.IsNullOrWhiteSpace(name))
-            throw new ArgumentException("Tên nhãn không được trống.");
+            throw LabelValidation(AppErrorCode.LABEL_NAME_REQUIRED, "Ten nhan khong duoc trong.");
         if (name.Length > 120)
-            throw new ArgumentException("Tên nhãn tối đa 120 ký tự.");
+            throw LabelValidation(
+                AppErrorCode.LABEL_NAME_TOO_LONG,
+                "Ten nhan toi da 120 ky tu.",
+                new { length = name.Length, maxLength = 120 });
         return name;
     }
 
@@ -380,7 +489,10 @@ public sealed class LabelService : ILabelService
         var color = value?.Trim();
         if (string.IsNullOrWhiteSpace(color)) return null;
         if (!HexColorRegex.IsMatch(color))
-            throw new ArgumentException("Màu nhãn phải là mã hex dạng #RRGGBB.");
+            throw LabelValidation(
+                AppErrorCode.LABEL_COLOR_INVALID,
+                "Mau nhan phai la ma hex dang #RRGGBB.",
+                new { color });
         return color.ToUpperInvariant();
     }
 
@@ -392,7 +504,10 @@ public sealed class LabelService : ILabelService
             LabelScopeTypes.Global => LabelScopeTypes.Global,
             LabelScopeTypes.Level => LabelScopeTypes.Level,
             LabelScopeTypes.Unit => LabelScopeTypes.Unit,
-            _ => throw new ArgumentException("ScopeType nhãn không hợp lệ.")
+            _ => throw LabelValidation(
+                AppErrorCode.LABEL_SCOPE_TYPE_INVALID,
+                "ScopeType nhan khong hop le.",
+                new { scopeType = value })
         };
     }
 
@@ -402,9 +517,15 @@ public sealed class LabelService : ILabelService
         if (scopeType == LabelScopeTypes.Global)
             return string.Empty;
         if (string.IsNullOrWhiteSpace(id))
-            throw new ArgumentException("ScopeId là bắt buộc với nhãn LEVEL hoặc UNIT.");
+            throw LabelValidation(
+                AppErrorCode.LABEL_SCOPE_ID_REQUIRED,
+                "ScopeId la bat buoc voi nhan LEVEL hoac UNIT.",
+                new { scopeType });
         if (!ObjectId.TryParse(id, out _))
-            throw new ArgumentException("ScopeId nhãn không hợp lệ.");
+            throw LabelValidation(
+                AppErrorCode.LABEL_SCOPE_ID_INVALID,
+                "ScopeId nhan khong hop le.",
+                new { scopeType, scopeId = id });
         return id;
     }
 }

@@ -27,6 +27,16 @@ public sealed class TemplateSnapshotDTO
     public string SpecJson { get; set; } = string.Empty;
 
     /// <summary>
+    /// Loại bảng Excel động: NUMERIC_GRID hoặc RECORD_TABLE.
+    /// </summary>
+    public string TableKind { get; set; } = "NUMERIC_GRID";
+
+    /// <summary>
+    /// Schema JSON cho RECORD_TABLE.
+    /// </summary>
+    public string? RecordTableSpecJson { get; set; }
+
+    /// <summary>
     /// Workbook JSON gốc của template.
     /// Đây là bản dùng để clone ra report draft.
     /// </summary>

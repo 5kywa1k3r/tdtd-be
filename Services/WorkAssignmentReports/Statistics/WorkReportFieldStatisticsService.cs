@@ -1,11 +1,14 @@
 using System.Globalization;
+using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using MongoDB.Bson;
 using MongoDB.Driver;
 using tdtd_be.Common.Auth;
 using tdtd_be.Data;
 using tdtd_be.DTOs.Statistics;
 using tdtd_be.Models;
+using tdtd_be.Models.Enums;
 using tdtd_be.Models.Statistics;
 
 namespace tdtd_be.Services.WorkAssignmentReports.Statistics;
@@ -31,8 +34,25 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
         string? actorUserId,
         CancellationToken ct = default)
     {
-        if (string.IsNullOrWhiteSpace(reportId))
+        var aggregateKey = await RebuildValuesForReportAsync(reportId, actorUserId, ct);
+        if (aggregateKey is null)
             return;
+
+        await RebuildAggregatesForWorkPeriodAsync(
+            aggregateKey.WorkId,
+            aggregateKey.PeriodInstanceKey,
+            aggregateKey.DynamicFormTemplateId,
+            actorUserId,
+            ct);
+    }
+
+    public async Task<ReportStatisticAggregateKey?> RebuildValuesForReportAsync(
+        string reportId,
+        string? actorUserId,
+        CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(reportId))
+            return null;
 
         var report = await _ctx.WorkAssignmentReports
             .Find(x => x.Id == reportId && !x.IsDeleted)
@@ -42,21 +62,41 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
         {
             await _ctx.WorkReportFieldStatValues
                 .DeleteManyAsync(x => x.WorkAssignmentReportId == reportId, ct);
-            return;
+            return null;
         }
 
         var assignment = await _ctx.WorkAssignments
             .Find(x => x.Id == report.WorkAssignmentId && !x.IsDeleted)
             .FirstOrDefaultAsync(ct);
+        var dynamicFormTemplateId = NormalizeObjectIdOrNull(report.DynamicFormTemplateId ?? assignment?.DynamicFormTemplateId);
 
         await _ctx.WorkReportFieldStatValues.DeleteManyAsync(
             x => x.WorkAssignmentReportId == report.Id,
             ct);
 
+        if (report.IsActive == false || report.Status != WorkAssignmentReportStatus.Approved)
+        {
+            return new ReportStatisticAggregateKey(
+                report.WorkId,
+                report.PeriodInstanceKey,
+                dynamicFormTemplateId);
+        }
+
+        var contributionPolicy = WorkReportCumulativeContributionPolicy.FromReport(report);
+        if (!contributionPolicy.IncludesReport)
+        {
+            return new ReportStatisticAggregateKey(
+                report.WorkId,
+                report.PeriodInstanceKey,
+                dynamicFormTemplateId);
+        }
+
         var template = await LoadTemplateAsync(report, assignment, ct);
         var fields = ExtractStatisticFields(template?.FieldsJson);
-        var values = ExtractFieldValues(report.FieldValuesJson, fields);
-        var dynamicFormTemplateId = NormalizeObjectIdOrNull(
+        var values = ExtractFieldValues(report.FieldValuesJson, fields)
+            .Where(value => contributionPolicy.ShouldIncludeField(value.Field.FieldKey))
+            .ToList();
+        dynamicFormTemplateId = NormalizeObjectIdOrNull(
             report.DynamicFormTemplateId ?? assignment?.DynamicFormTemplateId ?? template?.Id);
 
         if (values.Count > 0)
@@ -105,12 +145,10 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
                 await _ctx.WorkReportFieldStatValues.InsertManyAsync(rows, cancellationToken: ct);
         }
 
-        await RebuildAggregatesForWorkPeriodAsync(
+        return new ReportStatisticAggregateKey(
             report.WorkId,
             report.PeriodInstanceKey,
-            dynamicFormTemplateId,
-            actorUserId,
-            ct);
+            dynamicFormTemplateId);
     }
 
     public async Task RebuildAggregatesForWorkPeriodAsync(
@@ -221,7 +259,8 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
         var fb = Builders<WorkAssignmentReport>.Filter;
         var filter = fb.Eq(x => x.WorkId, normalized.WorkId)
                      & fb.Eq(x => x.IsDeleted, false)
-                     & fb.Eq(x => x.IsCurrent, true);
+                     & fb.Eq(x => x.IsCurrent, true)
+                     & fb.Ne(x => x.IsActive, false);
 
         if (!string.IsNullOrWhiteSpace(normalized.PeriodInstanceKey))
             filter &= fb.Eq(x => x.PeriodInstanceKey, normalized.PeriodInstanceKey);
@@ -320,6 +359,151 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
             TotalValueCount = resultRows.Sum(x => x.ValueCount),
             TotalSum = resultRows.Sum(x => x.Sum ?? 0m),
             TotalReportCount = resultRows.Sum(x => x.ReportCount)
+        };
+    }
+
+    public async Task<FieldTextConcatResponse> SearchTextConcatAsync(
+        FieldTextConcatRequest req,
+        CancellationToken ct = default)
+    {
+        var me = _me.RequireMe();
+        var normalized = NormalizeTextConcatRequest(req);
+        var data = await LoadTextConcatRowsAsync(normalized, me.Id, ct);
+        var totalRows = data.Rows.Count;
+        var pageRows = data.Rows
+            .Skip(normalized.Page * normalized.PageSize)
+            .Take(normalized.PageSize)
+            .ToList();
+
+        var (concatenatedText, totalChars, truncated) = BuildConcatenatedText(data.Rows, normalized.MaxChars);
+
+        return new FieldTextConcatResponse
+        {
+            WorkId = normalized.WorkId,
+            ScopeType = normalized.ScopeType!,
+            ScopeId = normalized.ScopeId,
+            DynamicFormTemplateId = normalized.DynamicFormTemplateId,
+            FieldId = data.Field.FieldId,
+            FieldKey = data.Field.FieldKey,
+            FieldLabel = data.Field.FieldLabel,
+            FieldType = data.Field.FieldType,
+            ConcatenatedText = concatenatedText,
+            Rows = pageRows,
+            Page = normalized.Page,
+            PageSize = normalized.PageSize,
+            TotalRows = totalRows,
+            ReturnedRows = pageRows.Count,
+            TotalChars = totalChars,
+            MaxChars = normalized.MaxChars,
+            Truncated = truncated || data.Rows.Any(x => x.RowTruncated),
+            MatchingReportCount = data.MatchingReportCount,
+            ScannedReportCount = data.ScannedReportCount,
+            ScanLimit = normalized.ScanLimit,
+            HasMoreReportsThanScanLimit = data.MatchingReportCount > data.ScannedReportCount
+        };
+    }
+
+    public async Task<FieldTextConcatExportFile> ExportTextConcatCsvAsync(
+        FieldTextConcatRequest req,
+        CancellationToken ct = default)
+    {
+        var me = _me.RequireMe();
+        var normalized = NormalizeTextConcatRequest(req, forExport: true);
+        var data = await LoadTextConcatRowsAsync(normalized, me.Id, ct);
+        var csv = BuildTextConcatCsv(normalized, data);
+        var preamble = Encoding.UTF8.GetPreamble();
+        var payload = Encoding.UTF8.GetBytes(csv);
+        var content = new byte[preamble.Length + payload.Length];
+        Buffer.BlockCopy(preamble, 0, content, 0, preamble.Length);
+        Buffer.BlockCopy(payload, 0, content, preamble.Length, payload.Length);
+
+        return new FieldTextConcatExportFile
+        {
+            Content = content,
+            ContentType = "text/csv; charset=utf-8",
+            FileName = BuildTextConcatExportFileName(data.Field)
+        };
+    }
+
+    private async Task<TextConcatQueryResult> LoadTextConcatRowsAsync(
+        FieldTextConcatRequest normalized,
+        string actorUserId,
+        CancellationToken ct)
+    {
+        var template = await _ctx.DynamicFormTemplates
+            .Find(x => x.Id == normalized.DynamicFormTemplateId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct)
+            ?? throw ReportStatisticExceptions.DynamicFormTemplateNotFound(
+                "FIELD_TEXT",
+                normalized.WorkId,
+                normalized.DynamicFormTemplateId);
+
+        var field = ResolveTextConcatField(template.FieldsJson, normalized);
+        var assignments = await LoadTextConcatScopeAssignmentsAsync(normalized, actorUserId, ct);
+        if (assignments.Count == 0)
+        {
+            return new TextConcatQueryResult
+            {
+                Field = field
+            };
+        }
+
+        var assignmentIds = assignments
+            .Select(x => x.Id)
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+
+        var reportFilter = BuildTextConcatReportFilter(normalized, assignmentIds);
+        var matchingReportCount = await _ctx.WorkAssignmentReports
+            .CountDocumentsAsync(reportFilter, cancellationToken: ct);
+
+        var reports = await _ctx.WorkAssignmentReports
+            .Find(reportFilter)
+            .SortByDescending(x => x.PeriodKey)
+            .ThenByDescending(x => x.UpdatedAtUtc)
+            .Limit(normalized.ScanLimit)
+            .ToListAsync(ct);
+
+        var periodIds = reports
+            .Select(x => x.WorkReportPeriodId)
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+
+        var periodsById = periodIds.Count == 0
+            ? new Dictionary<string, WorkReportPeriod>(StringComparer.Ordinal)
+            : (await _ctx.WorkReportPeriods
+                    .Find(x => periodIds.Contains(x.Id) && !x.IsDeleted)
+                    .ToListAsync(ct))
+                .ToDictionary(x => x.Id, x => x, StringComparer.Ordinal);
+
+        var assignmentsById = assignments.ToDictionary(x => x.Id, x => x, StringComparer.Ordinal);
+        var parsedRows = reports
+            .Select(report =>
+            {
+                periodsById.TryGetValue(report.WorkReportPeriodId, out var period);
+                assignmentsById.TryGetValue(report.WorkAssignmentId, out var assignment);
+                var text = ExtractTextFieldValue(report.FieldValuesJson, field);
+                if (string.IsNullOrWhiteSpace(text))
+                    return null;
+
+                if (!string.IsNullOrWhiteSpace(normalized.Q) &&
+                    !text.Contains(normalized.Q, StringComparison.OrdinalIgnoreCase))
+                {
+                    return null;
+                }
+
+                return MapTextConcatRow(report, period, assignment, text, normalized.MaxRowChars);
+            })
+            .OfType<FieldTextConcatRow>()
+            .ToList();
+
+        return new TextConcatQueryResult
+        {
+            Field = field,
+            Rows = parsedRows,
+            MatchingReportCount = matchingReportCount,
+            ScannedReportCount = reports.Count
         };
     }
 
@@ -435,24 +619,414 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
         return filter;
     }
 
+    private static FilterDefinition<WorkAssignmentReport> BuildTextConcatReportFilter(
+        FieldTextConcatRequest req,
+        List<string> assignmentIds)
+    {
+        var fb = Builders<WorkAssignmentReport>.Filter;
+        var filter = fb.Eq(x => x.WorkId, req.WorkId.Trim())
+            & fb.Eq(x => x.IsDeleted, false)
+            & fb.Eq(x => x.IsCurrent, true)
+            & fb.Ne(x => x.IsActive, false)
+            & fb.In(x => x.WorkAssignmentId, assignmentIds)
+            & fb.Eq(x => x.DynamicFormTemplateId, req.DynamicFormTemplateId.Trim())
+            & fb.Ne(x => x.FieldValuesJson, null);
+
+        if (!string.IsNullOrWhiteSpace(req.PeriodKey))
+            filter &= fb.Eq(x => x.PeriodKey, req.PeriodKey.Trim());
+
+        if (!string.IsNullOrWhiteSpace(req.PeriodKeyFrom))
+            filter &= fb.Gte(x => x.PeriodKey, req.PeriodKeyFrom.Trim());
+
+        if (!string.IsNullOrWhiteSpace(req.PeriodKeyTo))
+            filter &= fb.Lte(x => x.PeriodKey, req.PeriodKeyTo.Trim());
+
+        if (!string.IsNullOrWhiteSpace(req.PeriodInstanceKey))
+            filter &= fb.Eq(x => x.PeriodInstanceKey, req.PeriodInstanceKey.Trim());
+
+        if (req.ReportStatus.HasValue)
+            filter &= fb.Eq(x => x.Status, (WorkAssignmentReportStatus)req.ReportStatus.Value);
+
+        return filter;
+    }
+
+    private async Task<List<WorkAssignment>> LoadTextConcatScopeAssignmentsAsync(
+        FieldTextConcatRequest req,
+        string actorUserId,
+        CancellationToken ct)
+    {
+        var fb = Builders<WorkAssignment>.Filter;
+        var baseFilter = fb.Eq(x => x.WorkId, req.WorkId)
+            & fb.Eq(x => x.IsDeleted, false)
+            & fb.Eq(x => x.IsActive, true);
+
+        if (req.ScopeType is "ASSIGNMENT" or "ROOT")
+        {
+            if (string.IsNullOrWhiteSpace(req.ScopeId))
+                throw ReportStatisticExceptions.ScopeIdRequired("FIELD_TEXT", req.WorkId, req.ScopeType, req.ScopeId);
+
+            var node = await _ctx.WorkAssignments
+                .Find(baseFilter & fb.Eq(x => x.Id, req.ScopeId))
+                .FirstOrDefaultAsync(ct)
+                ?? throw ReportStatisticExceptions.AssignmentNotFound("FIELD_TEXT", req.WorkId, req.ScopeType, req.ScopeId);
+
+            if (!CanReadAssignment(node, actorUserId))
+                throw ReportStatisticExceptions.ReadForbidden("FIELD_TEXT", req.WorkId, req.ScopeType, req.ScopeId, actorUserId);
+
+            var scopedFilter = req.ScopeType == "ROOT"
+                ? baseFilter & fb.Eq(x => x.RootAssignmentId, node.RootAssignmentId)
+                : baseFilter & fb.Eq(x => x.RootAssignmentId, node.RootAssignmentId)
+                    & fb.Regex(x => x.Path, new BsonRegularExpression($"^{Regex.Escape(node.Path)}(?:/|$)"));
+
+            return await _ctx.WorkAssignments
+                .Find(scopedFilter)
+                .SortBy(x => x.Path)
+                .ToListAsync(ct);
+        }
+
+        var visibleFilter = baseFilter & fb.Or(
+            fb.Eq(x => x.CreatedByUserId, actorUserId),
+            fb.AnyEq(x => x.LeaderWatcherUserIds, actorUserId));
+
+        return await _ctx.WorkAssignments
+            .Find(visibleFilter)
+            .SortBy(x => x.Path)
+            .ToListAsync(ct);
+    }
+
+    private static FieldTextConcatRequest NormalizeTextConcatRequest(FieldTextConcatRequest req, bool forExport = false)
+    {
+        req ??= new FieldTextConcatRequest();
+
+        var workId = req.WorkId?.Trim();
+        if (string.IsNullOrWhiteSpace(workId))
+            throw ReportStatisticExceptions.WorkIdRequired("FIELD_TEXT", req.WorkId);
+
+        var dynamicFormTemplateId = NormalizeOptionalId(req.DynamicFormTemplateId);
+        if (string.IsNullOrWhiteSpace(dynamicFormTemplateId))
+            throw ReportStatisticExceptions.DynamicFormTemplateIdRequired(
+                "FIELD_TEXT",
+                workId,
+                req.DynamicFormTemplateId);
+
+        if (string.IsNullOrWhiteSpace(req.FieldId) && string.IsNullOrWhiteSpace(req.FieldKey))
+            throw ReportStatisticExceptions.FieldSelectorRequired(
+                "FIELD_TEXT",
+                workId,
+                dynamicFormTemplateId,
+                req.FieldId,
+                req.FieldKey);
+
+        var scopeType = string.IsNullOrWhiteSpace(req.ScopeType)
+            ? "WORK"
+            : req.ScopeType.Trim().ToUpperInvariant();
+
+        if (scopeType is not ("WORK" or "ROOT" or "ASSIGNMENT"))
+            throw ReportStatisticExceptions.ScopeTypeInvalid("FIELD_TEXT", workId, req.ScopeType);
+
+        return new FieldTextConcatRequest
+        {
+            WorkId = workId,
+            ScopeType = scopeType,
+            ScopeId = string.IsNullOrWhiteSpace(req.ScopeId)
+                ? (scopeType == "WORK" ? workId : null)
+                : req.ScopeId.Trim(),
+            DynamicFormTemplateId = dynamicFormTemplateId,
+            FieldId = string.IsNullOrWhiteSpace(req.FieldId) ? null : req.FieldId.Trim(),
+            FieldKey = string.IsNullOrWhiteSpace(req.FieldKey) ? null : req.FieldKey.Trim(),
+            Q = string.IsNullOrWhiteSpace(req.Q) ? null : req.Q.Trim(),
+            PeriodKey = string.IsNullOrWhiteSpace(req.PeriodKey) ? null : req.PeriodKey.Trim(),
+            PeriodKeyFrom = string.IsNullOrWhiteSpace(req.PeriodKeyFrom) ? null : req.PeriodKeyFrom.Trim(),
+            PeriodKeyTo = string.IsNullOrWhiteSpace(req.PeriodKeyTo) ? null : req.PeriodKeyTo.Trim(),
+            PeriodInstanceKey = string.IsNullOrWhiteSpace(req.PeriodInstanceKey) ? null : req.PeriodInstanceKey.Trim(),
+            ReportStatus = req.ReportStatus,
+            Page = forExport ? 0 : Math.Max(0, req.Page),
+            PageSize = forExport
+                ? Math.Clamp(req.PageSize <= 0 ? 1000 : req.PageSize, 1, 10000)
+                : Math.Clamp(req.PageSize <= 0 ? 50 : req.PageSize, 1, 200),
+            MaxChars = forExport
+                ? Math.Clamp(req.MaxChars <= 0 ? 500000 : req.MaxChars, 1000, 1000000)
+                : Math.Clamp(req.MaxChars <= 0 ? 10000 : req.MaxChars, 1000, 50000),
+            MaxRowChars = forExport
+                ? Math.Clamp(req.MaxRowChars <= 0 ? 10000 : req.MaxRowChars, 200, 50000)
+                : Math.Clamp(req.MaxRowChars <= 0 ? 2000 : req.MaxRowChars, 200, 10000),
+            ScanLimit = forExport
+                ? Math.Clamp(req.ScanLimit <= 0 ? 20000 : req.ScanLimit, 100, 50000)
+                : Math.Clamp(req.ScanLimit <= 0 ? 1000 : req.ScanLimit, 100, 5000)
+        };
+    }
+
+    private static StatisticFieldDefinition ResolveTextConcatField(
+        string? fieldsJson,
+        FieldTextConcatRequest req)
+    {
+        var fields = ExtractTextFields(fieldsJson);
+        var field = fields.FirstOrDefault(x =>
+            (!string.IsNullOrWhiteSpace(req.FieldId) &&
+             string.Equals(x.FieldId, req.FieldId, StringComparison.Ordinal)) ||
+            (!string.IsNullOrWhiteSpace(req.FieldKey) &&
+             string.Equals(x.FieldKey, req.FieldKey, StringComparison.Ordinal)));
+
+        if (field is null)
+            throw ReportStatisticExceptions.TextFieldNotFound(
+                "FIELD_TEXT",
+                req.WorkId,
+                req.DynamicFormTemplateId,
+                req.FieldId,
+                req.FieldKey);
+
+        return field;
+    }
+
+    private static List<StatisticFieldDefinition> ExtractTextFields(string? fieldsJson)
+    {
+        if (string.IsNullOrWhiteSpace(fieldsJson))
+            return new List<StatisticFieldDefinition>();
+
+        try
+        {
+            var rawFields = JsonSerializer.Deserialize<List<DynamicFormFieldDefinition>>(fieldsJson, JsonOptions);
+            if (rawFields is null || rawFields.Count == 0)
+                return new List<StatisticFieldDefinition>();
+
+            return rawFields
+                .Select(ToStatisticFieldDefinition)
+                .OfType<StatisticFieldDefinition>()
+                .Where(x => x.FieldType is "shortText" or "longText")
+                .GroupBy(x => x.FieldId, StringComparer.Ordinal)
+                .Select(x => x.First())
+                .ToList();
+        }
+        catch (JsonException)
+        {
+            return new List<StatisticFieldDefinition>();
+        }
+    }
+
+    private static string? ExtractTextFieldValue(
+        string? fieldValuesJson,
+        StatisticFieldDefinition field)
+    {
+        if (string.IsNullOrWhiteSpace(fieldValuesJson))
+            return null;
+
+        try
+        {
+            using var doc = JsonDocument.Parse(fieldValuesJson);
+            if (!TryGetValuesObject(doc.RootElement, out var valuesObject))
+                return null;
+
+            if (!TryGetFieldValue(valuesObject, field, out var value))
+                return null;
+
+            var text = ToNullableString(value);
+            return string.IsNullOrWhiteSpace(text) ? null : text.Trim();
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
+    private static FieldTextConcatRow MapTextConcatRow(
+        WorkAssignmentReport report,
+        WorkReportPeriod? period,
+        WorkAssignment? assignment,
+        string text,
+        int maxRowChars)
+    {
+        var assigneeUserId = period?.AssigneeUserId ?? report.AssigneeUserId;
+        var assignee = assignment?.Assignees?.FirstOrDefault(a =>
+            string.Equals(a.UserId, assigneeUserId, StringComparison.Ordinal));
+        var rowText = text.Length > maxRowChars ? text[..maxRowChars] : text;
+
+        return new FieldTextConcatRow
+        {
+            WorkAssignmentReportId = report.Id,
+            WorkReportPeriodId = report.WorkReportPeriodId,
+            AssignmentId = report.WorkAssignmentId,
+            AssignmentCode = assignment?.Code,
+            AssignmentName = assignment?.DynamicFormTemplateName
+                ?? assignment?.DynamicExcelName
+                ?? report.DynamicFormTemplateName
+                ?? report.DynamicExcelTemplateName,
+            AssigneeUserId = assigneeUserId,
+            AssigneeFullName = assignee?.FullName ?? assignee?.Username ?? assigneeUserId,
+            AssigneeUsername = assignee?.Username,
+            UnitId = period?.AssigneeUnitId ?? assignee?.UnitId,
+            UnitLabel = PickUnitLabel(assignee?.UnitSymbol, assignee?.UnitShortName, assignee?.UnitName)
+                ?? period?.AssigneeUnitId,
+            PeriodKey = report.PeriodKey,
+            PeriodInstanceKey = report.PeriodInstanceKey,
+            PeriodKind = report.PeriodKind,
+            ReportStatus = (int)report.Status,
+            Text = rowText,
+            CharCount = text.Length,
+            RowTruncated = text.Length > maxRowChars,
+            SubmittedAtUtc = report.SubmittedAtUtc ?? period?.LastSubmittedAtUtc,
+            ApprovedAtUtc = report.ApprovedAtUtc ?? period?.LastReviewedAtUtc
+        };
+    }
+
+    private static (string Text, int TotalChars, bool Truncated) BuildConcatenatedText(
+        List<FieldTextConcatRow> rows,
+        int maxChars)
+    {
+        var sourceChars = rows.Sum(x => x.CharCount);
+        var builder = new StringBuilder(capacity: Math.Min(maxChars, Math.Max(0, sourceChars)));
+        var truncated = false;
+
+        foreach (var row in rows)
+        {
+            var header = $"[{row.PeriodKey}] {row.AssignmentCode ?? row.AssignmentId} - {row.AssigneeFullName ?? row.AssigneeUserId ?? "-"}";
+            var segment = builder.Length == 0
+                ? $"{header}{Environment.NewLine}{row.Text}"
+                : $"{Environment.NewLine}{Environment.NewLine}---{Environment.NewLine}{header}{Environment.NewLine}{row.Text}";
+
+            var remaining = maxChars - builder.Length;
+            if (remaining <= 0)
+            {
+                truncated = true;
+                break;
+            }
+
+            if (segment.Length > remaining)
+            {
+                builder.Append(segment.AsSpan(0, remaining));
+                truncated = true;
+                break;
+            }
+
+            builder.Append(segment);
+        }
+
+        return (builder.ToString(), sourceChars, truncated);
+    }
+
+    private static string BuildTextConcatCsv(
+        FieldTextConcatRequest req,
+        TextConcatQueryResult data)
+    {
+        var builder = new StringBuilder();
+        var headers = new[]
+        {
+            "fieldLabel",
+            "fieldKey",
+            "scopeType",
+            "scopeId",
+            "periodKey",
+            "periodInstanceKey",
+            "periodKind",
+            "reportStatus",
+            "assignmentId",
+            "assignmentCode",
+            "assignmentName",
+            "assigneeUserId",
+            "assigneeFullName",
+            "assigneeUsername",
+            "unitId",
+            "unitLabel",
+            "charCount",
+            "rowTruncated",
+            "submittedAtUtc",
+            "approvedAtUtc",
+            "text"
+        };
+        builder.AppendLine(string.Join(",", headers.Select(EscapeCsv)));
+
+        foreach (var row in data.Rows)
+        {
+            var values = new[]
+            {
+                data.Field.FieldLabel,
+                data.Field.FieldKey,
+                req.ScopeType ?? string.Empty,
+                req.ScopeId ?? string.Empty,
+                row.PeriodKey,
+                row.PeriodInstanceKey,
+                row.PeriodKind,
+                row.ReportStatus.ToString(CultureInfo.InvariantCulture),
+                row.AssignmentId,
+                row.AssignmentCode ?? string.Empty,
+                row.AssignmentName,
+                row.AssigneeUserId ?? string.Empty,
+                row.AssigneeFullName ?? string.Empty,
+                row.AssigneeUsername ?? string.Empty,
+                row.UnitId ?? string.Empty,
+                row.UnitLabel ?? string.Empty,
+                row.CharCount.ToString(CultureInfo.InvariantCulture),
+                row.RowTruncated ? "true" : "false",
+                row.SubmittedAtUtc?.ToString("O", CultureInfo.InvariantCulture) ?? string.Empty,
+                row.ApprovedAtUtc?.ToString("O", CultureInfo.InvariantCulture) ?? string.Empty,
+                row.Text
+            };
+            builder.AppendLine(string.Join(",", values.Select(EscapeCsv)));
+        }
+
+        return builder.ToString();
+    }
+
+    private static string EscapeCsv(string? value)
+    {
+        var text = value ?? string.Empty;
+        return $"\"{text.Replace("\"", "\"\"", StringComparison.Ordinal)}\"";
+    }
+
+    private static string BuildTextConcatExportFileName(StatisticFieldDefinition field)
+    {
+        var fieldKey = SanitizeFilePart(field.FieldKey);
+        return $"text-concat-{fieldKey}-{DateTime.UtcNow:yyyyMMddHHmmss}.csv";
+    }
+
+    private static string SanitizeFilePart(string? value)
+    {
+        var raw = string.IsNullOrWhiteSpace(value) ? "field" : value.Trim();
+        var sanitized = Regex.Replace(raw, "[^A-Za-z0-9_.-]+", "-").Trim('-', '.');
+        return string.IsNullOrWhiteSpace(sanitized) ? "field" : sanitized;
+    }
+
+    private static FieldTextConcatResponse BuildEmptyTextConcatResponse(
+        FieldTextConcatRequest req,
+        StatisticFieldDefinition field)
+    {
+        return new FieldTextConcatResponse
+        {
+            WorkId = req.WorkId,
+            ScopeType = req.ScopeType!,
+            ScopeId = req.ScopeId,
+            DynamicFormTemplateId = req.DynamicFormTemplateId,
+            FieldId = field.FieldId,
+            FieldKey = field.FieldKey,
+            FieldLabel = field.FieldLabel,
+            FieldType = field.FieldType,
+            Page = req.Page,
+            PageSize = req.PageSize,
+            MaxChars = req.MaxChars,
+            ScanLimit = req.ScanLimit
+        };
+    }
+
+    private static string? PickUnitLabel(params string?[] values)
+        => values.FirstOrDefault(x => !string.IsNullOrWhiteSpace(x))?.Trim();
+
     private async Task EnsureCanReadScopeAsync(
         FieldStatisticSummaryRequest req,
         string actorUserId,
         CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(req.WorkId))
-            throw new InvalidOperationException("Thieu WorkId.");
+            throw ReportStatisticExceptions.WorkIdRequired("FIELD", req.WorkId);
 
         var scopeType = req.ScopeType?.Trim().ToUpperInvariant();
         if (scopeType is "ASSIGNMENT" or "ROOT")
         {
             if (string.IsNullOrWhiteSpace(req.ScopeId))
-                throw new InvalidOperationException("Thieu ScopeId.");
+                throw ReportStatisticExceptions.ScopeIdRequired("FIELD", req.WorkId, scopeType, req.ScopeId);
 
             var assignment = await _ctx.WorkAssignments
                 .Find(x => x.Id == req.ScopeId && x.WorkId == req.WorkId && !x.IsDeleted)
                 .FirstOrDefaultAsync(ct)
-                ?? throw new InvalidOperationException("Khong tim thay assignment thong ke.");
+                ?? throw ReportStatisticExceptions.AssignmentNotFound("FIELD", req.WorkId, scopeType, req.ScopeId);
 
             if (CanReadAssignment(assignment, actorUserId))
                 return;
@@ -471,7 +1045,7 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
                 return;
         }
 
-        throw new UnauthorizedAccessException("Ban khong co quyen xem thong ke field nay.");
+        throw ReportStatisticExceptions.ReadForbidden("FIELD", req.WorkId, scopeType, req.ScopeId, actorUserId);
     }
 
     private async Task EnsureCanReadWorkAsync(
@@ -488,7 +1062,7 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
             .AnyAsync(ct);
 
         if (!anyVisibleAssignment)
-            throw new UnauthorizedAccessException("Ban khong co quyen sua thong ke field nay.");
+            throw ReportStatisticExceptions.RebuildForbidden("FIELD", workId, actorUserId);
     }
 
     private static bool CanReadAssignment(WorkAssignment assignment, string actorUserId)
@@ -500,14 +1074,14 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
         req ??= new FieldStatisticSummaryRequest();
         var workId = req.WorkId?.Trim();
         if (string.IsNullOrWhiteSpace(workId))
-            throw new InvalidOperationException("Thieu WorkId.");
+            throw ReportStatisticExceptions.WorkIdRequired("FIELD", req.WorkId);
 
         var scopeType = string.IsNullOrWhiteSpace(req.ScopeType)
             ? "WORK"
             : req.ScopeType.Trim().ToUpperInvariant();
 
         if (scopeType is not ("WORK" or "ROOT" or "ASSIGNMENT"))
-            throw new InvalidOperationException("ScopeType khong hop le.");
+            throw ReportStatisticExceptions.ScopeTypeInvalid("FIELD", workId, req.ScopeType);
 
         var scopeId = string.IsNullOrWhiteSpace(req.ScopeId)
             ? (scopeType == "WORK" ? workId : null)
@@ -540,7 +1114,7 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
         req ??= new RebuildFieldStatisticRequest();
         var workId = req.WorkId?.Trim();
         if (string.IsNullOrWhiteSpace(workId))
-            throw new InvalidOperationException("Thieu WorkId.");
+            throw ReportStatisticExceptions.WorkIdRequired("FIELD", req.WorkId);
 
         return new RebuildFieldStatisticRequest
         {
@@ -583,7 +1157,7 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
 
         var fieldType = NormalizeFieldType(field.Type);
         var fieldKey = string.IsNullOrWhiteSpace(field.Key) ? fieldId : field.Key.Trim();
-        var label = string.IsNullOrWhiteSpace(field.Label) ? fieldKey : field.Label.Trim();
+        var label = ResolveFieldDisplayName(field) ?? fieldKey;
 
         var options = (field.Options ?? new List<DynamicFormFieldOption>())
             .Select(x => new FieldOption(
@@ -602,6 +1176,20 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
             field.Statistic?.ShowInTree ?? false,
             field.Statistic?.ShowInDetail ?? true,
             options);
+    }
+
+    private static string? ResolveFieldDisplayName(DynamicFormFieldDefinition field)
+        => PickNonBlank(field.Name, field.DisplayName, field.Label);
+
+    private static string? PickNonBlank(params string?[] values)
+    {
+        foreach (var value in values)
+        {
+            if (!string.IsNullOrWhiteSpace(value))
+                return value.Trim();
+        }
+
+        return null;
     }
 
     private static List<ParsedFieldValue> ExtractFieldValues(
@@ -932,6 +1520,8 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
     {
         public string? Id { get; set; }
         public string? Key { get; set; }
+        public string? Name { get; set; }
+        public string? DisplayName { get; set; }
         public string? Label { get; set; }
         public string? Type { get; set; }
         public bool IsStatistic { get; set; }
@@ -983,6 +1573,14 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
         string? BucketKey,
         string PeriodInstanceKey,
         int ReportStatus);
+
+    private sealed class TextConcatQueryResult
+    {
+        public StatisticFieldDefinition Field { get; set; } = default!;
+        public List<FieldTextConcatRow> Rows { get; set; } = new();
+        public long MatchingReportCount { get; set; }
+        public int ScannedReportCount { get; set; }
+    }
 
     private sealed class AggregateBucket
     {

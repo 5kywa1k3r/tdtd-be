@@ -35,7 +35,7 @@ public sealed class WorkReportPeriod : BaseEntity
 
     [BsonElement("dynamicExcelId")]
     [BsonRepresentation(BsonType.ObjectId)]
-    public string DynamicExcelId { get; set; } = default!;
+    public string? DynamicExcelId { get; set; }
 
     [BsonElement("dynamicExcelCode")]
     public string DynamicExcelCode { get; set; } = string.Empty;

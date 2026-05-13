@@ -64,6 +64,8 @@ public sealed class WorkAssignmentReportResponse
     public string DynamicExcelTemplateId { get; set; } = string.Empty;
     public string DynamicExcelTemplateCode { get; set; } = string.Empty;
     public string DynamicExcelTemplateName { get; set; } = string.Empty;
+    public string TableKind { get; set; } = "NUMERIC_GRID";
+    public string? RecordTableSpecJson { get; set; }
     public string? DynamicFormTemplateId { get; set; }
     public string? DynamicFormTemplateCode { get; set; }
     public string? DynamicFormTemplateName { get; set; }
@@ -79,6 +81,17 @@ public sealed class WorkAssignmentReportResponse
     public string Values1DJson { get; set; } = string.Empty;
     public string? FieldValuesJson { get; set; }
     public string? TableValuesJson { get; set; }
+    public string DataOrigin { get; set; } = string.Empty;
+    public string CumulativeContributionMode { get; set; } = string.Empty;
+    public string? CumulativeContributionPolicyJson { get; set; }
+    public string? SummarySourceJson { get; set; }
+    public List<string> AggregateSourceReportIds { get; set; } = new();
+    public List<string> AggregateSourceAssignmentIds { get; set; } = new();
+    public DateTime? AggregateSourceUpdatedAtUtc { get; set; }
+    public bool AggregateSnapshotDirty { get; set; }
+    public DateTime? AggregateSnapshotDirtyAtUtc { get; set; }
+    public DateTime? AggregateSnapshotRefreshedAtUtc { get; set; }
+    public string? AggregateRefreshError { get; set; }
 
     /// <summary>
     /// Bộ field trải phẳng mà lãnh đạo quan tâm.
@@ -97,6 +110,12 @@ public sealed class WorkAssignmentReportResponse
 
     public int VersionNo { get; set; }
     public bool IsCurrent { get; set; }
+    public bool IsActive { get; set; } = true;
+    public DateTime? DeactivatedAtUtc { get; set; }
+    public string? DeactivatedByUserId { get; set; }
+    public string? DeactivationReason { get; set; }
+    public DateTime? ReactivatedAtUtc { get; set; }
+    public string? ReactivatedByUserId { get; set; }
 
     public DateTime? SubmittedAtUtc { get; set; }
     public string? SubmittedByUserId { get; set; }

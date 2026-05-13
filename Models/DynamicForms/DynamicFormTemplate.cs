@@ -21,8 +21,8 @@ public sealed class DynamicFormTemplate : BaseEntity
     [BsonElement("description")]
     public string? Description { get; set; }
 
-    [BsonElement("labels")]
-    public string[] Labels { get; set; } = Array.Empty<string>();
+    [BsonElement("tagCodes")]
+    public string[] TagCodes { get; set; } = Array.Empty<string>();
 
     [BsonElement("createdByUsername")]
     public string CreatedByUsername { get; set; } = default!;
@@ -56,7 +56,21 @@ public sealed class DynamicFormTemplate : BaseEntity
     [BsonElement("excelBlockJson")]
     public string? ExcelBlockJson { get; set; }
 
+    [BsonElement("blocksJson")]
+    public string BlocksJson { get; set; } = "[]";
+
     [BsonElement("excelBlockDynamicExcelTemplateId")]
     [BsonRepresentation(BsonType.ObjectId)]
     public string? ExcelBlockDynamicExcelTemplateId { get; set; }
+
+    [BsonElement("statisticConfigUpdatedAtUtc")]
+    [BsonDateTimeOptions(Kind = DateTimeKind.Utc)]
+    public DateTime? StatisticConfigUpdatedAtUtc { get; set; }
+
+    [BsonElement("statisticConfigUpdatedByUserId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? StatisticConfigUpdatedByUserId { get; set; }
+
+    [BsonElement("statisticConfigUpdateMonthKey")]
+    public string? StatisticConfigUpdateMonthKey { get; set; }
 }

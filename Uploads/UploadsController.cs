@@ -3,6 +3,7 @@ using Minio;
 using Minio.DataModel.Args;
 using MongoDB.Driver;
 using tdtd_be.Common.Auth;
+using tdtd_be.Common.Errors;
 using tdtd_be.Data;
 using tdtd_be.Models;
 using tdtd_be.Uploads;
@@ -45,7 +46,8 @@ public sealed class UploadsController : ControllerBase
     [HttpGet("verify")]
     public async Task<IActionResult> Verify([FromQuery] string uploadId, [FromQuery] string fileName, CancellationToken ct)
     {
-        if (string.IsNullOrWhiteSpace(uploadId)) return BadRequest("uploadId is required.");
+        if (string.IsNullOrWhiteSpace(uploadId))
+            throw AppExceptionFactory.BadRequest(AppErrorCode.UPLOAD_ID_REQUIRED);
 
         var me = _me.RequireMe();
 
@@ -88,14 +90,17 @@ public sealed class UploadsController : ControllerBase
     [HttpGet("presign")]
     public async Task<IActionResult> Presign([FromQuery] string fileId, [FromQuery] int? ttlSeconds, CancellationToken ct = default)
     {
-        if (string.IsNullOrWhiteSpace(fileId)) return BadRequest("fileId is required.");
+        if (string.IsNullOrWhiteSpace(fileId))
+            throw AppExceptionFactory.BadRequest(AppErrorCode.UPLOAD_FILE_ID_REQUIRED);
 
         var me = _me.RequireMe();
 
         var doc = await _ctx.Files.Find(x => x.Id == fileId && !x.IsDeleted).FirstOrDefaultAsync(ct);
-        if (doc == null) return NotFound();
+        if (doc == null)
+            throw AppExceptionFactory.NotFound(AppErrorCode.UPLOAD_FILE_NOT_FOUND, new { fileId });
 
-        if (doc.CreatedByUserId != me.Id) return Forbid();
+        if (doc.CreatedByUserId != me.Id)
+            throw AppExceptionFactory.Forbidden(AppErrorCode.AUTH_FORBIDDEN, new { fileId });
 
         var ttl = ttlSeconds ?? _opt.PresignTtlSecondsDefault;
         ttl = Math.Clamp(ttl, 30, _opt.PresignTtlSecondsMax);
@@ -121,7 +126,7 @@ public sealed class UploadsController : ControllerBase
     {
         if (string.IsNullOrWhiteSpace(uploadId) ||
             string.IsNullOrWhiteSpace(fileName))
-            return BadRequest("uploadId and fileName are required.");
+            throw AppExceptionFactory.BadRequest(AppErrorCode.UPLOAD_DOWNLOAD_ARGUMENTS_REQUIRED);
 
         var objectKey = BuildObjectKey(uploadId, fileName);
 
@@ -148,7 +153,7 @@ public sealed class UploadsController : ControllerBase
         }
         catch
         {
-            return NotFound();
+            throw AppExceptionFactory.NotFound(AppErrorCode.UPLOAD_FILE_NOT_FOUND, new { uploadId, fileName });
         }
     }
 }

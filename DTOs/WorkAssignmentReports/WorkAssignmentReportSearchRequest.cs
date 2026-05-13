@@ -32,6 +32,7 @@ public sealed class WorkAssignmentReportSearchRequest
     public int? Status { get; set; }
 
     public bool? IsCurrent { get; set; }
+    public bool? IsActive { get; set; }
     public bool? IsLateSubmission { get; set; }
 
     public DateTime? DueFromUtc { get; set; }

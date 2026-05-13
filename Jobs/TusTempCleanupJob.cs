@@ -1,5 +1,6 @@
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
+using tdtd_be.Common.Time;
 using tdtd_be.Jobs;
 
 namespace tdtd_be.Uploads;
@@ -8,13 +9,16 @@ public sealed class TusTempCleanupJob : ITusTempCleanupJob
 {
     private readonly IConfiguration _cfg;
     private readonly ILogger<TusTempCleanupJob> _log;
+    private readonly IAppTimeService _time;
 
     public TusTempCleanupJob(
         IConfiguration cfg,
-        ILogger<TusTempCleanupJob> log)
+        ILogger<TusTempCleanupJob> log,
+        IAppTimeService time)
     {
         _cfg = cfg;
         _log = log;
+        _time = time;
     }
 
     public Task RunAsync(CancellationToken ct = default)
@@ -22,8 +26,8 @@ public sealed class TusTempCleanupJob : ITusTempCleanupJob
         var enabled = _cfg.GetValue<bool?>("UploadCleanup:Enabled") ?? true;
         if (!enabled) return Task.CompletedTask;
 
-        var tz = HangfireJobTimeHelper.ResolveBangkokTimeZone();
-        if (!HangfireJobTimeHelper.IsLastSundayOfMonth(DateTime.UtcNow, tz))
+        var tz = _time.ApplicationTimeZone;
+        if (!_time.IsLastSundayOfMonth(_time.UtcNow))
         {
             _log.LogInformation("TusTempCleanup skipped. Today is not last Sunday in timezone {timeZone}.", tz.Id);
             return Task.CompletedTask;
@@ -37,7 +41,7 @@ public sealed class TusTempCleanupJob : ITusTempCleanupJob
         }
 
         var olderDays = Math.Clamp(_cfg.GetValue<int?>("UploadCleanup:TempDeleteOlderDays") ?? 7, 1, 365);
-        var cutoffUtc = DateTime.UtcNow.AddDays(-olderDays);
+        var cutoffUtc = _time.UtcNow.AddDays(-olderDays);
         var deleted = 0;
         var failed = 0;
 

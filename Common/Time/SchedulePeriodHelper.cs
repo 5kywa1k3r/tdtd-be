@@ -4,22 +4,6 @@ namespace tdtd_be.Common.Time;
 
 public static class SchedulePeriodHelper
 {
-    public static string GetPeriodKey(string? cycleType, DateTime date)
-    {
-        //var type = NormalizeCycleType(cycleType);
-
-        //return type switch
-        //{
-        //    ReportCycleTypes.Daily => date.ToString("yyyy-MM-dd"),
-        //    ReportCycleTypes.Weekly => ScheduleWeekHelper.GetWeekPeriodKey(date),
-        //    ReportCycleTypes.Monthly => $"{date:yyyy-MM}",
-        //    ReportCycleTypes.Quarterly => $"{date.Year}-Q{GetQuarter(date)}",
-        //    ReportCycleTypes.SemiAnnual => $"{date.Year}-H{GetHalf(date)}",
-        //    _ => date.ToString("yyyy-MM-dd")
-        //};
-        return date.Date.ToString("yyyyMMdd");
-    }
-
     public static (DateTime start, DateTime end) GetPeriodRange(string? cycleType, DateTime date)
     {
         var type = NormalizeCycleType(cycleType);
@@ -45,14 +29,18 @@ public static class SchedulePeriodHelper
         2 => new DateTime(year, 4, 1),
         3 => new DateTime(year, 7, 1),
         4 => new DateTime(year, 10, 1),
-        _ => throw new InvalidOperationException("Quý không hợp lệ.")
+        _ => throw tdtd_be.Common.Errors.AppExceptionFactory.BadRequest(
+            tdtd_be.Common.Errors.AppErrorCode.COMMON_SCHEDULE_VALUE_INVALID,
+            new { field = "quarter", value = quarter })
     };
 
     public static DateTime GetHalfStartDate(int year, int half) => half switch
     {
         1 => new DateTime(year, 1, 1),
         2 => new DateTime(year, 7, 1),
-        _ => throw new InvalidOperationException("Nửa năm không hợp lệ.")
+        _ => throw tdtd_be.Common.Errors.AppExceptionFactory.BadRequest(
+            tdtd_be.Common.Errors.AppErrorCode.COMMON_SCHEDULE_VALUE_INVALID,
+            new { field = "half", value = half })
     };
 
     private static string NormalizeCycleType(string? cycleType)

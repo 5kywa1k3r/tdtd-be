@@ -9,6 +9,13 @@ public sealed class SubmitWorkAssignmentReportRequest
     public List<decimal?>? Values1D { get; set; } = default!;
     public string? FieldValuesJson { get; set; }
     public string? TableValuesJson { get; set; }
+    /// <summary>
+    /// Nếu đổi nguồn mà không gửi CumulativeContributionMode, BE tự áp default theo nguồn.
+    /// </summary>
+    public string? DataOrigin { get; set; }
+    public string? CumulativeContributionMode { get; set; }
+    public string? CumulativeContributionPolicyJson { get; set; }
+    public string? SummarySourceJson { get; set; }
     public string? CurrentProgressStatus { get; set; }
     public string? ReportReason { get; set; }
     public string? Difficulties { get; set; }

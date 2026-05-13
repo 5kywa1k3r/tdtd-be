@@ -1,4 +1,5 @@
-﻿using tdtd_be.Common.Time;
+using tdtd_be.Common.Errors;
+using tdtd_be.Common.Time;
 using tdtd_be.DTOs.WorkAssignments;
 using tdtd_be.Enum;
 using tdtd_be.Models;
@@ -26,9 +27,6 @@ internal static class WorkAssignmentScheduleHelper
             DynamicFormTemplateId = string.IsNullOrWhiteSpace(req.DynamicFormTemplateId)
                 ? null
                 : req.DynamicFormTemplateId.Trim(),
-            DynamicExcelId = string.IsNullOrWhiteSpace(req.DynamicExcelId)
-                ? null
-                : req.DynamicExcelId.Trim(),
             AssignmentType = assignmentType,
             AggregationType = req.AggregationType?.Trim() ?? string.Empty,
 
@@ -56,6 +54,10 @@ internal static class WorkAssignmentScheduleHelper
                 .Distinct(StringComparer.Ordinal)
                 .ToList(),
 
+            DynamicFormDataSourceRulesJson = string.IsNullOrWhiteSpace(req.DynamicFormDataSourceRulesJson)
+                ? null
+                : req.DynamicFormDataSourceRulesJson.Trim(),
+
             Description = string.IsNullOrWhiteSpace(req.Description)
                 ? null
                 : req.Description.Trim(),
@@ -67,26 +69,29 @@ internal static class WorkAssignmentScheduleHelper
 
     public static void ValidateRequest(SaveWorkAssignmentRequest req, Work work)
     {
-        if (string.IsNullOrWhiteSpace(req.DynamicFormTemplateId) &&
-            string.IsNullOrWhiteSpace(req.DynamicExcelId))
-            throw new InvalidOperationException("Thiếu Dynamic Form template.");
+        if (string.IsNullOrWhiteSpace(req.DynamicFormTemplateId))
+            throw AppExceptionFactory.BadRequest(AppErrorCode.DYNAMIC_FORM_TEMPLATE_REQUIRED);
 
         if (!WorkAssignmentTypes.All.Contains(req.AssignmentType))
-            throw new InvalidOperationException("Loại giao không hợp lệ.");
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_TYPE_INVALID,
+                new { req.AssignmentType });
 
         if (!WorkAggregationTypes.All.Contains(req.AggregationType))
-            throw new InvalidOperationException("Kiểu tổng hợp không hợp lệ.");
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_AGGREGATION_TYPE_INVALID,
+                new { req.AggregationType });
 
         if (req.AssigneeUserIds is null || req.AssigneeUserIds.Count == 0)
-            throw new InvalidOperationException("Phải chọn ít nhất 1 người được giao.");
+            throw AppExceptionFactory.BadRequest(AppErrorCode.WORK_ASSIGNMENT_ASSIGNEE_REQUIRED);
 
         if (req.AssignmentType == WorkAssignmentTypes.Once)
         {
             if (!req.DueAtUtc.HasValue)
-                throw new InvalidOperationException("Giao một lần bắt buộc phải có hạn nộp.");
+                throw AppExceptionFactory.BadRequest(AppErrorCode.WORK_ASSIGNMENT_ONCE_DUE_REQUIRED);
 
             if (req.Schedule is not null)
-                throw new InvalidOperationException("Giao một lần không được có cấu hình lịch định kỳ.");
+                throw AppExceptionFactory.BadRequest(AppErrorCode.WORK_ASSIGNMENT_ONCE_SCHEDULE_NOT_ALLOWED);
 
             ValidateOnceDueAt(req.DueAtUtc.Value, work);
             return;
@@ -98,7 +103,9 @@ internal static class WorkAssignmentScheduleHelper
             return;
         }
 
-        throw new InvalidOperationException("Loại giao không được hỗ trợ.");
+        throw AppExceptionFactory.BadRequest(
+            AppErrorCode.WORK_ASSIGNMENT_TYPE_UNSUPPORTED,
+            new { req.AssignmentType });
     }
 
     private static void ValidateOnceDueAt(DateTime dueAtUtc, Work work)
@@ -106,11 +113,16 @@ internal static class WorkAssignmentScheduleHelper
         var dueDate = dueAtUtc.Date;
 
         if (work.StartDate.HasValue && dueDate < work.StartDate.Value.Date)
-            throw new InvalidOperationException("Hạn nộp của giao một lần không được nhỏ hơn ngày bắt đầu công việc.");
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_ONCE_DUE_BEFORE_WORK_START,
+                new { dueAtUtc, work.StartDate });
 
         if (work.EndDate.HasValue && dueDate > work.EndDate.Value.Date)
-            throw new InvalidOperationException("Hạn nộp của giao một lần không được lớn hơn ngày kết thúc công việc.");
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_ONCE_DUE_AFTER_WORK_END,
+                new { dueAtUtc, work.EndDate });
     }
+
     public static AssignmentSchedule? MapSchedule(
         AssignmentScheduleDto? dto,
         string assignmentType)
@@ -186,28 +198,39 @@ internal static class WorkAssignmentScheduleHelper
     private static void ValidatePeriodicSchedule(AssignmentScheduleDto? scheduleDto, Work work)
     {
         if (scheduleDto is null)
-            throw new InvalidOperationException("Giao theo kỳ báo cáo bắt buộc có cấu hình lịch.");
+            throw AppExceptionFactory.BadRequest(AppErrorCode.WORK_ASSIGNMENT_PERIODIC_SCHEDULE_REQUIRED);
 
         if (!work.StartDate.HasValue || !work.EndDate.HasValue)
-            throw new InvalidOperationException("Công việc phải có từ ngày và đến ngày trước khi cấu hình giao định kỳ.");
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_PERIODIC_WORK_DATE_RANGE_REQUIRED,
+                new { work.Id, work.StartDate, work.EndDate });
 
         var workStart = work.StartDate.Value.Date;
         var workEnd = work.EndDate.Value.Date;
 
         if (workEnd < workStart)
-            throw new InvalidOperationException("Khoảng thời gian của công việc không hợp lệ.");
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_WORK_DATE_RANGE_INVALID,
+                new { work.Id, work.StartDate, work.EndDate });
 
         if (scheduleDto.StartDate.HasValue)
         {
             var scheduleStart = scheduleDto.StartDate.Value.Date;
             if (scheduleStart < workStart || scheduleStart > workEnd)
-                throw new InvalidOperationException("Ngày bắt đầu áp dụng lịch phải nằm trong khoảng thời gian của công việc.");
+                throw AppExceptionFactory.BadRequest(
+                    AppErrorCode.WORK_ASSIGNMENT_PERIODIC_START_OUT_OF_RANGE,
+                    new
+                    {
+                        scheduleStartDate = scheduleDto.StartDate,
+                        workStartDate = work.StartDate,
+                        workEndDate = work.EndDate
+                    });
         }
 
         var schedule = MapSchedule(scheduleDto, WorkAssignmentTypes.PeriodicReport);
 
         if (!ScheduleValidator.IsValid(schedule))
-            throw new InvalidOperationException("Cấu hình lịch báo cáo không hợp lệ.");
+            throw AppExceptionFactory.BadRequest(AppErrorCode.WORK_ASSIGNMENT_PERIODIC_SCHEDULE_INVALID);
 
         var occurrences = AssignmentScheduleOccurrenceHelper.GenerateOccurrences(
             schedule!,
@@ -215,6 +238,6 @@ internal static class WorkAssignmentScheduleHelper
             workEnd);
 
         if (occurrences.Count == 0)
-            throw new InvalidOperationException("Cấu hình kỳ báo cáo không tạo ra mốc báo cáo hợp lệ nào trong khoảng thời gian của công việc.");
+            throw AppExceptionFactory.BadRequest(AppErrorCode.WORK_ASSIGNMENT_PERIODIC_NO_OCCURRENCES);
     }
 }

@@ -17,7 +17,7 @@ public sealed class WorkAssignment : BaseEntity
 
     [BsonRepresentation(BsonType.ObjectId)]
     [BsonElement("dynamicExcelId")]
-    public string DynamicExcelId { get; set; } = default!;
+    public string? DynamicExcelId { get; set; }
 
     [BsonElement("dynamicExcelCode")]
     public string DynamicExcelCode { get; set; } = string.Empty;
@@ -34,6 +34,9 @@ public sealed class WorkAssignment : BaseEntity
 
     [BsonElement("dynamicFormTemplateName")]
     public string? DynamicFormTemplateName { get; set; }
+
+    [BsonElement("dynamicFormDataSourceRulesJson")]
+    public string? DynamicFormDataSourceRulesJson { get; set; }
 
     [BsonElement("workType")]
     public string WorkType { get; set; } = string.Empty;

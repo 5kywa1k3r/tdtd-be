@@ -13,6 +13,7 @@ public sealed class WorkAssignmentListResponse
     public string? DynamicFormTemplateId { get; set; }
     public string? DynamicFormTemplateCode { get; set; }
     public string? DynamicFormTemplateName { get; set; }
+    public string? DynamicFormDataSourceRulesJson { get; set; }
 
     public string AssignmentType { get; set; } = string.Empty;
     public string AggregationType { get; set; } = string.Empty;

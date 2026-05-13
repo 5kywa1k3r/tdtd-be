@@ -14,13 +14,20 @@ namespace tdtd_be.Common.Authentication
         {
             get
             {
-                var ctx = _http.HttpContext ?? throw new InvalidOperationException("No HttpContext.");
+                var ctx = _http.HttpContext
+                    ?? throw tdtd_be.Common.Errors.AppExceptionFactory.Unauthorized(
+                        tdtd_be.Common.Errors.AppErrorCode.AUTH_ME_NOT_AVAILABLE,
+                        new { reason = "httpContextMissing" });
 
                 if (!ctx.Items.TryGetValue(MeItemKey, out var obj) || obj is not MeResponse me)
-                    throw new InvalidOperationException($"MeResponse not found in HttpContext.Items['{MeItemKey}'].");
+                    throw tdtd_be.Common.Errors.AppExceptionFactory.Unauthorized(
+                        tdtd_be.Common.Errors.AppErrorCode.AUTH_ME_NOT_AVAILABLE,
+                        new { reason = "meContextMissing", key = MeItemKey });
 
                 if (me.IsDeleted)
-                    throw new InvalidOperationException("User is inactive.");
+                    throw tdtd_be.Common.Errors.AppExceptionFactory.Forbidden(
+                        tdtd_be.Common.Errors.AppErrorCode.AUTH_ACCOUNT_LOCKED,
+                        new { me.Id });
 
                 return me;
             }

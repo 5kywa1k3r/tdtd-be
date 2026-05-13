@@ -11,5 +11,6 @@ namespace tdtd_be.Common.Middleware
         public string? UnitName { get; set; }
         public IReadOnlyList<string> Roles { get; set; } = [];
         public string? PositionCode { get; set; }
+        public string? AccountKind { get; set; }
     }
 }

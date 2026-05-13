@@ -3,13 +3,16 @@ using MongoDB.Driver;
 using Microsoft.Extensions.Logging;
 using System.Text.Json;
 using tdtd_be.Common.Auth;
+using tdtd_be.Common.Errors;
 using tdtd_be.Data;
 using tdtd_be.DTOs.Common;
+using tdtd_be.DTOs.Operations;
 using tdtd_be.DTOs.WorkAssignments.Review;
 using tdtd_be.Enum;
 using tdtd_be.Models;
 using tdtd_be.Models.Enums;
 using tdtd_be.Services.Common;
+using tdtd_be.Services.WorkAssignmentReports;
 using tdtd_be.Services.WorkAssignmentReports.Statistics;
 using tdtd_be.Services.WorkAssignments.Internal;
 using tdtd_be.Services.WorkAssignments.Queue;
@@ -24,9 +27,11 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
     private readonly IWorkAssignmentStatusSyncService _statusSync;
     private readonly IDocRoleReadModelProjectionService _docRoleReadModelProjection;
     private readonly IWorkStatusOperationLogService _statusLog;
+    private readonly IUserActionLogService _userActionLog;
     private readonly IWorkReportLabelStatisticsService _labelStatistics;
     private readonly IWorkReportTableStatisticsService _tableStatistics;
     private readonly IWorkReportFieldStatisticsService _fieldStatistics;
+    private readonly IWorkAssignmentReportService _reportService;
     private readonly MeAccessor _me;
     private readonly ILogger<WorkAssignmentReviewService> _log;
 
@@ -36,9 +41,11 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
         IWorkAssignmentStatusSyncService statusSync,
         IDocRoleReadModelProjectionService docRoleReadModelProjection,
         IWorkStatusOperationLogService statusLog,
+        IUserActionLogService userActionLog,
         IWorkReportLabelStatisticsService labelStatistics,
         IWorkReportTableStatisticsService tableStatistics,
         IWorkReportFieldStatisticsService fieldStatistics,
+        IWorkAssignmentReportService reportService,
         MeAccessor me,
         ILogger<WorkAssignmentReviewService> log)
     {
@@ -47,9 +54,11 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
         _statusSync = statusSync;
         _docRoleReadModelProjection = docRoleReadModelProjection;
         _statusLog = statusLog;
+        _userActionLog = userActionLog;
         _labelStatistics = labelStatistics;
         _tableStatistics = tableStatistics;
         _fieldStatistics = fieldStatistics;
+        _reportService = reportService;
         _me = me;
         _log = log;
     }
@@ -222,17 +231,28 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
         var report = await _ctx.WorkAssignmentReports
             .Find(x => x.Id == reportId && !x.IsDeleted)
             .FirstOrDefaultAsync(ct)
-            ?? throw new InvalidOperationException("Không tìm thấy báo cáo.");
+            ?? throw ReportNotFound(reportId);
+
+        EnsureReportIsActive(report);
+        EnsureNotSelfReview(report, me.Id);
 
         if (report.Status != WorkAssignmentReportStatus.Submitted)
-            throw new InvalidOperationException("Chỉ báo cáo đã nộp mới được duyệt.");
+            throw InvalidReportStatus(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_APPROVE_STATUS_INVALID,
+                report,
+                WorkAssignmentReportStatus.Submitted);
 
         var assignment = await _ctx.WorkAssignments
             .Find(x => x.Id == report.WorkAssignmentId && !x.IsDeleted)
             .FirstOrDefaultAsync(ct)
-            ?? throw new InvalidOperationException("Không tìm thấy assignment của báo cáo.");
+            ?? throw ReportAssignmentNotFound(report);
 
         await EnsureCanReviewReportAsync(assignment, me.Id, ct);
+
+        var period = await _ctx.WorkReportPeriods
+            .Find(x => x.Id == report.WorkReportPeriodId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct);
+        await EnsurePreviousReportsApprovedAsync(period, ct);
 
         var now = DateTime.UtcNow;
 
@@ -253,10 +273,6 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
         report.ApprovedByUserId = me.Id;
         report.UpdatedAtUtc = now;
         report.UpdatedByUserId = me.Id;
-
-        var period = await _ctx.WorkReportPeriods
-            .Find(x => x.Id == report.WorkReportPeriodId && !x.IsDeleted)
-            .FirstOrDefaultAsync(ct);
 
         if (period is not null)
         {
@@ -306,6 +322,27 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
             ct);
 
         WorkAssignmentReportLogHelper.AppendApproveLog(report, me.Id, me.FullName ?? string.Empty);
+
+        await _userActionLog.RecordAsync(new UserActionLogSeed
+        {
+            Action = UserActionLogActions.ReportApproved,
+            Scope = "report",
+            ActorUserId = me.Id,
+            WorkId = report.WorkId,
+            WorkAssignmentId = report.WorkAssignmentId,
+            WorkReportPeriodId = report.WorkReportPeriodId,
+            WorkAssignmentReportId = report.Id,
+            TargetUserId = report.AssigneeUserId,
+            Summary = $"Approved report {report.PeriodInstanceKey}",
+            Data = new Dictionary<string, string>
+            {
+                { "fromStatus", WorkAssignmentReportStatus.Submitted.ToString() },
+                { "toStatus", WorkAssignmentReportStatus.Approved.ToString() }
+            },
+            OccurredAtUtc = now
+        }, CancellationToken.None);
+
+        await RefreshAggregateDependentsAfterReviewAsync(report.Id, me.Id, ct);
     }
 
     public async Task ReturnReportAsync(string reportId, ReturnReportRequest req, CancellationToken ct)
@@ -313,20 +350,26 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
         var me = _me.RequireMe();
 
         if (string.IsNullOrWhiteSpace(req.Comment))
-            throw new InvalidOperationException("Phải nhập lý do trả lại.");
+            throw AppExceptionFactory.BadRequest(AppErrorCode.WORK_ASSIGNMENT_REPORT_RETURN_COMMENT_REQUIRED);
 
         var report = await _ctx.WorkAssignmentReports
             .Find(x => x.Id == reportId && !x.IsDeleted)
             .FirstOrDefaultAsync(ct)
-            ?? throw new InvalidOperationException("Không tìm thấy báo cáo.");
+            ?? throw ReportNotFound(reportId);
+
+        EnsureReportIsActive(report);
+        EnsureNotSelfReview(report, me.Id);
 
         if (report.Status != WorkAssignmentReportStatus.Submitted)
-            throw new InvalidOperationException("Chỉ báo cáo đã nộp mới được trả lại.");
+            throw InvalidReportStatus(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_RETURN_STATUS_INVALID,
+                report,
+                WorkAssignmentReportStatus.Submitted);
 
         var assignment = await _ctx.WorkAssignments
             .Find(x => x.Id == report.WorkAssignmentId && !x.IsDeleted)
             .FirstOrDefaultAsync(ct)
-            ?? throw new InvalidOperationException("Không tìm thấy assignment của báo cáo.");
+            ?? throw ReportAssignmentNotFound(report);
 
         await EnsureCanReviewReportAsync(assignment, me.Id, ct);
 
@@ -408,6 +451,25 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
             ct);
 
         WorkAssignmentReportLogHelper.AppendReturnLog(report, me.Id, me.FullName ?? string.Empty, req.Comment);
+
+        await _userActionLog.RecordAsync(new UserActionLogSeed
+        {
+            Action = UserActionLogActions.ReportReturned,
+            Scope = "report",
+            ActorUserId = me.Id,
+            WorkId = report.WorkId,
+            WorkAssignmentId = report.WorkAssignmentId,
+            WorkReportPeriodId = report.WorkReportPeriodId,
+            WorkAssignmentReportId = report.Id,
+            TargetUserId = report.AssigneeUserId,
+            Summary = $"Returned report {report.PeriodInstanceKey}",
+            Data = new Dictionary<string, string>
+            {
+                { "fromStatus", WorkAssignmentReportStatus.Submitted.ToString() },
+                { "toStatus", WorkAssignmentReportStatus.Draft.ToString() }
+            },
+            OccurredAtUtc = now
+        }, CancellationToken.None);
     }
 
     public async Task RecallApprovedReportAsync(string reportId, ReturnReportRequest req, CancellationToken ct)
@@ -415,22 +477,32 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
         var me = _me.RequireMe();
 
         if (string.IsNullOrWhiteSpace(req.Comment))
-            throw new InvalidOperationException("Phải nhập lý do thu hồi duyệt.");
+            throw AppExceptionFactory.BadRequest(AppErrorCode.WORK_ASSIGNMENT_REPORT_RECALL_COMMENT_REQUIRED);
 
         var report = await _ctx.WorkAssignmentReports
             .Find(x => x.Id == reportId && !x.IsDeleted)
             .FirstOrDefaultAsync(ct)
-            ?? throw new InvalidOperationException("Không tìm thấy báo cáo.");
+            ?? throw ReportNotFound(reportId);
 
         if (report.Status != WorkAssignmentReportStatus.Approved)
-            throw new InvalidOperationException("Chỉ báo cáo đã duyệt mới được thu hồi duyệt.");
+            throw InvalidReportStatus(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_RECALL_STATUS_INVALID,
+                report,
+                WorkAssignmentReportStatus.Approved);
+
+        EnsureReportIsActive(report);
 
         var assignment = await _ctx.WorkAssignments
             .Find(x => x.Id == report.WorkAssignmentId && !x.IsDeleted)
             .FirstOrDefaultAsync(ct)
-            ?? throw new InvalidOperationException("Không tìm thấy assignment của báo cáo.");
+            ?? throw ReportAssignmentNotFound(report);
 
         await EnsureCanReviewReportAsync(assignment, me.Id, ct);
+
+        var period = await _ctx.WorkReportPeriods
+            .Find(x => x.Id == report.WorkReportPeriodId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct);
+        await EnsureNoLaterApprovedReportsAsync(period, ct);
 
         var now = DateTime.UtcNow;
         var nextPeriodStatus = WorkReportPeriodStatusHelper.ResolveSubmittedStatus(report.DueAtUtc, now);
@@ -454,10 +526,6 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
         report.ApprovedByUserId = null;
         report.UpdatedAtUtc = now;
         report.UpdatedByUserId = me.Id;
-
-        var period = await _ctx.WorkReportPeriods
-            .Find(x => x.Id == report.WorkReportPeriodId && !x.IsDeleted)
-            .FirstOrDefaultAsync(ct);
 
         if (period is not null)
         {
@@ -505,6 +573,310 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
             req.Comment,
             req.Comment,
             ct);
+
+        await RefreshAggregateDependentsAfterReviewAsync(report.Id, me.Id, ct);
+    }
+
+    public async Task DeactivateReportAsync(string reportId, ReportActiveRequest req, CancellationToken ct)
+    {
+        var me = _me.RequireMe();
+        req ??= new ReportActiveRequest();
+
+        var report = await _ctx.WorkAssignmentReports
+            .Find(x => x.Id == reportId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct)
+            ?? throw ReportNotFound(reportId);
+
+        var assignment = await _ctx.WorkAssignments
+            .Find(x => x.Id == report.WorkAssignmentId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct)
+            ?? throw ReportAssignmentNotFound(report);
+
+        await EnsureCanReviewReportAsync(assignment, me.Id, ct);
+
+        if (report.IsActive == false)
+            return;
+
+        var period = await _ctx.WorkReportPeriods
+            .Find(x => x.Id == report.WorkReportPeriodId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct);
+
+        if (report.Status == WorkAssignmentReportStatus.Approved)
+            await EnsureNoLaterApprovedReportsAsync(period, ct);
+
+        var now = DateTime.UtcNow;
+        var comment = NormalizeOptionalText(req.Comment);
+        var wasCurrent = report.IsCurrent || string.Equals(period?.CurrentReportId, report.Id, StringComparison.Ordinal);
+
+        await _ctx.WorkAssignmentReports.UpdateOneAsync(
+            x => x.Id == report.Id && !x.IsDeleted,
+            Builders<WorkAssignmentReport>.Update
+                .Set(x => x.IsActive, false)
+                .Set(x => x.IsCurrent, false)
+                .Set(x => x.DeactivatedAtUtc, now)
+                .Set(x => x.DeactivatedByUserId, me.Id)
+                .Set(x => x.DeactivationReason, comment)
+                .Set(x => x.UpdatedAtUtc, now)
+                .Set(x => x.UpdatedByUserId, me.Id),
+            cancellationToken: ct);
+
+        report.IsActive = false;
+        report.IsCurrent = false;
+        report.DeactivatedAtUtc = now;
+        report.DeactivatedByUserId = me.Id;
+        report.DeactivationReason = comment;
+        report.UpdatedAtUtc = now;
+        report.UpdatedByUserId = me.Id;
+
+        if (period is not null && wasCurrent)
+        {
+            var nextPeriodStatus = WorkReportPeriodStatusHelper.ResolveInitialStatus(period.DueAtUtc, now);
+            var deactivatePeriod = WorkReportPeriodKind.IsUserCreated(period.PeriodKind);
+            var update = Builders<WorkReportPeriod>.Update
+                .Set(x => x.CurrentReportId, (string?)null)
+                .Set(x => x.Status, nextPeriodStatus)
+                .Set(x => x.IsOverdue, WorkReportPeriodStatusHelper.IsOverdue(nextPeriodStatus))
+                .Set(x => x.LastDraftSavedAtUtc, (DateTime?)null)
+                .Set(x => x.LastSubmittedAtUtc, (DateTime?)null)
+                .Set(x => x.LastReviewedAtUtc, (DateTime?)null)
+                .Set(x => x.CurrentProgressStatus, null)
+                .Set(x => x.ReportReason, null)
+                .Set(x => x.Difficulties, null)
+                .Set(x => x.ProposedSolution, null)
+                .Set(x => x.LateReason, null)
+                .Set(x => x.ReviewerComment, null)
+                .Set(x => x.ReturnReason, null)
+                .Set(x => x.UpdatedAtUtc, now)
+                .Set(x => x.UpdatedByUserId, me.Id);
+
+            if (deactivatePeriod)
+                update = update.Set(x => x.IsActive, false);
+
+            await _ctx.WorkReportPeriods.UpdateOneAsync(
+                x => x.Id == period.Id && !x.IsDeleted,
+                update,
+                cancellationToken: ct);
+
+            period.CurrentReportId = null;
+            period.Status = nextPeriodStatus;
+            period.IsOverdue = WorkReportPeriodStatusHelper.IsOverdue(nextPeriodStatus);
+            period.LastDraftSavedAtUtc = null;
+            period.LastSubmittedAtUtc = null;
+            period.LastReviewedAtUtc = null;
+            period.CurrentProgressStatus = null;
+            period.ReportReason = null;
+            period.Difficulties = null;
+            period.ProposedSolution = null;
+            period.LateReason = null;
+            period.ReviewerComment = null;
+            period.ReturnReason = null;
+            period.IsActive = !deactivatePeriod;
+            period.UpdatedAtUtc = now;
+            period.UpdatedByUserId = me.Id;
+        }
+
+        if (period is not null)
+        {
+            await FinalizeReviewReportStatusOperationAsync(
+                "REVIEW_DEACTIVATE_REPORT",
+                report,
+                period,
+                "ACTIVE",
+                "INACTIVE",
+                me.Id,
+                upsertQueue: period.IsActive && WorkReportPeriodStatusHelper.ShouldKeepQueueActive(period.Status),
+                disableQueue: !period.IsActive || !WorkReportPeriodStatusHelper.ShouldKeepQueueActive(period.Status),
+                ct,
+                forceRebuildStatistics: true);
+        }
+        else
+        {
+            await RebuildReportStatisticsAsync(report, me.Id, ct);
+            await _statusSync.SyncFromAssignmentAsync(report.WorkAssignmentId, ct);
+        }
+
+        await InsertReportLogAsync(
+            report.WorkId,
+            report.WorkAssignmentId,
+            report.WorkReportPeriodId,
+            report.Id,
+            "Deactivate",
+            "ACTIVE",
+            "INACTIVE",
+            me.Id,
+            comment,
+            comment,
+            ct);
+
+        await _userActionLog.RecordAsync(new UserActionLogSeed
+        {
+            Action = UserActionLogActions.ReportDeactivated,
+            Scope = "report",
+            ActorUserId = me.Id,
+            WorkId = report.WorkId,
+            WorkAssignmentId = report.WorkAssignmentId,
+            WorkReportPeriodId = report.WorkReportPeriodId,
+            WorkAssignmentReportId = report.Id,
+            TargetUserId = report.AssigneeUserId,
+            Summary = $"Deactivated report {report.PeriodInstanceKey}",
+            Data = new Dictionary<string, string>
+            {
+                { "fromActive", "true" },
+                { "toActive", "false" }
+            },
+            OccurredAtUtc = now
+        }, CancellationToken.None);
+    }
+
+    public async Task ReactivateReportAsync(string reportId, ReportActiveRequest req, CancellationToken ct)
+    {
+        var me = _me.RequireMe();
+        req ??= new ReportActiveRequest();
+
+        var report = await _ctx.WorkAssignmentReports
+            .Find(x => x.Id == reportId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct)
+            ?? throw ReportNotFound(reportId);
+
+        var assignment = await _ctx.WorkAssignments
+            .Find(x => x.Id == report.WorkAssignmentId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct)
+            ?? throw ReportAssignmentNotFound(report);
+
+        await EnsureCanReviewReportAsync(assignment, me.Id, ct);
+
+        if (report.IsActive != false)
+            return;
+
+        var period = await _ctx.WorkReportPeriods
+            .Find(x => x.Id == report.WorkReportPeriodId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct)
+            ?? throw ReportPeriodNotFound(report);
+
+        if (report.Status == WorkAssignmentReportStatus.Approved)
+            await EnsurePreviousReportsApprovedAsync(period, ct);
+
+        var fb = Builders<WorkAssignmentReport>.Filter;
+        var activeCurrentConflict = await _ctx.WorkAssignmentReports
+            .Find(fb.Eq(x => x.WorkAssignmentId, report.WorkAssignmentId)
+                  & fb.Eq(x => x.AssigneeUserId, report.AssigneeUserId)
+                  & fb.Eq(x => x.PeriodInstanceKey, report.PeriodInstanceKey)
+                  & fb.Eq(x => x.IsCurrent, true)
+                  & fb.Ne(x => x.IsActive, false)
+                  & fb.Eq(x => x.IsDeleted, false)
+                  & fb.Ne(x => x.Id, report.Id))
+            .AnyAsync(ct);
+
+        if (activeCurrentConflict)
+            throw AppExceptionFactory.Create(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_CURRENT_CONFLICT,
+                ReportDetails(report));
+
+        var now = DateTime.UtcNow;
+        var comment = NormalizeOptionalText(req.Comment);
+        var nextPeriodStatus = ResolvePeriodStatusFromReport(period, report, now);
+
+        await _ctx.WorkAssignmentReports.UpdateOneAsync(
+            x => x.Id == report.Id && !x.IsDeleted,
+            Builders<WorkAssignmentReport>.Update
+                .Set(x => x.IsActive, true)
+                .Set(x => x.IsCurrent, true)
+                .Set(x => x.ReactivatedAtUtc, now)
+                .Set(x => x.ReactivatedByUserId, me.Id)
+                .Set(x => x.UpdatedAtUtc, now)
+                .Set(x => x.UpdatedByUserId, me.Id),
+            cancellationToken: ct);
+
+        report.IsActive = true;
+        report.IsCurrent = true;
+        report.ReactivatedAtUtc = now;
+        report.ReactivatedByUserId = me.Id;
+        report.UpdatedAtUtc = now;
+        report.UpdatedByUserId = me.Id;
+
+        await _ctx.WorkReportPeriods.UpdateOneAsync(
+            x => x.Id == period.Id && !x.IsDeleted,
+            Builders<WorkReportPeriod>.Update
+                .Set(x => x.IsActive, true)
+                .Set(x => x.CurrentReportId, report.Id)
+                .Set(x => x.Status, nextPeriodStatus)
+                .Set(x => x.IsOverdue, WorkReportPeriodStatusHelper.IsOverdue(nextPeriodStatus))
+                .Set(x => x.LastDraftSavedAtUtc, report.Status == WorkAssignmentReportStatus.Draft ? (DateTime?)report.UpdatedAtUtc : null)
+                .Set(x => x.LastSubmittedAtUtc, report.SubmittedAtUtc)
+                .Set(x => x.LastReviewedAtUtc, report.ApprovedAtUtc)
+                .Set(x => x.CurrentProgressStatus, report.CurrentProgressStatus)
+                .Set(x => x.ReportReason, report.ReportReason)
+                .Set(x => x.Difficulties, report.Difficulties)
+                .Set(x => x.ProposedSolution, report.ProposedSolution)
+                .Set(x => x.LateReason, report.LateReason)
+                .Set(x => x.ReviewerComment, report.ReviewerComment)
+                .Set(x => x.ReturnReason, report.ReturnReason)
+                .Set(x => x.RequiresLateReason, report.IsLateSubmission)
+                .Set(x => x.UpdatedAtUtc, now)
+                .Set(x => x.UpdatedByUserId, me.Id),
+            cancellationToken: ct);
+
+        period.IsActive = true;
+        period.CurrentReportId = report.Id;
+        period.Status = nextPeriodStatus;
+        period.IsOverdue = WorkReportPeriodStatusHelper.IsOverdue(nextPeriodStatus);
+        period.LastDraftSavedAtUtc = report.Status == WorkAssignmentReportStatus.Draft ? report.UpdatedAtUtc : null;
+        period.LastSubmittedAtUtc = report.SubmittedAtUtc;
+        period.LastReviewedAtUtc = report.ApprovedAtUtc;
+        period.CurrentProgressStatus = report.CurrentProgressStatus;
+        period.ReportReason = report.ReportReason;
+        period.Difficulties = report.Difficulties;
+        period.ProposedSolution = report.ProposedSolution;
+        period.LateReason = report.LateReason;
+        period.ReviewerComment = report.ReviewerComment;
+        period.ReturnReason = report.ReturnReason;
+        period.RequiresLateReason = report.IsLateSubmission;
+        period.UpdatedAtUtc = now;
+        period.UpdatedByUserId = me.Id;
+
+        await FinalizeReviewReportStatusOperationAsync(
+            "REVIEW_REACTIVATE_REPORT",
+            report,
+            period,
+            "INACTIVE",
+            "ACTIVE",
+            me.Id,
+            upsertQueue: WorkReportPeriodStatusHelper.ShouldKeepQueueActive(period.Status),
+            disableQueue: !WorkReportPeriodStatusHelper.ShouldKeepQueueActive(period.Status),
+            ct,
+            forceRebuildStatistics: true);
+
+        await InsertReportLogAsync(
+            report.WorkId,
+            report.WorkAssignmentId,
+            report.WorkReportPeriodId,
+            report.Id,
+            "Reactivate",
+            "INACTIVE",
+            "ACTIVE",
+            me.Id,
+            comment,
+            comment,
+            ct);
+
+        await _userActionLog.RecordAsync(new UserActionLogSeed
+        {
+            Action = UserActionLogActions.ReportReactivated,
+            Scope = "report",
+            ActorUserId = me.Id,
+            WorkId = report.WorkId,
+            WorkAssignmentId = report.WorkAssignmentId,
+            WorkReportPeriodId = report.WorkReportPeriodId,
+            WorkAssignmentReportId = report.Id,
+            TargetUserId = report.AssigneeUserId,
+            Summary = $"Reactivated report {report.PeriodInstanceKey}",
+            Data = new Dictionary<string, string>
+            {
+                { "fromActive", "false" },
+                { "toActive", "true" }
+            },
+            OccurredAtUtc = now
+        }, CancellationToken.None);
     }
 
     public async Task<PagedResult<ReviewReportFlatRowDto>> SearchReportsForReviewAsync(
@@ -514,7 +886,7 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
         var me = _me.RequireMe();
 
         if (string.IsNullOrWhiteSpace(req.WorkId))
-            throw new InvalidOperationException("Thiếu WorkId.");
+            throw ReviewWorkIdRequired(req.WorkId);
 
         var page = req.Page < 0 ? 0 : req.Page;
         var pageSize = req.PageSize <= 0 ? 20 : req.PageSize;
@@ -667,6 +1039,9 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
 
             ReportId = x.CurrentReportId,
             ReportStatus = x.ReportStatus.HasValue ? (int)x.ReportStatus.Value : null,
+            ReportIsActive = x.ReportIsActive,
+            ReportDeactivatedAtUtc = x.ReportDeactivatedAtUtc,
+            ReportDeactivationReason = x.ReportDeactivationReason,
             SubmittedAtUtc = x.SubmittedAtUtc,
             ApprovedAtUtc = x.ApprovedAtUtc,
             ReturnedAtUtc = x.ReturnedAtUtc,
@@ -744,7 +1119,7 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
         var me = _me.RequireMe();
 
         if (string.IsNullOrWhiteSpace(req.WorkId))
-            throw new InvalidOperationException("Thiếu WorkId.");
+            throw ReviewWorkIdRequired(req.WorkId);
 
         var page = req.Page < 0 ? 0 : req.Page;
         var pageSize = req.PageSize <= 0 ? 20 : req.PageSize;
@@ -880,6 +1255,234 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
             period.DueAtUtc,
             report.IsLateSubmission,
             now);
+    }
+
+    private static WorkReportPeriodStatus ResolvePeriodStatusFromReport(
+        WorkReportPeriod period,
+        WorkAssignmentReport report,
+        DateTime now)
+    {
+        return report.Status switch
+        {
+            WorkAssignmentReportStatus.Approved => ResolveApprovedPeriodStatus(period, report, now),
+            WorkAssignmentReportStatus.Submitted => WorkReportPeriodStatusHelper.ResolveSubmittedStatus(period.DueAtUtc, now),
+            _ => WorkReportPeriodStatusHelper.ResolveDraftStatus(period.DueAtUtc, now)
+        };
+    }
+
+    private static void EnsureReportIsActive(WorkAssignmentReport report)
+    {
+        if (report.IsActive == false)
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_INACTIVE,
+                ReportDetails(report));
+    }
+
+    private static string? NormalizeOptionalText(string? value)
+    {
+        var text = value?.Trim();
+        return string.IsNullOrWhiteSpace(text) ? null : text;
+    }
+
+    private static AppException ReviewWorkIdRequired(string? workId)
+        => AppExceptionFactory.BadRequest(
+            AppErrorCode.WORK_ASSIGNMENT_REVIEW_WORK_ID_REQUIRED,
+            new { workId });
+
+    private static AppException EvaluationAssignmentIdRequired(string? assignmentId)
+        => AppExceptionFactory.BadRequest(
+            AppErrorCode.WORK_ASSIGNMENT_EVALUATION_ASSIGNMENT_ID_REQUIRED,
+            new { assignmentId });
+
+    private static AppException EvaluationAssignmentNotFound(string? assignmentId)
+        => AppExceptionFactory.NotFound(
+            AppErrorCode.WORK_ASSIGNMENT_EVALUATION_ASSIGNMENT_NOT_FOUND,
+            new { assignmentId });
+
+    private static object AssignmentDetails(WorkAssignment assignment)
+        => new
+        {
+            assignmentId = assignment.Id,
+            assignment.WorkId,
+            assignment.ParentAssignmentId,
+            assignment.RootAssignmentId,
+            assignment.DynamicFormTemplateId,
+            assignment.EvaluationTemplateId,
+            ownerUserId = assignment.CreatedByUserId
+        };
+
+    private static AppException ReportNotFound(string? reportId)
+        => AppExceptionFactory.NotFound(
+            AppErrorCode.WORK_ASSIGNMENT_REPORT_NOT_FOUND,
+            new { reportId });
+
+    private static AppException ReportAssignmentNotFound(WorkAssignmentReport report)
+        => AppExceptionFactory.NotFound(
+            AppErrorCode.WORK_ASSIGNMENT_REPORT_ASSIGNMENT_NOT_FOUND,
+            ReportDetails(report));
+
+    private static AppException ReportPeriodNotFound(WorkAssignmentReport report)
+        => AppExceptionFactory.NotFound(
+            AppErrorCode.WORK_ASSIGNMENT_REPORT_PERIOD_NOT_FOUND,
+            ReportDetails(report));
+
+    private static AppException InvalidReportStatus(
+        AppErrorCode code,
+        WorkAssignmentReport report,
+        WorkAssignmentReportStatus expectedStatus)
+        => AppExceptionFactory.BadRequest(
+            code,
+            new
+            {
+                reportId = report.Id,
+                report.Status,
+                expectedStatus,
+                report.WorkAssignmentId,
+                report.WorkReportPeriodId,
+                report.PeriodInstanceKey
+            });
+
+    private static void EnsureNotSelfReview(WorkAssignmentReport report, string actorUserId)
+    {
+        if (string.Equals(report.AssigneeUserId, actorUserId, StringComparison.Ordinal))
+            throw AppExceptionFactory.Forbidden(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_REVIEW_SELF_FORBIDDEN,
+                new
+                {
+                    reportId = report.Id,
+                    report.WorkId,
+                    report.WorkAssignmentId,
+                    report.WorkReportPeriodId,
+                    report.PeriodKey,
+                    report.PeriodInstanceKey,
+                    report.AssigneeUserId,
+                    actorUserId
+                });
+    }
+
+    private static object ReportDetails(WorkAssignmentReport report)
+        => new
+        {
+            reportId = report.Id,
+            report.WorkId,
+            report.WorkAssignmentId,
+            report.WorkReportPeriodId,
+            report.PeriodKey,
+            report.PeriodInstanceKey,
+            report.AssigneeUserId
+        };
+
+    private async Task EnsurePreviousReportsApprovedAsync(
+        WorkReportPeriod? period,
+        CancellationToken ct)
+    {
+        if (period is null)
+            return;
+
+        var fb = Builders<WorkReportPeriod>.Filter;
+        var filter = fb.Eq(x => x.WorkAssignmentId, period.WorkAssignmentId)
+                     & fb.Eq(x => x.AssigneeUserId, period.AssigneeUserId)
+                     & fb.Eq(x => x.PeriodKind, period.PeriodKind)
+                     & fb.Eq(x => x.IsDeleted, false)
+                     & fb.Ne(x => x.Id, period.Id);
+
+        if (!string.IsNullOrWhiteSpace(period.DynamicFormTemplateId))
+            filter &= fb.Eq(x => x.DynamicFormTemplateId, period.DynamicFormTemplateId);
+        else if (!string.IsNullOrWhiteSpace(period.DynamicExcelId))
+            filter &= fb.Eq(x => x.DynamicExcelId, period.DynamicExcelId);
+
+        var candidates = await _ctx.WorkReportPeriods
+            .Find(filter)
+            .ToListAsync(ct);
+
+        var previousOpenPeriod = candidates
+            .Where(candidate => ComparePeriodOrder(candidate, period) < 0)
+            .Where(candidate => !WorkReportPeriodStatusHelper.IsTerminal(candidate.Status))
+            .OrderBy(ResolvePeriodOrder)
+            .FirstOrDefault();
+
+        if (previousOpenPeriod is not null)
+            throw AppExceptionFactory.Create(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_PREVIOUS_PERIOD_OPEN,
+                new
+                {
+                    periodId = period.Id,
+                    periodInstanceKey = period.PeriodInstanceKey,
+                    previousPeriodId = previousOpenPeriod.Id,
+                    previousPeriodInstanceKey = previousOpenPeriod.PeriodInstanceKey,
+                    previousPeriodStatus = previousOpenPeriod.Status
+                });
+    }
+
+    private async Task EnsureNoLaterApprovedReportsAsync(
+        WorkReportPeriod? period,
+        CancellationToken ct)
+    {
+        if (period is null)
+            return;
+
+        var fb = Builders<WorkReportPeriod>.Filter;
+        var filter = fb.Eq(x => x.WorkAssignmentId, period.WorkAssignmentId)
+                     & fb.Eq(x => x.AssigneeUserId, period.AssigneeUserId)
+                     & fb.Eq(x => x.PeriodKind, period.PeriodKind)
+                     & fb.Eq(x => x.IsDeleted, false)
+                     & fb.Ne(x => x.Id, period.Id);
+
+        if (!string.IsNullOrWhiteSpace(period.DynamicFormTemplateId))
+            filter &= fb.Eq(x => x.DynamicFormTemplateId, period.DynamicFormTemplateId);
+        else if (!string.IsNullOrWhiteSpace(period.DynamicExcelId))
+            filter &= fb.Eq(x => x.DynamicExcelId, period.DynamicExcelId);
+
+        var candidates = await _ctx.WorkReportPeriods
+            .Find(filter)
+            .ToListAsync(ct);
+
+        var laterApprovedPeriod = candidates
+            .Where(candidate => ComparePeriodOrder(candidate, period) > 0)
+            .Where(candidate => WorkReportPeriodStatusHelper.IsTerminal(candidate.Status))
+            .OrderBy(ResolvePeriodOrder)
+            .FirstOrDefault();
+
+        if (laterApprovedPeriod is not null)
+            throw AppExceptionFactory.Create(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_LATER_PERIOD_APPROVED,
+                new
+                {
+                    periodId = period.Id,
+                    periodInstanceKey = period.PeriodInstanceKey,
+                    laterPeriodId = laterApprovedPeriod.Id,
+                    laterPeriodInstanceKey = laterApprovedPeriod.PeriodInstanceKey,
+                    laterPeriodStatus = laterApprovedPeriod.Status
+                });
+    }
+
+    private static int ComparePeriodOrder(WorkReportPeriod left, WorkReportPeriod right)
+    {
+        var byTime = DateTime.Compare(ResolvePeriodOrder(left), ResolvePeriodOrder(right));
+        if (byTime != 0)
+            return byTime;
+
+        var byCreated = DateTime.Compare(left.CreatedAtUtc, right.CreatedAtUtc);
+        if (byCreated != 0)
+            return byCreated;
+
+        return string.Compare(left.Id, right.Id, StringComparison.Ordinal);
+    }
+
+    private static DateTime ResolvePeriodOrder(WorkReportPeriod period)
+    {
+        if (WorkReportPeriodKind.IsUserCreated(period.PeriodKind))
+            return period.ReportDate
+                   ?? period.PeriodStart
+                   ?? period.PeriodEnd
+                   ?? period.DueAtUtc
+                   ?? period.CreatedAtUtc;
+
+        return period.PeriodStart
+               ?? period.ReportDate
+               ?? period.PeriodEnd
+               ?? period.DueAtUtc
+               ?? period.CreatedAtUtc;
     }
 
     private static bool MatchUserTypeFilter(string? username, string? filter)
@@ -1031,15 +1634,17 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
         var me = _me.RequireMe();
 
         if (string.IsNullOrWhiteSpace(assignmentId))
-            throw new InvalidOperationException("Thiếu assignmentId.");
+            throw EvaluationAssignmentIdRequired(assignmentId);
 
         if (string.IsNullOrWhiteSpace(req.EvaluationCode))
-            throw new InvalidOperationException("Thiếu EvaluationCode.");
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_EVALUATION_CODE_REQUIRED,
+                new { assignmentId, req.EvaluationCode });
 
         var assignment = await _ctx.WorkAssignments
             .Find(x => x.Id == assignmentId && !x.IsDeleted)
             .FirstOrDefaultAsync(ct)
-            ?? throw new InvalidOperationException("Không tìm thấy assignment.");
+            ?? throw EvaluationAssignmentNotFound(assignmentId);
 
         EnsureCanEvaluateAssignment(assignment, me.Id);
 
@@ -1055,21 +1660,34 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
             .AnyAsync(ct);
 
         if (!hasApprovedPeriod)
-            throw new InvalidOperationException("Chỉ được đánh giá khi assignment đã có ít nhất một kỳ được approve.");
+            throw AppExceptionFactory.Create(
+                AppErrorCode.WORK_ASSIGNMENT_EVALUATION_APPROVED_PERIOD_REQUIRED,
+                AssignmentDetails(assignment));
 
         if (string.IsNullOrWhiteSpace(assignment.EvaluationTemplateId))
-            throw new InvalidOperationException("Assignment chưa được cấu hình bộ đánh giá.");
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_EVALUATION_TEMPLATE_REQUIRED,
+                AssignmentDetails(assignment));
 
         var template = await _ctx.EvaluationTemplates
             .Find(x => x.Id == assignment.EvaluationTemplateId && !x.IsDeleted)
             .FirstOrDefaultAsync(ct)
-            ?? throw new InvalidOperationException("Không tìm thấy bộ đánh giá của assignment.");
+            ?? throw AppExceptionFactory.NotFound(
+                AppErrorCode.WORK_ASSIGNMENT_EVALUATION_TEMPLATE_NOT_FOUND,
+                AssignmentDetails(assignment));
 
         var option = (template.Items ?? new List<EvaluationTemplateItem>())
             .FirstOrDefault(x => string.Equals(x.Code, req.EvaluationCode.Trim(), StringComparison.OrdinalIgnoreCase));
 
         if (option is null)
-            throw new InvalidOperationException("EvaluationCode không hợp lệ trong bộ đánh giá của assignment.");
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_EVALUATION_CODE_INVALID,
+                new
+                {
+                    assignmentId = assignment.Id,
+                    assignment.WorkId,
+                    evaluationCode = req.EvaluationCode
+                });
 
         var oldCode = assignment.EvaluationCode;
         var oldLabel = assignment.EvaluationLabel;
@@ -1132,12 +1750,12 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
         var me = _me.RequireMe();
 
         if (string.IsNullOrWhiteSpace(assignmentId))
-            throw new InvalidOperationException("Thiếu assignmentId.");
+            throw EvaluationAssignmentIdRequired(assignmentId);
 
         var assignment = await _ctx.WorkAssignments
             .Find(x => x.Id == assignmentId && !x.IsDeleted)
             .FirstOrDefaultAsync(ct)
-            ?? throw new InvalidOperationException("Không tìm thấy assignment.");
+            ?? throw EvaluationAssignmentNotFound(assignmentId);
 
         EnsureCanEvaluateAssignment(assignment, me.Id);
 
@@ -1219,7 +1837,8 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
         string actorUserId,
         bool upsertQueue,
         bool disableQueue,
-        CancellationToken ct)
+        CancellationToken ct,
+        bool forceRebuildStatistics = false)
     {
         var startedAtUtc = DateTime.UtcNow;
         var periodStatus = period.Status.ToString();
@@ -1231,11 +1850,10 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
             else if (upsertQueue)
                 await _queueService.UpsertPeriodAsync(period, actorUserId, ct);
 
-            await _docRoleReadModelProjection.RebuildReportPeriodAsync(period.Id, actorUserId, ct);
             await _statusSync.SyncFromAssignmentAsync(report.WorkAssignmentId, ct);
-            await _labelStatistics.RebuildForReportAsync(report.Id, actorUserId, ct);
-            await _tableStatistics.RebuildForReportAsync(report.Id, actorUserId, ct);
-            await _fieldStatistics.RebuildForReportAsync(report.Id, actorUserId, ct);
+            await _docRoleReadModelProjection.RebuildReportPeriodAsync(period.Id, actorUserId, ct);
+            if (forceRebuildStatistics || ShouldRebuildApprovedStatistics(fromStatus, toStatus))
+                await RebuildReportStatisticsAsync(report, actorUserId, ct);
 
             _log.LogInformation(
                 "WorkAssignment review report status operation completed. operation={operation} reportId={reportId} periodId={periodId} assignmentId={assignmentId} workId={workId} fromStatus={fromStatus} toStatus={toStatus}",
@@ -1260,7 +1878,7 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
                 FromStatus = fromStatus,
                 ToStatus = toStatus,
                 PeriodToStatus = periodStatus,
-                Summary = $"upsertQueue={upsertQueue};disableQueue={disableQueue};rebuildProjection=true;syncAssignment=true",
+                Summary = $"upsertQueue={upsertQueue};disableQueue={disableQueue};rebuildProjection=true;syncAssignment=true;forceRebuildStatistics={forceRebuildStatistics}",
                 StartedAtUtc = startedAtUtc
             }, startedAtUtc, ct);
         }
@@ -1294,7 +1912,7 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
                 FromStatus = fromStatus,
                 ToStatus = toStatus,
                 PeriodToStatus = periodStatus,
-                Summary = $"upsertQueue={upsertQueue};disableQueue={disableQueue};rebuildProjection=true;syncAssignment=true",
+                Summary = $"upsertQueue={upsertQueue};disableQueue={disableQueue};rebuildProjection=true;syncAssignment=true;forceRebuildStatistics={forceRebuildStatistics}",
                 ErrorType = ex.GetType().FullName,
                 ErrorMessage = ex.Message,
                 ErrorStackTrace = ex.ToString(),
@@ -1303,6 +1921,39 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
 
             throw;
         }
+    }
+
+    private static bool ShouldRebuildApprovedStatistics(string? fromStatus, string? toStatus)
+        => string.Equals(fromStatus, WorkAssignmentReportStatus.Approved.ToString(), StringComparison.OrdinalIgnoreCase)
+           || string.Equals(toStatus, WorkAssignmentReportStatus.Approved.ToString(), StringComparison.OrdinalIgnoreCase);
+
+    private async Task RefreshAggregateDependentsAfterReviewAsync(
+        string reportId,
+        string actorUserId,
+        CancellationToken ct)
+    {
+        try
+        {
+            await _reportService.RefreshDynamicFormAggregateDependentsAsync(reportId, actorUserId, ct);
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(
+                ex,
+                "Dynamic Form aggregate dependent refresh failed after review action. reportId={reportId} actorUserId={actorUserId}",
+                reportId,
+                actorUserId);
+        }
+    }
+
+    private async Task RebuildReportStatisticsAsync(
+        WorkAssignmentReport report,
+        string actorUserId,
+        CancellationToken ct)
+    {
+        await _labelStatistics.RebuildForReportAsync(report.Id, actorUserId, ct);
+        await _tableStatistics.RebuildForReportAsync(report.Id, actorUserId, ct);
+        await _fieldStatistics.RebuildForReportAsync(report.Id, actorUserId, ct);
     }
 
     private async Task WriteStatusOperationLogAsync(
@@ -1316,32 +1967,27 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
         await _statusLog.WriteAsync(log, ct);
     }
 
-    private async Task<WorkAssignment> EnsureCanReviewReportAsync(
+    private static Task<WorkAssignment> EnsureCanReviewReportAsync(
         WorkAssignment assignment,
         string reviewerUserId,
         CancellationToken ct)
     {
-        if (string.Equals(assignment.CreatedByUserId, reviewerUserId, StringComparison.Ordinal))
-            return assignment;
-
-        var canReviewByRuntimeBinding = await _ctx.WorkTemplateAssignees
-            .Find(x =>
-                x.WorkAssignmentId == assignment.Id &&
-                x.CreatedByUserId == reviewerUserId &&
-                !x.IsDeleted)
-            .AnyAsync(ct);
-
-        if (canReviewByRuntimeBinding)
-            return assignment;
-
         WorkAssignmentReviewPermissionHelper.EnsureCanReviewOnNode(assignment, reviewerUserId);
-        return assignment;
+        return Task.FromResult(assignment);
     }
 
     private static void EnsureCanEvaluateAssignment(WorkAssignment assignment, string actorUserId)
     {
         if (!string.Equals(assignment.CreatedByUserId, actorUserId, StringComparison.Ordinal))
-            throw new UnauthorizedAccessException("Chỉ owner của assignment mới được đánh giá tay.");
+            throw AppExceptionFactory.Forbidden(
+                AppErrorCode.WORK_ASSIGNMENT_EVALUATION_FORBIDDEN,
+                new
+                {
+                    assignmentId = assignment.Id,
+                    assignment.WorkId,
+                    actorUserId,
+                    ownerUserId = assignment.CreatedByUserId
+                });
     }
 
     private async Task<WorkAssignment> LoadParentForReviewAsync(
@@ -1350,12 +1996,16 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
         CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(parentAssignmentId))
-            throw new InvalidOperationException("Thiếu ParentAssignmentId.");
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_REVIEW_PARENT_ID_REQUIRED,
+                new { parentAssignmentId });
 
         var parent = await _ctx.WorkAssignments
             .Find(x => x.Id == parentAssignmentId && !x.IsDeleted)
             .FirstOrDefaultAsync(ct)
-            ?? throw new InvalidOperationException("Không tìm thấy node cha.");
+            ?? throw AppExceptionFactory.NotFound(
+                AppErrorCode.WORK_ASSIGNMENT_REVIEW_PARENT_NOT_FOUND,
+                new { parentAssignmentId });
 
         await EnsureCanReviewReportAsync(parent, reviewerUserId, ct);
         return parent;

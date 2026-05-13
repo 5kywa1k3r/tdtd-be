@@ -1,16 +1,16 @@
-﻿using System.Text.Json;
+using System.Text.Json;
+using tdtd_be.Common.Errors;
 
 namespace tdtd_be.Common.Middleware;
 
 public sealed class ApiExceptionMiddleware : IMiddleware
 {
+    private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private readonly ILogger<ApiExceptionMiddleware> _log;
-    private readonly IHostEnvironment _env;
 
     public ApiExceptionMiddleware(ILogger<ApiExceptionMiddleware> log, IHostEnvironment env)
     {
         _log = log;
-        _env = env;
     }
 
     public async Task InvokeAsync(HttpContext ctx, RequestDelegate next)
@@ -21,49 +21,56 @@ public sealed class ApiExceptionMiddleware : IMiddleware
         }
         catch (OperationCanceledException) when (ctx.RequestAborted.IsCancellationRequested)
         {
-            // Client hủy request -> không cần trả JSON (hoặc trả 499 nếu muốn)
-            ctx.Response.StatusCode = 499; // nginx style; optional
+            ctx.Response.StatusCode = 499;
+        }
+        catch (AppException ex)
+        {
+            await WriteAppExceptionAsync(ctx, ex);
         }
         catch (Exception ex)
         {
             _log.LogError(ex, "Unhandled exception: {Path}", ctx.Request.Path);
-
-            var (status, message) = Map(ex);
-
-            // luôn trả JSON chuẩn
-            ctx.Response.ContentType = "application/json; charset=utf-8";
-            ctx.Response.StatusCode = status;
-
-            // prod: không lộ stack trace
-            var payload = new ApiErrorResponse(message);
-
-            // dev: có thể cho thêm traceId để debug
-            // (không đưa stack)
-            payload = payload with { TraceId = ctx.TraceIdentifier };
-
-            await ctx.Response.WriteAsync(JsonSerializer.Serialize(payload));
+            await WriteAppExceptionAsync(ctx, MapLegacy(ex));
         }
     }
 
-    private static (int status, string message) Map(Exception ex)
+    private async Task WriteAppExceptionAsync(HttpContext ctx, AppException ex)
     {
-        // ✅ Lỗi nghiệp vụ / validation: trả 400 + message sạch
-        if (ex is InvalidOperationException)
-            return (StatusCodes.Status400BadRequest, ex.Message);
+        var descriptor = ex.Descriptor;
+        if (descriptor.HttpStatus >= StatusCodes.Status500InternalServerError)
+        {
+            _log.LogError(ex, "Application exception: {Path} {ErrorCode}", ctx.Request.Path, descriptor.Code);
+        }
+        else
+        {
+            _log.LogWarning(
+                "Application exception: {Path} {ErrorCode} {Message}",
+                ctx.Request.Path,
+                descriptor.Code,
+                ex.Message);
+        }
 
-        if (ex is ArgumentException)
-            return (StatusCodes.Status400BadRequest, ex.Message);
+        ctx.Response.ContentType = "application/json; charset=utf-8";
+        ctx.Response.StatusCode = descriptor.HttpStatus;
 
-        // ✅ Auth-related
-        if (ex is UnauthorizedAccessException)
-            return (StatusCodes.Status401Unauthorized, "Bạn không có quyền thực hiện thao tác này.");
-
-        // ✅ Còn lại: 500
-        return (StatusCodes.Status500InternalServerError, "Có lỗi hệ thống. Vui lòng thử lại.");
+        var payload = AppErrorResponse.From(ex, ctx.TraceIdentifier);
+        await ctx.Response.WriteAsync(JsonSerializer.Serialize(payload, JsonOptions));
     }
 
-    private record ApiErrorResponse(string Message)
+    private static AppException MapLegacy(Exception ex)
     {
-        public string? TraceId { get; init; }
+        if (ex is InvalidOperationException)
+            return AppExceptionFactory.BadRequest(AppErrorCode.COMMON_VALIDATION_FAILED, message: ex.Message);
+
+        if (ex is ArgumentException)
+            return AppExceptionFactory.BadRequest(AppErrorCode.COMMON_VALIDATION_FAILED, message: ex.Message);
+
+        if (ex is UnauthorizedAccessException)
+            return AppExceptionFactory.Unauthorized();
+
+        if (ex is BadHttpRequestException)
+            return AppExceptionFactory.BadRequest(AppErrorCode.COMMON_VALIDATION_FAILED, message: ex.Message);
+
+        return AppExceptionFactory.Create(AppErrorCode.COMMON_INTERNAL_ERROR);
     }
 }

@@ -42,6 +42,13 @@ public sealed class DynamicFormController : ControllerBase
         CancellationToken ct)
         => _svc.UpdateAsync(id, req, ct);
 
+    [HttpPatch("{id}/statistics")]
+    public Task<DynamicFormStatisticConfigUpdateResp> UpdateStatisticConfig(
+        [FromRoute] string id,
+        [FromBody] UpdateDynamicFormStatisticConfigReq req,
+        CancellationToken ct)
+        => _svc.UpdateStatisticConfigAsync(id, req, ct);
+
     [HttpPost("{id}/publish")]
     public Task<DynamicFormDetail> Publish([FromRoute] string id, CancellationToken ct)
         => _svc.PublishAsync(id, ct);
@@ -58,6 +65,13 @@ public sealed class DynamicFormController : ControllerBase
         [FromBody] WrapDynamicExcelAsFormReq req,
         CancellationToken ct)
         => _svc.WrapDynamicExcelAsync(req, ct);
+
+    [HttpPost("{id}/blocks/import-dynamic-excel")]
+    public Task<DynamicFormDetail> ImportDynamicExcelBlock(
+        [FromRoute] string id,
+        [FromBody] ImportDynamicExcelBlockReq req,
+        CancellationToken ct)
+        => _svc.ImportDynamicExcelBlockAsync(id, req, ct);
 
     [HttpDelete("{id}")]
     public Task Delete([FromRoute] string id, CancellationToken ct)

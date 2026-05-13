@@ -1,4 +1,5 @@
 using MongoDB.Driver;
+using tdtd_be.Common.Errors;
 using tdtd_be.Data;
 using tdtd_be.Models;
 
@@ -39,7 +40,7 @@ public sealed class UnitSelectionService : IUnitSelectionService
         var selectedById = selectedUnits.ToDictionary(x => x.Id, x => x, StringComparer.Ordinal);
         var missingIds = inputIds.Where(id => !selectedById.ContainsKey(id)).ToList();
         if (missingIds.Count > 0)
-            throw new InvalidOperationException("Selected unit does not exist or is deleted.");
+            throw AppExceptionFactory.NotFound(AppErrorCode.UNIT_NOT_FOUND, new { unitIds = missingIds });
 
         var result = new HashSet<string>(StringComparer.Ordinal);
 
@@ -94,7 +95,7 @@ public sealed class UnitSelectionService : IUnitSelectionService
             .ToHashSet(StringComparer.Ordinal);
 
         if (foundUnits.Count != concreteUnitIds.Count)
-            throw new InvalidOperationException("Some selected units do not have a management account.");
+            throw AppExceptionFactory.BadRequest(AppErrorCode.UNIT_MANAGER_MISSING, new { unitIds = concreteUnitIds });
 
         return managers
             .Select(x => x.Id)

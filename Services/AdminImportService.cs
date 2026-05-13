@@ -2,6 +2,7 @@ using System.Text;
 using ClosedXML.Excel;
 using MongoDB.Driver;
 using tdtd_be.Common.Auth;
+using tdtd_be.Common.Errors;
 using tdtd_be.Data;
 using tdtd_be.DTOs.AdminImport;
 using tdtd_be.DTOs.Units;
@@ -24,6 +25,9 @@ public sealed class AdminImportService : IAdminImportService
     {
         "externalKey",
         "parentExternalKey",
+        "parentUnitCode",
+        "quantity",
+        "expectedCode",
         "fullName",
         "shortName",
         "symbol",
@@ -63,22 +67,23 @@ public sealed class AdminImportService : IAdminImportService
     public async Task<ImportTemplateFile> BuildUnitTemplateAsync(string? format, CancellationToken ct)
     {
         var me = _me.RequireMe();
-        RoleGuard.RequireSystemAdmin(me);
+        RoleGuard.RequireAdminOrSystemAdmin(me);
 
         var fmt = NormalizeFormat(format);
         if (fmt == "csv")
             return BuildCsvTemplate("unit-import-template.csv", UnitHeaders, new[]
             {
-                new[] { "U001", "", "Cong an tinh", "CAT", "CAT", "CAT", "false", "" },
-                new[] { "U002", "U001", "Phong Tham muu", "PV01", "PV01", "PHONG", "false", "" }
+                new[] { "U001", "", "ROOT", "1", "", "Công an tỉnh", "CAT", "CAT", "CAT", "false", "" },
+                new[] { "U002", "U001", "", "1", "", "Phòng Tham mưu", "PV01", "PV01", "PHONG", "false", "" }
             });
 
         var unitTypes = await _ctx.UnitTypes.Find(x => !x.IsDeleted).SortBy(x => x.Code).ToListAsync(ct);
+        var units = await _ctx.Units.Find(x => !x.IsDeleted).SortBy(x => x.Code).Limit(500).ToListAsync(ct);
         using var wb = new XLWorkbook();
         var ws = wb.AddWorksheet("Units");
         WriteHeader(ws, UnitHeaders);
-        WriteRow(ws, 2, new[] { "U001", "", "Cong an tinh", "CAT", "CAT", "CAT", "false", "" });
-        WriteRow(ws, 3, new[] { "U002", "U001", "Phong Tham muu", "PV01", "PV01", "PHONG", "false", "" });
+        WriteRow(ws, 2, new[] { "U001", "", "ROOT", "1", "", "Công an tỉnh", "CAT", "CAT", "CAT", "false", "" });
+        WriteRow(ws, 3, new[] { "U002", "U001", "", "1", "", "Phòng Tham mưu", "PV01", "PV01", "PHONG", "false", "" });
         ws.Columns().AdjustToContents();
 
         var typeWs = wb.AddWorksheet("UnitTypes");
@@ -87,6 +92,13 @@ public sealed class AdminImportService : IAdminImportService
         foreach (var type in unitTypes)
             WriteRow(typeWs, row++, new[] { type.Code, type.Name });
         typeWs.Columns().AdjustToContents();
+
+        var unitWs = wb.AddWorksheet("ExistingUnits");
+        WriteHeader(unitWs, new[] { "code", "name", "primaryUnitTypeCode", "isVirtual" });
+        row = 2;
+        foreach (var unit in units)
+            WriteRow(unitWs, row++, new[] { unit.Code ?? "", unit.ShortName ?? unit.FullName, unit.PrimaryUnitTypeCode ?? "", unit.IsVirtual ? "true" : "false" });
+        unitWs.Columns().AdjustToContents();
 
         return BuildXlsxTemplate(wb, "unit-import-template.xlsx");
     }
@@ -132,7 +144,7 @@ public sealed class AdminImportService : IAdminImportService
     public async Task<ImportResult> ImportUnitsAsync(IFormFile file, bool dryRun, CancellationToken ct)
     {
         var me = _me.RequireMe();
-        RoleGuard.RequireSystemAdmin(me);
+        RoleGuard.RequireAdminOrSystemAdmin(me);
 
         var rows = await ReadRowsAsync(file, UnitHeaders, ct);
         var errors = new List<ImportRowError>();
@@ -140,6 +152,9 @@ public sealed class AdminImportService : IAdminImportService
             x.RowNumber,
             Value(x, "externalKey"),
             Value(x, "parentExternalKey"),
+            PositionAdminService.NormalizeOptionalCode(Value(x, "parentUnitCode")) ?? "",
+            Value(x, "quantity"),
+            Value(x, "expectedCode"),
             Value(x, "fullName"),
             Value(x, "shortName"),
             Value(x, "symbol"),
@@ -150,8 +165,11 @@ public sealed class AdminImportService : IAdminImportService
 
         RequireRows(parsed.Count, errors);
         AddRequiredErrors(parsed, errors, x => x.ExternalKey, "externalKey");
+        AddRequiredErrors(parsed, errors, x => x.QuantityRaw, "quantity");
         AddRequiredErrors(parsed, errors, x => x.FullName, "fullName");
         AddRequiredErrors(parsed, errors, x => x.PrimaryUnitTypeCode, "primaryUnitTypeCode");
+        AddMaxLengthErrors(parsed, errors, x => x.ParentUnitCode, "parentUnitCode", 50);
+        AddMaxLengthErrors(parsed, errors, x => x.ExpectedCode, "expectedCode", 50);
         AddMaxLengthErrors(parsed, errors, x => x.FullName, "fullName", 500);
         AddMaxLengthErrors(parsed, errors, x => x.ShortName, "shortName", 300);
         AddMaxLengthErrors(parsed, errors, x => x.Symbol, "symbol", 30);
@@ -162,6 +180,14 @@ public sealed class AdminImportService : IAdminImportService
         {
             if (!TryParseImportBool(row.IsVirtualRaw, out _))
                 errors.Add(new(row.RowNumber, "isVirtual", "INVALID_BOOL", "isVirtual must be true/false, 1/0, yes/no, or blank."));
+
+            if (!TryParseQuantity(row.QuantityRaw, out var quantity))
+                errors.Add(new(row.RowNumber, "quantity", "INVALID_QUANTITY", "quantity must be a positive integer."));
+            else if (quantity != 1)
+                errors.Add(new(row.RowNumber, "quantity", "QUANTITY_NOT_SUPPORTED", "Each import row creates exactly one unit. Split multiple units into separate rows so BE can generate codes sequentially."));
+
+            if (!string.IsNullOrWhiteSpace(row.ParentExternalKey) && !string.IsNullOrWhiteSpace(row.ParentUnitCode))
+                errors.Add(new(row.RowNumber, "parentUnitCode", "MULTIPLE_PARENT_SOURCES", "Use either parentExternalKey or parentUnitCode, not both."));
         }
 
         var keySet = parsed.Select(x => x.ExternalKey).Where(x => !string.IsNullOrWhiteSpace(x)).ToHashSet(StringComparer.OrdinalIgnoreCase);
@@ -172,6 +198,8 @@ public sealed class AdminImportService : IAdminImportService
         }
 
         AddCycleErrors(parsed, errors);
+
+        var importPlan = await BuildUnitImportPlanAsync(parsed, errors, ct);
 
         var typeCodes = parsed.Select(x => x.PrimaryUnitTypeCode).Where(x => !string.IsNullOrWhiteSpace(x)).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
         var existingTypes = await _ctx.UnitTypes.Find(x => typeCodes.Contains(x.Code) && !x.IsDeleted).Project(x => x.Code).ToListAsync(ct);
@@ -195,14 +223,15 @@ public sealed class AdminImportService : IAdminImportService
         }
 
         if (errors.Count > 0 || dryRun)
-            return BuildResult(parsed.Count, errors, Array.Empty<string>());
+            return BuildResult(parsed.Count, errors, Array.Empty<string>(), importPlan.Rows);
 
         var createdIds = new List<string>();
         var createdByKey = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var existingByCode = importPlan.ExistingByCode;
         foreach (var row in TopologicalSort(parsed))
         {
             var parentId = string.IsNullOrWhiteSpace(row.ParentExternalKey)
-                ? null
+                ? ResolveExistingParentId(row.ParentUnitCode, existingByCode)
                 : createdByKey[row.ParentExternalKey];
 
             var created = await _units.CreateAsync(new CreateUnitRequest
@@ -218,9 +247,10 @@ public sealed class AdminImportService : IAdminImportService
 
             createdIds.Add(created.Id);
             createdByKey[row.ExternalKey] = created.Id;
+            importPlan.SetCreatedId(row.RowNumber, created.Id);
         }
 
-        return BuildResult(parsed.Count, errors, createdIds);
+        return BuildResult(parsed.Count, errors, createdIds, importPlan.Rows);
     }
 
     public async Task<ImportResult> ImportUsersAsync(IFormFile file, bool dryRun, CancellationToken ct)
@@ -333,10 +363,173 @@ public sealed class AdminImportService : IAdminImportService
         return BuildResult(parsed.Count, errors, createdIds);
     }
 
-    private static ImportResult BuildResult(int totalRows, IReadOnlyList<ImportRowError> errors, IReadOnlyList<string> createdIds)
+    private static ImportResult BuildResult(
+        int totalRows,
+        IReadOnlyList<ImportRowError> errors,
+        IReadOnlyList<string> createdIds,
+        IReadOnlyList<ImportPreviewRow>? rows = null)
     {
         var errorRows = errors.Select(x => x.RowNumber).Distinct().Count();
-        return new ImportResult(totalRows, totalRows - errorRows, errorRows, errors, createdIds);
+        return new ImportResult(totalRows, totalRows - errorRows, errorRows, errors, createdIds)
+        {
+            Rows = rows ?? Array.Empty<ImportPreviewRow>()
+        };
+    }
+
+    private async Task<UnitImportPlan> BuildUnitImportPlanAsync(
+        IReadOnlyList<UnitImportRow> rows,
+        List<ImportRowError> errors,
+        CancellationToken ct)
+    {
+        var existingUnits = await _ctx.Units
+            .Find(x => !x.IsDeleted)
+            .SortBy(x => x.Code)
+            .ToListAsync(ct);
+
+        var existingByCode = existingUnits
+            .Where(x => !string.IsNullOrWhiteSpace(x.Code))
+            .GroupBy(x => x.Code!, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(x => x.Key, x => x.First(), StringComparer.OrdinalIgnoreCase);
+
+        foreach (var row in rows.Where(x => !string.IsNullOrWhiteSpace(x.ParentUnitCode) && !IsRootParentCode(x.ParentUnitCode)))
+        {
+            if (!existingByCode.ContainsKey(row.ParentUnitCode))
+                errors.Add(new(row.RowNumber, "parentUnitCode", "PARENT_UNIT_NOT_FOUND", "Parent unit code does not exist or is deleted."));
+        }
+
+        var hiddenRoot = existingUnits
+            .Where(x => string.IsNullOrWhiteSpace(x.ParentUnitId))
+            .FirstOrDefault(IsHiddenRootUnit);
+
+        var planRows = new List<ImportPreviewRow>();
+        var generatedByExternalKey = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var nextRoot = GetNextRootSequence(existingUnits);
+        var nextChildByParentCode = new Dictionary<string, int>(StringComparer.Ordinal);
+
+        foreach (var row in TopologicalSort(rows))
+        {
+            string? parentCode = null;
+            var canPlan = true;
+
+            if (!string.IsNullOrWhiteSpace(row.ParentExternalKey))
+            {
+                canPlan = generatedByExternalKey.TryGetValue(row.ParentExternalKey, out parentCode);
+            }
+            else if (!string.IsNullOrWhiteSpace(row.ParentUnitCode))
+            {
+                if (IsRootParentCode(row.ParentUnitCode))
+                {
+                    parentCode = hiddenRoot?.Code;
+                }
+                else if (existingByCode.TryGetValue(row.ParentUnitCode, out var parent))
+                {
+                    parentCode = parent.Code;
+                }
+                else
+                {
+                    canPlan = false;
+                }
+            }
+            else
+            {
+                parentCode = hiddenRoot?.Code;
+            }
+
+            string? generatedCode = null;
+            if (canPlan)
+            {
+                generatedCode = string.IsNullOrWhiteSpace(parentCode)
+                    ? (nextRoot++).ToString().PadLeft(3, '0')
+                    : NextChildCode(parentCode!, existingUnits, nextChildByParentCode);
+
+                if (!string.IsNullOrWhiteSpace(row.ExternalKey))
+                    generatedByExternalKey[row.ExternalKey] = generatedCode;
+
+                if (!string.IsNullOrWhiteSpace(row.ExpectedCode) &&
+                    !string.Equals(row.ExpectedCode, generatedCode, StringComparison.Ordinal))
+                {
+                    errors.Add(new(
+                        row.RowNumber,
+                        "expectedCode",
+                        "CODE_MISMATCH",
+                        $"expectedCode does not match BE generated code. Expected {row.ExpectedCode}, generated {generatedCode}."));
+                }
+            }
+
+            planRows.Add(new ImportPreviewRow(
+                row.RowNumber,
+                row.ExternalKey,
+                row.FullName,
+                parentCode,
+                generatedCode));
+        }
+
+        return new UnitImportPlan(existingByCode, planRows);
+    }
+
+    private static string? ResolveExistingParentId(string? parentUnitCode, IReadOnlyDictionary<string, Unit> existingByCode)
+    {
+        var code = (parentUnitCode ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(code) || IsRootParentCode(code))
+            return null;
+
+        return existingByCode.TryGetValue(code, out var parent) ? parent.Id : null;
+    }
+
+    private static int GetNextRootSequence(IReadOnlyList<Unit> existingUnits)
+    {
+        var last = existingUnits
+            .Where(x => string.IsNullOrWhiteSpace(x.ParentUnitId) && !string.IsNullOrWhiteSpace(x.Code) && int.TryParse(x.Code, out _))
+            .Select(x => int.Parse(x.Code!))
+            .DefaultIfEmpty(0)
+            .Max();
+
+        return last + 1;
+    }
+
+    private static string NextChildCode(
+        string parentCode,
+        IReadOnlyList<Unit> existingUnits,
+        Dictionary<string, int> nextChildByParentCode)
+    {
+        if (!nextChildByParentCode.TryGetValue(parentCode, out var next))
+        {
+            var childLevel = parentCode.Length / 3 + 1;
+            var last = existingUnits
+                .Where(x =>
+                    !string.IsNullOrWhiteSpace(x.Code) &&
+                    x.Code!.StartsWith(parentCode, StringComparison.Ordinal) &&
+                    x.Level == childLevel &&
+                    x.Code.Length >= 3)
+                .Select(x => int.TryParse(x.Code![^3..], out var value) ? value : 0)
+                .DefaultIfEmpty(0)
+                .Max();
+
+            next = last + 1;
+        }
+
+        nextChildByParentCode[parentCode] = next + 1;
+        return parentCode + next.ToString().PadLeft(3, '0');
+    }
+
+    private static bool IsRootParentCode(string? value)
+    {
+        var normalized = (value ?? string.Empty).Trim().ToUpperInvariant();
+        return normalized is "" or "ROOT" or "ROOT UNIT";
+    }
+
+    private static bool IsHiddenRootUnit(Unit unit)
+    {
+        var code = (unit.Code ?? string.Empty).Trim().ToUpperInvariant();
+        var fullName = (unit.FullName ?? string.Empty).Trim().ToUpperInvariant();
+        var shortName = (unit.ShortName ?? string.Empty).Trim().ToUpperInvariant();
+        var symbol = (unit.Symbol ?? string.Empty).Trim().ToUpperInvariant();
+
+        if (code is "" or "ROOT") return true;
+        return string.IsNullOrWhiteSpace(unit.ParentUnitId) &&
+               (fullName is "ROOT" or "ROOT UNIT" ||
+                shortName is "ROOT" or "ROOT UNIT" ||
+                symbol is "ROOT" or "ROOT UNIT");
     }
 
     private static void RequireRows(int count, List<ImportRowError> errors)
@@ -386,7 +579,8 @@ public sealed class AdminImportService : IAdminImportService
     {
         var byKey = rows
             .Where(x => !string.IsNullOrWhiteSpace(x.ExternalKey))
-            .ToDictionary(x => x.ExternalKey, StringComparer.OrdinalIgnoreCase);
+            .GroupBy(x => x.ExternalKey, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(x => x.Key, x => x.First(), StringComparer.OrdinalIgnoreCase);
 
         var state = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
 
@@ -420,7 +614,10 @@ public sealed class AdminImportService : IAdminImportService
 
     private static IReadOnlyList<UnitImportRow> TopologicalSort(IReadOnlyList<UnitImportRow> rows)
     {
-        var byKey = rows.ToDictionary(x => x.ExternalKey, StringComparer.OrdinalIgnoreCase);
+        var byKey = rows
+            .Where(x => !string.IsNullOrWhiteSpace(x.ExternalKey))
+            .GroupBy(x => x.ExternalKey, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(x => x.Key, x => x.First(), StringComparer.OrdinalIgnoreCase);
         var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var result = new List<UnitImportRow>();
 
@@ -431,7 +628,8 @@ public sealed class AdminImportService : IAdminImportService
 
         void Visit(UnitImportRow row)
         {
-            if (!visited.Add(row.ExternalKey))
+            var key = string.IsNullOrWhiteSpace(row.ExternalKey) ? $"__row:{row.RowNumber}" : row.ExternalKey;
+            if (!visited.Add(key))
                 return;
 
             if (!string.IsNullOrWhiteSpace(row.ParentExternalKey) && byKey.TryGetValue(row.ParentExternalKey, out var parent))
@@ -453,7 +651,7 @@ public sealed class AdminImportService : IAdminImportService
         if (RoleGuard.IsAdmin(me) || RoleGuard.IsSystemAdmin(me) || RoleGuard.IsManagerLevel(me) || RoleGuard.TryGetManagerUnit(me, out _))
             return;
 
-        throw new BadHttpRequestException("User management role required.");
+        throw AppExceptionFactory.Forbidden(AppErrorCode.ADMIN_IMPORT_ROLE_REQUIRED, new { me.Id, me.Roles });
     }
 
     private static string? EmptyToNull(string? value)
@@ -504,6 +702,12 @@ public sealed class AdminImportService : IAdminImportService
         return false;
     }
 
+    private static bool TryParseQuantity(string? raw, out int quantity)
+    {
+        var s = (raw ?? string.Empty).Trim();
+        return int.TryParse(s, out quantity) && quantity > 0;
+    }
+
     private static string Value(ImportRow row, string key)
         => row.Values.TryGetValue(key, out var value) ? value.Trim() : "";
 
@@ -512,7 +716,7 @@ public sealed class AdminImportService : IAdminImportService
         var fmt = (format ?? "xlsx").Trim().ToLowerInvariant();
         if (fmt is "xlsx" or "csv")
             return fmt;
-        throw new InvalidOperationException("Unsupported template format.");
+        throw AppExceptionFactory.BadRequest(AppErrorCode.ADMIN_IMPORT_TEMPLATE_FORMAT_UNSUPPORTED, new { format });
     }
 
     private static ImportTemplateFile BuildCsvTemplate(string fileName, string[] headers, IEnumerable<string[]> exampleRows)
@@ -560,7 +764,7 @@ public sealed class AdminImportService : IAdminImportService
     private async Task<List<ImportRow>> ReadRowsAsync(IFormFile file, IReadOnlyList<string> expectedHeaders, CancellationToken ct)
     {
         if (file is null || file.Length == 0)
-            throw new InvalidOperationException("Import file is required.");
+            throw AppExceptionFactory.BadRequest(AppErrorCode.ADMIN_IMPORT_FILE_REQUIRED, new { fileName = file?.FileName, length = file?.Length });
 
         var ext = Path.GetExtension(file.FileName).ToLowerInvariant();
         await using var stream = file.OpenReadStream();
@@ -569,7 +773,7 @@ public sealed class AdminImportService : IAdminImportService
         {
             ".csv" => await ReadCsvRowsAsync(stream, expectedHeaders, ct),
             ".xlsx" => ReadXlsxRows(stream, expectedHeaders),
-            _ => throw new InvalidOperationException("Unsupported import file type. Only .xlsx and .csv are supported.")
+            _ => throw AppExceptionFactory.BadRequest(AppErrorCode.ADMIN_IMPORT_FILE_TYPE_UNSUPPORTED, new { file.FileName, extension = ext })
         };
     }
 
@@ -579,7 +783,7 @@ public sealed class AdminImportService : IAdminImportService
         var text = await reader.ReadToEndAsync(ct);
         var lines = text.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n');
         if (lines.Length == 0)
-            throw new InvalidOperationException("CSV file is empty.");
+            throw AppExceptionFactory.BadRequest(AppErrorCode.ADMIN_IMPORT_CSV_EMPTY);
 
         var headers = ParseCsvLine(lines[0]).Select(x => x.Trim()).ToList();
         EnsureHeaders(headers, expectedHeaders);
@@ -608,7 +812,8 @@ public sealed class AdminImportService : IAdminImportService
     {
         using var wb = new XLWorkbook(stream);
         var ws = wb.Worksheets.First();
-        var firstRow = ws.FirstRowUsed() ?? throw new InvalidOperationException("XLSX file is empty.");
+        var firstRow = ws.FirstRowUsed()
+            ?? throw AppExceptionFactory.BadRequest(AppErrorCode.ADMIN_IMPORT_XLSX_EMPTY);
         var headers = Enumerable.Range(1, expectedHeaders.Count)
             .Select(i => firstRow.Cell(i).GetString().Trim())
             .ToList();
@@ -636,7 +841,12 @@ public sealed class AdminImportService : IAdminImportService
         for (var i = 0; i < expectedHeaders.Count; i++)
         {
             if (i >= actualHeaders.Count || !string.Equals(actualHeaders[i], expectedHeaders[i], StringComparison.OrdinalIgnoreCase))
-                throw new InvalidOperationException($"Invalid import header. Expected column {i + 1}: {expectedHeaders[i]}.");
+                throw AppExceptionFactory.BadRequest(AppErrorCode.ADMIN_IMPORT_HEADER_INVALID, new
+                {
+                    column = i + 1,
+                    expected = expectedHeaders[i],
+                    actual = i < actualHeaders.Count ? actualHeaders[i] : null
+                });
         }
     }
 
@@ -691,10 +901,32 @@ public sealed class AdminImportService : IAdminImportService
 
     private sealed record ImportRow(int RowNumber, Dictionary<string, string> Values);
 
+    private sealed class UnitImportPlan
+    {
+        public UnitImportPlan(Dictionary<string, Unit> existingByCode, List<ImportPreviewRow> rows)
+        {
+            ExistingByCode = existingByCode;
+            Rows = rows;
+        }
+
+        public Dictionary<string, Unit> ExistingByCode { get; }
+        public List<ImportPreviewRow> Rows { get; }
+
+        public void SetCreatedId(int rowNumber, string createdId)
+        {
+            var index = Rows.FindIndex(x => x.RowNumber == rowNumber);
+            if (index >= 0)
+                Rows[index] = Rows[index] with { CreatedId = createdId };
+        }
+    }
+
     private sealed record UnitImportRow(
         int RowNumber,
         string ExternalKey,
         string ParentExternalKey,
+        string ParentUnitCode,
+        string QuantityRaw,
+        string ExpectedCode,
         string FullName,
         string ShortName,
         string Symbol,

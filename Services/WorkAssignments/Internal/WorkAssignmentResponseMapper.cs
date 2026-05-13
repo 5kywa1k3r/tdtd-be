@@ -25,6 +25,7 @@ internal static class WorkAssignmentResponseMapper
             DynamicFormTemplateId = entity.DynamicFormTemplateId,
             DynamicFormTemplateCode = entity.DynamicFormTemplateCode,
             DynamicFormTemplateName = entity.DynamicFormTemplateName,
+            DynamicFormDataSourceRulesJson = entity.DynamicFormDataSourceRulesJson,
 
             WorkType = entity.WorkType,
             AssignmentType = entity.AssignmentType,
@@ -47,9 +48,19 @@ internal static class WorkAssignmentResponseMapper
             HasData = hasData,
             TemplateLocked = hasData,
 
+            ProgressStatus = entity.ProgressStatus,
+            ProgressStatusUpdatedAtUtc = entity.ProgressStatusUpdatedAtUtc,
+            LatestPeriodKey = entity.LatestPeriodKey,
+            LatestDueAtUtc = entity.LatestDueAtUtc,
+            HasAnyDuePeriod = entity.HasAnyDuePeriod,
+            HasOverduePeriod = entity.HasOverduePeriod,
+
             CreatedAtUtc = entity.CreatedAtUtc,
             UpdatedAtUtc = entity.UpdatedAtUtc,
 
+            EvaluationTemplateId = entity.EvaluationTemplateId,
+            EvaluationTemplateCode = entity.EvaluationTemplateCode,
+            EvaluationTemplateLabel = entity.EvaluationTemplateLabel,
             EvaluationCode = entity.EvaluationCode,
             EvaluationLabel = entity.EvaluationLabel,
             EvaluationNote = entity.EvaluationNote,
@@ -59,6 +70,11 @@ internal static class WorkAssignmentResponseMapper
             WorstPeriodStatus = entity.WorstPeriodStatus,
             WorstOverdueReasonCode = entity.WorstOverdueReasonCode,
             WorstOverdueReasonLabel = entity.WorstOverdueReasonLabel,
+            HasManualEvaluations = entity.HasManualEvaluations,
+            EvaluatedAssignmentCount = entity.EvaluatedAssignmentCount,
+            WorstEvaluationCode = entity.WorstEvaluationCode,
+            WorstEvaluationLabel = entity.WorstEvaluationLabel,
+            DueAtUtc = entity.DueAtUtc,
         };
     }
 

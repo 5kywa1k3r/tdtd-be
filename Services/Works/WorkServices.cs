@@ -2,8 +2,10 @@
 using MongoDB.Driver;
 using Microsoft.Extensions.Logging;
 using tdtd_be.Common.Auth;
+using tdtd_be.Common.Errors;
 using tdtd_be.Data;
 using tdtd_be.DTOs.Common;
+using tdtd_be.DTOs.Operations;
 using tdtd_be.DTOs.Users;
 using tdtd_be.DTOs.Works;
 using tdtd_be.Enum;
@@ -32,6 +34,7 @@ namespace tdtd_be.Services.Works
             private readonly IDocRoleService _docRole;
             private readonly IDocRoleReadModelProjectionService _docRoleReadModelProjection;
             private readonly IDocRoleReadModelFreshnessService _docRoleReadModelFreshness;
+            private readonly IUserActionLogService _userActionLog;
             private readonly IWorkPermissionService _permission;
             private readonly ILogger<WorkService> _log;
 
@@ -43,6 +46,7 @@ namespace tdtd_be.Services.Works
                 IDocRoleService docRole,
                 IDocRoleReadModelProjectionService docRoleReadModelProjection,
                 IDocRoleReadModelFreshnessService docRoleReadModelFreshness,
+                IUserActionLogService userActionLog,
                 IWorkPermissionService permission,
                 ILogger<WorkService> log)
             {
@@ -53,6 +57,7 @@ namespace tdtd_be.Services.Works
                 _docRole = docRole;
                 _docRoleReadModelProjection = docRoleReadModelProjection;
                 _docRoleReadModelFreshness = docRoleReadModelFreshness;
+                _userActionLog = userActionLog;
                 _permission = permission;
                 _log = log;
             }
@@ -142,7 +147,9 @@ namespace tdtd_be.Services.Works
                 return await _ctx.EvaluationTemplates
                     .Find(x => x.Id == evaluationTemplateId.Trim() && !x.IsDeleted && x.IsActive)
                     .FirstOrDefaultAsync(ct)
-                    ?? throw new InvalidOperationException("Không tìm thấy bộ mã đánh giá.");
+                    ?? throw AppExceptionFactory.BadRequest(
+                        AppErrorCode.WORK_EVALUATION_TEMPLATE_NOT_FOUND,
+                        new { evaluationTemplateId });
             }
 
             // ===============================
@@ -155,7 +162,7 @@ namespace tdtd_be.Services.Works
                 _permission.EnsureCanCreateRoot(me);
 
                 if (string.IsNullOrWhiteSpace(req.Name))
-                    throw new InvalidOperationException("Name is required.");
+                    throw AppExceptionFactory.BadRequest(AppErrorCode.WORK_NAME_REQUIRED);
 
 
                 var now = DateTime.UtcNow;
@@ -216,6 +223,22 @@ namespace tdtd_be.Services.Works
                     },
                     ct: ct);
 
+                await _userActionLog.RecordAsync(new UserActionLogSeed
+                {
+                    Action = UserActionLogActions.WorkCreated,
+                    Scope = "work",
+                    ActorUserId = me.Id,
+                    WorkId = doc.Id,
+                    Summary = $"Created work {doc.AutoCode}",
+                    Data = new Dictionary<string, string>
+                    {
+                        { "autoCode", doc.AutoCode },
+                        { "type", doc.Type.ToString() },
+                        { "priority", doc.Priority.ToString() }
+                    },
+                    OccurredAtUtc = now
+                }, CancellationToken.None);
+
                 return ToResponse(doc);
             }
 
@@ -228,7 +251,7 @@ namespace tdtd_be.Services.Works
                     .FirstOrDefaultAsync(ct);
 
                 if (doc is null)
-                    throw new InvalidOperationException("Work not found.");
+                    throw AppExceptionFactory.NotFound(AppErrorCode.WORK_NOT_FOUND, new { workId = id });
 
                 await _permission.EnsureCanReadAsync(id, me.Id, ct);
 
@@ -343,7 +366,7 @@ namespace tdtd_be.Services.Works
                     .FirstOrDefaultAsync(ct);
 
                 if (doc is null)
-                    throw new InvalidOperationException("Work not found.");
+                    throw AppExceptionFactory.NotFound(AppErrorCode.WORK_NOT_FOUND, new { workId = id });
 
                 await _permission.EnsureCanUpdateRootAsync(id, me.Id, ct);
 
@@ -426,7 +449,7 @@ namespace tdtd_be.Services.Works
                     .FirstOrDefaultAsync(ct);
 
                 if (doc is null)
-                    throw new InvalidOperationException("Work not found.");
+                    throw AppExceptionFactory.NotFound(AppErrorCode.WORK_NOT_FOUND, new { workId = id });
 
                 await _permission.EnsureCanDeleteRootAsync(id, me.Id, ct);
 

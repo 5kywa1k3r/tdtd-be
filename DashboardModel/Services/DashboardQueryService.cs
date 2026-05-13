@@ -5,6 +5,7 @@ using System.Text;
 using tdtd_be.Caching;
 using tdtd_be.Common.Auth;
 using tdtd_be.Common.Cache;
+using tdtd_be.Common.Errors;
 using tdtd_be.DashboardModel.DTOs;
 using tdtd_be.Data;
 using tdtd_be.Enum;
@@ -95,7 +96,7 @@ public sealed class DashboardQueryService : IDashboardQueryService
         CancellationToken ct = default)
     {
         if (string.IsNullOrWhiteSpace(workId))
-            throw new ArgumentException("workId không được trống.", nameof(workId));
+            throw AppExceptionFactory.BadRequest(AppErrorCode.DASHBOARD_WORK_ID_REQUIRED, new { field = "workId", value = workId });
 
         var me = _me.RequireMe();
         req ??= new WorkDashboardDetailRequest();
@@ -122,7 +123,7 @@ public sealed class DashboardQueryService : IDashboardQueryService
                     .FirstOrDefaultAsync(innerCt);
 
                 if (work is null)
-                    throw new InvalidOperationException("Không tìm thấy công việc.");
+                    throw AppExceptionFactory.NotFound(AppErrorCode.DASHBOARD_WORK_NOT_FOUND, new { workId });
 
                 var roots = await LoadRootAssignmentsForSingleWorkAsync(me.Id, workId, unitIds, innerCt);
 

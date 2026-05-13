@@ -34,6 +34,11 @@ public sealed class WorkAssignmentReportListRow
     public string? DynamicFormTemplateId { get; set; }
     public string? DynamicFormTemplateCode { get; set; }
     public string? DynamicFormTemplateName { get; set; }
+    public string DataOrigin { get; set; } = string.Empty;
+    public bool AggregateSnapshotDirty { get; set; }
+    public DateTime? AggregateSnapshotDirtyAtUtc { get; set; }
+    public DateTime? AggregateSnapshotRefreshedAtUtc { get; set; }
+    public string? AggregateRefreshError { get; set; }
 
     public string? CurrentProgressStatus { get; set; }
     public string? ReportReason { get; set; }
@@ -42,6 +47,9 @@ public sealed class WorkAssignmentReportListRow
 
     public int VersionNo { get; set; }
     public bool IsCurrent { get; set; }
+    public bool IsActive { get; set; } = true;
+    public DateTime? DeactivatedAtUtc { get; set; }
+    public string? DeactivationReason { get; set; }
 
     public DateTime? SubmittedAtUtc { get; set; }
     public string? SubmittedByUserId { get; set; }

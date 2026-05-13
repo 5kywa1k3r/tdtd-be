@@ -2,6 +2,7 @@ using MongoDB.Bson;
 using MongoDB.Driver;
 using System.Text.RegularExpressions;
 using tdtd_be.Common.Auth;
+using tdtd_be.Common.Errors;
 using tdtd_be.DashboardModel.DTOs;
 using tdtd_be.DashboardModel.DTOs.MindMap;
 using tdtd_be.Data;
@@ -45,7 +46,7 @@ public interface IDashboardMindMapQueryService
 
     Task<DashboardMindMapCursorResult<DashboardMindMapTemplateUserDto>> SearchTemplateUsersAsync(
         string assignmentId,
-        string dynamicExcelId,
+        string dynamicFormTemplateId,
         string? q,
         string? cursor,
         int limit = 5,
@@ -53,7 +54,7 @@ public interface IDashboardMindMapQueryService
 
     Task<DashboardMindMapCursorResult<DashboardMindMapReportRowDto>> SearchTemplateReportsAsync(
         string assignmentId,
-        string dynamicExcelId,
+        string dynamicFormTemplateId,
         DashboardMindMapTemplateReportsSearchRequest? req,
         CancellationToken ct = default);
 
@@ -80,6 +81,11 @@ public interface IDashboardMindMapQueryService
     Task<PagedResult<DashboardMindMapFieldMetricReportRowDto>> SearchNodeFieldMetricReportsAsync(
         string assignmentId,
         DashboardMindMapFieldMetricReportsSearchRequest? req,
+        CancellationToken ct = default);
+
+    Task<PagedResult<DashboardMindMapLabelReportRowDto>> SearchNodeLabelReportsAsync(
+        string assignmentId,
+        DashboardMindMapLabelReportsSearchRequest? req,
         CancellationToken ct = default);
 }
 
@@ -137,6 +143,17 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
         _me = me;
         _docRole = docRole;
     }
+
+    private static AppException DashboardRequired(AppErrorCode code, string field, string? value = null)
+        => AppExceptionFactory.BadRequest(
+            code,
+            new { field, value });
+
+    private static AppException DashboardNotFound(AppErrorCode code, object details)
+        => AppExceptionFactory.NotFound(code, details);
+
+    private static AppException DashboardForbidden(AppErrorCode code, object details)
+        => AppExceptionFactory.Forbidden(code, details);
 
     public async Task<DashboardMindMapWorkResponse> GetWorkTreeAsync(
         string workId,
@@ -380,8 +397,8 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
             .ToListAsync(ct);
 
         var templateIds = bindings
-            .Select(x => x.DynamicExcelId)
-            .Concat(periods.Select(x => x.DynamicExcelId))
+            .Select(x => x.DynamicFormTemplateId)
+            .Concat(periods.Select(x => x.DynamicFormTemplateId))
             .Where(x => !string.IsNullOrWhiteSpace(x))
             .Distinct(StringComparer.Ordinal)
             .ToList();
@@ -390,10 +407,10 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
             .Select(templateId =>
             {
                 var templateBindings = bindings
-                    .Where(x => string.Equals(x.DynamicExcelId, templateId, StringComparison.Ordinal))
+                    .Where(x => string.Equals(x.DynamicFormTemplateId, templateId, StringComparison.Ordinal))
                     .ToList();
                 var templatePeriods = periods
-                    .Where(x => string.Equals(x.DynamicExcelId, templateId, StringComparison.Ordinal))
+                    .Where(x => string.Equals(x.DynamicFormTemplateId, templateId, StringComparison.Ordinal))
                     .ToList();
                 var sampleBinding = templateBindings.FirstOrDefault();
                 var samplePeriod = templatePeriods.FirstOrDefault();
@@ -401,7 +418,10 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
                 return new DashboardMindMapTemplateGroupDto
                 {
                     AssignmentId = node.Id,
-                    DynamicExcelId = templateId,
+                    DynamicFormTemplateId = templateId,
+                    DynamicFormTemplateCode = sampleBinding?.DynamicFormTemplateCode ?? samplePeriod?.DynamicFormTemplateCode ?? node.DynamicFormTemplateCode ?? string.Empty,
+                    DynamicFormTemplateName = sampleBinding?.DynamicFormTemplateName ?? samplePeriod?.DynamicFormTemplateName ?? node.DynamicFormTemplateName ?? string.Empty,
+                    DynamicExcelId = sampleBinding?.DynamicExcelId ?? samplePeriod?.DynamicExcelId ?? node.DynamicExcelId,
                     DynamicExcelCode = sampleBinding?.DynamicExcelCode ?? samplePeriod?.DynamicExcelCode ?? node.DynamicExcelCode,
                     DynamicExcelName = sampleBinding?.DynamicExcelName ?? samplePeriod?.DynamicExcelName ?? node.DynamicExcelName,
                     UserCount = templateBindings
@@ -422,13 +442,13 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
             })
             .OrderByDescending(x => x.OverdueCount)
             .ThenByDescending(x => x.ReportCount)
-            .ThenBy(x => x.DynamicExcelName)
+            .ThenBy(x => x.DynamicFormTemplateName)
             .ToList();
     }
 
     public async Task<DashboardMindMapCursorResult<DashboardMindMapTemplateUserDto>> SearchTemplateUsersAsync(
         string assignmentId,
-        string dynamicExcelId,
+        string dynamicFormTemplateId,
         string? q,
         string? cursor,
         int limit = 5,
@@ -442,7 +462,7 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
         var bindings = await _ctx.WorkTemplateAssignees
             .Find(x =>
                 x.WorkAssignmentId == node.Id &&
-                x.DynamicExcelId == dynamicExcelId &&
+                x.DynamicFormTemplateId == dynamicFormTemplateId &&
                 x.IsActive &&
                 !x.IsDeleted)
             .ToListAsync(ct);
@@ -450,7 +470,7 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
         var periods = await _ctx.WorkReportPeriods
             .Find(x =>
                 x.WorkAssignmentId == node.Id &&
-                x.DynamicExcelId == dynamicExcelId &&
+                x.DynamicFormTemplateId == dynamicFormTemplateId &&
                 x.IsActive &&
                 !x.IsDeleted)
             .ToListAsync(ct);
@@ -460,7 +480,7 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
             .ToDictionary(x => x.Key, x => x.ToList(), StringComparer.Ordinal);
 
         var rows = bindings
-            .Select(x => MapTemplateUser(node.Id, dynamicExcelId, x, periodsByUser.GetValueOrDefault(x.AssigneeUserId) ?? new List<WorkReportPeriod>()))
+            .Select(x => MapTemplateUser(node.Id, dynamicFormTemplateId, x, periodsByUser.GetValueOrDefault(x.AssigneeUserId) ?? new List<WorkReportPeriod>()))
             .ToList();
 
         var missingPeriodUsers = periodsByUser.Keys
@@ -470,7 +490,7 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
 
         foreach (var userId in missingPeriodUsers)
         {
-            rows.Add(MapTemplateUserFromPeriods(node.Id, dynamicExcelId, userId, periodsByUser[userId]));
+            rows.Add(MapTemplateUserFromPeriods(node.Id, dynamicFormTemplateId, userId, periodsByUser[userId]));
         }
 
         if (!string.IsNullOrWhiteSpace(q))
@@ -496,7 +516,7 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
 
     public async Task<DashboardMindMapCursorResult<DashboardMindMapReportRowDto>> SearchTemplateReportsAsync(
         string assignmentId,
-        string dynamicExcelId,
+        string dynamicFormTemplateId,
         DashboardMindMapTemplateReportsSearchRequest? req,
         CancellationToken ct = default)
     {
@@ -510,7 +530,7 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
         var statusBuckets = NormalizeReportBuckets(req.StatusBuckets);
 
         var filter = Builders<WorkReportPeriod>.Filter.Eq(x => x.WorkAssignmentId, node.Id)
-            & Builders<WorkReportPeriod>.Filter.Eq(x => x.DynamicExcelId, dynamicExcelId)
+            & Builders<WorkReportPeriod>.Filter.Eq(x => x.DynamicFormTemplateId, dynamicFormTemplateId)
             & Builders<WorkReportPeriod>.Filter.Eq(x => x.IsDeleted, false)
             & Builders<WorkReportPeriod>.Filter.Eq(x => x.IsActive, true);
 
@@ -560,7 +580,10 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
         if (currentReportIds.Count > 0)
         {
             currentReports = (await _ctx.WorkAssignmentReports
-                    .Find(x => currentReportIds.Contains(x.Id) && !x.IsDeleted && x.IsCurrent)
+                    .Find(Builders<WorkAssignmentReport>.Filter.In(x => x.Id, currentReportIds)
+                          & Builders<WorkAssignmentReport>.Filter.Eq(x => x.IsDeleted, false)
+                          & Builders<WorkAssignmentReport>.Filter.Eq(x => x.IsCurrent, true)
+                          & Builders<WorkAssignmentReport>.Filter.Ne(x => x.IsActive, false))
                     .ToListAsync(ct))
                 .ToDictionary(x => x.Id, x => x, StringComparer.Ordinal);
         }
@@ -568,7 +591,7 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
         var bindings = await _ctx.WorkTemplateAssignees
             .Find(x =>
                 x.WorkAssignmentId == node.Id &&
-                x.DynamicExcelId == dynamicExcelId &&
+                x.DynamicFormTemplateId == dynamicFormTemplateId &&
                 x.IsActive &&
                 !x.IsDeleted)
             .ToListAsync(ct);
@@ -1034,7 +1057,7 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
         req ??= new DashboardMindMapTableMetricReportsSearchRequest();
 
         if (string.IsNullOrWhiteSpace(req.MetricKey))
-            throw new InvalidOperationException("Thieu metricKey.");
+            throw DashboardRequired(AppErrorCode.DASHBOARD_TABLE_METRIC_KEY_REQUIRED, nameof(req.MetricKey), req.MetricKey);
 
         var safePage = Math.Max(req.Page, 0);
         var safePageSize = ClampPageSize(req.PageSize);
@@ -1144,7 +1167,9 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
         var reportsById = reportIds.Count == 0
             ? new Dictionary<string, WorkAssignmentReport>(StringComparer.Ordinal)
             : (await _ctx.WorkAssignmentReports
-                    .Find(x => reportIds.Contains(x.Id) && !x.IsDeleted)
+                    .Find(Builders<WorkAssignmentReport>.Filter.In(x => x.Id, reportIds)
+                          & Builders<WorkAssignmentReport>.Filter.Eq(x => x.IsDeleted, false)
+                          & Builders<WorkAssignmentReport>.Filter.Ne(x => x.IsActive, false))
                     .ToListAsync(ct))
                 .ToDictionary(x => x.Id, x => x, StringComparer.Ordinal);
 
@@ -1171,7 +1196,7 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
         req ??= new DashboardMindMapFieldMetricReportsSearchRequest();
 
         if (string.IsNullOrWhiteSpace(req.FieldId))
-            throw new InvalidOperationException("Thieu fieldId.");
+            throw DashboardRequired(AppErrorCode.DASHBOARD_FIELD_ID_REQUIRED, nameof(req.FieldId), req.FieldId);
 
         var safePage = Math.Max(req.Page, 0);
         var safePageSize = ClampPageSize(req.PageSize);
@@ -1307,7 +1332,9 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
         var reportsById = reportIds.Count == 0
             ? new Dictionary<string, WorkAssignmentReport>(StringComparer.Ordinal)
             : (await _ctx.WorkAssignmentReports
-                    .Find(x => reportIds.Contains(x.Id) && !x.IsDeleted)
+                    .Find(Builders<WorkAssignmentReport>.Filter.In(x => x.Id, reportIds)
+                          & Builders<WorkAssignmentReport>.Filter.Eq(x => x.IsDeleted, false)
+                          & Builders<WorkAssignmentReport>.Filter.Ne(x => x.IsActive, false))
                     .ToListAsync(ct))
                 .ToDictionary(x => x.Id, x => x, StringComparer.Ordinal);
 
@@ -1323,6 +1350,150 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
             .ToList();
 
         return new PagedResult<DashboardMindMapFieldMetricReportRowDto>(rows, total, safePage, safePageSize);
+    }
+
+    public async Task<PagedResult<DashboardMindMapLabelReportRowDto>> SearchNodeLabelReportsAsync(
+        string assignmentId,
+        DashboardMindMapLabelReportsSearchRequest? req,
+        CancellationToken ct = default)
+    {
+        var me = _me.RequireMe();
+        req ??= new DashboardMindMapLabelReportsSearchRequest();
+
+        if (string.IsNullOrWhiteSpace(req.LabelCode))
+            throw DashboardRequired(AppErrorCode.DASHBOARD_LABEL_CODE_REQUIRED, nameof(req.LabelCode), req.LabelCode);
+
+        var safePage = Math.Max(req.Page, 0);
+        var safePageSize = ClampPageSize(req.PageSize);
+        var normalizedScope = NormalizeScope(req);
+        var node = await LoadAccessibleAssignmentAsync(assignmentId, me.Id, ct);
+        var ctx = await LoadSubtreeContextAsync(node, normalizedScope, includeCurrentReports: false, ct);
+
+        var assignmentIds = ctx.Assignments
+            .Select(x => x.Id)
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+
+        if (assignmentIds.Count == 0)
+        {
+            return new PagedResult<DashboardMindMapLabelReportRowDto>(
+                new List<DashboardMindMapLabelReportRowDto>(),
+                0,
+                safePage,
+                safePageSize);
+        }
+
+        var periodInstanceKeys = normalizedScope.HasFilters
+            ? ctx.Periods
+                .Select(x => x.PeriodInstanceKey)
+                .Where(x => !string.IsNullOrWhiteSpace(x))
+                .Distinct(StringComparer.Ordinal)
+                .ToList()
+            : new List<string>();
+
+        if (normalizedScope.HasFilters && periodInstanceKeys.Count == 0)
+        {
+            return new PagedResult<DashboardMindMapLabelReportRowDto>(
+                new List<DashboardMindMapLabelReportRowDto>(),
+                0,
+                safePage,
+                safePageSize);
+        }
+
+        var filter = BuildLabelValueFilter(node.WorkId, assignmentIds, periodInstanceKeys, req);
+        var groupId = BuildLabelReportGroupId();
+
+        var totalResult = await _ctx.WorkReportLabelStatValues
+            .Aggregate()
+            .Match(filter)
+            .Group(new BsonDocument { { "_id", groupId } })
+            .Count()
+            .FirstOrDefaultAsync(ct);
+
+        var total = totalResult?.Count ?? 0;
+        if (total == 0)
+        {
+            return new PagedResult<DashboardMindMapLabelReportRowDto>(
+                new List<DashboardMindMapLabelReportRowDto>(),
+                0,
+                safePage,
+                safePageSize);
+        }
+
+        var docs = await _ctx.WorkReportLabelStatValues
+            .Aggregate()
+            .Match(filter)
+            .Group(new BsonDocument
+            {
+                { "_id", groupId },
+                { "workAssignmentReportId", new BsonDocument("$first", "$workAssignmentReportId") },
+                { "workReportPeriodId", new BsonDocument("$first", "$workReportPeriodId") },
+                { "assignmentId", new BsonDocument("$first", "$workAssignmentId") },
+                { "dynamicFormTemplateId", new BsonDocument("$first", "$dynamicFormTemplateId") },
+                { "dynamicFormTemplateName", new BsonDocument("$first", "$dynamicFormTemplateName") },
+                { "dynamicExcelTemplateId", new BsonDocument("$first", "$dynamicExcelTemplateId") },
+                { "labelCode", new BsonDocument("$first", "$labelCode") },
+                { "periodKey", new BsonDocument("$first", "$periodKey") },
+                { "periodInstanceKey", new BsonDocument("$first", "$periodInstanceKey") },
+                { "periodKind", new BsonDocument("$first", "$periodKind") },
+                { "reportStatus", new BsonDocument("$first", "$reportStatus") },
+                { "rowCount", new BsonDocument("$sum", 1) },
+                { "blockIds", new BsonDocument("$addToSet", "$blockId") },
+                { "rowKeys", new BsonDocument("$addToSet", "$rowKey") },
+                { "sources", new BsonDocument("$addToSet", "$source") },
+            })
+            .Sort(new BsonDocument
+            {
+                { "rowCount", -1 },
+                { "periodInstanceKey", 1 },
+                { "workAssignmentReportId", 1 },
+            })
+            .Skip(safePage * safePageSize)
+            .Limit(safePageSize)
+            .ToListAsync(ct);
+
+        var reportIds = docs
+            .Select(x => ReadBsonString(x, "workAssignmentReportId"))
+            .OfType<string>()
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+
+        var periodIds = docs
+            .Select(x => ReadBsonString(x, "workReportPeriodId"))
+            .OfType<string>()
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+
+        var reportsById = reportIds.Count == 0
+            ? new Dictionary<string, WorkAssignmentReport>(StringComparer.Ordinal)
+            : (await _ctx.WorkAssignmentReports
+                    .Find(Builders<WorkAssignmentReport>.Filter.In(x => x.Id, reportIds)
+                          & Builders<WorkAssignmentReport>.Filter.Eq(x => x.IsDeleted, false)
+                          & Builders<WorkAssignmentReport>.Filter.Ne(x => x.IsActive, false))
+                    .ToListAsync(ct))
+                .ToDictionary(x => x.Id, x => x, StringComparer.Ordinal);
+
+        var periodsById = periodIds.Count == 0
+            ? new Dictionary<string, WorkReportPeriod>(StringComparer.Ordinal)
+            : (await _ctx.WorkReportPeriods
+                    .Find(x => periodIds.Contains(x.Id) && !x.IsDeleted)
+                    .ToListAsync(ct))
+                .ToDictionary(x => x.Id, x => x, StringComparer.Ordinal);
+
+        var labelCode = NormalizeLabelCode(req.LabelCode);
+        var label = string.IsNullOrWhiteSpace(labelCode)
+            ? null
+            : await _ctx.Labels
+                .Find(x => x.Code == labelCode && x.IsActive && !x.IsDeleted)
+                .FirstOrDefaultAsync(ct);
+
+        var rows = docs
+            .Select(doc => MapLabelReportRow(doc, ctx, reportsById, periodsById, label))
+            .ToList();
+
+        return new PagedResult<DashboardMindMapLabelReportRowDto>(rows, total, safePage, safePageSize);
     }
 
     private static FilterDefinition<WorkReportTableStatValue> BuildTableMetricValueFilter(
@@ -1351,6 +1522,36 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
 
         if (!string.IsNullOrWhiteSpace(req.TableMode))
             filter &= fb.Eq(x => x.TableMode, NormalizeTableMode(req.TableMode));
+
+        if (req.ReportStatus.HasValue)
+            filter &= fb.Eq(x => x.ReportStatus, req.ReportStatus.Value);
+
+        return filter;
+    }
+
+    private static FilterDefinition<WorkReportLabelStatValue> BuildLabelValueFilter(
+        string workId,
+        List<string> assignmentIds,
+        List<string> periodInstanceKeys,
+        DashboardMindMapLabelReportsSearchRequest req)
+    {
+        var fb = Builders<WorkReportLabelStatValue>.Filter;
+        var filter = fb.Eq(x => x.WorkId, workId)
+            & fb.Eq(x => x.IsDeleted, false)
+            & fb.In(x => x.WorkAssignmentId, assignmentIds)
+            & fb.Eq(x => x.LabelCode, NormalizeLabelCode(req.LabelCode));
+
+        if (periodInstanceKeys.Count > 0)
+            filter &= fb.In(x => x.PeriodInstanceKey, periodInstanceKeys);
+
+        if (!string.IsNullOrWhiteSpace(req.DynamicFormTemplateId))
+            filter &= fb.Eq(x => x.DynamicFormTemplateId, req.DynamicFormTemplateId.Trim());
+
+        if (!string.IsNullOrWhiteSpace(req.DynamicExcelTemplateId))
+            filter &= fb.Eq(x => x.DynamicExcelTemplateId, req.DynamicExcelTemplateId.Trim());
+
+        if (!string.IsNullOrWhiteSpace(req.BlockId))
+            filter &= fb.Eq(x => x.BlockId, NormalizeTableBlockId(req.BlockId));
 
         if (req.ReportStatus.HasValue)
             filter &= fb.Eq(x => x.ReportStatus, req.ReportStatus.Value);
@@ -1405,6 +1606,17 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
             { "assignmentId", "$workAssignmentId" },
             { "fieldId", "$fieldId" },
             { "bucketKey", "$bucketKey" },
+        };
+    }
+
+    private static BsonDocument BuildLabelReportGroupId()
+    {
+        return new BsonDocument
+        {
+            { "workAssignmentReportId", "$workAssignmentReportId" },
+            { "workReportPeriodId", "$workReportPeriodId" },
+            { "assignmentId", "$workAssignmentId" },
+            { "labelCode", "$labelCode" },
         };
     }
 
@@ -1520,6 +1732,56 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
         };
     }
 
+    private static DashboardMindMapLabelReportRowDto MapLabelReportRow(
+        BsonDocument doc,
+        SubtreeContext ctx,
+        Dictionary<string, WorkAssignmentReport> reportsById,
+        Dictionary<string, WorkReportPeriod> periodsById,
+        LabelCatalogItem? label)
+    {
+        var reportId = ReadBsonString(doc, "workAssignmentReportId") ?? string.Empty;
+        var periodId = ReadBsonString(doc, "workReportPeriodId") ?? string.Empty;
+        var assignmentId = ReadBsonString(doc, "assignmentId") ?? string.Empty;
+
+        reportsById.TryGetValue(reportId, out var report);
+        periodsById.TryGetValue(periodId, out var period);
+        ctx.AssignmentById.TryGetValue(assignmentId, out var assignment);
+
+        var assignee = assignment?.Assignees?.FirstOrDefault(a =>
+            string.Equals(a.UserId, period?.AssigneeUserId ?? report?.CreatedByUserId, StringComparison.Ordinal));
+
+        return new DashboardMindMapLabelReportRowDto
+        {
+            WorkAssignmentReportId = reportId,
+            WorkReportPeriodId = periodId,
+            AssignmentId = assignmentId,
+            AssignmentCode = assignment?.Code,
+            AssignmentName = assignment?.DynamicExcelName ?? period?.DynamicExcelName ?? string.Empty,
+            AssigneeUserId = period?.AssigneeUserId,
+            AssigneeFullName = assignee?.FullName ?? assignee?.Username ?? period?.AssigneeUserId,
+            AssigneeUsername = assignee?.Username,
+            UnitId = period?.AssigneeUnitId ?? assignee?.UnitId,
+            UnitLabel = PickUnitLabel(assignee?.UnitSymbol, assignee?.UnitShortName, assignee?.UnitName)
+                ?? period?.AssigneeUnitId,
+            PeriodKey = ReadBsonString(doc, "periodKey") ?? period?.PeriodKey ?? string.Empty,
+            PeriodInstanceKey = ReadBsonString(doc, "periodInstanceKey") ?? period?.PeriodInstanceKey ?? string.Empty,
+            PeriodKind = ReadBsonString(doc, "periodKind") ?? period?.PeriodKind ?? string.Empty,
+            ReportStatus = ReadBsonInt32(doc, "reportStatus"),
+            DynamicFormTemplateId = ReadBsonString(doc, "dynamicFormTemplateId"),
+            DynamicFormTemplateName = ReadBsonString(doc, "dynamicFormTemplateName"),
+            DynamicExcelTemplateId = ReadBsonString(doc, "dynamicExcelTemplateId"),
+            LabelCode = ReadBsonString(doc, "labelCode") ?? string.Empty,
+            LabelName = label?.Name,
+            LabelColor = label?.Color,
+            RowCount = ReadBsonInt64(doc, "rowCount"),
+            BlockIds = ReadBsonStringArray(doc, "blockIds"),
+            RowKeys = ReadBsonStringArray(doc, "rowKeys"),
+            Sources = ReadBsonStringArray(doc, "sources"),
+            SubmittedAtUtc = report?.SubmittedAtUtc ?? period?.LastSubmittedAtUtc,
+            ApprovedAtUtc = report?.ApprovedAtUtc ?? period?.LastReviewedAtUtc,
+        };
+    }
+
     private static int ClampPageSize(int pageSize) => Math.Clamp(pageSize <= 0 ? 20 : pageSize, 1, 100);
 
     private static int ClampGraphLimit(int limit) => Math.Clamp(limit <= 0 ? DefaultGraphLimit : limit, 1, MaxGraphLimit);
@@ -1584,14 +1846,16 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
         CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(workId))
-            throw new ArgumentException("workId khong duoc trong.", nameof(workId));
+            throw DashboardRequired(AppErrorCode.DASHBOARD_WORK_ID_REQUIRED, nameof(workId), workId);
 
         var work = await _ctx.Works
             .Find(x => x.Id == workId && !x.IsDeleted)
             .FirstOrDefaultAsync(ct);
 
         if (work is null)
-            throw new InvalidOperationException("Khong tim thay work.");
+            throw DashboardNotFound(
+                AppErrorCode.DASHBOARD_WORK_NOT_FOUND,
+                new { workId });
 
         var hasFullAccess = string.Equals(work.CreatedByUserId, actorUserId, StringComparison.Ordinal)
             || await HasFullWorkReadRoleAsync(workId, actorUserId, ct);
@@ -1607,24 +1871,30 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
         if (hasWorkRole)
             return new WorkAccessContext(work, false, new List<WorkAssignment>());
 
-        throw new UnauthorizedAccessException("Ban khong co quyen xem work nay.");
+        throw DashboardForbidden(
+            AppErrorCode.DASHBOARD_WORK_READ_FORBIDDEN,
+            new { workId, actorUserId });
     }
 
     private async Task<WorkAssignment> LoadAccessibleAssignmentAsync(string assignmentId, string actorUserId, CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(assignmentId))
-            throw new ArgumentException("assignmentId khong duoc trong.", nameof(assignmentId));
+            throw DashboardRequired(AppErrorCode.DASHBOARD_ASSIGNMENT_ID_REQUIRED, nameof(assignmentId), assignmentId);
 
         var assignment = await _ctx.WorkAssignments
             .Find(x => x.Id == assignmentId && !x.IsDeleted && x.IsActive)
             .FirstOrDefaultAsync(ct);
 
         if (assignment is null)
-            throw new InvalidOperationException("Khong tim thay assignment.");
+            throw DashboardNotFound(
+                AppErrorCode.DASHBOARD_ASSIGNMENT_NOT_FOUND,
+                new { assignmentId });
 
         var access = await LoadWorkAccessContextAsync(assignment.WorkId, actorUserId, ct);
         if (!access.FullAccess && !IsAssignmentInAccessibleBranch(assignment, access.EntryAssignments))
-            throw new UnauthorizedAccessException("Ban khong co quyen xem assignment nay.");
+            throw DashboardForbidden(
+                AppErrorCode.DASHBOARD_ASSIGNMENT_READ_FORBIDDEN,
+                new { assignmentId, assignment.WorkId, actorUserId });
 
         return assignment;
     }
@@ -1767,7 +2037,10 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
             if (currentReportIds.Count > 0)
             {
                 var currentReportItems = await _ctx.WorkAssignmentReports
-                    .Find(x => currentReportIds.Contains(x.Id) && !x.IsDeleted && x.IsCurrent)
+                    .Find(Builders<WorkAssignmentReport>.Filter.In(x => x.Id, currentReportIds)
+                          & Builders<WorkAssignmentReport>.Filter.Eq(x => x.IsDeleted, false)
+                          & Builders<WorkAssignmentReport>.Filter.Eq(x => x.IsCurrent, true)
+                          & Builders<WorkAssignmentReport>.Filter.Ne(x => x.IsActive, false))
                     .ToListAsync(ct);
 
                 currentReports = currentReportItems.ToDictionary(x => x.Id, x => x, StringComparer.Ordinal);
@@ -1884,6 +2157,9 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
     private static string NormalizeTableBlockId(string? value)
         => string.IsNullOrWhiteSpace(value) ? "excel_block" : value.Trim();
 
+    private static string NormalizeLabelCode(string? value)
+        => string.IsNullOrWhiteSpace(value) ? string.Empty : value.Trim().ToLowerInvariant();
+
     private static string NormalizeTableMode(string? value)
     {
         var tableMode = string.IsNullOrWhiteSpace(value) ? "FIXED_GRID" : value.Trim().ToUpperInvariant();
@@ -1920,15 +2196,44 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
 
         if (parent == null)
         {
+            var fb = Builders<WorkAssignment>.Filter;
+            var branchFilters = new List<FilterDefinition<WorkAssignment>>();
+            foreach (var candidate in candidates)
+            {
+                var branchFilter = fb.Eq(x => x.Id, candidate.Id);
+                if (!string.IsNullOrWhiteSpace(candidate.RootAssignmentId)
+                    && !string.IsNullOrWhiteSpace(candidate.Path))
+                {
+                    branchFilter |= fb.Eq(x => x.RootAssignmentId, candidate.RootAssignmentId)
+                                    & fb.Regex(
+                                        x => x.Path,
+                                        new BsonRegularExpression($"^{Regex.Escape(candidate.Path)}(?:/|$)"));
+                }
+
+                branchFilters.Add(branchFilter);
+            }
+
             subtreeAssignments = await _ctx.WorkAssignments
-                .Find(BuildNodeBaseFilter(workId)
-                    & Builders<WorkAssignment>.Filter.In(x => x.RootAssignmentId, candidateIds))
+                .Find(BuildNodeBaseFilter(workId) & fb.Or(branchFilters))
                 .ToListAsync(ct);
+
+            var candidatePathPairs = candidates
+                .Select(x => new KeyValuePair<string, string>(x.Id, x.Path))
+                .Where(x => !string.IsNullOrWhiteSpace(x.Value))
+                .OrderByDescending(x => x.Value.Length)
+                .ToList();
 
             foreach (var assignment in subtreeAssignments)
             {
-                if (candidateIds.Contains(assignment.RootAssignmentId))
-                    candidateIdByAssignmentId[assignment.Id] = assignment.RootAssignmentId;
+                if (candidateIds.Contains(assignment.Id))
+                {
+                    candidateIdByAssignmentId[assignment.Id] = assignment.Id;
+                    continue;
+                }
+
+                var candidateId = ResolveCandidateIdByPath(candidatePathPairs, assignment.Path);
+                if (!string.IsNullOrWhiteSpace(candidateId))
+                    candidateIdByAssignmentId[assignment.Id] = candidateId;
             }
         }
         else
@@ -2089,9 +2394,13 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
             RootAssignmentId = assignment.RootAssignmentId,
             Level = assignment.Level,
             Code = assignment.Code,
+            DynamicFormTemplateId = assignment.DynamicFormTemplateId,
+            DynamicFormTemplateCode = assignment.DynamicFormTemplateCode,
+            DynamicFormTemplateName = assignment.DynamicFormTemplateName,
             DynamicExcelCode = assignment.DynamicExcelCode,
             DynamicExcelName = assignment.DynamicExcelName,
             Description = assignment.Description,
+            SummaryText = BuildNodeSummaryText(assignment),
             IsActive = assignment.IsActive,
             ProgressStatus = assignment.ProgressStatus,
             HasAnyDuePeriod = assignment.HasAnyDuePeriod,
@@ -2128,16 +2437,43 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
         };
     }
 
+    private static string BuildNodeSummaryText(WorkAssignment assignment)
+    {
+        var parts = new List<string>();
+
+        if (assignment.Assignees is { Count: > 0 })
+            parts.Add($"{assignment.Assignees.Count} assignee");
+
+        if (assignment.ActiveChildCount > 0)
+            parts.Add($"{assignment.ActiveChildCount} child");
+
+        if (assignment.HasOverduePeriod)
+            parts.Add("overdue");
+        else if (assignment.HasAnyDuePeriod)
+            parts.Add("has due period");
+
+        if (!string.IsNullOrWhiteSpace(assignment.LatestPeriodKey))
+            parts.Add($"latest {assignment.LatestPeriodKey}");
+
+        if (!string.IsNullOrWhiteSpace(assignment.Description))
+            parts.Add(assignment.Description.Trim());
+
+        return string.Join("; ", parts);
+    }
+
     private static DashboardMindMapTemplateUserDto MapTemplateUser(
         string assignmentId,
-        string dynamicExcelId,
+        string dynamicFormTemplateId,
         WorkTemplateAssignee binding,
         List<WorkReportPeriod> periods)
     {
         return new DashboardMindMapTemplateUserDto
         {
             AssignmentId = assignmentId,
-            DynamicExcelId = dynamicExcelId,
+            DynamicFormTemplateId = dynamicFormTemplateId,
+            DynamicFormTemplateCode = binding.DynamicFormTemplateCode ?? string.Empty,
+            DynamicFormTemplateName = binding.DynamicFormTemplateName ?? string.Empty,
+            DynamicExcelId = binding.DynamicExcelId,
             AssigneeUserId = binding.AssigneeUserId,
             AssigneeUsername = binding.AssigneeUsername,
             AssigneeFullName = string.IsNullOrWhiteSpace(binding.AssigneeFullName)
@@ -2161,14 +2497,18 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
 
     private static DashboardMindMapTemplateUserDto MapTemplateUserFromPeriods(
         string assignmentId,
-        string dynamicExcelId,
+        string dynamicFormTemplateId,
         string assigneeUserId,
         List<WorkReportPeriod> periods)
     {
+        var sample = periods.FirstOrDefault();
         return new DashboardMindMapTemplateUserDto
         {
             AssignmentId = assignmentId,
-            DynamicExcelId = dynamicExcelId,
+            DynamicFormTemplateId = dynamicFormTemplateId,
+            DynamicFormTemplateCode = sample?.DynamicFormTemplateCode ?? string.Empty,
+            DynamicFormTemplateName = sample?.DynamicFormTemplateName ?? string.Empty,
+            DynamicExcelId = sample?.DynamicExcelId,
             AssigneeUserId = assigneeUserId,
             AssigneeUsername = assigneeUserId,
             AssigneeFullName = assigneeUserId,
@@ -2304,8 +2644,8 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
             Total = summary.Total,
             Segments = new List<DashboardStackedBarSegmentDto>
             {
-                BuildSegment(BucketPending, "Chua mo", summary.PendingCount),
-                BuildSegment(BucketDraft, "Ban nhap", summary.DraftCount),
+                BuildSegment(BucketPending, "Chua bat dau", summary.PendingCount),
+                BuildSegment(BucketDraft, "Draft", summary.DraftCount),
                 BuildSegment(BucketSubmitted, "Da gui", summary.SubmittedCount),
                 BuildSegment(BucketApproved, "Da duyet", summary.ApprovedCount),
                 BuildSegment(BucketOverdue, "Qua han", overdue),

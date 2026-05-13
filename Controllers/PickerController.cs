@@ -39,6 +39,25 @@ public sealed class PickersController : ControllerBase
             fb.Ne(x => x.Symbol, "ROOT UNIT")
         );
 
+    private static bool IsRootCodeToken(string? value)
+    {
+        var normalized = (value ?? string.Empty).Trim().ToUpperInvariant();
+        return normalized is "" or "ROOT";
+    }
+
+    private static bool IsRootNameToken(string? value)
+    {
+        var normalized = (value ?? string.Empty).Trim().ToUpperInvariant();
+        return normalized is "ROOT" or "ROOT UNIT";
+    }
+
+    private static bool IsHiddenRootUnit(UnitPickRow row)
+        => IsRootCodeToken(row.Code) ||
+           (string.IsNullOrWhiteSpace(row.ParentId) &&
+            (IsRootNameToken(row.FullName) ||
+             IsRootNameToken(row.ShortName) ||
+             IsRootNameToken(row.Symbol)));
+
     // =========================
     // UNITS: children (node cha -> node con)
     // =========================
@@ -55,31 +74,68 @@ public sealed class PickersController : ControllerBase
         var pid = (parentId ?? "").Trim();
         if (string.Equals(pid, "null", StringComparison.OrdinalIgnoreCase)) pid = "";
 
-        var fb = Builders<Unit>.Filter;
-        var filter = fb.And(fb.Eq(x => x.IsDeleted, false), ExcludeHiddenRoot(fb));
-
         if (string.IsNullOrWhiteSpace(pid))
         {
-            // ✅ START NODE: trả "cấp gần nhất dưới ROOT"
-            // Rule theo bệ hạ: ROOT code dài 3 => con trực tiếp code dài 6
-            filter = fb.And(
-                filter,
-                fb.Ne(x => x.Code, null),
-                fb.Where(x => x.Code.Length == 6)
-            );
+            var roots = await _ctx.Units.Find(x => !x.IsDeleted && x.ParentUnitId == null)
+                .SortBy(x => x.ShortName).ThenBy(x => x.Code)
+                .Project(x => new UnitPickRow
+                {
+                    Id = x.Id,
+                    Code = x.Code ?? "",
+                    FullName = x.FullName,
+                    ShortName = x.ShortName,
+                    Symbol = x.Symbol,
+                    Level = x.Level,
+                    ParentId = x.ParentUnitId,
+                    IsVirtual = x.IsVirtual
+                })
+                .ToListAsync(ct);
+
+            var hiddenRootIds = roots
+                .Where(IsHiddenRootUnit)
+                .Select(x => x.Id)
+                .ToList();
+
+            var rootRows = roots
+                .Where(x => !IsHiddenRootUnit(x))
+                .ToList();
+
+            if (hiddenRootIds.Count > 0)
+            {
+                var hiddenRootChildren = await _ctx.Units
+                    .Find(x => !x.IsDeleted && x.ParentUnitId != null && hiddenRootIds.Contains(x.ParentUnitId))
+                    .SortBy(x => x.ShortName).ThenBy(x => x.Code)
+                    .Project(x => new UnitPickRow
+                    {
+                        Id = x.Id,
+                        Code = x.Code ?? "",
+                        FullName = x.FullName,
+                        ShortName = x.ShortName,
+                        Symbol = x.Symbol,
+                        Level = x.Level,
+                        ParentId = x.ParentUnitId,
+                        IsVirtual = x.IsVirtual
+                    })
+                    .ToListAsync(ct);
+
+                rootRows.AddRange(hiddenRootChildren.Where(x => !IsHiddenRootUnit(x)));
+            }
+
+            return Ok(rootRows
+                .OrderBy(x => x.ShortName)
+                .ThenBy(x => x.Code)
+                .ToList());
         }
-        else
-        {
-            // ✅ CHILDREN of specific parent
-            filter = fb.And(filter, fb.Eq(x => x.ParentUnitId, pid));
-        }
+
+        var fb = Builders<Unit>.Filter;
+        var filter = fb.And(fb.Eq(x => x.IsDeleted, false), ExcludeHiddenRoot(fb), fb.Eq(x => x.ParentUnitId, pid));
 
         var rows = await _ctx.Units.Find(filter)
             .SortBy(x => x.ShortName).ThenBy(x => x.Code)
             .Project(x => new UnitPickRow
             {
                 Id = x.Id,
-                Code = x.Code,
+                Code = x.Code ?? "",
                 FullName = x.FullName,
                 ShortName = x.ShortName,
                 Symbol = x.Symbol,
@@ -128,7 +184,7 @@ public sealed class PickersController : ControllerBase
             .Project(x => new UnitPickRow
             {
                 Id = x.Id,
-                Code = x.Code,
+                Code = x.Code ?? "",
                 FullName = x.FullName,
                 ShortName = x.ShortName,
                 Symbol = x.Symbol,

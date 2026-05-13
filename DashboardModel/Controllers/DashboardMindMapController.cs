@@ -77,10 +77,10 @@ public sealed class DashboardMindMapController : ControllerBase
         return Ok(result);
     }
 
-    [HttpGet("nodes/{assignmentId}/templates/{dynamicExcelId}/users")]
+    [HttpGet("nodes/{assignmentId}/forms/{dynamicFormTemplateId}/users")]
     public async Task<ActionResult<DashboardMindMapCursorResult<DashboardMindMapTemplateUserDto>>> SearchTemplateUsers(
         [FromRoute] string assignmentId,
-        [FromRoute] string dynamicExcelId,
+        [FromRoute] string dynamicFormTemplateId,
         [FromQuery] string? q,
         [FromQuery] string? cursor,
         [FromQuery] int limit = 5,
@@ -88,7 +88,7 @@ public sealed class DashboardMindMapController : ControllerBase
     {
         var result = await _service.SearchTemplateUsersAsync(
             assignmentId,
-            dynamicExcelId,
+            dynamicFormTemplateId,
             q,
             cursor,
             limit,
@@ -96,14 +96,14 @@ public sealed class DashboardMindMapController : ControllerBase
         return Ok(result);
     }
 
-    [HttpPost("nodes/{assignmentId}/templates/{dynamicExcelId}/reports/search")]
+    [HttpPost("nodes/{assignmentId}/forms/{dynamicFormTemplateId}/reports/search")]
     public async Task<ActionResult<DashboardMindMapCursorResult<DashboardMindMapReportRowDto>>> SearchTemplateReports(
         [FromRoute] string assignmentId,
-        [FromRoute] string dynamicExcelId,
+        [FromRoute] string dynamicFormTemplateId,
         [FromBody] DashboardMindMapTemplateReportsSearchRequest? req,
         CancellationToken ct = default)
     {
-        var result = await _service.SearchTemplateReportsAsync(assignmentId, dynamicExcelId, req, ct);
+        var result = await _service.SearchTemplateReportsAsync(assignmentId, dynamicFormTemplateId, req, ct);
         return Ok(result);
     }
 
@@ -159,6 +159,16 @@ public sealed class DashboardMindMapController : ControllerBase
         CancellationToken ct = default)
     {
         var result = await _service.SearchNodeFieldMetricReportsAsync(assignmentId, req, ct);
+        return Ok(result);
+    }
+
+    [HttpPost("nodes/{assignmentId}/labels/reports/search")]
+    public async Task<ActionResult<PagedResult<DashboardMindMapLabelReportRowDto>>> SearchNodeLabelReports(
+        [FromRoute] string assignmentId,
+        [FromBody] DashboardMindMapLabelReportsSearchRequest? req,
+        CancellationToken ct = default)
+    {
+        var result = await _service.SearchNodeLabelReportsAsync(assignmentId, req, ct);
         return Ok(result);
     }
 

@@ -30,6 +30,9 @@ public sealed class LabelCatalogItem : BaseEntity
     [BsonElement("groupCode")]
     public string? GroupCode { get; set; }
 
+    [BsonElement("dataType")]
+    public string DataType { get; set; } = LabelDataTypes.Number;
+
     [BsonElement("scopeType")]
     public string ScopeType { get; set; } = LabelScopeTypes.Global;
 
@@ -53,4 +56,32 @@ public static class LabelScopeTypes
     public const string Global = "GLOBAL";
     public const string Level = "LEVEL";
     public const string Unit = "UNIT";
+}
+
+public static class LabelDataTypes
+{
+    public const string Number = "NUMBER";
+    public const string ShortText = "SHORT_TEXT";
+    public const string LongText = "LONG_TEXT";
+    public const string Date = "DATE";
+    public const string Boolean = "BOOLEAN";
+
+    public static string Normalize(string? value)
+    {
+        var normalized = value?.Trim().ToUpperInvariant();
+        return normalized switch
+        {
+            Number => Number,
+            ShortText => ShortText,
+            LongText => LongText,
+            Date => Date,
+            Boolean => Boolean,
+            "TEXT" => ShortText,
+            "STRING" => ShortText,
+            "SHORTTEXT" => ShortText,
+            "LONGDATE" => LongText,
+            "LONGTEXT" => LongText,
+            _ => Number
+        };
+    }
 }

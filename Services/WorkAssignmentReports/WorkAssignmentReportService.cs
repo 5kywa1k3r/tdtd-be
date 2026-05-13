@@ -3,15 +3,23 @@ using Microsoft.Extensions.Logging;
 using MongoDB.Bson;
 using System.Globalization;
 using System.Text.Json;
+using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
+using tdtd_be.Common.Errors;
 using tdtd_be.Common.Time;
 using tdtd_be.Data;
 using tdtd_be.DTOs.Common;
+using tdtd_be.DTOs.Operations;
+using tdtd_be.DTOs.WorkAssignments.AggregateTable;
 using tdtd_be.DTOs.WorkAssignmentReports;
 using tdtd_be.Enum;
 using tdtd_be.Models;
 using tdtd_be.Models.Enums;
 using tdtd_be.Services.Common;
+using tdtd_be.Services;
+using tdtd_be.Services.WorkAssignments.Domain;
 using tdtd_be.Services.WorkAssignments.Internal;
+using tdtd_be.Services.WorkAssignments.Aggregate;
 using tdtd_be.Services.WorkAssignments.Queue;
 using tdtd_be.Services.WorkAssignments.Runtime;
 using tdtd_be.Services.WorkAssignmentReports.Statistics;
@@ -20,6 +28,8 @@ namespace tdtd_be.Services.WorkAssignmentReports;
 
 public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
 {
+    private static readonly Regex LabelCodeRegex = new("^[a-z0-9][a-z0-9_.-]{0,63}$", RegexOptions.Compiled);
+
     private readonly MongoDbContext _ctx;
     private readonly IWorkAssignmentQueueService _queueService;
     private readonly IWorkAssignmentStatusSyncService _statusSync;
@@ -27,9 +37,11 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
     private readonly IDocRoleReadModelProjectionService _docRoleReadModelProjection;
     private readonly IDocRoleReadModelFreshnessService _docRoleReadModelFreshness;
     private readonly IWorkStatusOperationLogService _statusLog;
+    private readonly IUserActionLogService _userActionLog;
     private readonly IWorkReportLabelStatisticsService _labelStatistics;
     private readonly IWorkReportTableStatisticsService _tableStatistics;
     private readonly IWorkReportFieldStatisticsService _fieldStatistics;
+    private readonly IAggregateTableService _aggregateTableService;
     private readonly ILogger<WorkAssignmentReportService> _log;
 
     private static readonly JsonSerializerOptions _jsonOptions = new(JsonSerializerDefaults.Web)
@@ -45,9 +57,11 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         IDocRoleReadModelProjectionService docRoleReadModelProjection,
         IDocRoleReadModelFreshnessService docRoleReadModelFreshness,
         IWorkStatusOperationLogService statusLog,
+        IUserActionLogService userActionLog,
         IWorkReportLabelStatisticsService labelStatistics,
         IWorkReportTableStatisticsService tableStatistics,
         IWorkReportFieldStatisticsService fieldStatistics,
+        IAggregateTableService aggregateTableService,
         ILogger<WorkAssignmentReportService> log)
     {
         _ctx = ctx;
@@ -57,9 +71,11 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         _docRoleReadModelProjection = docRoleReadModelProjection;
         _docRoleReadModelFreshness = docRoleReadModelFreshness;
         _statusLog = statusLog;
+        _userActionLog = userActionLog;
         _labelStatistics = labelStatistics;
         _tableStatistics = tableStatistics;
         _fieldStatistics = fieldStatistics;
+        _aggregateTableService = aggregateTableService;
         _log = log;
     }
 
@@ -72,7 +88,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         EnsureActor(actorUserId);
 
         if (string.IsNullOrWhiteSpace(workId))
-            throw new ArgumentException("workId không được trống.", nameof(workId));
+            throw ReportWorkIdRequired(workId);
 
         req ??= new MyReportTemplateSearchRequest();
         var page = req.Page < 0 ? 0 : req.Page;
@@ -87,9 +103,11 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         if (!string.IsNullOrWhiteSpace(req.Q))
         {
             var q = req.Q.Trim();
-            var regex = new MongoDB.Bson.BsonRegularExpression(q, "i");
+            var regex = new MongoDB.Bson.BsonRegularExpression(Regex.Escape(q), "i");
 
             filter &= Builders<MyReportTemplateListDocRole>.Filter.Or(
+                Builders<MyReportTemplateListDocRole>.Filter.Regex(x => x.DynamicFormTemplateCode, regex),
+                Builders<MyReportTemplateListDocRole>.Filter.Regex(x => x.DynamicFormTemplateName, regex),
                 Builders<MyReportTemplateListDocRole>.Filter.Regex(x => x.DynamicExcelCode, regex),
                 Builders<MyReportTemplateListDocRole>.Filter.Regex(x => x.DynamicExcelName, regex)
             );
@@ -107,28 +125,32 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
 
         var total = await _ctx.MyReportTemplateListDocRoles.CountDocumentsAsync(filter, cancellationToken: ct);
 
-        var items = await _ctx.MyReportTemplateListDocRoles
+        var rows = await _ctx.MyReportTemplateListDocRoles
             .Find(filter)
             .Sort(BuildTemplateListDocRoleSort(req.SortField, req.SortDirection))
             .Skip(page * pageSize)
             .Limit(pageSize)
-            .Project(x => new MyReportTemplateRow
-            {
-                DynamicExcelId = x.DynamicExcelId,
-                DynamicExcelCode = x.DynamicExcelCode,
-                DynamicExcelName = x.DynamicExcelName,
-                BindingCount = x.BindingCount,
-                PeriodCount = x.PeriodCount,
-                ReportCount = x.ReportCount,
-                LatestPeriodId = x.LatestPeriodId,
-                LatestPeriodKey = x.LatestPeriodKey,
-                LatestPeriodStatus = x.LatestPeriodStatus.HasValue ? (int?)x.LatestPeriodStatus.Value : null,
-                LatestDueAtUtc = x.LatestDueAtUtc,
-                LatestReportId = x.LatestReportId,
-                LatestUpdatedAtUtc = x.LatestUpdatedAtUtc,
-                HasOverduePeriod = x.HasOverduePeriod
-            })
             .ToListAsync(ct);
+
+        var items = rows.Select(x => new MyReportTemplateRow
+        {
+            DynamicFormTemplateId = x.DynamicFormTemplateId ?? string.Empty,
+            DynamicFormTemplateCode = x.DynamicFormTemplateCode ?? string.Empty,
+            DynamicFormTemplateName = x.DynamicFormTemplateName ?? string.Empty,
+            DynamicExcelId = x.DynamicExcelId,
+            DynamicExcelCode = x.DynamicExcelCode ?? string.Empty,
+            DynamicExcelName = x.DynamicExcelName ?? string.Empty,
+            BindingCount = x.BindingCount,
+            PeriodCount = x.PeriodCount,
+            ReportCount = x.ReportCount,
+            LatestPeriodId = x.LatestPeriodId,
+            LatestPeriodKey = x.LatestPeriodKey,
+            LatestPeriodStatus = x.LatestPeriodStatus.HasValue ? (int?)x.LatestPeriodStatus.Value : null,
+            LatestDueAtUtc = x.LatestDueAtUtc,
+            LatestReportId = x.LatestReportId,
+            LatestUpdatedAtUtc = x.LatestUpdatedAtUtc,
+            HasOverduePeriod = x.HasOverduePeriod
+        }).ToList();
 
         return new PagedResult<MyReportTemplateRow>(items, total, page, pageSize);
     }
@@ -142,7 +164,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         var assignment = await _ctx.WorkAssignments
             .Find(x => x.Id == workAssignmentId && !x.IsDeleted)
             .FirstOrDefaultAsync(ct)
-            ?? throw new InvalidOperationException("Không tìm thấy WorkAssignment.");
+            ?? throw ReportAssignmentNotFound(workAssignmentId);
 
         var isOwner = assignment.CreatedByUserId == actorUserId;
         var isAssignee = false;
@@ -158,7 +180,9 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             isAssignee = true;
 
         if (!isOwner && !isAssignee)
-            throw new UnauthorizedAccessException("Bạn không có quyền truy cập báo cáo của assignment này.");
+            throw AppExceptionFactory.Forbidden(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_ASSIGNMENT_ACCESS_FORBIDDEN,
+                new { workAssignmentId, actorUserId });
 
         return (assignment, isOwner, isAssignee);
     }
@@ -179,14 +203,14 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
 
     private async Task<List<WorkTemplateAssignee>> LoadVisibleReportBindingsByTemplateAsync(
         string workId,
-        string dynamicExcelId,
+        string dynamicFormTemplateId,
         string actorUserId,
         CancellationToken ct)
     {
         return await _ctx.WorkTemplateAssignees
             .Find(x =>
                 x.WorkId == workId &&
-                x.DynamicExcelId == dynamicExcelId &&
+                x.DynamicFormTemplateId == dynamicFormTemplateId &&
                 x.AssigneeUserId == actorUserId &&
                 !x.IsDeleted)
             .ToListAsync(ct);
@@ -235,32 +259,73 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         string actorUserId,
         CancellationToken ct)
     {
-        var access = await EnsureAssignmentReportAccessAsync(report.WorkAssignmentId, actorUserId, ct);
+        var assignment = await _ctx.WorkAssignments
+            .Find(x => x.Id == report.WorkAssignmentId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct)
+            ?? throw ReportAssignmentNotFound(report.WorkAssignmentId);
 
-        var isAssignee = access.isAssignee || (!string.IsNullOrWhiteSpace(report.AssigneeUserId) && report.AssigneeUserId == actorUserId);
-        if (!access.isOwner && !isAssignee)
-            throw new UnauthorizedAccessException("Bạn không có quyền truy cập báo cáo này.");
+        var isOwner = assignment.CreatedByUserId == actorUserId;
+        var isAssignee = !string.IsNullOrWhiteSpace(report.AssigneeUserId) && report.AssigneeUserId == actorUserId;
 
-        return (access.assignment, access.isOwner, isAssignee);
+        if (!isAssignee)
+        {
+            isAssignee = await _ctx.WorkTemplateAssignees
+                .Find(x =>
+                    x.WorkAssignmentId == report.WorkAssignmentId &&
+                    x.AssigneeUserId == actorUserId &&
+                    !x.IsDeleted)
+                .Limit(1)
+                .AnyAsync(ct);
+        }
+
+        var canReview = !isOwner && !isAssignee && await HasReviewReportReadAccessAsync(report, actorUserId, ct);
+
+        if (!isOwner && !isAssignee && !canReview)
+            throw AppExceptionFactory.Forbidden(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_ACCESS_FORBIDDEN,
+                ReportDetails(report, actorUserId));
+
+        return (assignment, isOwner, isAssignee);
+    }
+
+    private Task<bool> HasReviewReportReadAccessAsync(
+        WorkAssignmentReport report,
+        string actorUserId,
+        CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(actorUserId))
+            return Task.FromResult(false);
+
+        return _ctx.ReviewReportListDocRoles
+            .Find(x =>
+                x.ReviewerUserId == actorUserId &&
+                (x.CurrentReportId == report.Id || x.WorkReportPeriodId == report.WorkReportPeriodId) &&
+                !x.IsDeleted)
+            .Limit(1)
+            .AnyAsync(ct);
     }
     public async Task<MyReportTemplateDetailResponse> GetMyReportTemplateDetailAsync(
         string workId,
-        string dynamicExcelId,
+        string dynamicFormTemplateId,
         string actorUserId,
         CancellationToken ct = default)
     {
         EnsureActor(actorUserId);
 
         if (string.IsNullOrWhiteSpace(workId))
-            throw new ArgumentException("workId không được trống.", nameof(workId));
+            throw ReportWorkIdRequired(workId);
 
-        if (string.IsNullOrWhiteSpace(dynamicExcelId))
-            throw new ArgumentException("dynamicExcelId không được trống.", nameof(dynamicExcelId));
+        if (string.IsNullOrWhiteSpace(dynamicFormTemplateId))
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_DYNAMIC_FORM_TEMPLATE_ID_REQUIRED,
+                new { workId, dynamicFormTemplateId });
 
-        var bindings = await LoadVisibleReportBindingsByTemplateAsync(workId, dynamicExcelId, actorUserId, ct);
+        var bindings = await LoadVisibleReportBindingsByTemplateAsync(workId, dynamicFormTemplateId, actorUserId, ct);
 
         if (bindings.Count == 0)
-            throw new UnauthorizedAccessException("Bạn không có quyền xem chi tiết biểu mẫu báo cáo này.");
+            throw AppExceptionFactory.Forbidden(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_TEMPLATE_ACCESS_FORBIDDEN,
+                new { workId, dynamicFormTemplateId, actorUserId });
 
         var primaryBinding = bindings
             .OrderByDescending(x => x.UpdatedAtUtc)
@@ -295,22 +360,25 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                 .ToListAsync(ct);
         }
 
-        var template = await _ctx.DynamicExcelTemplates
-            .Find(x => x.Id == dynamicExcelId && !x.IsDeleted)
-            .FirstOrDefaultAsync(ct);
-
-        if (template is null)
-            throw new InvalidOperationException("Không tìm thấy DynamicExcelTemplate.");
+        var dynamicExcelId = primaryBinding.DynamicExcelId;
+        var template = string.IsNullOrWhiteSpace(dynamicExcelId)
+            ? null
+            : await _ctx.DynamicExcelTemplates
+                .Find(x => x.Id == dynamicExcelId && !x.IsDeleted)
+                .FirstOrDefaultAsync(ct);
 
         return new MyReportTemplateDetailResponse
         {
             WorkId = workId,
+            DynamicFormTemplateId = dynamicFormTemplateId,
+            DynamicFormTemplateCode = primaryBinding.DynamicFormTemplateCode ?? string.Empty,
+            DynamicFormTemplateName = primaryBinding.DynamicFormTemplateName ?? string.Empty,
             DynamicExcelId = dynamicExcelId,
-            DynamicExcelCode = template.Code,
-            DynamicExcelName = template.Name,
+            DynamicExcelCode = template?.Code ?? primaryBinding.DynamicExcelCode,
+            DynamicExcelName = template?.Name ?? primaryBinding.DynamicExcelName,
             WorkTemplateAssigneeId = primaryBinding.Id,
             WorkAssignmentId = primaryBinding.WorkAssignmentId,
-            TemplateSnapshotJson = JsonSerializer.Serialize(BuildTemplateSnapshot(template), _jsonOptions),
+            TemplateSnapshotJson = template is null ? string.Empty : JsonSerializer.Serialize(BuildTemplateSnapshot(template), _jsonOptions),
             Periods = periods.Select(MapToPeriodRow).ToList()
         };
     }
@@ -323,27 +391,33 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         EnsureActor(actorUserId);
 
         if (string.IsNullOrWhiteSpace(workReportPeriodId))
-            throw new ArgumentException("workReportPeriodId không được trống.", nameof(workReportPeriodId));
+            throw ReportPeriodIdRequired(workReportPeriodId);
 
         var period = await _ctx.WorkReportPeriods
             .Find(x => x.Id == workReportPeriodId && !x.IsDeleted)
             .FirstOrDefaultAsync(ct);
 
         if (period is null)
-            throw new InvalidOperationException("Không tìm thấy kỳ báo cáo.");
+            throw ReportPeriodNotFound(workReportPeriodId);
 
         await EnsurePeriodAccessAsync(period, actorUserId, ct);
 
         if (period.AssigneeUserId != actorUserId)
-            throw new UnauthorizedAccessException("Bạn không có quyền mở kỳ báo cáo này.");
+            throw AppExceptionFactory.Forbidden(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_PERIOD_ACCESS_FORBIDDEN,
+                PeriodDetails(period, actorUserId));
 
         if (!period.IsActive)
-            throw new InvalidOperationException("Kỳ báo cáo không còn hiệu lực.");
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_PERIOD_INACTIVE,
+                PeriodDetails(period, actorUserId));
 
         if (!string.IsNullOrWhiteSpace(period.CurrentReportId))
         {
             var existed = await _ctx.WorkAssignmentReports
-                .Find(x => x.Id == period.CurrentReportId && !x.IsDeleted)
+                .Find(Builders<WorkAssignmentReport>.Filter.Eq(x => x.Id, period.CurrentReportId)
+                      & Builders<WorkAssignmentReport>.Filter.Eq(x => x.IsDeleted, false)
+                      & Builders<WorkAssignmentReport>.Filter.Ne(x => x.IsActive, false))
                 .FirstOrDefaultAsync(ct);
 
             if (existed is not null)
@@ -381,12 +455,14 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         EnsureActor(actorUserId);
 
         if (string.IsNullOrWhiteSpace(workAssignmentId))
-            throw new ArgumentException("workAssignmentId không được trống.", nameof(workAssignmentId));
+            throw ReportAssignmentIdRequired(workAssignmentId);
 
         req ??= new InitWorkAssignmentReportRequest();
 
         if (string.IsNullOrWhiteSpace(req.PeriodKey))
-            throw new ArgumentException("PeriodKey không được trống.", nameof(req));
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_PERIOD_KEY_REQUIRED,
+                new { workAssignmentId, req.PeriodKey });
 
         var binding = await _ctx.WorkTemplateAssignees
             .Find(x =>
@@ -396,7 +472,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             .FirstOrDefaultAsync(ct);
 
         if (binding is null)
-            throw new UnauthorizedAccessException("Bạn không có binding báo cáo hiện hành cho assignment này.");
+            throw ReportBindingNotFound(workAssignmentId, actorUserId);
 
         var existedPeriod = await _ctx.WorkReportPeriods
             .Find(x =>
@@ -407,7 +483,9 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             .FirstOrDefaultAsync(ct);
 
         if (existedPeriod is null)
-            throw new InvalidOperationException("Kỳ báo cáo chưa được materialize hoặc không tồn tại.");
+            throw AppExceptionFactory.NotFound(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_PERIOD_NOT_MATERIALIZED,
+                new { workAssignmentId, actorUserId, periodKey = req.PeriodKey });
 
         return await OpenPeriodAsync(existedPeriod.Id, actorUserId, ct);
     }
@@ -421,7 +499,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         EnsureActor(actorUserId);
 
         if (string.IsNullOrWhiteSpace(workAssignmentId))
-            throw new ArgumentException("workAssignmentId không được trống.", nameof(workAssignmentId));
+            throw ReportAssignmentIdRequired(workAssignmentId);
 
         req ??= new CreateUserCreatedReportRequest();
 
@@ -433,18 +511,22 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             .FirstOrDefaultAsync(ct);
 
         if (binding is null)
-            throw new UnauthorizedAccessException("Bạn không có binding báo cáo hiện hành cho assignment này.");
+            throw ReportBindingNotFound(workAssignmentId, actorUserId);
 
         var assignment = await _ctx.WorkAssignments
             .Find(x => x.Id == workAssignmentId && !x.IsDeleted)
             .FirstOrDefaultAsync(ct)
-            ?? throw new InvalidOperationException("Không tìm thấy WorkAssignment.");
+            ?? throw ReportAssignmentNotFound(workAssignmentId);
 
         if (!assignment.IsActive || !binding.IsActive)
-            throw new InvalidOperationException("Phân công báo cáo không còn hiệu lực.");
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_ASSIGNMENT_INACTIVE,
+                new { workAssignmentId, bindingId = binding.Id, actorUserId });
 
         if (!assignment.AllowUserCreatedReports || !binding.AllowUserCreatedReports)
-            throw new InvalidOperationException("Phân công này chưa cho phép tạo báo cáo chủ động.");
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_USER_CREATED_NOT_ALLOWED,
+                new { workAssignmentId, bindingId = binding.Id, actorUserId });
 
         WorkReportPeriod? linkedScheduledPeriod = null;
         if (!string.IsNullOrWhiteSpace(req.LinkedScheduledPeriodId))
@@ -456,7 +538,15 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                     x.AssigneeUserId == actorUserId &&
                     !x.IsDeleted)
                 .FirstOrDefaultAsync(ct)
-                ?? throw new InvalidOperationException("Không tìm thấy kỳ định kỳ được liên kết.");
+                ?? throw AppExceptionFactory.NotFound(
+                    AppErrorCode.WORK_ASSIGNMENT_REPORT_LINKED_PERIOD_NOT_FOUND,
+                    new
+                    {
+                        workAssignmentId,
+                        bindingId = binding.Id,
+                        actorUserId,
+                        linkedScheduledPeriodId = req.LinkedScheduledPeriodId
+                    });
         }
 
         var now = DateTime.UtcNow;
@@ -525,27 +615,33 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         EnsureActor(actorUserId);
 
         if (string.IsNullOrWhiteSpace(id))
-            throw new ArgumentException("Id không được trống.", nameof(id));
+            throw ReportIdRequired(id);
 
         var entity = await _ctx.WorkAssignmentReports
             .Find(x => x.Id == id && !x.IsDeleted)
             .FirstOrDefaultAsync(ct)
-            ?? throw new InvalidOperationException("Không tìm thấy WorkAssignmentReport.");
+            ?? throw ReportNotFound(id);
 
         var reportAccess = await EnsureReportAccessAsync(entity, actorUserId, ct);
         if (!reportAccess.isAssignee || entity.AssigneeUserId != actorUserId)
-            throw new UnauthorizedAccessException("Bạn không có quyền xóa báo cáo này.");
+            throw AppExceptionFactory.Forbidden(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_DELETE_FORBIDDEN,
+                ReportDetails(entity, actorUserId));
 
         if (entity.Status == WorkAssignmentReportStatus.Approved)
-            throw new InvalidOperationException("Báo cáo đã được duyệt, không thể xóa.");
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_DELETE_APPROVED_FORBIDDEN,
+                ReportDetails(entity, actorUserId));
 
         var period = await _ctx.WorkReportPeriods
             .Find(x => x.Id == entity.WorkReportPeriodId && !x.IsDeleted)
             .FirstOrDefaultAsync(ct)
-            ?? throw new InvalidOperationException("Không tìm thấy kỳ báo cáo.");
+            ?? throw ReportPeriodNotFound(entity.WorkReportPeriodId);
 
         if (!WorkReportPeriodKind.IsUserCreated(period.PeriodKind))
-            throw new InvalidOperationException("Chỉ được xóa báo cáo chủ động.");
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_DELETE_USER_CREATED_ONLY,
+                PeriodDetails(period, actorUserId));
 
         var now = DateTime.UtcNow;
         await _ctx.WorkAssignmentReports.UpdateOneAsync(
@@ -596,14 +692,14 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         EnsureActor(actorUserId);
 
         if (string.IsNullOrWhiteSpace(id))
-            throw new ArgumentException("Id không được trống.", nameof(id));
+            throw ReportIdRequired(id);
 
         var entity = await _ctx.WorkAssignmentReports
             .Find(x => x.Id == id && !x.IsDeleted)
             .FirstOrDefaultAsync(ct);
 
         if (entity is null)
-            throw new InvalidOperationException("Không tìm thấy WorkAssignmentReport.");
+            throw ReportNotFound(id);
 
         await EnsureReportAccessAsync(entity, actorUserId, ct);
 
@@ -612,6 +708,8 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             .FirstOrDefaultAsync(ct);
 
         await _docRoleReadModelFreshness.EnsureReportPeriodFreshAsync(period, entity, actorUserId, ct);
+
+        entity = await RefreshAggregateSnapshotForReadAsync(entity, actorUserId, ct);
 
         return await MapToResponseAsync(entity, period, ct);
     }
@@ -624,12 +722,13 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         EnsureActor(actorUserId);
 
         if (string.IsNullOrWhiteSpace(workAssignmentId))
-            throw new ArgumentException("workAssignmentId không được trống.", nameof(workAssignmentId));
+            throw ReportAssignmentIdRequired(workAssignmentId);
 
         var access = await EnsureAssignmentReportAccessAsync(workAssignmentId, actorUserId, ct);
 
         var reportFilter = Builders<WorkAssignmentReport>.Filter.Eq(x => x.WorkAssignmentId, workAssignmentId)
-            & Builders<WorkAssignmentReport>.Filter.Eq(x => x.IsDeleted, false);
+            & Builders<WorkAssignmentReport>.Filter.Eq(x => x.IsDeleted, false)
+            & Builders<WorkAssignmentReport>.Filter.Ne(x => x.IsActive, false);
 
         if (!access.isOwner)
             reportFilter &= Builders<WorkAssignmentReport>.Filter.Eq(x => x.AssigneeUserId, actorUserId);
@@ -733,42 +832,106 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         EnsureActor(actorUserId);
 
         if (string.IsNullOrWhiteSpace(id))
-            throw new ArgumentException("Id không được trống.", nameof(id));
+            throw ReportIdRequired(id);
 
         if (req is null)
-            throw new ArgumentNullException(nameof(req));
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_REQUEST_REQUIRED,
+                new { reportId = id });
 
         var entity = await _ctx.WorkAssignmentReports
             .Find(x => x.Id == id && !x.IsDeleted)
             .FirstOrDefaultAsync(ct);
 
         if (entity is null)
-            throw new InvalidOperationException("Không tìm thấy WorkAssignmentReport.");
+            throw ReportNotFound(id);
+        EnsureReportIsActive(entity);
 
         var reportAccess = await EnsureReportAccessAsync(entity, actorUserId, ct);
         if (!reportAccess.isAssignee || entity.AssigneeUserId != actorUserId)
-            throw new UnauthorizedAccessException("Bạn không có quyền sửa báo cáo này.");
+            throw AppExceptionFactory.Forbidden(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_SAVE_FORBIDDEN,
+                ReportDetails(entity, actorUserId));
 
         if (entity.Status != WorkAssignmentReportStatus.Draft)
-            throw new InvalidOperationException("Chỉ được lưu khi báo cáo đang ở trạng thái Draft");
+            throw InvalidReportStatus(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_SAVE_STATUS_INVALID,
+                entity,
+                WorkAssignmentReportStatus.Draft,
+                actorUserId);
 
         var expectedLength = entity.W * entity.H;
         var actualLength = req.Values1D?.Count ?? 0;
 
         if (actualLength != expectedLength)
-            throw new InvalidOperationException($"Values1D không hợp lệ. Expected={expectedLength}, Actual={actualLength}.");
+            throw InvalidReportValues(entity, expectedLength, actualLength, actorUserId);
 
         var now = DateTime.UtcNow;
-        var values1DJson = JsonSerializer.Serialize(req.Values1D, _jsonOptions);
         var fromStatus = entity.Status;
         var nextStatus = WorkAssignmentReportStatus.Draft;
+        var nextDataOrigin = ResolveReportDataOrigin(req.DataOrigin, entity.DataOrigin);
+        var nextContributionMode = ResolveCumulativeContributionMode(
+            req.CumulativeContributionMode,
+            req.DataOrigin,
+            entity.CumulativeContributionMode,
+            entity.DataOrigin);
+        var nextContributionPolicyJson = ResolveContributionPolicyJsonOverride(
+            req.CumulativeContributionPolicyJson,
+            entity.CumulativeContributionPolicyJson,
+            id,
+            actorUserId);
+        var nextSummarySourceJson = ResolveSummarySourceJsonOverride(
+            req.SummarySourceJson,
+            entity.SummarySourceJson,
+            id,
+            actorUserId);
+        var nextAggregateSources = ExtractAggregateSourceSnapshot(nextSummarySourceJson);
+        var acceptsReportDataPayload = ShouldAcceptReportDataPayload(entity, nextDataOrigin, nextSummarySourceJson);
+
+        await ValidateRuntimeRowLabelsAsync(
+            entity,
+            acceptsReportDataPayload ? req.TableValuesJson : entity.TableValuesJson,
+            ct);
+        await ValidateRuntimeRecordTableAsync(
+            entity,
+            acceptsReportDataPayload ? req.TableValuesJson : entity.TableValuesJson,
+            ct);
+
+        var values1DJson = acceptsReportDataPayload
+            ? JsonSerializer.Serialize(req.Values1D, _jsonOptions)
+            : entity.Values1DJson;
+        var fieldValuesJson = acceptsReportDataPayload ? req.FieldValuesJson : entity.FieldValuesJson;
+        var tableValuesJson = acceptsReportDataPayload ? req.TableValuesJson : entity.TableValuesJson;
+        var nextAggregateSnapshotDirty = nextAggregateSources.IsAggregate
+            ? !acceptsReportDataPayload && entity.AggregateSnapshotDirty
+            : false;
+        var nextAggregateSnapshotDirtyAtUtc = nextAggregateSnapshotDirty
+            ? entity.AggregateSnapshotDirtyAtUtc
+            : null;
+        var nextAggregateSnapshotRefreshedAtUtc = nextAggregateSources.IsAggregate && acceptsReportDataPayload
+            ? now
+            : entity.AggregateSnapshotRefreshedAtUtc;
+        var nextAggregateSourceUpdatedAtUtc = nextAggregateSources.IsAggregate
+            ? (acceptsReportDataPayload ? now : entity.AggregateSourceUpdatedAtUtc)
+            : null;
 
         await _ctx.WorkAssignmentReports.UpdateOneAsync(
             x => x.Id == id && !x.IsDeleted,
             Builders<WorkAssignmentReport>.Update
                 .Set(x => x.Values1DJson, values1DJson)
-                .Set(x => x.FieldValuesJson, req.FieldValuesJson)
-                .Set(x => x.TableValuesJson, req.TableValuesJson)
+                .Set(x => x.FieldValuesJson, fieldValuesJson)
+                .Set(x => x.TableValuesJson, tableValuesJson)
+                .Set(x => x.DataOrigin, nextDataOrigin)
+                .Set(x => x.CumulativeContributionMode, nextContributionMode)
+                .Set(x => x.CumulativeContributionPolicyJson, nextContributionPolicyJson)
+                .Set(x => x.SummarySourceJson, nextSummarySourceJson)
+                .Set(x => x.AggregateSourceReportIds, nextAggregateSources.ReportIds)
+                .Set(x => x.AggregateSourceAssignmentIds, nextAggregateSources.AssignmentIds)
+                .Set(x => x.AggregateSourceUpdatedAtUtc, nextAggregateSourceUpdatedAtUtc)
+                .Set(x => x.AggregateSnapshotDirty, nextAggregateSnapshotDirty)
+                .Set(x => x.AggregateSnapshotDirtyAtUtc, nextAggregateSnapshotDirtyAtUtc)
+                .Set(x => x.AggregateSnapshotRefreshedAtUtc, nextAggregateSnapshotRefreshedAtUtc)
+                .Set(x => x.AggregateRefreshError, (string?)null)
                 .Set(x => x.CurrentProgressStatus, req.CurrentProgressStatus)
                 .Set(x => x.ReportReason, req.ReportReason)
                 .Set(x => x.Difficulties, req.Difficulties)
@@ -781,8 +944,19 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             cancellationToken: ct);
 
         entity.Values1DJson = values1DJson;
-        entity.FieldValuesJson = req.FieldValuesJson;
-        entity.TableValuesJson = req.TableValuesJson;
+        entity.FieldValuesJson = fieldValuesJson;
+        entity.TableValuesJson = tableValuesJson;
+        entity.DataOrigin = nextDataOrigin;
+        entity.CumulativeContributionMode = nextContributionMode;
+        entity.CumulativeContributionPolicyJson = nextContributionPolicyJson;
+        entity.SummarySourceJson = nextSummarySourceJson;
+        entity.AggregateSourceReportIds = nextAggregateSources.ReportIds;
+        entity.AggregateSourceAssignmentIds = nextAggregateSources.AssignmentIds;
+        entity.AggregateSourceUpdatedAtUtc = nextAggregateSourceUpdatedAtUtc;
+        entity.AggregateSnapshotDirty = nextAggregateSnapshotDirty;
+        entity.AggregateSnapshotDirtyAtUtc = nextAggregateSnapshotDirtyAtUtc;
+        entity.AggregateSnapshotRefreshedAtUtc = nextAggregateSnapshotRefreshedAtUtc;
+        entity.AggregateRefreshError = null;
         entity.CurrentProgressStatus = req.CurrentProgressStatus;
         entity.ReportReason = req.ReportReason;
         entity.Difficulties = req.Difficulties;
@@ -861,6 +1035,156 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         return await MapToResponseAsync(entity, period, ct);
     }
 
+    public async Task<WorkAssignmentReportResponse> ApplyDynamicFormAggregateDraftAsync(
+        string id,
+        ApplyDynamicFormAggregateDraftRequest req,
+        string actorUserId,
+        CancellationToken ct = default)
+    {
+        EnsureActor(actorUserId);
+
+        if (string.IsNullOrWhiteSpace(id))
+            throw ReportIdRequired(id);
+
+        if (req is null || req.AggregateRequest is null)
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_AGGREGATE_DRAFT_REQUEST_INVALID,
+                new { reportId = id });
+
+        var entity = await _ctx.WorkAssignmentReports
+            .Find(x => x.Id == id && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct);
+
+        if (entity is null)
+            throw ReportNotFound(id);
+        EnsureReportIsActive(entity);
+
+        var reportAccess = await EnsureReportAccessAsync(entity, actorUserId, ct);
+        if (!reportAccess.isAssignee || entity.AssigneeUserId != actorUserId)
+            throw AppExceptionFactory.Forbidden(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_SAVE_FORBIDDEN,
+                ReportDetails(entity, actorUserId));
+
+        if (entity.Status != WorkAssignmentReportStatus.Draft)
+            throw InvalidReportStatus(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_SAVE_STATUS_INVALID,
+                entity,
+                WorkAssignmentReportStatus.Draft,
+                actorUserId);
+
+        if (string.IsNullOrWhiteSpace(entity.DynamicFormTemplateId))
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_AGGREGATE_DRAFT_TEMPLATE_MISMATCH,
+                ReportDetails(entity, actorUserId));
+
+        var aggregateReq = NormalizeAggregateDraftRequest(req.AggregateRequest);
+
+        if (!string.Equals(entity.DynamicFormTemplateId, aggregateReq.DynamicFormTemplateId, StringComparison.Ordinal))
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_AGGREGATE_DRAFT_TEMPLATE_MISMATCH,
+                new
+                {
+                    reportId = id,
+                    reportTemplateId = entity.DynamicFormTemplateId,
+                    aggregateTemplateId = aggregateReq.DynamicFormTemplateId
+                });
+
+        var aggregate = await _aggregateTableService.GetDynamicFormAggregateAsync(aggregateReq, ct);
+
+        var form = await _ctx.DynamicFormTemplates
+            .Find(x => x.Id == entity.DynamicFormTemplateId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct);
+
+        if (form is null)
+            throw AppExceptionFactory.NotFound(
+                AppErrorCode.WORK_REPORT_STATISTICS_DYNAMIC_FORM_TEMPLATE_NOT_FOUND,
+                new { dynamicFormTemplateId = entity.DynamicFormTemplateId, reportId = id });
+
+        var targetBlockId = NormalizeBlockId(req.TargetBlockId ?? aggregateReq.BlockId ?? aggregate.Meta.BlockId);
+        var block = ResolveAggregateDraftBlock(form, targetBlockId)
+            ?? throw AppExceptionFactory.NotFound(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_AGGREGATE_DRAFT_BLOCK_NOT_FOUND,
+                new { reportId = id, dynamicFormTemplateId = form.Id, blockId = targetBlockId });
+
+        var dataOrigin = WorkReportDataOrigin.Normalize(req.DataOrigin ?? WorkReportDataOrigin.AutoSummary);
+        var valueSelector = NormalizeAggregateDraftValueSelector(req.ValueSelector);
+        var previousSummary = TryReadAggregateDraftSummary(entity.SummarySourceJson);
+        var existingTopLevelValues = DeserializeValues1D(entity.Values1DJson);
+        var isTopLevelBlock = string.Equals(targetBlockId, ResolveTopLevelBlockId(form), StringComparison.Ordinal);
+        var clearExisting = req.ClearExistingValues ?? dataOrigin != WorkReportDataOrigin.PartialMapping;
+        var currentBlockValues = isTopLevelBlock
+            ? existingTopLevelValues
+            : ExtractBlockDecimalValues(entity.TableValuesJson, targetBlockId);
+        var targetValues = clearExisting
+            ? CreateEmptyValues1D(block.W, block.H)
+            : NormalizeDecimalValues(currentBlockValues, block.W * block.H);
+
+        if (!clearExisting && IsSameAggregateDraftTarget(previousSummary, entity.DynamicFormTemplateId, targetBlockId))
+            ClearAggregateDraftTargetIndexes(targetValues, previousSummary!.TargetIndexes);
+
+        ApplyAggregateRowsToValues(targetValues, aggregate.Rows, block, valueSelector);
+
+        var tableValuesJson = BuildAggregateDraftTableValuesJson(entity, form, block, targetValues, aggregate);
+        var topLevelValues = isTopLevelBlock
+            ? targetValues
+            : NormalizeDecimalValues(existingTopLevelValues, entity.W * entity.H);
+        var contributionMode = string.IsNullOrWhiteSpace(req.CumulativeContributionMode)
+            ? WorkReportDataOrigin.DefaultContributionMode(dataOrigin)
+            : WorkReportCumulativeContributionMode.Normalize(req.CumulativeContributionMode);
+        var contributionPolicyJson = NormalizeOptionalTextOrNull(req.CumulativeContributionPolicyJson)
+            ?? BuildAggregateDraftContributionPolicyJson(dataOrigin, aggregate.Rows, block.BlockId);
+        var summarySourceJson = BuildAggregateDraftSummarySourceJson(
+            dataOrigin,
+            aggregateReq,
+            aggregate,
+            block,
+            valueSelector,
+            targetBlockId,
+            clearExisting);
+
+        var saveReq = new SaveWorkAssignmentReportDraftRequest
+        {
+            Values1D = topLevelValues,
+            FieldValuesJson = entity.FieldValuesJson,
+            TableValuesJson = tableValuesJson,
+            DataOrigin = dataOrigin,
+            CumulativeContributionMode = contributionMode,
+            CumulativeContributionPolicyJson = contributionPolicyJson,
+            SummarySourceJson = summarySourceJson,
+            CurrentProgressStatus = entity.CurrentProgressStatus,
+            ReportReason = entity.ReportReason,
+            Difficulties = entity.Difficulties,
+            ProposedSolution = entity.ProposedSolution,
+            LateReason = entity.LateReason,
+            Note = entity.Note
+        };
+
+        return await SaveDraftAsync(id, saveReq, actorUserId, ct);
+    }
+
+    public async Task RefreshDynamicFormAggregateDependentsAsync(
+        string sourceReportId,
+        string currentUserId,
+        CancellationToken ct = default)
+    {
+        EnsureActor(currentUserId);
+        if (string.IsNullOrWhiteSpace(sourceReportId))
+            throw ReportIdRequired(sourceReportId);
+
+        var source = await _ctx.WorkAssignmentReports
+            .Find(x => x.Id == sourceReportId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct);
+
+        if (source is null)
+            throw ReportNotFound(sourceReportId);
+
+        await RefreshDynamicFormAggregateDependentsRecursiveAsync(
+            source,
+            currentUserId,
+            new HashSet<string>(StringComparer.Ordinal),
+            ct);
+    }
+
     public async Task<WorkAssignmentReportResponse> SubmitAsync(
         string id,
         SubmitWorkAssignmentReportRequest req,
@@ -870,7 +1194,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         EnsureActor(actorUserId);
 
         if (string.IsNullOrWhiteSpace(id))
-            throw new ArgumentException("Id không được trống.", nameof(id));
+            throw ReportIdRequired(id);
 
         req ??= new SubmitWorkAssignmentReportRequest();
 
@@ -879,38 +1203,107 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             .FirstOrDefaultAsync(ct);
 
         if (entity is null)
-            throw new InvalidOperationException("Không tìm thấy WorkAssignmentReport.");
+            throw ReportNotFound(id);
+        EnsureReportIsActive(entity);
 
         var reportAccess = await EnsureReportAccessAsync(entity, actorUserId, ct);
         if (!reportAccess.isAssignee || entity.AssigneeUserId != actorUserId)
-            throw new UnauthorizedAccessException("Bạn không có quyền nộp báo cáo này.");
+            throw AppExceptionFactory.Forbidden(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_SUBMIT_FORBIDDEN,
+                ReportDetails(entity, actorUserId));
 
         if (entity.Status != WorkAssignmentReportStatus.Draft)
-            throw new InvalidOperationException("Chỉ được nộp khi báo cáo đang ở trạng thái nháp");
+            throw InvalidReportStatus(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_SUBMIT_STATUS_INVALID,
+                entity,
+                WorkAssignmentReportStatus.Draft,
+                actorUserId);
 
         var now = DateTime.UtcNow;
         var fromStatus = entity.Status;
 
+        string? requestedValues1DJson = null;
         if (req.Values1D is { Count: > 0 })
         {
             var expectedLength = entity.W * entity.H;
             if (req.Values1D.Count != expectedLength)
-                throw new InvalidOperationException($"Values1D không hợp lệ. Expected={expectedLength}, Actual={req.Values1D.Count}.");
+                throw InvalidReportValues(entity, expectedLength, req.Values1D.Count, actorUserId);
 
-            entity.Values1DJson = JsonSerializer.Serialize(req.Values1D, _jsonOptions);
+            requestedValues1DJson = JsonSerializer.Serialize(req.Values1D, _jsonOptions);
         }
 
-        if (req.FieldValuesJson is not null)
-            entity.FieldValuesJson = req.FieldValuesJson;
+        var nextDataOrigin = ResolveReportDataOrigin(req.DataOrigin, entity.DataOrigin);
+        var nextContributionMode = ResolveCumulativeContributionMode(
+            req.CumulativeContributionMode,
+            req.DataOrigin,
+            entity.CumulativeContributionMode,
+            entity.DataOrigin);
+        var nextContributionPolicyJson = ResolveContributionPolicyJsonOverride(
+            req.CumulativeContributionPolicyJson,
+            entity.CumulativeContributionPolicyJson,
+            id,
+            actorUserId);
+        var nextSummarySourceJson = ResolveSummarySourceJsonOverride(
+            req.SummarySourceJson,
+            entity.SummarySourceJson,
+            id,
+            actorUserId);
+        var nextAggregateSources = ExtractAggregateSourceSnapshot(nextSummarySourceJson);
+        var acceptsReportDataPayload = ShouldAcceptReportDataPayload(entity, nextDataOrigin, nextSummarySourceJson);
 
-        if (req.TableValuesJson is not null)
-            entity.TableValuesJson = req.TableValuesJson;
+        await ValidateRuntimeRowLabelsAsync(
+            entity,
+            acceptsReportDataPayload ? req.TableValuesJson ?? entity.TableValuesJson : entity.TableValuesJson,
+            ct);
+        await ValidateRuntimeRecordTableAsync(
+            entity,
+            acceptsReportDataPayload ? req.TableValuesJson ?? entity.TableValuesJson : entity.TableValuesJson,
+            ct);
+
+        if (acceptsReportDataPayload)
+        {
+            if (requestedValues1DJson is not null)
+                entity.Values1DJson = requestedValues1DJson;
+
+            if (req.FieldValuesJson is not null)
+                entity.FieldValuesJson = req.FieldValuesJson;
+
+            if (req.TableValuesJson is not null)
+                entity.TableValuesJson = req.TableValuesJson;
+        }
+
+        var nextAggregateSnapshotDirty = nextAggregateSources.IsAggregate
+            ? !acceptsReportDataPayload && entity.AggregateSnapshotDirty
+            : false;
+        var nextAggregateSnapshotDirtyAtUtc = nextAggregateSnapshotDirty
+            ? entity.AggregateSnapshotDirtyAtUtc
+            : null;
+        var nextAggregateSnapshotRefreshedAtUtc = nextAggregateSources.IsAggregate && acceptsReportDataPayload
+            ? now
+            : entity.AggregateSnapshotRefreshedAtUtc;
+        var nextAggregateSourceUpdatedAtUtc = nextAggregateSources.IsAggregate
+            ? (acceptsReportDataPayload ? now : entity.AggregateSourceUpdatedAtUtc)
+            : null;
+
+        entity.DataOrigin = nextDataOrigin;
+        entity.CumulativeContributionMode = nextContributionMode;
+        entity.CumulativeContributionPolicyJson = nextContributionPolicyJson;
+        entity.SummarySourceJson = nextSummarySourceJson;
+        entity.AggregateSourceReportIds = nextAggregateSources.ReportIds;
+        entity.AggregateSourceAssignmentIds = nextAggregateSources.AssignmentIds;
+        entity.AggregateSourceUpdatedAtUtc = nextAggregateSourceUpdatedAtUtc;
+        entity.AggregateSnapshotDirty = nextAggregateSnapshotDirty;
+        entity.AggregateSnapshotDirtyAtUtc = nextAggregateSnapshotDirtyAtUtc;
+        entity.AggregateSnapshotRefreshedAtUtc = nextAggregateSnapshotRefreshedAtUtc;
+        entity.AggregateRefreshError = null;
 
         var isLate = entity.DueAtUtc.HasValue && now > entity.DueAtUtc.Value;
         var lateReason = string.IsNullOrWhiteSpace(req.LateReason) ? entity.LateReason : req.LateReason?.Trim();
 
         if (isLate && string.IsNullOrWhiteSpace(lateReason))
-            throw new InvalidOperationException("Báo cáo nộp trễ hạn bắt buộc phải có lý do.");
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_LATE_REASON_REQUIRED,
+                ReportDetails(entity, actorUserId));
 
         entity.Status = WorkAssignmentReportStatus.Submitted;
         entity.CurrentProgressStatus = req.CurrentProgressStatus ?? entity.CurrentProgressStatus;
@@ -933,6 +1326,17 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                 .Set(x => x.Values1DJson, entity.Values1DJson)
                 .Set(x => x.FieldValuesJson, entity.FieldValuesJson)
                 .Set(x => x.TableValuesJson, entity.TableValuesJson)
+                .Set(x => x.DataOrigin, entity.DataOrigin)
+                .Set(x => x.CumulativeContributionMode, entity.CumulativeContributionMode)
+                .Set(x => x.CumulativeContributionPolicyJson, entity.CumulativeContributionPolicyJson)
+                .Set(x => x.SummarySourceJson, entity.SummarySourceJson)
+                .Set(x => x.AggregateSourceReportIds, entity.AggregateSourceReportIds)
+                .Set(x => x.AggregateSourceAssignmentIds, entity.AggregateSourceAssignmentIds)
+                .Set(x => x.AggregateSourceUpdatedAtUtc, entity.AggregateSourceUpdatedAtUtc)
+                .Set(x => x.AggregateSnapshotDirty, entity.AggregateSnapshotDirty)
+                .Set(x => x.AggregateSnapshotDirtyAtUtc, entity.AggregateSnapshotDirtyAtUtc)
+                .Set(x => x.AggregateSnapshotRefreshedAtUtc, entity.AggregateSnapshotRefreshedAtUtc)
+                .Set(x => x.AggregateRefreshError, entity.AggregateRefreshError)
                 .Set(x => x.Status, entity.Status)
                 .Set(x => x.CurrentProgressStatus, entity.CurrentProgressStatus)
                 .Set(x => x.ReportReason, entity.ReportReason)
@@ -1018,29 +1422,36 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                 ct);
         }
 
+        await _userActionLog.RecordAsync(new UserActionLogSeed
+        {
+            Action = UserActionLogActions.ReportSubmitted,
+            Scope = "report",
+            ActorUserId = actorUserId,
+            WorkId = entity.WorkId,
+            WorkAssignmentId = entity.WorkAssignmentId,
+            WorkReportPeriodId = entity.WorkReportPeriodId,
+            WorkAssignmentReportId = entity.Id,
+            TargetUserId = entity.AssigneeUserId,
+            Summary = $"Submitted report {entity.PeriodInstanceKey}",
+            Data = new Dictionary<string, string>
+            {
+                { "fromStatus", fromStatus.ToString() },
+                { "toStatus", WorkAssignmentReportStatus.Submitted.ToString() },
+                { "isLateSubmission", isLate.ToString() }
+            },
+            OccurredAtUtc = now
+        }, CancellationToken.None);
+
         return await MapToResponseAsync(entity, period, ct);
     }
 
-    private async Task<WorkAssignment> LoadReviewNodeAsync(
+    private static Task<WorkAssignment> LoadReviewNodeAsync(
         WorkAssignment assignment,
         string reviewerUserId,
         CancellationToken ct)
     {
-        if (string.Equals(assignment.CreatedByUserId, reviewerUserId, StringComparison.Ordinal))
-            return assignment;
-
-        var canReviewByRuntimeBinding = await _ctx.WorkTemplateAssignees
-            .Find(x =>
-                x.WorkAssignmentId == assignment.Id &&
-                x.CreatedByUserId == reviewerUserId &&
-                !x.IsDeleted)
-            .AnyAsync(ct);
-
-        if (canReviewByRuntimeBinding)
-            return assignment;
-
         WorkAssignmentReviewPermissionHelper.EnsureCanReviewOnNode(assignment, reviewerUserId);
-        return assignment;
+        return Task.FromResult(assignment);
     }
 
     public async Task<List<WorkAssignmentReportLogRow>> GetLogsAsync(
@@ -1051,19 +1462,19 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         EnsureActor(actorUserId);
 
         if (string.IsNullOrWhiteSpace(reportId))
-            throw new ArgumentException("reportId không được trống.", nameof(reportId));
+            throw ReportIdRequired(reportId);
 
         var report = await _ctx.WorkAssignmentReports
             .Find(x => x.Id == reportId && !x.IsDeleted)
             .FirstOrDefaultAsync(ct);
 
         if (report is null)
-            throw new InvalidOperationException("Không tìm thấy WorkAssignmentReport.");
+            throw ReportNotFound(reportId);
 
         var assignment = await _ctx.WorkAssignments
             .Find(x => x.Id == report.WorkAssignmentId && !x.IsDeleted)
             .FirstOrDefaultAsync(ct)
-            ?? throw new InvalidOperationException("Không tìm thấy WorkAssignment.");
+            ?? throw ReportAssignmentNotFound(report.WorkAssignmentId);
 
         var isAssignee = report.AssigneeUserId == actorUserId;
         var canReview = false;
@@ -1078,8 +1489,13 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             canReview = false;
         }
 
+        if (!canReview)
+            canReview = await HasReviewReportReadAccessAsync(report, actorUserId, ct);
+
         if (!isAssignee && !canReview)
-            throw new UnauthorizedAccessException("Bạn không có quyền xem log của báo cáo này.");
+            throw AppExceptionFactory.Forbidden(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_LOG_ACCESS_FORBIDDEN,
+                ReportDetails(report, actorUserId));
 
         var logs = await _ctx.WorkAssignmentReportLogs
             .Find(x => x.WorkAssignmentReportId == reportId && !x.IsDeleted)
@@ -1113,7 +1529,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         EnsureActor(actorUserId);
 
         if (string.IsNullOrWhiteSpace(id))
-            throw new ArgumentException("Id không được trống.", nameof(id));
+            throw ReportIdRequired(id);
 
         req ??= new AcceptWorkAssignmentReportRequest();
 
@@ -1122,20 +1538,32 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             .FirstOrDefaultAsync(ct);
 
         if (entity is null)
-            throw new InvalidOperationException("Không tìm thấy WorkAssignmentReport.");
+            throw ReportNotFound(id);
+        EnsureReportIsActive(entity);
 
         if (entity.AssigneeUserId == actorUserId)
-            throw new UnauthorizedAccessException("Người báo cáo không thể tự duyệt báo cáo của chính mình.");
+            throw AppExceptionFactory.Forbidden(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_REVIEW_SELF_FORBIDDEN,
+                ReportDetails(entity, actorUserId));
 
         if (entity.Status != WorkAssignmentReportStatus.Submitted)
-            throw new InvalidOperationException("Chỉ báo cáo đã nộp mới được duyệt.");
+            throw InvalidReportStatus(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_APPROVE_STATUS_INVALID,
+                entity,
+                WorkAssignmentReportStatus.Submitted,
+                actorUserId);
 
         var assignment = await _ctx.WorkAssignments
             .Find(x => x.Id == entity.WorkAssignmentId && !x.IsDeleted)
             .FirstOrDefaultAsync(ct)
-            ?? throw new InvalidOperationException("Không tìm thấy WorkAssignment.");
+            ?? throw ReportAssignmentNotFound(entity.WorkAssignmentId);
 
         await LoadReviewNodeAsync(assignment, actorUserId, ct);
+
+        var period = await _ctx.WorkReportPeriods
+            .Find(x => x.Id == entity.WorkReportPeriodId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct);
+        await EnsurePreviousReportsApprovedAsync(period, ct);
 
         var now = DateTime.UtcNow;
         var lateReason = string.IsNullOrWhiteSpace(req.LateReasonOverride)
@@ -1165,10 +1593,6 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         entity.ApprovedByUserId = actorUserId;
         entity.UpdatedAtUtc = now;
         entity.UpdatedByUserId = actorUserId;
-
-        var period = await _ctx.WorkReportPeriods
-            .Find(x => x.Id == entity.WorkReportPeriodId && !x.IsDeleted)
-            .FirstOrDefaultAsync(ct);
 
         if (period is not null)
         {
@@ -1222,6 +1646,25 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             syncAssignment: true,
             ct);
 
+        await _userActionLog.RecordAsync(new UserActionLogSeed
+        {
+            Action = UserActionLogActions.ReportApproved,
+            Scope = "report",
+            ActorUserId = actorUserId,
+            WorkId = entity.WorkId,
+            WorkAssignmentId = entity.WorkAssignmentId,
+            WorkReportPeriodId = entity.WorkReportPeriodId,
+            WorkAssignmentReportId = entity.Id,
+            TargetUserId = entity.AssigneeUserId,
+            Summary = $"Approved report {entity.PeriodInstanceKey}",
+            Data = new Dictionary<string, string>
+            {
+                { "fromStatus", WorkAssignmentReportStatus.Submitted.ToString() },
+                { "toStatus", WorkAssignmentReportStatus.Approved.ToString() }
+            },
+            OccurredAtUtc = now
+        }, CancellationToken.None);
+
         return await MapToResponseAsync(entity, period, ct);
     }
 
@@ -1234,30 +1677,39 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         EnsureActor(actorUserId);
 
         if (string.IsNullOrWhiteSpace(id))
-            throw new ArgumentException("Id không được trống.", nameof(id));
+            throw ReportIdRequired(id);
 
         req ??= new ReturnWorkAssignmentReportRequest();
 
         if (string.IsNullOrWhiteSpace(req.ReturnReason))
-            throw new InvalidOperationException("Trả lại báo cáo bắt buộc phải có lý do.");
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_RETURN_COMMENT_REQUIRED,
+                new { reportId = id, req.ReturnReason });
 
         var entity = await _ctx.WorkAssignmentReports
             .Find(x => x.Id == id && !x.IsDeleted)
             .FirstOrDefaultAsync(ct);
 
         if (entity is null)
-            throw new InvalidOperationException("Không tìm thấy WorkAssignmentReport.");
+            throw ReportNotFound(id);
+        EnsureReportIsActive(entity);
 
         if (entity.AssigneeUserId == actorUserId)
-            throw new UnauthorizedAccessException("Người báo cáo không thể tự trả lại báo cáo của chính mình.");
+            throw AppExceptionFactory.Forbidden(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_REVIEW_SELF_FORBIDDEN,
+                ReportDetails(entity, actorUserId));
 
         if (entity.Status != WorkAssignmentReportStatus.Submitted)
-            throw new InvalidOperationException("Chỉ báo cáo đã nộp mới được trả lại.");
+            throw InvalidReportStatus(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_RETURN_STATUS_INVALID,
+                entity,
+                WorkAssignmentReportStatus.Submitted,
+                actorUserId);
 
         var assignment = await _ctx.WorkAssignments
             .Find(x => x.Id == entity.WorkAssignmentId && !x.IsDeleted)
             .FirstOrDefaultAsync(ct)
-            ?? throw new InvalidOperationException("Không tìm thấy WorkAssignment.");
+            ?? throw ReportAssignmentNotFound(entity.WorkAssignmentId);
 
         await LoadReviewNodeAsync(assignment, actorUserId, ct);
 
@@ -1344,6 +1796,25 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             syncAssignment: true,
             ct);
 
+        await _userActionLog.RecordAsync(new UserActionLogSeed
+        {
+            Action = UserActionLogActions.ReportReturned,
+            Scope = "report",
+            ActorUserId = actorUserId,
+            WorkId = entity.WorkId,
+            WorkAssignmentId = entity.WorkAssignmentId,
+            WorkReportPeriodId = entity.WorkReportPeriodId,
+            WorkAssignmentReportId = entity.Id,
+            TargetUserId = entity.AssigneeUserId,
+            Summary = $"Returned report {entity.PeriodInstanceKey}",
+            Data = new Dictionary<string, string>
+            {
+                { "fromStatus", WorkAssignmentReportStatus.Submitted.ToString() },
+                { "toStatus", WorkAssignmentReportStatus.Draft.ToString() }
+            },
+            OccurredAtUtc = now
+        }, CancellationToken.None);
+
         return await MapToResponseAsync(entity, period, ct);
     }
 
@@ -1356,20 +1827,27 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         EnsureActor(actorUserId);
 
         if (string.IsNullOrWhiteSpace(id))
-            throw new ArgumentException("Id không được trống.", nameof(id));
+            throw ReportIdRequired(id);
 
         req ??= new ReturnWorkAssignmentReportRequest();
 
         var entity = await _ctx.WorkAssignmentReports
             .Find(x => x.Id == id && !x.IsDeleted)
             .FirstOrDefaultAsync(ct)
-            ?? throw new InvalidOperationException("Không tìm thấy WorkAssignmentReport.");
+            ?? throw ReportNotFound(id);
+        EnsureReportIsActive(entity);
 
         if (entity.AssigneeUserId != actorUserId)
-            throw new UnauthorizedAccessException("Bạn không có quyền thu hồi báo cáo này.");
+            throw AppExceptionFactory.Forbidden(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_WITHDRAW_FORBIDDEN,
+                ReportDetails(entity, actorUserId));
 
         if (entity.Status != WorkAssignmentReportStatus.Submitted)
-            throw new InvalidOperationException("Chỉ báo cáo đã nộp và chưa duyệt mới được thu hồi.");
+            throw InvalidReportStatus(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_WITHDRAW_STATUS_INVALID,
+                entity,
+                WorkAssignmentReportStatus.Submitted,
+                actorUserId);
 
         var now = DateTime.UtcNow;
         var withdrawReason = string.IsNullOrWhiteSpace(req.ReturnReason)
@@ -1465,23 +1943,27 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             .FirstOrDefaultAsync(ct);
 
         if (assignment is null)
-            throw new InvalidOperationException("Không tìm thấy WorkAssignment của kỳ báo cáo.");
+            throw ReportAssignmentNotFound(period.WorkAssignmentId);
 
         if (!assignment.IsActive)
-            throw new InvalidOperationException("WorkAssignment đã dừng hiệu lực, không thể tạo draft mới.");
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_ASSIGNMENT_INACTIVE,
+                PeriodDetails(period, actorUserId));
 
         var template = await _ctx.DynamicExcelTemplates
             .Find(x => x.Id == period.DynamicExcelId && !x.IsDeleted)
             .FirstOrDefaultAsync(ct);
 
         if (template is null)
-            throw new InvalidOperationException("Không tìm thấy DynamicExcelTemplate.");
+            throw AppExceptionFactory.NotFound(
+                AppErrorCode.DYNAMIC_EXCEL_TEMPLATE_NOT_FOUND,
+                new { dynamicExcelTemplateId = period.DynamicExcelId, periodId = period.Id });
 
         var existedCurrent = await _ctx.WorkAssignmentReports
-            .Find(x =>
-                x.WorkReportPeriodId == period.Id &&
-                x.IsCurrent &&
-                !x.IsDeleted)
+            .Find(Builders<WorkAssignmentReport>.Filter.Eq(x => x.WorkReportPeriodId, period.Id)
+                  & Builders<WorkAssignmentReport>.Filter.Eq(x => x.IsCurrent, true)
+                  & Builders<WorkAssignmentReport>.Filter.Ne(x => x.IsActive, false)
+                  & Builders<WorkAssignmentReport>.Filter.Eq(x => x.IsDeleted, false))
             .FirstOrDefaultAsync(ct);
 
         if (existedCurrent is not null)
@@ -1493,6 +1975,8 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         var now = DateTime.UtcNow;
         var periodInstanceKey = NormalizePeriodInstanceKey(period);
         var periodKind = NormalizePeriodKind(period.PeriodKind);
+        var defaultDataOrigin = DynamicFormDataSourceRuleNormalizer.ResolveDefaultReportDataOrigin(
+            assignment.DynamicFormDataSourceRulesJson);
 
         var entity = new WorkAssignmentReport
         {
@@ -1520,6 +2004,9 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             DynamicExcelTemplateId = template.Id,
             DynamicExcelTemplateCode = template.Code,
             DynamicExcelTemplateName = template.Name,
+            DynamicExcelTableKind = NormalizeDynamicExcelTableKind(template.TableKind),
+            RecordTableSpecJson = template.RecordTableSpecJson,
+            SpecJson = template.SpecJson,
 
             DataRectR0 = template.DataRectR0,
             DataRectC0 = template.DataRectC0,
@@ -1529,9 +2016,12 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             H = template.H,
 
             Values1DJson = JsonSerializer.Serialize(CreateEmptyValues1D(template.W, template.H), _jsonOptions),
+            DataOrigin = defaultDataOrigin,
+            CumulativeContributionMode = WorkReportDataOrigin.DefaultContributionMode(defaultDataOrigin),
 
             VersionNo = Math.Max(1, period.ReportVersionCount + 1),
             IsCurrent = true,
+            IsActive = true,
 
             CreatedAtUtc = now,
             UpdatedAtUtc = now,
@@ -1585,6 +2075,299 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         return entity;
     }
 
+    private async Task ValidateRuntimeRowLabelsAsync(
+        WorkAssignmentReport report,
+        string? tableValuesJson,
+        CancellationToken ct)
+    {
+        var rows = ExtractRuntimeRowLabelPayloads(report, tableValuesJson);
+        if (rows.Count == 0)
+            return;
+
+        var labelCodes = rows
+            .SelectMany(x => x.LabelCodes)
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+
+        var activeCodes = await _ctx.Labels
+            .Find(x => labelCodes.Contains(x.Code) && x.IsActive && !x.IsDeleted)
+            .Project(x => x.Code)
+            .ToListAsync(ct);
+
+        var missingCodes = labelCodes
+            .Except(activeCodes, StringComparer.Ordinal)
+            .ToList();
+
+        if (missingCodes.Count > 0)
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_LABEL_NOT_FOUND_OR_INACTIVE,
+                new
+                {
+                    reportId = report.Id,
+                    workAssignmentId = report.WorkAssignmentId,
+                    dynamicFormTemplateId = report.DynamicFormTemplateId,
+                    labelCodes = missingCodes.Take(20).ToArray()
+                });
+
+        if (string.IsNullOrWhiteSpace(report.DynamicFormTemplateId))
+            return;
+
+        var form = await _ctx.DynamicFormTemplates
+            .Find(x => x.Id == report.DynamicFormTemplateId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct);
+
+        var allowedByBlock = BuildAllowedRowLabelsByBlock(form, report);
+        if (allowedByBlock.Count == 0)
+            return;
+
+        foreach (var row in rows)
+        {
+            if (!allowedByBlock.TryGetValue(row.BlockId, out var allowed) || allowed.Count == 0)
+                continue;
+
+            var disallowed = row.LabelCodes
+                .Where(code => !allowed.Contains(code))
+                .Distinct(StringComparer.Ordinal)
+                .ToList();
+
+            if (disallowed.Count > 0)
+                throw AppExceptionFactory.BadRequest(
+                    AppErrorCode.WORK_ASSIGNMENT_REPORT_LABEL_NOT_ALLOWED,
+                    new
+                    {
+                        reportId = report.Id,
+                        workAssignmentId = report.WorkAssignmentId,
+                        dynamicFormTemplateId = report.DynamicFormTemplateId,
+                        blockId = row.BlockId,
+                        labelCodes = disallowed.Take(20).ToArray()
+                    });
+        }
+    }
+
+    private async Task ValidateRuntimeRecordTableAsync(
+        WorkAssignmentReport report,
+        string? tableValuesJson,
+        CancellationToken ct)
+    {
+        if (!string.Equals(
+                NormalizeDynamicExcelTableKind(report.DynamicExcelTableKind),
+                DynamicExcelTableKind.RecordTable,
+                StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        var specJson = report.RecordTableSpecJson;
+        if (string.IsNullOrWhiteSpace(specJson))
+        {
+            var template = await _ctx.DynamicExcelTemplates
+                .Find(x => x.Id == report.DynamicExcelTemplateId && !x.IsDeleted)
+                .FirstOrDefaultAsync(ct);
+            specJson = template?.RecordTableSpecJson;
+        }
+
+        DynamicExcelRecordTableRuntime.ValidateTableValues(
+            tableValuesJson,
+            specJson,
+            report.DynamicExcelTemplateId,
+            report.Id);
+    }
+
+    private static List<RuntimeRowLabelPayload> ExtractRuntimeRowLabelPayloads(
+        WorkAssignmentReport report,
+        string? tableValuesJson)
+    {
+        if (string.IsNullOrWhiteSpace(tableValuesJson))
+            return new List<RuntimeRowLabelPayload>();
+
+        try
+        {
+            using var document = JsonDocument.Parse(tableValuesJson);
+            if (!TryGetJsonProperty(document.RootElement, "blocks", out var blocks) ||
+                blocks.ValueKind != JsonValueKind.Array)
+            {
+                return new List<RuntimeRowLabelPayload>();
+            }
+
+            var result = new List<RuntimeRowLabelPayload>();
+            foreach (var block in blocks.EnumerateArray())
+            {
+                if (block.ValueKind != JsonValueKind.Object)
+                    continue;
+
+                var blockId = NormalizeBlockId(ReadJsonString(block, "blockId"));
+                if (!TryGetJsonProperty(block, "rowLabels", out var rowLabels) ||
+                    rowLabels.ValueKind != JsonValueKind.Array)
+                {
+                    continue;
+                }
+
+                foreach (var row in rowLabels.EnumerateArray())
+                {
+                    if (row.ValueKind != JsonValueKind.Object)
+                        continue;
+
+                    var codes = ReadJsonStringArray(row, "rowLabelCodes")
+                        .Select(code => NormalizeRuntimeLabelCode(code, report, blockId))
+                        .Where(code => !string.IsNullOrWhiteSpace(code))
+                        .Distinct(StringComparer.Ordinal)
+                        .ToList();
+
+                    if (codes.Count > 0)
+                        result.Add(new RuntimeRowLabelPayload(blockId, codes));
+                }
+            }
+
+            return result;
+        }
+        catch (JsonException ex)
+        {
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_TABLE_VALUES_JSON_INVALID,
+                new
+                {
+                    reportId = report.Id,
+                    workAssignmentId = report.WorkAssignmentId,
+                    dynamicFormTemplateId = report.DynamicFormTemplateId,
+                    error = ex.Message
+                });
+        }
+    }
+
+    private static Dictionary<string, HashSet<string>> BuildAllowedRowLabelsByBlock(
+        DynamicFormTemplate? form,
+        WorkAssignmentReport report)
+    {
+        var result = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
+        if (form is null)
+            return result;
+
+        AddAllowedRowLabelsFromJson(form.BlocksJson, result, report);
+        AddAllowedRowLabelsFromJson(form.ExcelBlockJson, result, report);
+        return result;
+    }
+
+    private static void AddAllowedRowLabelsFromJson(
+        string? json,
+        Dictionary<string, HashSet<string>> target,
+        WorkAssignmentReport report)
+    {
+        if (string.IsNullOrWhiteSpace(json))
+            return;
+
+        try
+        {
+            using var document = JsonDocument.Parse(json);
+            if (document.RootElement.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var block in document.RootElement.EnumerateArray())
+                    AddAllowedRowLabelsFromBlock(block, target, report);
+            }
+            else
+            {
+                AddAllowedRowLabelsFromBlock(document.RootElement, target, report);
+            }
+        }
+        catch (JsonException)
+        {
+            return;
+        }
+    }
+
+    private static void AddAllowedRowLabelsFromBlock(
+        JsonElement block,
+        Dictionary<string, HashSet<string>> target,
+        WorkAssignmentReport report)
+    {
+        if (block.ValueKind != JsonValueKind.Object)
+            return;
+
+        var blockId = NormalizeBlockId(ReadJsonString(block, "blockId") ?? ReadJsonString(block, "id"));
+        var codes = ReadJsonStringArray(block, "allowedRowLabelCodes")
+            .Select(code => NormalizeRuntimeLabelCode(code, report, blockId))
+            .Where(code => !string.IsNullOrWhiteSpace(code))
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+
+        if (codes.Count == 0)
+            return;
+
+        if (!target.TryGetValue(blockId, out var set))
+        {
+            set = new HashSet<string>(StringComparer.Ordinal);
+            target[blockId] = set;
+        }
+
+        foreach (var code in codes)
+            set.Add(code);
+    }
+
+    private static bool TryGetJsonProperty(JsonElement element, string name, out JsonElement value)
+    {
+        if (element.ValueKind == JsonValueKind.Object)
+        {
+            foreach (var property in element.EnumerateObject())
+            {
+                if (string.Equals(property.Name, name, StringComparison.OrdinalIgnoreCase))
+                {
+                    value = property.Value;
+                    return true;
+                }
+            }
+        }
+
+        value = default;
+        return false;
+    }
+
+    private static string? ReadJsonString(JsonElement element, string name)
+        => TryGetJsonProperty(element, name, out var value) && value.ValueKind == JsonValueKind.String
+            ? value.GetString()
+            : null;
+
+    private static List<string> ReadJsonStringArray(JsonElement element, string name)
+    {
+        if (!TryGetJsonProperty(element, name, out var value) || value.ValueKind != JsonValueKind.Array)
+            return new List<string>();
+
+        return value.EnumerateArray()
+            .Where(item => item.ValueKind == JsonValueKind.String)
+            .Select(item => item.GetString())
+            .Where(item => !string.IsNullOrWhiteSpace(item))
+            .Select(item => item!.Trim())
+            .ToList();
+    }
+
+    private static string NormalizeBlockId(string? value)
+        => string.IsNullOrWhiteSpace(value) ? "excel_block" : value.Trim();
+
+    private static string NormalizeRuntimeLabelCode(
+        string? value,
+        WorkAssignmentReport report,
+        string blockId)
+    {
+        var code = string.IsNullOrWhiteSpace(value)
+            ? string.Empty
+            : value.Trim().ToLowerInvariant();
+
+        if (string.IsNullOrWhiteSpace(code))
+            return string.Empty;
+
+        if (!LabelCodeRegex.IsMatch(code))
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_LABEL_CODE_INVALID,
+                new
+                {
+                    reportId = report.Id,
+                    workAssignmentId = report.WorkAssignmentId,
+                    dynamicFormTemplateId = report.DynamicFormTemplateId,
+                    blockId,
+                    labelCode = code
+                });
+
+        return code;
+    }
+
     private async Task<WorkAssignmentReportResponse> MapToResponseAsync(
         WorkAssignmentReport x,
         WorkReportPeriod? period,
@@ -1595,7 +2378,15 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             .FirstOrDefaultAsync(ct);
 
         if (template is null)
-            throw new InvalidOperationException("Không tìm thấy DynamicExcelTemplate.");
+            throw AppExceptionFactory.NotFound(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_DYNAMIC_EXCEL_TEMPLATE_NOT_FOUND,
+                new
+                {
+                    reportId = x.Id,
+                    workAssignmentId = x.WorkAssignmentId,
+                    dynamicExcelTemplateId = x.DynamicExcelTemplateId,
+                    dynamicFormTemplateId = x.DynamicFormTemplateId
+                });
 
         return new WorkAssignmentReportResponse
         {
@@ -1622,9 +2413,14 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             DynamicExcelTemplateId = x.DynamicExcelTemplateId,
             DynamicExcelTemplateCode = x.DynamicExcelTemplateCode,
             DynamicExcelTemplateName = x.DynamicExcelTemplateName,
+            TableKind = NormalizeDynamicExcelTableKind(x.DynamicExcelTableKind ?? template.TableKind),
+            RecordTableSpecJson = string.IsNullOrWhiteSpace(x.RecordTableSpecJson)
+                ? template.RecordTableSpecJson
+                : x.RecordTableSpecJson,
             DynamicFormTemplateId = x.DynamicFormTemplateId ?? period?.DynamicFormTemplateId,
             DynamicFormTemplateCode = x.DynamicFormTemplateCode ?? period?.DynamicFormTemplateCode,
             DynamicFormTemplateName = x.DynamicFormTemplateName ?? period?.DynamicFormTemplateName,
+            SpecJson = string.IsNullOrWhiteSpace(x.SpecJson) ? template.SpecJson : x.SpecJson,
 
             DataRectR0 = x.DataRectR0,
             DataRectC0 = x.DataRectC0,
@@ -1636,6 +2432,17 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             Values1DJson = x.Values1DJson,
             FieldValuesJson = x.FieldValuesJson,
             TableValuesJson = x.TableValuesJson,
+            DataOrigin = WorkReportDataOrigin.Normalize(x.DataOrigin),
+            CumulativeContributionMode = WorkReportCumulativeContributionMode.Normalize(x.CumulativeContributionMode),
+            CumulativeContributionPolicyJson = x.CumulativeContributionPolicyJson,
+            SummarySourceJson = x.SummarySourceJson,
+            AggregateSourceReportIds = x.AggregateSourceReportIds ?? new List<string>(),
+            AggregateSourceAssignmentIds = x.AggregateSourceAssignmentIds ?? new List<string>(),
+            AggregateSourceUpdatedAtUtc = x.AggregateSourceUpdatedAtUtc,
+            AggregateSnapshotDirty = x.AggregateSnapshotDirty,
+            AggregateSnapshotDirtyAtUtc = x.AggregateSnapshotDirtyAtUtc,
+            AggregateSnapshotRefreshedAtUtc = x.AggregateSnapshotRefreshedAtUtc,
+            AggregateRefreshError = x.AggregateRefreshError,
 
             CurrentProgressStatus = x.CurrentProgressStatus,
             ReportReason = x.ReportReason,
@@ -1651,6 +2458,12 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
 
             VersionNo = x.VersionNo,
             IsCurrent = x.IsCurrent,
+            IsActive = x.IsActive,
+            DeactivatedAtUtc = x.DeactivatedAtUtc,
+            DeactivatedByUserId = x.DeactivatedByUserId,
+            DeactivationReason = x.DeactivationReason,
+            ReactivatedAtUtc = x.ReactivatedAtUtc,
+            ReactivatedByUserId = x.ReactivatedByUserId,
 
             SubmittedAtUtc = x.SubmittedAtUtc,
             SubmittedByUserId = x.SubmittedByUserId,
@@ -1663,6 +2476,8 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             UpdatedAtUtc = x.UpdatedAtUtc
         };
     }
+
+    private sealed record RuntimeRowLabelPayload(string BlockId, List<string> LabelCodes);
 
     private async Task InsertLogAsync(
         string workId,
@@ -1728,17 +2543,29 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                     await _queueService.DisableByPeriodAsync(period.WorkAssignmentId, period.AssigneeUserId, period.PeriodKey, actorUserId, ct);
                 else if (upsertQueue)
                     await _queueService.UpsertPeriodAsync(period, actorUserId, ct);
-
-                if (rebuildProjection)
-                    await _docRoleReadModelProjection.RebuildReportPeriodAsync(period.Id, actorUserId, ct);
             }
 
             if (syncAssignment)
                 await _statusSync.SyncFromAssignmentAsync(report.WorkAssignmentId, ct);
 
-            await _labelStatistics.RebuildForReportAsync(report.Id, actorUserId, ct);
-            await _tableStatistics.RebuildForReportAsync(report.Id, actorUserId, ct);
-            await _fieldStatistics.RebuildForReportAsync(report.Id, actorUserId, ct);
+            if (period is not null && rebuildProjection)
+                await _docRoleReadModelProjection.RebuildReportPeriodAsync(period.Id, actorUserId, ct);
+
+            if (ShouldRebuildApprovedStatistics(fromStatus, toStatus))
+            {
+                await _labelStatistics.RebuildForReportAsync(report.Id, actorUserId, ct);
+                await _tableStatistics.RebuildForReportAsync(report.Id, actorUserId, ct);
+                await _fieldStatistics.RebuildForReportAsync(report.Id, actorUserId, ct);
+            }
+
+            if (ShouldRefreshAggregateDependents(fromStatus, toStatus))
+            {
+                await RefreshDynamicFormAggregateDependentsRecursiveAsync(
+                    report,
+                    actorUserId,
+                    new HashSet<string>(StringComparer.Ordinal),
+                    ct);
+            }
 
             _log.LogInformation(
                 "WorkAssignment report status operation completed. operation={operation} reportId={reportId} periodId={periodId} assignmentId={assignmentId} workId={workId} fromStatus={fromStatus} toStatus={toStatus}",
@@ -1810,6 +2637,570 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         }
     }
 
+    private static bool ShouldRebuildApprovedStatistics(string? fromStatus, string? toStatus)
+        => string.Equals(fromStatus, WorkAssignmentReportStatus.Approved.ToString(), StringComparison.OrdinalIgnoreCase)
+           || string.Equals(toStatus, WorkAssignmentReportStatus.Approved.ToString(), StringComparison.OrdinalIgnoreCase);
+
+    private static bool ShouldRefreshAggregateDependents(string? fromStatus, string? toStatus)
+        => ShouldRebuildApprovedStatistics(fromStatus, toStatus);
+
+    private async Task RefreshDynamicFormAggregateDependentsRecursiveAsync(
+        WorkAssignmentReport source,
+        string actorUserId,
+        HashSet<string> visitedReportIds,
+        CancellationToken ct)
+    {
+        if (source is null || string.IsNullOrWhiteSpace(source.Id))
+            return;
+        if (!visitedReportIds.Add(source.Id))
+            return;
+        if (string.IsNullOrWhiteSpace(source.DynamicFormTemplateId))
+            return;
+
+        var sourceAssignment = await _ctx.WorkAssignments
+            .Find(x => x.Id == source.WorkAssignmentId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct);
+
+        var candidates = await LoadDynamicFormAggregateRefreshCandidatesAsync(source, ct);
+        if (candidates.Count == 0)
+            return;
+
+        var scopeAssignments = new Dictionary<string, WorkAssignment?>(StringComparer.Ordinal);
+        foreach (var candidate in candidates)
+        {
+            if (visitedReportIds.Contains(candidate.Id))
+                continue;
+
+            var summary = TryReadAggregateDraftSummary(candidate.SummarySourceJson);
+            if (summary is null)
+                continue;
+
+            bool mayInclude;
+            try
+            {
+                mayInclude = await AggregateRequestMayIncludeSourceAsync(
+                    summary.AggregateRequest,
+                    source,
+                    sourceAssignment,
+                    scopeAssignments,
+                    ct);
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(
+                    ex,
+                    "Dynamic Form aggregate auto-refresh skipped invalid dependency. sourceReportId={sourceReportId} candidateReportId={candidateReportId}",
+                    source.Id,
+                    candidate.Id);
+                continue;
+            }
+
+            if (!mayInclude)
+            {
+                continue;
+            }
+
+            await RefreshAggregateDependentAfterSourceChangeAsync(
+                candidate,
+                source,
+                actorUserId,
+                ct);
+        }
+    }
+
+    private async Task RefreshAggregateDependentAfterSourceChangeAsync(
+        WorkAssignmentReport candidate,
+        WorkAssignmentReport source,
+        string actorUserId,
+        CancellationToken ct)
+    {
+        try
+        {
+            var summary = TryReadAggregateDraftSummary(candidate.SummarySourceJson);
+            if (summary is null)
+            {
+                await MarkAggregateSnapshotDirtyAsync(candidate, source, actorUserId, ct);
+                return;
+            }
+
+            var wasApproved = candidate.Status == WorkAssignmentReportStatus.Approved;
+            var refreshed = await RefreshDynamicFormAggregateReportFromSummaryAsync(
+                candidate,
+                summary,
+                actorUserId,
+                ct);
+
+            if (refreshed is null)
+            {
+                await MarkAggregateSnapshotDirtyAsync(candidate, source, actorUserId, ct);
+                return;
+            }
+
+            if (wasApproved)
+            {
+                await MoveApprovedAggregateReportBackToSubmittedAsync(
+                    refreshed,
+                    actorUserId,
+                    $"Nguồn tổng hợp thay đổi; sourceReportId={source.Id}",
+                    ct);
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(
+                ex,
+                "Dynamic Form aggregate dependent refresh failed. sourceReportId={sourceReportId} candidateReportId={candidateReportId}",
+                source.Id,
+                candidate.Id);
+
+            await MarkAggregateSnapshotDirtyAsync(
+                candidate,
+                source,
+                actorUserId,
+                ct,
+                NormalizeOptionalTextOrNull(ex.Message) ?? ex.GetType().Name);
+        }
+    }
+
+    private async Task MoveApprovedAggregateReportBackToSubmittedAsync(
+        WorkAssignmentReport report,
+        string actorUserId,
+        string reason,
+        CancellationToken ct)
+    {
+        if (report.Status != WorkAssignmentReportStatus.Approved)
+            return;
+
+        var period = await _ctx.WorkReportPeriods
+            .Find(x => x.Id == report.WorkReportPeriodId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct);
+
+        var now = DateTime.UtcNow;
+        var fromStatus = report.Status;
+
+        await _ctx.WorkAssignmentReports.UpdateOneAsync(
+            x => x.Id == report.Id && !x.IsDeleted,
+            Builders<WorkAssignmentReport>.Update
+                .Set(x => x.Status, WorkAssignmentReportStatus.Submitted)
+                .Set(x => x.ApprovedAtUtc, (DateTime?)null)
+                .Set(x => x.ApprovedByUserId, (string?)null)
+                .Set(x => x.ReviewerComment, reason)
+                .Set(x => x.UpdatedAtUtc, now)
+                .Set(x => x.UpdatedByUserId, actorUserId),
+            cancellationToken: ct);
+
+        report.Status = WorkAssignmentReportStatus.Submitted;
+        report.ApprovedAtUtc = null;
+        report.ApprovedByUserId = null;
+        report.ReviewerComment = reason;
+        report.UpdatedAtUtc = now;
+        report.UpdatedByUserId = actorUserId;
+
+        if (period is not null)
+        {
+            var nextPeriodStatus = WorkReportPeriodStatusHelper.ResolveSubmittedStatus(period.DueAtUtc, now);
+
+            await _ctx.WorkReportPeriods.UpdateOneAsync(
+                x => x.Id == period.Id && !x.IsDeleted,
+                Builders<WorkReportPeriod>.Update
+                    .Set(x => x.Status, nextPeriodStatus)
+                    .Set(x => x.IsOverdue, WorkReportPeriodStatusHelper.IsOverdue(nextPeriodStatus))
+                    .Set(x => x.LastReviewedAtUtc, (DateTime?)null)
+                    .Set(x => x.ReviewerComment, reason)
+                    .Set(x => x.UpdatedAtUtc, now)
+                    .Set(x => x.UpdatedByUserId, actorUserId),
+                cancellationToken: ct);
+
+            period.Status = nextPeriodStatus;
+            period.IsOverdue = WorkReportPeriodStatusHelper.IsOverdue(nextPeriodStatus);
+            period.LastReviewedAtUtc = null;
+            period.ReviewerComment = reason;
+            period.UpdatedAtUtc = now;
+            period.UpdatedByUserId = actorUserId;
+
+            await FinalizeReportStatusOperationAsync(
+                "AUTO_AGGREGATE_REVIEW_INVALIDATED",
+                report,
+                period,
+                fromStatus.ToString(),
+                WorkAssignmentReportStatus.Submitted.ToString(),
+                actorUserId,
+                upsertQueue: true,
+                disableQueue: false,
+                rebuildProjection: true,
+                syncAssignment: true,
+                ct);
+        }
+        else
+        {
+            await _statusSync.SyncFromAssignmentAsync(report.WorkAssignmentId, ct);
+            if (!string.IsNullOrWhiteSpace(report.WorkReportPeriodId))
+                await _docRoleReadModelProjection.RebuildReportPeriodAsync(report.WorkReportPeriodId, actorUserId, ct);
+        }
+
+        await InsertLogAsync(
+            workId: report.WorkId,
+            workAssignmentId: report.WorkAssignmentId,
+            workReportPeriodId: report.WorkReportPeriodId,
+            workAssignmentReportId: report.Id,
+            action: "AUTO_AGGREGATE_REVIEW_INVALIDATED",
+            fromStatus: fromStatus.ToString(),
+            toStatus: WorkAssignmentReportStatus.Submitted.ToString(),
+            actionByUserId: actorUserId,
+            reason: reason,
+            comment: reason,
+            snapshotJson: null,
+            ct: ct);
+    }
+
+    private async Task MarkAggregateSnapshotDirtyAsync(
+        WorkAssignmentReport candidate,
+        WorkAssignmentReport source,
+        string actorUserId,
+        CancellationToken ct,
+        string? refreshError = null)
+    {
+        var now = DateTime.UtcNow;
+        await _ctx.WorkAssignmentReports.UpdateOneAsync(
+            x => x.Id == candidate.Id && !x.IsDeleted,
+            Builders<WorkAssignmentReport>.Update
+                .Set(x => x.AggregateSnapshotDirty, true)
+                .Set(x => x.AggregateSnapshotDirtyAtUtc, now)
+                .Set(x => x.AggregateRefreshError, refreshError)
+                .Set(x => x.UpdatedAtUtc, now)
+                .Set(x => x.UpdatedByUserId, actorUserId),
+            cancellationToken: ct);
+
+        candidate.AggregateSnapshotDirty = true;
+        candidate.AggregateSnapshotDirtyAtUtc = now;
+        candidate.AggregateRefreshError = refreshError;
+        candidate.UpdatedAtUtc = now;
+        candidate.UpdatedByUserId = actorUserId;
+
+        if (!string.IsNullOrWhiteSpace(candidate.WorkReportPeriodId))
+            await _docRoleReadModelProjection.RebuildReportPeriodAsync(candidate.WorkReportPeriodId, actorUserId, ct);
+
+        await InsertLogAsync(
+            workId: candidate.WorkId,
+            workAssignmentId: candidate.WorkAssignmentId,
+            workReportPeriodId: candidate.WorkReportPeriodId,
+            workAssignmentReportId: candidate.Id,
+            action: "MARK_AGGREGATE_SNAPSHOT_DIRTY",
+            fromStatus: candidate.Status.ToString(),
+            toStatus: candidate.Status.ToString(),
+            actionByUserId: actorUserId,
+            reason: null,
+            comment: string.IsNullOrWhiteSpace(refreshError)
+                ? $"sourceReportId={source.Id}"
+                : $"sourceReportId={source.Id};refreshError={refreshError}",
+            snapshotJson: null,
+            ct: ct);
+    }
+
+    private async Task<List<WorkAssignmentReport>> LoadDynamicFormAggregateRefreshCandidatesAsync(
+        WorkAssignmentReport source,
+        CancellationToken ct)
+    {
+        var aggregateOrigins = new[]
+        {
+            WorkReportDataOrigin.AutoSummary,
+            WorkReportDataOrigin.CopiedSummary,
+            WorkReportDataOrigin.PartialMapping
+        };
+
+        var fb = Builders<WorkAssignmentReport>.Filter;
+        var filter = fb.Eq(x => x.WorkId, source.WorkId)
+                     & fb.Eq(x => x.DynamicFormTemplateId, source.DynamicFormTemplateId)
+                     & fb.Ne(x => x.Id, source.Id)
+                     & fb.In(x => x.DataOrigin, aggregateOrigins)
+                     & fb.Ne(x => x.SummarySourceJson, null)
+                     & fb.Ne(x => x.IsActive, false)
+                     & fb.Eq(x => x.IsDeleted, false);
+
+        return await _ctx.WorkAssignmentReports
+            .Find(filter)
+            .SortBy(x => x.UpdatedAtUtc)
+            .Limit(200)
+            .ToListAsync(ct);
+    }
+
+    private async Task<WorkAssignmentReport> RefreshAggregateSnapshotForReadAsync(
+        WorkAssignmentReport report,
+        string actorUserId,
+        CancellationToken ct)
+    {
+        if (!report.AggregateSnapshotDirty)
+            return report;
+
+        var summary = TryReadAggregateDraftSummary(report.SummarySourceJson);
+        if (summary is null)
+            return report;
+
+        try
+        {
+            var refreshed = await RefreshDynamicFormAggregateReportFromSummaryAsync(
+                report,
+                summary,
+                actorUserId,
+                ct) ?? report;
+
+            if (refreshed.Status == WorkAssignmentReportStatus.Approved)
+            {
+                await MoveApprovedAggregateReportBackToSubmittedAsync(
+                    refreshed,
+                    actorUserId,
+                    "Nguồn tổng hợp đã thay đổi trước khi mở báo cáo.",
+                    ct);
+            }
+
+            return refreshed;
+        }
+        catch (Exception ex)
+        {
+            var now = DateTime.UtcNow;
+            var error = NormalizeOptionalTextOrNull(ex.Message) ?? ex.GetType().Name;
+            _log.LogWarning(
+                ex,
+                "Dynamic Form aggregate snapshot lazy refresh failed. reportId={reportId} actorUserId={actorUserId}",
+                report.Id,
+                actorUserId);
+
+            await _ctx.WorkAssignmentReports.UpdateOneAsync(
+                x => x.Id == report.Id && !x.IsDeleted,
+                Builders<WorkAssignmentReport>.Update
+                    .Set(x => x.AggregateRefreshError, error)
+                    .Set(x => x.UpdatedAtUtc, now)
+                    .Set(x => x.UpdatedByUserId, actorUserId),
+                cancellationToken: ct);
+
+            report.AggregateRefreshError = error;
+            report.UpdatedAtUtc = now;
+            report.UpdatedByUserId = actorUserId;
+            return report;
+        }
+    }
+
+    private async Task<bool> AggregateRequestMayIncludeSourceAsync(
+        DynamicFormAggregateRequest req,
+        WorkAssignmentReport source,
+        WorkAssignment? sourceAssignment,
+        Dictionary<string, WorkAssignment?> scopeAssignments,
+        CancellationToken ct)
+    {
+        var normalized = NormalizeAggregateDraftRequest(req);
+        if (!string.Equals(normalized.DynamicFormTemplateId, source.DynamicFormTemplateId, StringComparison.Ordinal))
+            return false;
+
+        if (!PeriodMatchesAggregateRequest(normalized, source))
+            return false;
+
+        if (sourceAssignment is null)
+            return false;
+
+        if (normalized.SelectedUnitIds is { Count: > 0 })
+        {
+            var selectedUnits = normalized.SelectedUnitIds.ToHashSet(StringComparer.Ordinal);
+            if (!(sourceAssignment.Assignees ?? new List<UserRef>())
+                    .Any(x => !string.IsNullOrWhiteSpace(x.UnitId) && selectedUnits.Contains(x.UnitId)))
+            {
+                return false;
+            }
+        }
+
+        var scopeId = normalized.ScopeAssignmentId;
+        if (!scopeAssignments.TryGetValue(scopeId, out var scopeAssignment))
+        {
+            scopeAssignment = await _ctx.WorkAssignments
+                .Find(x => x.Id == scopeId && !x.IsDeleted)
+                .FirstOrDefaultAsync(ct);
+            scopeAssignments[scopeId] = scopeAssignment;
+        }
+
+        if (scopeAssignment is null)
+            return false;
+
+        if (string.Equals(normalized.ScopeMode, "SUBTREE", StringComparison.Ordinal))
+        {
+            var pathPrefix = $"{scopeAssignment.Path}/";
+            return string.Equals(sourceAssignment.WorkId, scopeAssignment.WorkId, StringComparison.Ordinal)
+                   && !string.IsNullOrWhiteSpace(sourceAssignment.Path)
+                   && sourceAssignment.Path.StartsWith(pathPrefix, StringComparison.Ordinal);
+        }
+
+        return string.Equals(sourceAssignment.ParentAssignmentId, scopeAssignment.Id, StringComparison.Ordinal);
+    }
+
+    private static bool PeriodMatchesAggregateRequest(
+        DynamicFormAggregateRequest req,
+        WorkAssignmentReport source)
+    {
+        var periodKey = NormalizeOptionalTextOrNull(source.PeriodKey);
+        return req.PeriodScopeMode switch
+        {
+            "SINGLE_PERIOD" => string.Equals(periodKey, req.PeriodKey, StringComparison.Ordinal),
+            "PERIOD_RANGE" => string.CompareOrdinal(periodKey, req.PeriodKeyFrom) >= 0
+                              && string.CompareOrdinal(periodKey, req.PeriodKeyTo) <= 0,
+            "CUMULATIVE_TO_PERIOD" => string.CompareOrdinal(periodKey, req.PeriodKeyTo) <= 0,
+            _ => true
+        };
+    }
+
+    private async Task<WorkAssignmentReport?> RefreshDynamicFormAggregateReportFromSummaryAsync(
+        WorkAssignmentReport report,
+        AggregateDraftSummary summary,
+        string actorUserId,
+        CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(report.DynamicFormTemplateId))
+            return null;
+
+        var aggregateReq = NormalizeAggregateDraftRequest(summary.AggregateRequest);
+        if (!string.Equals(report.DynamicFormTemplateId, aggregateReq.DynamicFormTemplateId, StringComparison.Ordinal))
+            return null;
+
+        var aggregate = await _aggregateTableService.GetDynamicFormAggregateAsync(aggregateReq, ct);
+
+        var form = await _ctx.DynamicFormTemplates
+            .Find(x => x.Id == report.DynamicFormTemplateId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct);
+
+        if (form is null)
+            return null;
+
+        var targetBlockId = NormalizeBlockId(summary.TargetBlockId ?? aggregateReq.BlockId ?? aggregate.Meta.BlockId);
+        var block = ResolveAggregateDraftBlock(form, targetBlockId);
+        if (block is null)
+            return null;
+
+        var dataOrigin = WorkReportDataOrigin.Normalize(summary.DataOrigin);
+        var existingTopLevelValues = DeserializeValues1D(report.Values1DJson);
+        var isTopLevelBlock = string.Equals(targetBlockId, ResolveTopLevelBlockId(form), StringComparison.Ordinal);
+        var currentBlockValues = isTopLevelBlock
+            ? existingTopLevelValues
+            : ExtractBlockDecimalValues(report.TableValuesJson, targetBlockId);
+        var clearExisting = summary.ClearExistingValues ?? dataOrigin != WorkReportDataOrigin.PartialMapping;
+        var targetValues = clearExisting
+            ? CreateEmptyValues1D(block.W, block.H)
+            : NormalizeDecimalValues(currentBlockValues, block.W * block.H);
+
+        if (!clearExisting)
+            ClearAggregateDraftTargetIndexes(targetValues, summary.TargetIndexes);
+
+        ApplyAggregateRowsToValues(
+            targetValues,
+            aggregate.Rows,
+            block,
+            NormalizeAggregateDraftValueSelector(summary.ValueSelector));
+
+        var tableValuesJson = BuildAggregateDraftTableValuesJson(report, form, block, targetValues, aggregate);
+        var topLevelValues = isTopLevelBlock
+            ? targetValues
+            : NormalizeDecimalValues(existingTopLevelValues, report.W * report.H);
+        var values1DJson = JsonSerializer.Serialize(topLevelValues, _jsonOptions);
+        var contributionPolicyJson = BuildAggregateDraftContributionPolicyJson(dataOrigin, aggregate.Rows, block.BlockId);
+        var summarySourceJson = BuildAggregateDraftSummarySourceJson(
+            dataOrigin,
+            aggregateReq,
+            aggregate,
+            block,
+            NormalizeAggregateDraftValueSelector(summary.ValueSelector),
+            targetBlockId,
+            clearExisting);
+        var sourceSnapshot = ExtractAggregateSourceSnapshot(summarySourceJson);
+        var now = DateTime.UtcNow;
+
+        await _ctx.WorkAssignmentReports.UpdateOneAsync(
+            x => x.Id == report.Id && !x.IsDeleted,
+            Builders<WorkAssignmentReport>.Update
+                .Set(x => x.Values1DJson, values1DJson)
+                .Set(x => x.TableValuesJson, tableValuesJson)
+                .Set(x => x.DataOrigin, dataOrigin)
+                .Set(x => x.CumulativeContributionMode, WorkReportDataOrigin.DefaultContributionMode(dataOrigin))
+                .Set(x => x.CumulativeContributionPolicyJson, contributionPolicyJson)
+                .Set(x => x.SummarySourceJson, summarySourceJson)
+                .Set(x => x.AggregateSourceReportIds, sourceSnapshot.ReportIds)
+                .Set(x => x.AggregateSourceAssignmentIds, sourceSnapshot.AssignmentIds)
+                .Set(x => x.AggregateSourceUpdatedAtUtc, now)
+                .Set(x => x.AggregateSnapshotDirty, false)
+                .Set(x => x.AggregateSnapshotDirtyAtUtc, (DateTime?)null)
+                .Set(x => x.AggregateSnapshotRefreshedAtUtc, now)
+                .Set(x => x.AggregateRefreshError, (string?)null)
+                .Set(x => x.UpdatedAtUtc, now)
+                .Set(x => x.UpdatedByUserId, actorUserId),
+            cancellationToken: ct);
+
+        report.Values1DJson = values1DJson;
+        report.TableValuesJson = tableValuesJson;
+        report.DataOrigin = dataOrigin;
+        report.CumulativeContributionMode = WorkReportDataOrigin.DefaultContributionMode(dataOrigin);
+        report.CumulativeContributionPolicyJson = contributionPolicyJson;
+        report.SummarySourceJson = summarySourceJson;
+        report.AggregateSourceReportIds = sourceSnapshot.ReportIds;
+        report.AggregateSourceAssignmentIds = sourceSnapshot.AssignmentIds;
+        report.AggregateSourceUpdatedAtUtc = now;
+        report.AggregateSnapshotDirty = false;
+        report.AggregateSnapshotDirtyAtUtc = null;
+        report.AggregateSnapshotRefreshedAtUtc = now;
+        report.AggregateRefreshError = null;
+        report.UpdatedAtUtc = now;
+        report.UpdatedByUserId = actorUserId;
+
+        await InsertLogAsync(
+            workId: report.WorkId,
+            workAssignmentId: report.WorkAssignmentId,
+            workReportPeriodId: report.WorkReportPeriodId,
+            workAssignmentReportId: report.Id,
+            action: "AUTO_REFRESH_AGGREGATE",
+            fromStatus: report.Status.ToString(),
+            toStatus: report.Status.ToString(),
+            actionByUserId: actorUserId,
+            reason: null,
+            comment: $"sourceReportCount={aggregate.Sources.Count};rowCount={aggregate.Rows.Count}",
+            snapshotJson: null,
+            ct: ct);
+
+        if (report.Status == WorkAssignmentReportStatus.Approved)
+        {
+            await _labelStatistics.RebuildForReportAsync(report.Id, actorUserId, ct);
+            await _tableStatistics.RebuildForReportAsync(report.Id, actorUserId, ct);
+            await _fieldStatistics.RebuildForReportAsync(report.Id, actorUserId, ct);
+        }
+
+        if (!string.IsNullOrWhiteSpace(report.WorkReportPeriodId))
+            await _docRoleReadModelProjection.RebuildReportPeriodAsync(report.WorkReportPeriodId, actorUserId, ct);
+
+        return report;
+    }
+
+    private static void ClearAggregateDraftTargetIndexes(
+        List<decimal?> targetValues,
+        IReadOnlyCollection<int> targetIndexes)
+    {
+        foreach (var index in targetIndexes)
+        {
+            if (index >= 0 && index < targetValues.Count)
+                targetValues[index] = null;
+        }
+    }
+
+    private static bool IsSameAggregateDraftTarget(
+        AggregateDraftSummary? summary,
+        string dynamicFormTemplateId,
+        string targetBlockId)
+    {
+        if (summary is null || summary.TargetIndexes.Count == 0)
+            return false;
+
+        if (!string.IsNullOrWhiteSpace(summary.AggregateRequest.DynamicFormTemplateId) &&
+            !string.Equals(summary.AggregateRequest.DynamicFormTemplateId.Trim(), dynamicFormTemplateId, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        var previousTargetBlockId = NormalizeBlockId(summary.TargetBlockId ?? summary.AggregateRequest.BlockId);
+        return string.Equals(previousTargetBlockId, targetBlockId, StringComparison.Ordinal);
+    }
+
     private async Task WriteStatusOperationLogAsync(
         WorkStatusOperationLog log,
         DateTime startedAtUtc,
@@ -1830,6 +3221,8 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
 
         Func<MyReportTemplateRow, object?> keySelector = (sortField ?? "latestUpdatedAtUtc").ToLowerInvariant() switch
         {
+            "dynamicformtemplatecode" => x => x.DynamicFormTemplateCode,
+            "dynamicformtemplatename" => x => x.DynamicFormTemplateName,
             "dynamicexcelcode" => x => x.DynamicExcelCode,
             "dynamicexcelname" => x => x.DynamicExcelName,
             "latestdueatutc" => x => x.LatestDueAtUtc,
@@ -1881,6 +3274,8 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
 
         return (sortField ?? "latestUpdatedAtUtc").ToLowerInvariant() switch
         {
+            "dynamicformtemplatecode" => desc ? sort.Descending(x => x.DynamicFormTemplateCode) : sort.Ascending(x => x.DynamicFormTemplateCode),
+            "dynamicformtemplatename" => desc ? sort.Descending(x => x.DynamicFormTemplateName) : sort.Ascending(x => x.DynamicFormTemplateName),
             "dynamicexcelcode" => desc ? sort.Descending(x => x.DynamicExcelCode) : sort.Ascending(x => x.DynamicExcelCode),
             "dynamicexcelname" => desc ? sort.Descending(x => x.DynamicExcelName) : sort.Ascending(x => x.DynamicExcelName),
             "latestdueatutc" => desc ? sort.Descending(x => x.LatestDueAtUtc) : sort.Ascending(x => x.LatestDueAtUtc),
@@ -1920,8 +3315,79 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             now);
     }
 
+    private async Task EnsurePreviousReportsApprovedAsync(
+        WorkReportPeriod? period,
+        CancellationToken ct)
+    {
+        if (period is null)
+            return;
+
+        var fb = Builders<WorkReportPeriod>.Filter;
+        var filter = fb.Eq(x => x.WorkAssignmentId, period.WorkAssignmentId)
+                     & fb.Eq(x => x.AssigneeUserId, period.AssigneeUserId)
+                     & fb.Eq(x => x.PeriodKind, period.PeriodKind)
+                     & fb.Eq(x => x.IsDeleted, false)
+                     & fb.Ne(x => x.Id, period.Id);
+
+        if (!string.IsNullOrWhiteSpace(period.DynamicFormTemplateId))
+            filter &= fb.Eq(x => x.DynamicFormTemplateId, period.DynamicFormTemplateId);
+        else if (!string.IsNullOrWhiteSpace(period.DynamicExcelId))
+            filter &= fb.Eq(x => x.DynamicExcelId, period.DynamicExcelId);
+
+        var candidates = await _ctx.WorkReportPeriods
+            .Find(filter)
+            .ToListAsync(ct);
+
+        var previousOpenPeriod = candidates
+            .Where(candidate => ComparePeriodOrder(candidate, period) < 0)
+            .Where(candidate => !WorkReportPeriodStatusHelper.IsTerminal(candidate.Status))
+            .OrderBy(ResolvePeriodOrder)
+            .FirstOrDefault();
+
+        if (previousOpenPeriod is not null)
+            throw AppExceptionFactory.Create(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_PREVIOUS_PERIOD_OPEN,
+                new
+                {
+                    periodId = period.Id,
+                    periodInstanceKey = period.PeriodInstanceKey,
+                    previousPeriodId = previousOpenPeriod.Id,
+                    previousPeriodInstanceKey = previousOpenPeriod.PeriodInstanceKey,
+                    previousPeriodStatus = previousOpenPeriod.Status
+                });
+    }
+
+    private static int ComparePeriodOrder(WorkReportPeriod left, WorkReportPeriod right)
+    {
+        var byTime = DateTime.Compare(ResolvePeriodOrder(left), ResolvePeriodOrder(right));
+        if (byTime != 0)
+            return byTime;
+
+        var byCreated = DateTime.Compare(left.CreatedAtUtc, right.CreatedAtUtc);
+        if (byCreated != 0)
+            return byCreated;
+
+        return string.Compare(left.Id, right.Id, StringComparison.Ordinal);
+    }
+
+    private static DateTime ResolvePeriodOrder(WorkReportPeriod period)
+    {
+        if (WorkReportPeriodKind.IsUserCreated(period.PeriodKind))
+            return period.ReportDate
+                   ?? period.PeriodStart
+                   ?? period.PeriodEnd
+                   ?? period.DueAtUtc
+                   ?? period.CreatedAtUtc;
+
+        return period.PeriodStart
+               ?? period.ReportDate
+               ?? period.PeriodEnd
+               ?? period.DueAtUtc
+               ?? period.CreatedAtUtc;
+    }
+
     private static DateTime NormalizeDueAtUtc(DateTime date)
-        => date.Date.AddDays(1).AddTicks(-1);
+        => AppTimeRangeHelper.EndOfUtcDate(date);
 
     private static TemplateSnapshotDTO BuildTemplateSnapshot(DynamicExcelTemplate template)
     {
@@ -1931,6 +3397,8 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             Code = template.Code,
             Name = template.Name,
             SpecJson = template.SpecJson,
+            TableKind = NormalizeDynamicExcelTableKind(template.TableKind),
+            RecordTableSpecJson = template.RecordTableSpecJson,
             RawWorkbookDataJson = template.RawWorkbookDataJson,
             DataRectR0 = template.DataRectR0,
             DataRectC0 = template.DataRectC0,
@@ -1951,7 +3419,8 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             MonthDays = assignment.Schedule?.MonthDays?.ToArray() ?? Array.Empty<int>(),
             QuarterDays = assignment.Schedule?.QuarterDays?.ToArray() ?? Array.Empty<int>(),
             SemiAnnualDays = assignment.Schedule?.SemiAnnualDays?.ToArray() ?? Array.Empty<int>(),
-            Note = assignment.Schedule?.Note
+            Note = assignment.Schedule?.Note,
+            DynamicFormDataSourceRulesJson = assignment.DynamicFormDataSourceRulesJson
         };
     }
 
@@ -1960,6 +3429,11 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         var len = Math.Max(0, w) * Math.Max(0, h);
         return Enumerable.Range(0, len).Select(_ => (decimal?)null).ToList();
     }
+
+    private static string NormalizeDynamicExcelTableKind(string? value)
+        => string.Equals(value?.Trim(), DynamicExcelTableKind.RecordTable, StringComparison.OrdinalIgnoreCase)
+            ? DynamicExcelTableKind.RecordTable
+            : DynamicExcelTableKind.NumericGrid;
 
     private static WorkReportPeriodRow MapToPeriodRow(WorkReportPeriod x)
     {
@@ -2028,12 +3502,20 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             DynamicFormTemplateId = x.DynamicFormTemplateId,
             DynamicFormTemplateCode = x.DynamicFormTemplateCode,
             DynamicFormTemplateName = x.DynamicFormTemplateName,
+            DataOrigin = WorkReportDataOrigin.Normalize(x.DataOrigin),
+            AggregateSnapshotDirty = x.AggregateSnapshotDirty,
+            AggregateSnapshotDirtyAtUtc = x.AggregateSnapshotDirtyAtUtc,
+            AggregateSnapshotRefreshedAtUtc = x.AggregateSnapshotRefreshedAtUtc,
+            AggregateRefreshError = x.AggregateRefreshError,
             CurrentProgressStatus = x.CurrentProgressStatus,
             ReportReason = x.ReportReason,
             Difficulties = x.Difficulties,
             ProposedSolution = x.ProposedSolution,
             VersionNo = x.VersionNo,
             IsCurrent = x.IsCurrent,
+            IsActive = x.IsActive,
+            DeactivatedAtUtc = x.DeactivatedAtUtc,
+            DeactivationReason = x.DeactivationReason,
             SubmittedAtUtc = x.SubmittedAtUtc,
             SubmittedByUserId = x.SubmittedByUserId,
             ApprovedAtUtc = x.ApprovedAtUtc,
@@ -2077,6 +3559,9 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             ProposedSolution = null,
             VersionNo = x.VersionNo,
             IsCurrent = x.IsCurrentReport,
+            IsActive = x.ReportIsActive,
+            DeactivatedAtUtc = x.ReportDeactivatedAtUtc,
+            DeactivationReason = x.ReportDeactivationReason,
             SubmittedAtUtc = x.LastSubmittedAtUtc,
             SubmittedByUserId = null,
             ReturnedAtUtc = x.ReturnedAtUtc,
@@ -2091,13 +3576,984 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
     private static void EnsureActor(string actorUserId)
     {
         if (string.IsNullOrWhiteSpace(actorUserId))
-            throw new UnauthorizedAccessException("Không xác định được người dùng thực hiện.");
+            throw AppExceptionFactory.Unauthorized(
+                AppErrorCode.AUTH_UNAUTHORIZED,
+                new { actorUserId });
     }
+
+    private static void EnsureReportIsActive(WorkAssignmentReport report)
+    {
+        if (report.IsActive == false)
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_INACTIVE,
+                ReportDetails(report));
+    }
+
+    private static AppException ReportWorkIdRequired(string? workId)
+        => AppExceptionFactory.BadRequest(
+            AppErrorCode.WORK_ASSIGNMENT_REPORT_WORK_ID_REQUIRED,
+            new { workId });
+
+    private static AppException ReportAssignmentIdRequired(string? workAssignmentId)
+        => AppExceptionFactory.BadRequest(
+            AppErrorCode.WORK_ASSIGNMENT_REPORT_ASSIGNMENT_ID_REQUIRED,
+            new { workAssignmentId });
+
+    private static AppException ReportPeriodIdRequired(string? workReportPeriodId)
+        => AppExceptionFactory.BadRequest(
+            AppErrorCode.WORK_ASSIGNMENT_REPORT_PERIOD_ID_REQUIRED,
+            new { workReportPeriodId });
+
+    private static AppException ReportIdRequired(string? reportId)
+        => AppExceptionFactory.BadRequest(
+            AppErrorCode.WORK_ASSIGNMENT_REPORT_ID_REQUIRED,
+            new { reportId });
+
+    private static AppException ReportNotFound(string? reportId)
+        => AppExceptionFactory.NotFound(
+            AppErrorCode.WORK_ASSIGNMENT_REPORT_NOT_FOUND,
+            new { reportId });
+
+    private static AppException ReportAssignmentNotFound(string? workAssignmentId)
+        => AppExceptionFactory.NotFound(
+            AppErrorCode.WORK_ASSIGNMENT_REPORT_ASSIGNMENT_NOT_FOUND,
+            new { workAssignmentId });
+
+    private static AppException ReportPeriodNotFound(string? workReportPeriodId)
+        => AppExceptionFactory.NotFound(
+            AppErrorCode.WORK_ASSIGNMENT_REPORT_PERIOD_NOT_FOUND,
+            new { workReportPeriodId });
+
+    private static AppException ReportBindingNotFound(string? workAssignmentId, string? actorUserId)
+        => AppExceptionFactory.Forbidden(
+            AppErrorCode.WORK_ASSIGNMENT_REPORT_BINDING_NOT_FOUND,
+            new { workAssignmentId, actorUserId });
+
+    private static AppException InvalidReportStatus(
+        AppErrorCode code,
+        WorkAssignmentReport report,
+        WorkAssignmentReportStatus expectedStatus,
+        string? actorUserId = null)
+        => AppExceptionFactory.BadRequest(
+            code,
+            new
+            {
+                reportId = report.Id,
+                report.Status,
+                expectedStatus,
+                report.WorkId,
+                report.WorkAssignmentId,
+                report.WorkReportPeriodId,
+                report.AssigneeUserId,
+                actorUserId
+            });
+
+    private static AppException InvalidReportValues(
+        WorkAssignmentReport report,
+        int expectedLength,
+        int actualLength,
+        string? actorUserId = null)
+        => AppExceptionFactory.BadRequest(
+            AppErrorCode.WORK_ASSIGNMENT_REPORT_VALUES_INVALID,
+            new
+            {
+                reportId = report.Id,
+                report.WorkId,
+                report.WorkAssignmentId,
+                report.WorkReportPeriodId,
+                report.W,
+                report.H,
+                expectedLength,
+                actualLength,
+                actorUserId
+            });
+
+    private static object ReportDetails(WorkAssignmentReport report, string? actorUserId = null)
+        => new
+        {
+            reportId = report.Id,
+            report.WorkId,
+            report.WorkAssignmentId,
+            report.WorkReportPeriodId,
+            report.AssigneeUserId,
+            report.PeriodKey,
+            report.PeriodInstanceKey,
+            report.Status,
+            actorUserId
+        };
+
+    private static object PeriodDetails(WorkReportPeriod period, string? actorUserId = null)
+        => new
+        {
+            periodId = period.Id,
+            period.WorkId,
+            period.WorkAssignmentId,
+            period.WorkTemplateAssigneeId,
+            period.AssigneeUserId,
+            period.PeriodKey,
+            period.PeriodInstanceKey,
+            period.PeriodKind,
+            period.Status,
+            actorUserId
+        };
 
     private static string? NormalizeOptionalTextOrNull(string? value)
     {
         var text = value?.Trim();
         return string.IsNullOrWhiteSpace(text) ? null : text;
+    }
+
+    private static string ResolveReportDataOrigin(string? requested, string? current)
+        => requested is null
+            ? WorkReportDataOrigin.Normalize(current)
+            : WorkReportDataOrigin.Normalize(requested);
+
+    private static bool ShouldAcceptReportDataPayload(
+        WorkAssignmentReport entity,
+        string nextDataOrigin,
+        string? nextSummarySourceJson)
+    {
+        if (!string.Equals(
+                WorkReportDataOrigin.Normalize(nextDataOrigin),
+                WorkReportDataOrigin.AutoSummary,
+                StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        if (string.IsNullOrWhiteSpace(nextSummarySourceJson))
+            return true;
+
+        // Auto-summary cells are the report container cache. Once the aggregate
+        // contract exists, normal draft/submit calls may update metadata only.
+        return !string.Equals(
+            NormalizeOptionalTextOrNull(entity.SummarySourceJson),
+            NormalizeOptionalTextOrNull(nextSummarySourceJson),
+            StringComparison.Ordinal);
+    }
+
+    private static string ResolveCumulativeContributionMode(
+        string? requestedMode,
+        string? requestedOrigin,
+        string? currentMode,
+        string? currentOrigin)
+    {
+        if (!string.IsNullOrWhiteSpace(requestedMode))
+            return WorkReportCumulativeContributionMode.Normalize(requestedMode);
+
+        if (requestedOrigin is not null)
+            return WorkReportDataOrigin.DefaultContributionMode(requestedOrigin);
+
+        if (!string.IsNullOrWhiteSpace(currentMode))
+            return WorkReportCumulativeContributionMode.Normalize(currentMode);
+
+        return WorkReportDataOrigin.DefaultContributionMode(currentOrigin);
+    }
+
+    private static string? ResolveOptionalJsonOverride(string? requested, string? current)
+        => requested is null ? NormalizeOptionalTextOrNull(current) : NormalizeOptionalTextOrNull(requested);
+
+    private static string? ResolveContributionPolicyJsonOverride(
+        string? requested,
+        string? current,
+        string reportId,
+        string actorUserId)
+    {
+        var json = ResolveOptionalJsonOverride(requested, current);
+        EnsureJsonObjectOrNull(
+            json,
+            AppErrorCode.WORK_ASSIGNMENT_REPORT_CONTRIBUTION_POLICY_JSON_INVALID,
+            "cumulativeContributionPolicyJson",
+            reportId,
+            actorUserId);
+        return json;
+    }
+
+    private static string? ResolveSummarySourceJsonOverride(
+        string? requested,
+        string? current,
+        string reportId,
+        string actorUserId)
+    {
+        var json = ResolveOptionalJsonOverride(requested, current);
+        EnsureJsonObjectOrNull(
+            json,
+            AppErrorCode.WORK_ASSIGNMENT_REPORT_SUMMARY_SOURCE_JSON_INVALID,
+            "summarySourceJson",
+            reportId,
+            actorUserId);
+        return json;
+    }
+
+    private static void EnsureJsonObjectOrNull(
+        string? json,
+        AppErrorCode errorCode,
+        string field,
+        string reportId,
+        string actorUserId)
+    {
+        if (string.IsNullOrWhiteSpace(json))
+            return;
+
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            if (doc.RootElement.ValueKind == JsonValueKind.Object)
+                return;
+        }
+        catch (JsonException)
+        {
+            // Throw the coded error below so FE and automation receive a stable contract.
+        }
+
+        throw AppExceptionFactory.BadRequest(
+            errorCode,
+            new { field, reportId, actorUserId });
+    }
+
+    private static AggregateSourceSnapshot ExtractAggregateSourceSnapshot(string? summarySourceJson)
+    {
+        if (string.IsNullOrWhiteSpace(summarySourceJson))
+            return new AggregateSourceSnapshot(false, new List<string>(), new List<string>());
+
+        try
+        {
+            using var doc = JsonDocument.Parse(summarySourceJson);
+            if (doc.RootElement.ValueKind != JsonValueKind.Object)
+                return new AggregateSourceSnapshot(false, new List<string>(), new List<string>());
+
+            var kind = ReadJsonString(doc.RootElement, "kind");
+            if (!string.Equals(kind, "DYNAMIC_FORM_AGGREGATE_DRAFT", StringComparison.Ordinal))
+                return new AggregateSourceSnapshot(false, new List<string>(), new List<string>());
+
+            return new AggregateSourceSnapshot(
+                true,
+                ReadJsonStringArray(doc.RootElement, "sourceReportIds"),
+                ReadJsonStringArray(doc.RootElement, "sourceAssignmentIds"));
+        }
+        catch (JsonException)
+        {
+            return new AggregateSourceSnapshot(false, new List<string>(), new List<string>());
+        }
+    }
+
+    private static AggregateDraftSummary? TryReadAggregateDraftSummary(string? summarySourceJson)
+    {
+        if (string.IsNullOrWhiteSpace(summarySourceJson))
+            return null;
+
+        try
+        {
+            using var doc = JsonDocument.Parse(summarySourceJson);
+            if (doc.RootElement.ValueKind != JsonValueKind.Object)
+                return null;
+
+            var kind = ReadJsonString(doc.RootElement, "kind");
+            if (!string.Equals(kind, "DYNAMIC_FORM_AGGREGATE_DRAFT", StringComparison.Ordinal))
+                return null;
+
+            if (!TryGetJsonProperty(doc.RootElement, "aggregateRequest", out var requestElement) ||
+                requestElement.ValueKind != JsonValueKind.Object)
+            {
+                return null;
+            }
+
+            var aggregateRequest = JsonSerializer.Deserialize<DynamicFormAggregateRequest>(
+                requestElement.GetRawText(),
+                _jsonOptions);
+            if (aggregateRequest is null)
+                return null;
+
+            return new AggregateDraftSummary(
+                WorkReportDataOrigin.Normalize(ReadJsonString(doc.RootElement, "dataOrigin")),
+                aggregateRequest,
+                ReadJsonString(doc.RootElement, "valueSelector"),
+                ReadJsonString(doc.RootElement, "targetBlockId"),
+                ReadJsonBool(doc.RootElement, "clearExistingValues"),
+                ReadJsonIntArray(doc.RootElement, "targetIndexes"));
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
+    private static bool? ReadJsonBool(JsonElement element, string name)
+    {
+        if (!TryGetJsonProperty(element, name, out var value))
+            return null;
+
+        return value.ValueKind switch
+        {
+            JsonValueKind.True => true,
+            JsonValueKind.False => false,
+            JsonValueKind.String when bool.TryParse(value.GetString(), out var parsed) => parsed,
+            _ => null
+        };
+    }
+
+    private static List<int> ReadJsonIntArray(JsonElement element, string name)
+    {
+        if (!TryGetJsonProperty(element, name, out var value) || value.ValueKind != JsonValueKind.Array)
+            return new List<int>();
+
+        return value
+            .EnumerateArray()
+            .Select(item =>
+            {
+                if (item.ValueKind == JsonValueKind.Number && item.TryGetInt32(out var number))
+                    return (int?)number;
+                if (item.ValueKind == JsonValueKind.String && int.TryParse(item.GetString(), out var parsed))
+                    return parsed;
+                return null;
+            })
+            .Where(x => x.HasValue)
+            .Select(x => x!.Value)
+            .Distinct()
+            .OrderBy(x => x)
+            .ToList();
+    }
+
+    private static DynamicFormAggregateRequest NormalizeAggregateDraftRequest(DynamicFormAggregateRequest req)
+    {
+        if (string.IsNullOrWhiteSpace(req.ScopeAssignmentId) ||
+            string.IsNullOrWhiteSpace(req.DynamicFormTemplateId))
+        {
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_AGGREGATE_DRAFT_REQUEST_INVALID,
+                new { req.ScopeAssignmentId, req.DynamicFormTemplateId });
+        }
+
+        var periodScope = string.IsNullOrWhiteSpace(req.PeriodScopeMode)
+            ? "ALL_PERIODS"
+            : req.PeriodScopeMode.Trim().ToUpperInvariant();
+
+        return new DynamicFormAggregateRequest
+        {
+            ScopeAssignmentId = req.ScopeAssignmentId.Trim(),
+            ScopeMode = string.IsNullOrWhiteSpace(req.ScopeMode)
+                ? "DIRECT_CHILDREN"
+                : req.ScopeMode.Trim().ToUpperInvariant(),
+            DynamicFormTemplateId = req.DynamicFormTemplateId.Trim(),
+            BlockId = NormalizeBlockId(req.BlockId),
+            TableMode = string.IsNullOrWhiteSpace(req.TableMode) ? null : req.TableMode.Trim().ToUpperInvariant(),
+            MetricKeys = req.MetricKeys?
+                .Select(x => x?.Trim())
+                .Where(x => !string.IsNullOrWhiteSpace(x))
+                .Select(x => x!)
+                .Distinct(StringComparer.Ordinal)
+                .ToList(),
+            PeriodScopeMode = periodScope,
+            PeriodKey = NormalizeOptionalTextOrNull(req.PeriodKey),
+            PeriodKeyFrom = NormalizeOptionalTextOrNull(req.PeriodKeyFrom),
+            PeriodKeyTo = NormalizeOptionalTextOrNull(req.PeriodKeyTo),
+            SourceStatusMode = "APPROVED_ONLY",
+            SelectedUnitIds = req.SelectedUnitIds?
+                .Select(NormalizeOptionalTextOrNull)
+                .Where(x => !string.IsNullOrWhiteSpace(x))
+                .Select(x => x!)
+                .Distinct(StringComparer.Ordinal)
+                .ToList()
+        };
+    }
+
+    private static string NormalizeAggregateDraftValueSelector(string? value)
+    {
+        var selector = value?.Trim().ToUpperInvariant();
+        return selector switch
+        {
+            "COUNT" => "COUNT",
+            "AVG" or "AVERAGE" => "AVERAGE",
+            "MIN" => "MIN",
+            "MAX" => "MAX",
+            _ => "SUM"
+        };
+    }
+
+    private static AggregateDraftBlockContract? ResolveAggregateDraftBlock(
+        DynamicFormTemplate form,
+        string targetBlockId)
+    {
+        var blocks = ReadAggregateDraftBlocks(form.BlocksJson);
+        if (blocks.Count == 0 && !string.IsNullOrWhiteSpace(form.ExcelBlockJson))
+            blocks.AddRange(ReadAggregateDraftBlocks(form.ExcelBlockJson));
+
+        return blocks.FirstOrDefault(block =>
+            string.Equals(block.BlockId, targetBlockId, StringComparison.Ordinal));
+    }
+
+    private static string ResolveTopLevelBlockId(DynamicFormTemplate form)
+    {
+        var blocks = ReadAggregateDraftBlocks(form.BlocksJson);
+        if (blocks.Count > 0)
+            return blocks[0].BlockId;
+
+        var legacy = ReadAggregateDraftBlocks(form.ExcelBlockJson);
+        return legacy.Count > 0 ? legacy[0].BlockId : "excel_block";
+    }
+
+    private static List<AggregateDraftBlockContract> ReadAggregateDraftBlocks(string? json)
+    {
+        if (string.IsNullOrWhiteSpace(json))
+            return new List<AggregateDraftBlockContract>();
+
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            if (doc.RootElement.ValueKind == JsonValueKind.Array)
+            {
+                return doc.RootElement
+                    .EnumerateArray()
+                    .Select(ParseAggregateDraftBlock)
+                    .Where(x => x is not null)
+                    .Select(x => x!)
+                    .ToList();
+            }
+
+            var block = ParseAggregateDraftBlock(doc.RootElement);
+            return block is null ? new List<AggregateDraftBlockContract>() : new List<AggregateDraftBlockContract> { block };
+        }
+        catch (JsonException)
+        {
+            return new List<AggregateDraftBlockContract>();
+        }
+    }
+
+    private static AggregateDraftBlockContract? ParseAggregateDraftBlock(JsonElement element)
+    {
+        if (element.ValueKind != JsonValueKind.Object)
+            return null;
+
+        var blockId = NormalizeBlockId(ReadJsonString(element, "blockId") ?? ReadJsonString(element, "id"));
+        var tableMode = NormalizeAggregateTableMode(ReadJsonString(element, "tableMode"));
+        var w = ReadJsonInt(element, "w") ?? ReadJsonInt(element, "W") ?? 0;
+        var h = ReadJsonInt(element, "h") ?? ReadJsonInt(element, "H") ?? 0;
+        if (w <= 0 || h <= 0)
+            return null;
+
+        var dataRect = TryGetJsonProperty(element, "dataRect", out var dataRectNode) &&
+                       dataRectNode.ValueKind == JsonValueKind.Object
+            ? JsonNode.Parse(dataRectNode.GetRawText())
+            : BuildDefaultDataRectNode(w, h);
+
+        var indexMap = ReadAggregateDraftIndexMap(element, blockId, tableMode, w, h);
+        var dynamicExcelTemplateId = ReadJsonString(element, "dynamicExcelTemplateId")
+            ?? ReadJsonString(element, "excelBlockDynamicExcelTemplateId");
+
+        return new AggregateDraftBlockContract(blockId, tableMode, w, h, dynamicExcelTemplateId, dataRect, indexMap);
+    }
+
+    private static string NormalizeAggregateTableMode(string? value)
+    {
+        var mode = value?.Trim().ToUpperInvariant();
+        return mode is "APPEND_ROWS" or "APPEND_COLUMNS" or "MATRIX" or "SUMMARY_TEMPLATE"
+            ? mode
+            : "FIXED_GRID";
+    }
+
+    private static int? ReadJsonInt(JsonElement element, string name)
+    {
+        if (!TryGetJsonProperty(element, name, out var value))
+            return null;
+
+        return value.ValueKind switch
+        {
+            JsonValueKind.Number when value.TryGetInt32(out var number) => number,
+            JsonValueKind.String when int.TryParse(value.GetString(), out var parsed) => parsed,
+            _ => null
+        };
+    }
+
+    private static List<AggregateDraftIndexMapItem> ReadAggregateDraftIndexMap(
+        JsonElement block,
+        string blockId,
+        string tableMode,
+        int w,
+        int h)
+    {
+        var result = new List<AggregateDraftIndexMapItem>();
+        if (TryGetJsonProperty(block, "indexMap", out var items) && items.ValueKind == JsonValueKind.Array)
+        {
+            var fallback = 0;
+            foreach (var item in items.EnumerateArray())
+            {
+                if (item.ValueKind != JsonValueKind.Object)
+                    continue;
+
+                var index = ReadJsonInt(item, "index") ?? fallback;
+                var rowKey = NormalizeMetricPart(ReadJsonString(item, "rowKey"), $"row_{fallback + 1}");
+                var columnKey = NormalizeMetricPart(ReadJsonString(item, "columnKey"), "value");
+                var metricKey = NormalizeOptionalTextOrNull(ReadJsonString(item, "metricKey"))
+                    ?? BuildAggregateMetricKey(blockId, rowKey, columnKey);
+                result.Add(new AggregateDraftIndexMapItem(index, rowKey, columnKey, metricKey));
+                fallback++;
+            }
+        }
+
+        if (result.Count > 0 || tableMode is not ("FIXED_GRID" or "MATRIX"))
+            return result
+                .GroupBy(x => x.MetricKey, StringComparer.Ordinal)
+                .Select(x => x.First())
+                .OrderBy(x => x.Index)
+                .ToList();
+
+        return Enumerable.Range(0, Math.Max(0, w * h))
+            .Select(index =>
+            {
+                var rowKey = $"row_{(index / Math.Max(1, w)) + 1}";
+                var columnKey = $"col_{(index % Math.Max(1, w)) + 1}";
+                return new AggregateDraftIndexMapItem(index, rowKey, columnKey, BuildAggregateMetricKey(blockId, rowKey, columnKey));
+            })
+            .ToList();
+    }
+
+    private static JsonObject BuildDefaultDataRectNode(int w, int h)
+        => new()
+        {
+            ["r0"] = 0,
+            ["c0"] = 0,
+            ["r1"] = Math.Max(0, h - 1),
+            ["c1"] = Math.Max(0, w - 1)
+        };
+
+    private static string NormalizeMetricPart(string? value, string fallback)
+    {
+        var text = value?.Trim();
+        return string.IsNullOrWhiteSpace(text) ? fallback : text;
+    }
+
+    private static string BuildAggregateMetricKey(string blockId, string rowKey, string columnKey)
+        => $"table:{blockId}.row:{rowKey}.column:{columnKey}";
+
+    private static List<decimal?> DeserializeValues1D(string? json)
+    {
+        if (string.IsNullOrWhiteSpace(json))
+            return new List<decimal?>();
+
+        try
+        {
+            return JsonSerializer.Deserialize<List<decimal?>>(json, _jsonOptions) ?? new List<decimal?>();
+        }
+        catch (JsonException)
+        {
+            return new List<decimal?>();
+        }
+    }
+
+    private static List<decimal?> NormalizeDecimalValues(IReadOnlyList<decimal?> values, int length)
+    {
+        var result = CreateEmptyValues1D(length, 1);
+        for (var i = 0; i < Math.Min(length, values.Count); i++)
+            result[i] = values[i];
+        return result;
+    }
+
+    private static List<decimal?> ExtractBlockDecimalValues(string? tableValuesJson, string blockId)
+    {
+        if (string.IsNullOrWhiteSpace(tableValuesJson))
+            return new List<decimal?>();
+
+        try
+        {
+            using var doc = JsonDocument.Parse(tableValuesJson);
+            if (!TryGetJsonProperty(doc.RootElement, "blocks", out var blocks) ||
+                blocks.ValueKind != JsonValueKind.Array)
+            {
+                return new List<decimal?>();
+            }
+
+            foreach (var block in blocks.EnumerateArray())
+            {
+                if (!string.Equals(NormalizeBlockId(ReadJsonString(block, "blockId")), blockId, StringComparison.Ordinal))
+                    continue;
+
+                if (!TryGetJsonProperty(block, "values1D", out var values) ||
+                    values.ValueKind != JsonValueKind.Array)
+                {
+                    return new List<decimal?>();
+                }
+
+                return values.EnumerateArray().Select(ToNullableDecimal).ToList();
+            }
+        }
+        catch (JsonException)
+        {
+            return new List<decimal?>();
+        }
+
+        return new List<decimal?>();
+    }
+
+    private static decimal? ToNullableDecimal(JsonElement value)
+    {
+        return value.ValueKind switch
+        {
+            JsonValueKind.Number when value.TryGetDecimal(out var number) => number,
+            JsonValueKind.String when decimal.TryParse(value.GetString(), NumberStyles.Any, CultureInfo.InvariantCulture, out var parsed) => parsed,
+            _ => null
+        };
+    }
+
+    private static void ApplyAggregateRowsToValues(
+        List<decimal?> targetValues,
+        IReadOnlyCollection<DynamicFormAggregateRowDto> rows,
+        AggregateDraftBlockContract block,
+        string valueSelector)
+    {
+        foreach (var row in rows)
+        {
+            var value = SelectAggregateDraftValue(row, valueSelector);
+            if (!value.HasValue)
+                continue;
+
+            var index = ResolveAggregateDraftValueIndex(row, block);
+            if (index < 0 || index >= targetValues.Count)
+                continue;
+
+            targetValues[index] = value.Value;
+        }
+    }
+
+    private static decimal? SelectAggregateDraftValue(DynamicFormAggregateRowDto row, string selector)
+    {
+        return selector switch
+        {
+            "COUNT" => row.Count,
+            "AVERAGE" => row.Average,
+            "MIN" => row.Min,
+            "MAX" => row.Max,
+            _ => row.Sum
+        };
+    }
+
+    private static int ResolveAggregateDraftValueIndex(DynamicFormAggregateRowDto row, AggregateDraftBlockContract block)
+    {
+        if (string.Equals(block.TableMode, "SUMMARY_TEMPLATE", StringComparison.Ordinal) &&
+            row.OutputRowIndex.HasValue)
+        {
+            return row.OutputRowIndex.Value * Math.Max(1, block.W);
+        }
+
+        if (string.Equals(block.TableMode, "APPEND_COLUMNS", StringComparison.Ordinal))
+            return row.Index * Math.Max(1, block.W);
+
+        return row.Index;
+    }
+
+    private static string BuildAggregateDraftTableValuesJson(
+        WorkAssignmentReport report,
+        DynamicFormTemplate form,
+        AggregateDraftBlockContract block,
+        List<decimal?> values,
+        DynamicFormAggregateResponse aggregate)
+    {
+        var root = ParseTableValuesRoot(report.TableValuesJson) ?? new JsonObject();
+        root["dynamicFormTemplateId"] = report.DynamicFormTemplateId ?? form.Id;
+        root["dynamicFormTemplateCode"] = report.DynamicFormTemplateCode ?? form.Code;
+        root["dynamicFormTemplateName"] = report.DynamicFormTemplateName ?? form.Name;
+        root["updatedAtUtc"] = DateTime.UtcNow.ToString("O", CultureInfo.InvariantCulture);
+
+        var blocks = root["blocks"] as JsonArray;
+        if (blocks is null)
+        {
+            blocks = new JsonArray();
+            root["blocks"] = blocks;
+        }
+
+        var existingRowLabels = ExtractExistingBlockProperty(report.TableValuesJson, block.BlockId, "rowLabels")
+            ?? new JsonArray();
+
+        for (var i = blocks.Count - 1; i >= 0; i--)
+        {
+            var item = blocks[i] as JsonObject;
+            var itemBlockId = item?["blockId"]?.GetValue<string>();
+            if (string.Equals(NormalizeBlockId(itemBlockId), block.BlockId, StringComparison.Ordinal))
+                blocks.RemoveAt(i);
+        }
+
+        blocks.Add(BuildAggregateDraftTableBlockNode(block, values, aggregate, existingRowLabels));
+        return root.ToJsonString(_jsonOptions);
+    }
+
+    private static JsonObject? ParseTableValuesRoot(string? tableValuesJson)
+    {
+        if (string.IsNullOrWhiteSpace(tableValuesJson))
+            return null;
+
+        try
+        {
+            return JsonNode.Parse(tableValuesJson) as JsonObject;
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
+    private static JsonNode? ExtractExistingBlockProperty(string? tableValuesJson, string blockId, string propertyName)
+    {
+        var root = ParseTableValuesRoot(tableValuesJson);
+        if (root?["blocks"] is not JsonArray blocks)
+            return null;
+
+        foreach (var node in blocks)
+        {
+            if (node is not JsonObject block)
+                continue;
+
+            var itemBlockId = block["blockId"]?.GetValue<string>();
+            if (!string.Equals(NormalizeBlockId(itemBlockId), blockId, StringComparison.Ordinal))
+                continue;
+
+            return block[propertyName]?.DeepClone();
+        }
+
+        return null;
+    }
+
+    private static JsonObject BuildAggregateDraftTableBlockNode(
+        AggregateDraftBlockContract block,
+        List<decimal?> values,
+        DynamicFormAggregateResponse aggregate,
+        JsonNode existingRowLabels)
+    {
+        var indexMap = BuildAggregateDraftIndexMap(block, aggregate.Rows);
+        return new JsonObject
+        {
+            ["blockId"] = block.BlockId,
+            ["dynamicExcelTemplateId"] = block.DynamicExcelTemplateId,
+            ["tableMode"] = block.TableMode,
+            ["w"] = block.W,
+            ["h"] = block.H,
+            ["dataRect"] = block.DataRect?.DeepClone() ?? BuildDefaultDataRectNode(block.W, block.H),
+            ["values1D"] = JsonSerializer.SerializeToNode(values, _jsonOptions),
+            ["indexMap"] = JsonSerializer.SerializeToNode(indexMap, _jsonOptions),
+            ["rowLabels"] = existingRowLabels,
+            ["rows"] = JsonSerializer.SerializeToNode(BuildAggregateDraftAppendRows(block, values), _jsonOptions),
+            ["columns"] = JsonSerializer.SerializeToNode(BuildAggregateDraftAppendColumns(block, values), _jsonOptions),
+            ["cells"] = JsonSerializer.SerializeToNode(BuildAggregateDraftMatrixCells(block, values, indexMap), _jsonOptions),
+            ["aggregateMeta"] = JsonSerializer.SerializeToNode(new
+            {
+                aggregate.Meta.ScopeAssignmentId,
+                aggregate.Meta.ScopeMode,
+                aggregate.Meta.PeriodScopeMode,
+                aggregate.Meta.PeriodKey,
+                aggregate.Meta.PeriodKeyFrom,
+                aggregate.Meta.PeriodKeyTo,
+                aggregate.Meta.SourceStatusMode,
+                aggregate.Meta.SourceReportCount,
+                aggregate.Meta.MetricCount
+            }, _jsonOptions)
+        };
+    }
+
+    private static List<AggregateDraftIndexMapItem> BuildAggregateDraftIndexMap(
+        AggregateDraftBlockContract block,
+        IReadOnlyCollection<DynamicFormAggregateRowDto> rows)
+    {
+        if (block.IndexMap.Count > 0)
+            return block.IndexMap;
+
+        return rows
+            .Select(row => new AggregateDraftIndexMapItem(
+                ResolveAggregateDraftValueIndex(row, block),
+                NormalizeMetricPart(row.RowKey, $"row_{row.Index + 1}"),
+                NormalizeMetricPart(row.ColumnKey, "value"),
+                row.SourceMetricKey ?? row.MetricKey))
+            .GroupBy(x => x.MetricKey, StringComparer.Ordinal)
+            .Select(x => x.First())
+            .OrderBy(x => x.Index)
+            .ToList();
+    }
+
+    private static List<object> BuildAggregateDraftAppendRows(AggregateDraftBlockContract block, List<decimal?> values)
+    {
+        if (!string.Equals(block.TableMode, "APPEND_ROWS", StringComparison.Ordinal))
+            return new List<object>();
+
+        var rows = new List<object>();
+        for (var r = 0; r < block.H; r++)
+        {
+            var cells = new Dictionary<string, decimal?>(StringComparer.Ordinal);
+            for (var c = 0; c < block.W; c++)
+            {
+                var value = values[r * block.W + c];
+                if (value.HasValue)
+                    cells[$"col_{c + 1}"] = value.Value;
+            }
+
+            if (cells.Count > 0)
+            {
+                rows.Add(new
+                {
+                    rowInstanceId = $"{block.BlockId}:summary-row:{r + 1}",
+                    rowOrder = r + 1,
+                    rowKey = $"summary:R{r + 1}",
+                    rowLabelCodes = Array.Empty<string>(),
+                    cells
+                });
+            }
+        }
+
+        return rows;
+    }
+
+    private static List<object> BuildAggregateDraftAppendColumns(AggregateDraftBlockContract block, List<decimal?> values)
+    {
+        if (!string.Equals(block.TableMode, "APPEND_COLUMNS", StringComparison.Ordinal))
+            return new List<object>();
+
+        var columns = new List<object>();
+        for (var c = 0; c < block.W; c++)
+        {
+            var cells = new Dictionary<string, decimal?>(StringComparer.Ordinal);
+            for (var r = 0; r < block.H; r++)
+            {
+                var value = values[r * block.W + c];
+                if (value.HasValue)
+                    cells[$"row_{r + 1}"] = value.Value;
+            }
+
+            if (cells.Count > 0)
+            {
+                columns.Add(new
+                {
+                    columnInstanceId = $"{block.BlockId}:summary-column:{c + 1}",
+                    columnOrder = c + 1,
+                    columnKey = $"summary:C{c + 1}",
+                    columnLabelCodes = Array.Empty<string>(),
+                    cells
+                });
+            }
+        }
+
+        return columns;
+    }
+
+    private static List<object> BuildAggregateDraftMatrixCells(
+        AggregateDraftBlockContract block,
+        List<decimal?> values,
+        List<AggregateDraftIndexMapItem> indexMap)
+    {
+        if (!string.Equals(block.TableMode, "MATRIX", StringComparison.Ordinal))
+            return new List<object>();
+
+        var metricByIndex = indexMap.ToDictionary(x => x.Index, x => x);
+        var cells = new List<object>();
+        for (var i = 0; i < values.Count; i++)
+        {
+            if (!values[i].HasValue)
+                continue;
+
+            if (!metricByIndex.TryGetValue(i, out var metric))
+            {
+                metric = new AggregateDraftIndexMapItem(
+                    i,
+                    $"row_{(i / Math.Max(1, block.W)) + 1}",
+                    $"col_{(i % Math.Max(1, block.W)) + 1}",
+                    BuildAggregateMetricKey(block.BlockId, $"row_{(i / Math.Max(1, block.W)) + 1}", $"col_{(i % Math.Max(1, block.W)) + 1}"));
+            }
+
+            cells.Add(new
+            {
+                rowAxisKey = "row",
+                rowKey = metric.RowKey,
+                columnAxisKey = "column",
+                columnKey = metric.ColumnKey,
+                metricKey = metric.MetricKey,
+                value = values[i]
+            });
+        }
+
+        return cells;
+    }
+
+    private static string? BuildAggregateDraftContributionPolicyJson(
+        string dataOrigin,
+        IReadOnlyCollection<DynamicFormAggregateRowDto> rows,
+        string blockId)
+    {
+        if (!string.Equals(WorkReportDataOrigin.Normalize(dataOrigin), WorkReportDataOrigin.PartialMapping, StringComparison.Ordinal))
+            return null;
+
+        var rules = rows
+            .Select(row => new
+            {
+                targetKind = "TABLE_METRIC",
+                blockId,
+                metricKey = row.SourceMetricKey ?? row.MetricKey,
+                rowKey = NormalizeOptionalTextOrNull(row.RowKey),
+                columnKey = NormalizeOptionalTextOrNull(row.ColumnKey),
+                mode = WorkReportCumulativeContributionMode.Exclude
+            })
+            .GroupBy(x => $"{x.blockId}|{x.metricKey}|{x.rowKey}|{x.columnKey}", StringComparer.Ordinal)
+            .Select(x => x.First())
+            .ToList();
+
+        return JsonSerializer.Serialize(new
+        {
+            defaultMode = WorkReportCumulativeContributionMode.Include,
+            rules
+        }, _jsonOptions);
+    }
+
+    private static string BuildAggregateDraftSummarySourceJson(
+        string dataOrigin,
+        DynamicFormAggregateRequest aggregateRequest,
+        DynamicFormAggregateResponse aggregate,
+        AggregateDraftBlockContract block,
+        string valueSelector,
+        string targetBlockId,
+        bool clearExistingValues)
+    {
+        var sourceReportIds = aggregate.Sources
+            .Select(x => x.ReportId)
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+        var sourceAssignmentIds = aggregate.Sources
+            .Select(x => x.WorkAssignmentId)
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+        var targetIndexes = aggregate.Rows
+            .Select(row => ResolveAggregateDraftValueIndex(row, block))
+            .Where(index => index >= 0 && index < block.W * block.H)
+            .Distinct()
+            .OrderBy(x => x)
+            .ToArray();
+
+        return JsonSerializer.Serialize(new
+        {
+            kind = "DYNAMIC_FORM_AGGREGATE_DRAFT",
+            dataOrigin = WorkReportDataOrigin.Normalize(dataOrigin),
+            appliedAtUtc = DateTime.UtcNow,
+            valueSelector,
+            targetBlockId,
+            clearExistingValues,
+            aggregateRequest = new DynamicFormAggregateRequest
+            {
+                ScopeAssignmentId = aggregateRequest.ScopeAssignmentId,
+                ScopeMode = aggregateRequest.ScopeMode,
+                DynamicFormTemplateId = aggregateRequest.DynamicFormTemplateId,
+                BlockId = aggregateRequest.BlockId,
+                TableMode = aggregateRequest.TableMode,
+                MetricKeys = aggregateRequest.MetricKeys,
+                PeriodScopeMode = aggregateRequest.PeriodScopeMode,
+                PeriodKey = aggregateRequest.PeriodKey,
+                PeriodKeyFrom = aggregateRequest.PeriodKeyFrom,
+                PeriodKeyTo = aggregateRequest.PeriodKeyTo,
+                SourceStatusMode = "APPROVED_ONLY",
+                SelectedUnitIds = aggregate.Meta.SelectedUnitIds.Count > 0
+                    ? aggregate.Meta.SelectedUnitIds
+                    : aggregateRequest.SelectedUnitIds
+            },
+            sourceReportIds,
+            sourceAssignmentIds,
+            targetIndexes,
+            rowCount = aggregate.Rows.Count,
+            sourceReportCount = aggregate.Sources.Count
+        }, _jsonOptions);
     }
 
     private static string NormalizeUserCreatedPeriodKey(string? value, DateTime reportDate)
@@ -2123,6 +4579,34 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         => WorkReportPeriodKind.IsUserCreated(value)
             ? WorkReportPeriodKind.UserCreated
             : WorkReportPeriodKind.Scheduled;
+
+    private sealed record AggregateDraftBlockContract(
+        string BlockId,
+        string TableMode,
+        int W,
+        int H,
+        string? DynamicExcelTemplateId,
+        JsonNode? DataRect,
+        List<AggregateDraftIndexMapItem> IndexMap);
+
+    private sealed record AggregateDraftIndexMapItem(
+        int Index,
+        string RowKey,
+        string ColumnKey,
+        string MetricKey);
+
+    private sealed record AggregateSourceSnapshot(
+        bool IsAggregate,
+        List<string> ReportIds,
+        List<string> AssignmentIds);
+
+    private sealed record AggregateDraftSummary(
+        string DataOrigin,
+        DynamicFormAggregateRequest AggregateRequest,
+        string? ValueSelector,
+        string? TargetBlockId,
+        bool? ClearExistingValues,
+        List<int> TargetIndexes);
 
     private sealed record PeriodDefinition(
         string PeriodKey,

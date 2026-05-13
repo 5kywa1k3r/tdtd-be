@@ -1,6 +1,7 @@
 ﻿// Controllers/AuthController.cs
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using tdtd_be.Common.Errors;
 using tdtd_be.DTOs.Auth;
 using tdtd_be.Services;
 
@@ -67,7 +68,7 @@ namespace tdtd_be.Controllers
         {
             var refreshRaw = GetRefreshCookie();
             if (string.IsNullOrWhiteSpace(refreshRaw))
-                return Unauthorized(new { error = "NO_REFRESH_TOKEN", message = "Không có refresh token." });
+                throw AppExceptionFactory.Unauthorized(AppErrorCode.AUTH_REFRESH_TOKEN_MISSING);
 
             var (resp, newRefreshRaw) = await _svc.RefreshAsync(refreshRaw, ct);
 
@@ -99,7 +100,7 @@ namespace tdtd_be.Controllers
                 return Ok(me);
 
             // nếu token hợp lệ nhưng middleware chưa set (hiếm)
-            return Unauthorized(new { error = "ME_NOT_AVAILABLE", message = "Không lấy được thông tin người dùng." });
+            throw AppExceptionFactory.Unauthorized(AppErrorCode.AUTH_ME_NOT_AVAILABLE);
         }
     }
 }

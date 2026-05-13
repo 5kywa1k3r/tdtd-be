@@ -30,7 +30,7 @@ public interface IWorkAssignmentReportService
     /// </summary>
     Task<MyReportTemplateDetailResponse> GetMyReportTemplateDetailAsync(
         string workId,
-        string dynamicExcelId,
+        string dynamicFormTemplateId,
         string currentUserId,
         CancellationToken ct = default);
 
@@ -95,6 +95,17 @@ public interface IWorkAssignmentReportService
     Task<WorkAssignmentReportResponse> SaveDraftAsync(
         string id,
         SaveWorkAssignmentReportDraftRequest req,
+        string currentUserId,
+        CancellationToken ct = default);
+
+    Task<WorkAssignmentReportResponse> ApplyDynamicFormAggregateDraftAsync(
+        string id,
+        ApplyDynamicFormAggregateDraftRequest req,
+        string currentUserId,
+        CancellationToken ct = default);
+
+    Task RefreshDynamicFormAggregateDependentsAsync(
+        string sourceReportId,
         string currentUserId,
         CancellationToken ct = default);
 

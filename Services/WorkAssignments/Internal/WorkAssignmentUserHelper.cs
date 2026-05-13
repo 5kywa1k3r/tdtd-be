@@ -1,4 +1,5 @@
-﻿using MongoDB.Driver;
+using MongoDB.Driver;
+using tdtd_be.Common.Errors;
 using tdtd_be.Data;
 using tdtd_be.Enum;
 using tdtd_be.Models;
@@ -17,9 +18,9 @@ internal static class WorkAssignmentUserHelper
             ctx: ctx,
             userIdsInput: assigneeUserIds,
             ct: ct,
-            notFoundMessage: "Có người dùng không tồn tại hoặc đã bị xóa.",
+            notFoundCode: AppErrorCode.WORK_ASSIGNMENT_ASSIGNEE_USER_NOT_FOUND,
             allowedUnitIds: null,
-            invalidUnitMessage: null,
+            invalidUnitCode: null,
             seedUsers: seedUsers);
     }
 
@@ -40,9 +41,9 @@ internal static class WorkAssignmentUserHelper
             ctx: ctx,
             userIdsInput: leaderWatcherUserIds,
             ct: ct,
-            notFoundMessage: "Có leader watcher không tồn tại hoặc đã bị xóa.",
+            notFoundCode: AppErrorCode.WORK_ASSIGNMENT_LEADER_WATCHER_NOT_FOUND,
             allowedUnitIds: allowedUnitIds,
-            invalidUnitMessage: "Leader watcher phải thuộc cùng đơn vị với assignee của nhánh.",
+            invalidUnitCode: AppErrorCode.WORK_ASSIGNMENT_LEADER_WATCHER_UNIT_MISMATCH,
             seedUsers: seedUsers);
     }
 
@@ -50,9 +51,9 @@ internal static class WorkAssignmentUserHelper
         MongoDbContext ctx,
         List<string>? userIdsInput,
         CancellationToken ct,
-        string notFoundMessage,
+        AppErrorCode notFoundCode,
         List<string>? allowedUnitIds,
-        string? invalidUnitMessage,
+        AppErrorCode? invalidUnitCode,
         IEnumerable<UserRef>? seedUsers = null)
     {
         var userIds = (userIdsInput ?? new List<string>())
@@ -80,7 +81,7 @@ internal static class WorkAssignmentUserHelper
                 .ToListAsync(ct);
 
             if (users.Count != missingIds.Count)
-                throw new InvalidOperationException(notFoundMessage);
+                throw AppExceptionFactory.BadRequest(notFoundCode, new { userIds });
 
             var unitIds = users
                 .Where(x => !string.IsNullOrWhiteSpace(x.UnitId))
@@ -95,7 +96,9 @@ internal static class WorkAssignmentUserHelper
                     .ToListAsync(ct);
 
             if (units.Count != unitIds.Count)
-                throw new InvalidOperationException("Có người dùng thuộc đơn vị đã ngừng dùng, không thể dùng cho assignment mới.");
+                throw AppExceptionFactory.BadRequest(
+                    AppErrorCode.WORK_ASSIGNMENT_USER_UNIT_INACTIVE,
+                    new { userIds, unitIds });
 
             var unitMap = units.ToDictionary(x => x.Id!, x => x, StringComparer.Ordinal);
 
@@ -117,7 +120,7 @@ internal static class WorkAssignmentUserHelper
             finalMap[item.UserId!] = item;
 
         if (finalMap.Count != userIds.Count || userIds.Any(id => !finalMap.ContainsKey(id)))
-            throw new InvalidOperationException(notFoundMessage);
+            throw AppExceptionFactory.BadRequest(notFoundCode, new { userIds });
 
         var result = userIds
             .Select(id => finalMap[id])
@@ -129,8 +132,9 @@ internal static class WorkAssignmentUserHelper
                     string.IsNullOrWhiteSpace(x.UnitId) ||
                     !allowedUnitIds.Contains(x.UnitId!, StringComparer.Ordinal)))
             {
-                throw new InvalidOperationException(
-                    invalidUnitMessage ?? "Người dùng không thuộc đơn vị hợp lệ.");
+                throw AppExceptionFactory.BadRequest(
+                    invalidUnitCode ?? AppErrorCode.WORK_ASSIGNMENT_USER_UNIT_INVALID,
+                    new { userIds, allowedUnitIds });
             }
         }
 

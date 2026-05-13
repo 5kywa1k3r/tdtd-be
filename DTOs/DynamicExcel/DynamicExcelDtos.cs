@@ -8,7 +8,8 @@ public sealed record DynamicExcelRow(
     string Name,
     string[] Labels,
     string CreatedByUsername,
-    DateTime CreatedAtUtc
+    DateTime CreatedAtUtc,
+    string TableKind
 );
 
 public sealed record DynamicExcelDetail(
@@ -18,6 +19,8 @@ public sealed record DynamicExcelDetail(
     string[] Labels,
     string CreatedByUsername,
     DateTime CreatedAtUtc,
+    string TableKind,
+    string? RecordTableSpecJson,
     string RawWorkbookDataJson,
     string SpecJson,
     DynamicExcelDataRectDto DataRect,
@@ -31,9 +34,11 @@ public sealed record CreateDynamicExcelReq(
     string[]? Labels,
     string RawWorkbookDataJson,
     string SpecJson,
-    DynamicExcelDataRectDto DataRect,
+    DynamicExcelDataRectDto? DataRect,
     int W,
-    int H
+    int H,
+    string? TableKind = null,
+    string? RecordTableSpecJson = null
 );
 
 public sealed record UpdateDynamicExcelReq(
@@ -41,9 +46,11 @@ public sealed record UpdateDynamicExcelReq(
     string[]? Labels,
     string RawWorkbookDataJson,
     string SpecJson,
-    DynamicExcelDataRectDto DataRect,
+    DynamicExcelDataRectDto? DataRect,
     int W,
-    int H
+    int H,
+    string? TableKind = null,
+    string? RecordTableSpecJson = null
 );
 
 public sealed record DynamicExcelSearchReq(

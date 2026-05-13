@@ -1,5 +1,6 @@
 using Microsoft.Extensions.Logging;
 using MongoDB.Driver;
+using tdtd_be.Common.Errors;
 using tdtd_be.Data;
 using tdtd_be.Models;
 
@@ -82,7 +83,7 @@ public sealed class DocRoleReadModelRepairService : IDocRoleReadModelRepairServi
         CancellationToken ct = default)
     {
         if (string.IsNullOrWhiteSpace(workId))
-            throw new ArgumentException("workId is required.", nameof(workId));
+            throw AppExceptionFactory.BadRequest(AppErrorCode.OPERATIONS_REPAIR_TARGET_REQUIRED, new { field = "workId" });
 
         var normalized = Normalize(options);
         var result = CreateResult("work", workId, normalized);
@@ -147,7 +148,7 @@ public sealed class DocRoleReadModelRepairService : IDocRoleReadModelRepairServi
         CancellationToken ct = default)
     {
         if (string.IsNullOrWhiteSpace(assignmentId))
-            throw new ArgumentException("assignmentId is required.", nameof(assignmentId));
+            throw AppExceptionFactory.BadRequest(AppErrorCode.OPERATIONS_REPAIR_TARGET_REQUIRED, new { field = "assignmentId" });
 
         var normalized = Normalize(options);
         var result = CreateResult("assignment", assignmentId, normalized);
@@ -193,7 +194,7 @@ public sealed class DocRoleReadModelRepairService : IDocRoleReadModelRepairServi
         CancellationToken ct = default)
     {
         if (string.IsNullOrWhiteSpace(workReportPeriodId))
-            throw new ArgumentException("workReportPeriodId is required.", nameof(workReportPeriodId));
+            throw AppExceptionFactory.BadRequest(AppErrorCode.OPERATIONS_REPAIR_TARGET_REQUIRED, new { field = "workReportPeriodId" });
 
         var normalized = Normalize(options);
         var result = CreateResult("period", workReportPeriodId, normalized);

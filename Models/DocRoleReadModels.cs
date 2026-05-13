@@ -102,7 +102,7 @@ public sealed class AssignmentListDocRole : DocRoleReadModelBase
 
     [BsonElement("dynamicExcelId")]
     [BsonRepresentation(BsonType.ObjectId)]
-    public string DynamicExcelId { get; set; } = default!;
+    public string? DynamicExcelId { get; set; }
 
     [BsonElement("dynamicExcelCode")]
     public string DynamicExcelCode { get; set; } = string.Empty;
@@ -119,6 +119,9 @@ public sealed class AssignmentListDocRole : DocRoleReadModelBase
 
     [BsonElement("dynamicFormTemplateName")]
     public string? DynamicFormTemplateName { get; set; }
+
+    [BsonElement("dynamicFormDataSourceRulesJson")]
+    public string? DynamicFormDataSourceRulesJson { get; set; }
 
     [BsonElement("assignmentType")]
     public string AssignmentType { get; set; } = string.Empty;
@@ -233,7 +236,7 @@ public sealed class MyReportTemplateListDocRole : DocRoleReadModelBase
 
     [BsonElement("dynamicExcelId")]
     [BsonRepresentation(BsonType.ObjectId)]
-    public string DynamicExcelId { get; set; } = default!;
+    public string? DynamicExcelId { get; set; }
 
     [BsonElement("dynamicExcelCode")]
     public string DynamicExcelCode { get; set; } = string.Empty;
@@ -371,6 +374,15 @@ public sealed class MyReportPeriodListDocRole : DocRoleReadModelBase
     [BsonElement("isCurrentReport")]
     public bool IsCurrentReport { get; set; }
 
+    [BsonElement("reportIsActive")]
+    public bool ReportIsActive { get; set; } = true;
+
+    [BsonElement("reportDeactivatedAtUtc")]
+    public DateTime? ReportDeactivatedAtUtc { get; set; }
+
+    [BsonElement("reportDeactivationReason")]
+    public string? ReportDeactivationReason { get; set; }
+
     [BsonElement("isLateSubmission")]
     public bool IsLateSubmission { get; set; }
 
@@ -492,6 +504,15 @@ public sealed class ReviewReportListDocRole : DocRoleReadModelBase
 
     [BsonElement("reportStatus")]
     public WorkAssignmentReportStatus? ReportStatus { get; set; }
+
+    [BsonElement("reportIsActive")]
+    public bool ReportIsActive { get; set; } = true;
+
+    [BsonElement("reportDeactivatedAtUtc")]
+    public DateTime? ReportDeactivatedAtUtc { get; set; }
+
+    [BsonElement("reportDeactivationReason")]
+    public string? ReportDeactivationReason { get; set; }
 
     [BsonElement("submittedAtUtc")]
     public DateTime? SubmittedAtUtc { get; set; }

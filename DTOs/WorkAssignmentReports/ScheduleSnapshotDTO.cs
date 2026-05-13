@@ -41,4 +41,9 @@ public sealed class ScheduleSnapshotDTO
     /// Ghi chú thêm cho schedule.
     /// </summary>
     public string? Note { get; set; }
+
+    /// <summary>
+    /// Cấu hình nguồn dữ liệu theo section của dynamic form tại thời điểm report được tạo.
+    /// </summary>
+    public string? DynamicFormDataSourceRulesJson { get; set; }
 }

@@ -10,6 +10,8 @@ public interface IWorkAssignmentReviewService
     Task<PagedResult<ReviewReportFlatRowDto>> SearchReportsForReviewAsync(ReviewReportFlatSearchRequest req, CancellationToken ct = default);
     Task ApproveReportAsync(string reportId, ApproveReportRequest req, CancellationToken ct = default);
     Task ReturnReportAsync(string reportId, ReturnReportRequest req, CancellationToken ct = default);
+    Task DeactivateReportAsync(string reportId, ReportActiveRequest req, CancellationToken ct = default);
+    Task ReactivateReportAsync(string reportId, ReportActiveRequest req, CancellationToken ct = default);
     Task<bool> EvaluateAssignmentAsync(string assignmentId, EvaluateAssignmentRequest req, CancellationToken ct = default);
     Task<PagedResult<WorkAssignmentEvaluationLogRow>> GetEvaluationLogsAsync(string assignmentId, int page, int pageSize, CancellationToken ct = default);
     Task RecallApprovedReportAsync(string reportId, ReturnReportRequest req, CancellationToken ct);

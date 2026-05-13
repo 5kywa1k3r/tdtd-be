@@ -31,10 +31,15 @@ namespace tdtd_be.Data
         public IMongoCollection<MyReportTemplateListDocRole> MyReportTemplateListDocRoles { get; }
         public IMongoCollection<MyReportPeriodListDocRole> MyReportPeriodListDocRoles { get; }
         public IMongoCollection<ReviewReportListDocRole> ReviewReportListDocRoles { get; }
+        public IMongoCollection<DocRoleReadModelProjectionRetryJob> DocRoleReadModelProjectionRetryJobs { get; }
         public IMongoCollection<WorkAssignmentReport> WorkAssignmentReports { get; }
         public IMongoCollection<WorkReportPeriod> WorkReportPeriods { get; }
         public IMongoCollection<WorkAssignmentReportLog> WorkAssignmentReportLogs { get; }
+        public IMongoCollection<WorkAssignmentHandoverHistory> WorkAssignmentHandoverHistories { get; }
         public IMongoCollection<WorkStatusOperationLog> WorkStatusOperationLogs { get; }
+        public IMongoCollection<DynamicFormCloneRequest> DynamicFormCloneRequests { get; }
+        public IMongoCollection<UserActionLog> UserActionLogs { get; }
+        public IMongoCollection<UserActionLogRetryJob> UserActionLogRetryJobs { get; }
         public IMongoCollection<WorkAssignmentQueueItem> WorkAssignmentQueueItems { get; }
         public IMongoCollection<WorkAssignmentEvaluationLog> WorkAssignmentEvaluationLogs { get; }
         public IMongoCollection<WorkAssignmentMaterializeJobs> WorkAssignmentMaterializeJobs { get; }
@@ -45,6 +50,8 @@ namespace tdtd_be.Data
         public IMongoCollection<WorkReportTableStatAggregate> WorkReportTableStatAggregates { get; }
         public IMongoCollection<WorkReportFieldStatValue> WorkReportFieldStatValues { get; }
         public IMongoCollection<WorkReportFieldStatAggregate> WorkReportFieldStatAggregates { get; }
+        public IMongoCollection<WorkReportStatisticRebuildJob> WorkReportStatisticRebuildJobs { get; }
+        public IMongoCollection<UserNotification> Notifications { get; }
         public MongoDbContext(IOptions<MongoOptions> opt)
         {
             var o = opt.Value;
@@ -72,10 +79,15 @@ namespace tdtd_be.Data
             MyReportTemplateListDocRoles = Db.GetCollection<MyReportTemplateListDocRole>(o.MyReportTemplateListDocRoleCollection);
             MyReportPeriodListDocRoles = Db.GetCollection<MyReportPeriodListDocRole>(o.MyReportPeriodListDocRoleCollection);
             ReviewReportListDocRoles = Db.GetCollection<ReviewReportListDocRole>(o.ReviewReportListDocRoleCollection);
+            DocRoleReadModelProjectionRetryJobs = Db.GetCollection<DocRoleReadModelProjectionRetryJob>(o.DocRoleReadModelProjectionRetryJobCollection);
             WorkAssignmentReports = Db.GetCollection<WorkAssignmentReport>(o.WorkAssignmentReportCollection);
             WorkReportPeriods = Db.GetCollection<WorkReportPeriod>(o.WorkReportPeriodCollection);
             WorkAssignmentReportLogs = Db.GetCollection<WorkAssignmentReportLog>(o.WorkAssignmentReportLogCollection);
+            WorkAssignmentHandoverHistories = Db.GetCollection<WorkAssignmentHandoverHistory>(o.WorkAssignmentHandoverHistoryCollection);
             WorkStatusOperationLogs = Db.GetCollection<WorkStatusOperationLog>(o.WorkStatusOperationLogCollection);
+            DynamicFormCloneRequests = Db.GetCollection<DynamicFormCloneRequest>(o.DynamicFormCloneRequestCollection);
+            UserActionLogs = Db.GetCollection<UserActionLog>(o.UserActionLogCollection);
+            UserActionLogRetryJobs = Db.GetCollection<UserActionLogRetryJob>(o.UserActionLogRetryJobCollection);
             WorkAssignmentQueueItems = Db.GetCollection<WorkAssignmentQueueItem>(o.WorkAssignmentQueueCollection);
             WorkAssignmentEvaluationLogs = Db.GetCollection<WorkAssignmentEvaluationLog>(o.WorkAssignmentEvaluationLogCollection);
             WorkAssignmentMaterializeJobs = Db.GetCollection<WorkAssignmentMaterializeJobs>(o.WorkAssignmentMaterializeJobCollection);
@@ -86,6 +98,8 @@ namespace tdtd_be.Data
             WorkReportTableStatAggregates = Db.GetCollection<WorkReportTableStatAggregate>(o.WorkReportTableStatAggregateCollection);
             WorkReportFieldStatValues = Db.GetCollection<WorkReportFieldStatValue>(o.WorkReportFieldStatValueCollection);
             WorkReportFieldStatAggregates = Db.GetCollection<WorkReportFieldStatAggregate>(o.WorkReportFieldStatAggregateCollection);
+            WorkReportStatisticRebuildJobs = Db.GetCollection<WorkReportStatisticRebuildJob>(o.WorkReportStatisticRebuildJobCollection);
+            Notifications = Db.GetCollection<UserNotification>(o.NotificationCollection);
         }
     }
 }

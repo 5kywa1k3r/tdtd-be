@@ -5,6 +5,7 @@ using tdtd_be.Common.Auth;
 using tdtd_be.Data;
 using tdtd_be.DTOs.Statistics;
 using tdtd_be.Models;
+using tdtd_be.Models.Enums;
 using tdtd_be.Models.Statistics;
 
 namespace tdtd_be.Services.WorkAssignmentReports.Statistics;
@@ -30,8 +31,25 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
         string? actorUserId,
         CancellationToken ct = default)
     {
-        if (string.IsNullOrWhiteSpace(reportId))
+        var aggregateKey = await RebuildValuesForReportAsync(reportId, actorUserId, ct);
+        if (aggregateKey is null)
             return;
+
+        await RebuildAggregatesForWorkPeriodAsync(
+            aggregateKey.WorkId,
+            aggregateKey.PeriodInstanceKey,
+            aggregateKey.DynamicFormTemplateId,
+            actorUserId,
+            ct);
+    }
+
+    public async Task<ReportStatisticAggregateKey?> RebuildValuesForReportAsync(
+        string reportId,
+        string? actorUserId,
+        CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(reportId))
+            return null;
 
         var report = await _ctx.WorkAssignmentReports
             .Find(x => x.Id == reportId && !x.IsDeleted)
@@ -41,7 +59,7 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
         {
             await _ctx.WorkReportTableStatValues
                 .DeleteManyAsync(x => x.WorkAssignmentReportId == reportId, ct);
-            return;
+            return null;
         }
 
         var assignment = await _ctx.WorkAssignments
@@ -52,7 +70,31 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
             x => x.WorkAssignmentReportId == report.Id,
             ct);
 
-        var metricValues = ExtractMetricValues(report.TableValuesJson);
+        if (report.IsActive == false || report.Status != WorkAssignmentReportStatus.Approved)
+        {
+            return new ReportStatisticAggregateKey(
+                report.WorkId,
+                report.PeriodInstanceKey,
+                report.DynamicFormTemplateId);
+        }
+
+        var contributionPolicy = WorkReportCumulativeContributionPolicy.FromReport(report);
+        if (!contributionPolicy.IncludesReport)
+        {
+            return new ReportStatisticAggregateKey(
+                report.WorkId,
+                report.PeriodInstanceKey,
+                report.DynamicFormTemplateId);
+        }
+
+        var metricValues = ExtractMetricValues(report.TableValuesJson)
+            .Where(value => contributionPolicy.ShouldIncludeTableMetric(
+                value.BlockId,
+                value.MetricKey,
+                value.RowKey,
+                value.ColumnKey,
+                value.SourceKey))
+            .ToList();
         if (metricValues.Count > 0)
         {
             var now = DateTime.UtcNow;
@@ -94,12 +136,10 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
                 await _ctx.WorkReportTableStatValues.InsertManyAsync(rows, cancellationToken: ct);
         }
 
-        await RebuildAggregatesForWorkPeriodAsync(
+        return new ReportStatisticAggregateKey(
             report.WorkId,
             report.PeriodInstanceKey,
-            report.DynamicFormTemplateId,
-            actorUserId,
-            ct);
+            report.DynamicFormTemplateId);
     }
 
     public async Task RebuildAggregatesForWorkPeriodAsync(
@@ -210,7 +250,8 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
         var fb = Builders<WorkAssignmentReport>.Filter;
         var filter = fb.Eq(x => x.WorkId, normalized.WorkId)
                      & fb.Eq(x => x.IsDeleted, false)
-                     & fb.Eq(x => x.IsCurrent, true);
+                     & fb.Eq(x => x.IsCurrent, true)
+                     & fb.Ne(x => x.IsActive, false);
 
         if (!string.IsNullOrWhiteSpace(normalized.PeriodInstanceKey))
             filter &= fb.Eq(x => x.PeriodInstanceKey, normalized.PeriodInstanceKey);
@@ -383,18 +424,18 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
         CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(req.WorkId))
-            throw new InvalidOperationException("Thieu WorkId.");
+            throw ReportStatisticExceptions.WorkIdRequired("TABLE", req.WorkId);
 
         var scopeType = req.ScopeType?.Trim().ToUpperInvariant();
         if (scopeType is "ASSIGNMENT" or "ROOT")
         {
             if (string.IsNullOrWhiteSpace(req.ScopeId))
-                throw new InvalidOperationException("Thieu ScopeId.");
+                throw ReportStatisticExceptions.ScopeIdRequired("TABLE", req.WorkId, scopeType, req.ScopeId);
 
             var assignment = await _ctx.WorkAssignments
                 .Find(x => x.Id == req.ScopeId && x.WorkId == req.WorkId && !x.IsDeleted)
                 .FirstOrDefaultAsync(ct)
-                ?? throw new InvalidOperationException("Khong tim thay assignment thong ke.");
+                ?? throw ReportStatisticExceptions.AssignmentNotFound("TABLE", req.WorkId, scopeType, req.ScopeId);
 
             if (CanReadAssignment(assignment, actorUserId))
                 return;
@@ -413,7 +454,7 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
                 return;
         }
 
-        throw new UnauthorizedAccessException("Ban khong co quyen xem thong ke bang nay.");
+        throw ReportStatisticExceptions.ReadForbidden("TABLE", req.WorkId, scopeType, req.ScopeId, actorUserId);
     }
 
     private async Task EnsureCanReadWorkAsync(
@@ -430,7 +471,7 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
             .AnyAsync(ct);
 
         if (!anyVisibleAssignment)
-            throw new UnauthorizedAccessException("Ban khong co quyen sua thong ke bang nay.");
+            throw ReportStatisticExceptions.RebuildForbidden("TABLE", workId, actorUserId);
     }
 
     private static bool CanReadAssignment(WorkAssignment assignment, string actorUserId)
@@ -442,14 +483,14 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
         req ??= new TableStatisticSummaryRequest();
         var workId = req.WorkId?.Trim();
         if (string.IsNullOrWhiteSpace(workId))
-            throw new InvalidOperationException("Thieu WorkId.");
+            throw ReportStatisticExceptions.WorkIdRequired("TABLE", req.WorkId);
 
         var scopeType = string.IsNullOrWhiteSpace(req.ScopeType)
             ? "WORK"
             : req.ScopeType.Trim().ToUpperInvariant();
 
         if (scopeType is not ("WORK" or "ROOT" or "ASSIGNMENT"))
-            throw new InvalidOperationException("ScopeType khong hop le.");
+            throw ReportStatisticExceptions.ScopeTypeInvalid("TABLE", workId, req.ScopeType);
 
         var scopeId = string.IsNullOrWhiteSpace(req.ScopeId)
             ? (scopeType == "WORK" ? workId : null)
@@ -478,7 +519,7 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
         req ??= new RebuildTableStatisticRequest();
         var workId = req.WorkId?.Trim();
         if (string.IsNullOrWhiteSpace(workId))
-            throw new InvalidOperationException("Thieu WorkId.");
+            throw ReportStatisticExceptions.WorkIdRequired("TABLE", req.WorkId);
 
         return new RebuildTableStatisticRequest
         {

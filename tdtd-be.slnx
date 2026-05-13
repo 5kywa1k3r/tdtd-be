@@ -1,3 +1,4 @@
 <Solution>
   <Project Path="tdtd-be.csproj" />
+  <Project Path="tests\tdtd-be.Tests\tdtd-be.Tests.csproj" />
 </Solution>

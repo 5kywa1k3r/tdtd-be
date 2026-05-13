@@ -1,4 +1,5 @@
-﻿using tdtd_be.Models;
+using tdtd_be.Common.Errors;
+using tdtd_be.Models;
 
 namespace tdtd_be.Services.WorkAssignments.Internal;
 
@@ -6,11 +7,13 @@ internal static class WorkAssignmentReviewPermissionHelper
 {
     public static void EnsureCanReviewOnNode(WorkAssignment node, string currentUserId)
     {
-        if (node == null) throw new InvalidOperationException("Node không hợp lệ.");
+        if (node == null) throw AppExceptionFactory.BadRequest(AppErrorCode.WORK_ASSIGNMENT_NODE_INVALID);
         if (string.IsNullOrWhiteSpace(currentUserId))
-            throw new UnauthorizedAccessException("Không xác định được người dùng review.");
+            throw AppExceptionFactory.Unauthorized(AppErrorCode.WORK_ASSIGNMENT_REVIEWER_MISSING);
 
         if (!string.Equals(node.CreatedByUserId, currentUserId, StringComparison.Ordinal))
-            throw new UnauthorizedAccessException("Chỉ owner của node review mới được xem và duyệt báo cáo.");
+            throw AppExceptionFactory.Forbidden(
+                AppErrorCode.WORK_ASSIGNMENT_REVIEW_FORBIDDEN,
+                new { assignmentId = node.Id });
     }
 }

@@ -1,14 +1,12 @@
 using System.Text.Json;
 using MongoDB.Driver;
+using tdtd_be.Common.Errors;
 using tdtd_be.Data;
-using tdtd_be.DTOs.DynamicForms;
 
 namespace tdtd_be.Services.WorkAssignments.Lookups;
 
 public sealed class WorkAssignmentTemplateResolver : IWorkAssignmentTemplateResolver
 {
-    private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
-
     private readonly MongoDbContext _ctx;
 
     public WorkAssignmentTemplateResolver(MongoDbContext ctx)
@@ -18,16 +16,12 @@ public sealed class WorkAssignmentTemplateResolver : IWorkAssignmentTemplateReso
 
     public async Task<WorkAssignmentTemplateResolution> ResolveAsync(
         string? dynamicFormTemplateId,
-        string? dynamicExcelId,
         CancellationToken ct = default)
     {
-        if (!string.IsNullOrWhiteSpace(dynamicFormTemplateId))
-            return await ResolveDynamicFormAsync(dynamicFormTemplateId.Trim(), ct);
+        if (string.IsNullOrWhiteSpace(dynamicFormTemplateId))
+            throw AppExceptionFactory.BadRequest(AppErrorCode.DYNAMIC_FORM_TEMPLATE_REQUIRED);
 
-        if (!string.IsNullOrWhiteSpace(dynamicExcelId))
-            return await ResolveLegacyDynamicExcelAsync(dynamicExcelId.Trim(), ct);
-
-        throw new InvalidOperationException("Thiếu Dynamic Form template.");
+        return await ResolveDynamicFormAsync(dynamicFormTemplateId.Trim(), ct);
     }
 
     private async Task<WorkAssignmentTemplateResolution> ResolveDynamicFormAsync(
@@ -41,41 +35,36 @@ public sealed class WorkAssignmentTemplateResolver : IWorkAssignmentTemplateReso
                 x.IsPublished &&
                 !x.IsDeleted)
             .FirstOrDefaultAsync(ct)
-            ?? throw new InvalidOperationException("Dynamic Form template không tồn tại hoặc chưa publish.");
+            ?? throw AppExceptionFactory.NotFound(
+                AppErrorCode.DYNAMIC_FORM_TEMPLATE_NOT_FOUND_OR_UNPUBLISHED,
+                new { dynamicFormTemplateId });
 
         var excelId = NormalizeId(form.ExcelBlockDynamicExcelTemplateId)
-            ?? ExtractExcelTemplateId(form.ExcelBlockJson);
+            ?? ExtractExcelTemplateId(form.ExcelBlockJson)
+            ?? ExtractExcelTemplateIdFromBlocks(form.BlocksJson);
 
         if (string.IsNullOrWhiteSpace(excelId))
-            throw new InvalidOperationException("Dynamic Form template chưa có Excel block để chạy báo cáo hiện tại.");
+        {
+            return new WorkAssignmentTemplateResolution(
+                form.Id,
+                form.Code,
+                form.Name,
+                null,
+                string.Empty,
+                string.Empty);
+        }
 
         var excel = await _ctx.DynamicExcelTemplates
             .Find(x => x.Id == excelId && !x.IsDeleted)
             .FirstOrDefaultAsync(ct)
-            ?? throw new InvalidOperationException("Excel block của Dynamic Form không tồn tại.");
+            ?? throw AppExceptionFactory.NotFound(
+                AppErrorCode.DYNAMIC_FORM_EXCEL_BLOCK_NOT_FOUND,
+                new { dynamicFormTemplateId, dynamicExcelTemplateId = excelId });
 
         return new WorkAssignmentTemplateResolution(
             form.Id,
             form.Code,
             form.Name,
-            excel.Id,
-            excel.Code ?? string.Empty,
-            excel.Name ?? string.Empty);
-    }
-
-    private async Task<WorkAssignmentTemplateResolution> ResolveLegacyDynamicExcelAsync(
-        string dynamicExcelId,
-        CancellationToken ct)
-    {
-        var excel = await _ctx.DynamicExcelTemplates
-            .Find(x => x.Id == dynamicExcelId && !x.IsDeleted)
-            .FirstOrDefaultAsync(ct)
-            ?? throw new InvalidOperationException("Biểu mẫu/bảng động không tồn tại.");
-
-        return new WorkAssignmentTemplateResolution(
-            null,
-            null,
-            null,
             excel.Id,
             excel.Code ?? string.Empty,
             excel.Name ?? string.Empty);
@@ -88,16 +77,59 @@ public sealed class WorkAssignmentTemplateResolver : IWorkAssignmentTemplateReso
 
         try
         {
-            var snapshot = JsonSerializer.Deserialize<DynamicFormExcelBlockSnapshot>(
-                excelBlockJson,
-                JsonOptions);
-
-            return NormalizeId(snapshot?.DynamicExcelTemplateId);
+            using var document = JsonDocument.Parse(excelBlockJson);
+            return ExtractExcelTemplateId(document.RootElement);
         }
         catch (JsonException)
         {
             return null;
         }
+    }
+
+    private static string? ExtractExcelTemplateIdFromBlocks(string? blocksJson)
+    {
+        if (string.IsNullOrWhiteSpace(blocksJson))
+            return null;
+
+        try
+        {
+            using var document = JsonDocument.Parse(blocksJson);
+            if (document.RootElement.ValueKind != JsonValueKind.Array)
+                return null;
+
+            foreach (var item in document.RootElement.EnumerateArray())
+            {
+                var id = ExtractExcelTemplateId(item);
+                if (!string.IsNullOrWhiteSpace(id))
+                    return id;
+            }
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+
+        return null;
+    }
+
+    private static string? ExtractExcelTemplateId(JsonElement root)
+    {
+        if (root.ValueKind != JsonValueKind.Object)
+            return null;
+
+        if (root.TryGetProperty("dynamicExcelTemplateId", out var camel)
+            && camel.ValueKind == JsonValueKind.String)
+        {
+            return NormalizeId(camel.GetString());
+        }
+
+        if (root.TryGetProperty("DynamicExcelTemplateId", out var pascal)
+            && pascal.ValueKind == JsonValueKind.String)
+        {
+            return NormalizeId(pascal.GetString());
+        }
+
+        return null;
     }
 
     private static string? NormalizeId(string? value)

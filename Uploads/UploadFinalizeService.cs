@@ -2,6 +2,7 @@
 using Minio.DataModel.Args;
 using MongoDB.Bson;
 using MongoDB.Driver;
+using tdtd_be.Common.Errors;
 using tdtd_be.Data;
 using tdtd_be.Models;
 using tusdotnet.Interfaces;
@@ -41,14 +42,14 @@ public sealed class UploadFinalizeService
 
         // 1) validate upload token
         if (!ctx.HttpContext.Request.Headers.TryGetValue("Upload-Token", out var tok) || string.IsNullOrWhiteSpace(tok))
-            throw new InvalidOperationException("Missing Upload-Token on finalize");
+            throw AppExceptionFactory.BadRequest(AppErrorCode.UPLOAD_TOKEN_MISSING, new { uploadId });
 
         var payload = _tokens.Validate(tok!);
         if (payload == null)
-            throw new InvalidOperationException("Invalid Upload-Token on finalize");
+            throw AppExceptionFactory.BadRequest(AppErrorCode.UPLOAD_TOKEN_INVALID, new { uploadId });
         var sourceId = payload.SourceId;
         if (string.IsNullOrWhiteSpace(sourceId))
-            throw new InvalidOperationException("Upload missing SourceId");
+            throw AppExceptionFactory.BadRequest(AppErrorCode.UPLOAD_SOURCE_ID_MISSING, new { uploadId });
 
         var tusFile = await ctx.GetFileAsync();
         var meta = await tusFile.GetMetadataAsync(ctx.CancellationToken);
@@ -95,7 +96,7 @@ public sealed class UploadFinalizeService
                 _log.LogError(
                     "Finalize: invalid putSize. uploadId={uploadId}, canSeek={canSeek}, declaredLen={declaredLen}",
                     uploadId, content.CanSeek, payload.Length);
-                throw new InvalidOperationException($"Invalid upload size: {putSize}");
+                throw AppExceptionFactory.BadRequest(AppErrorCode.UPLOAD_SIZE_COMMITTED_INVALID, new { uploadId, putSize });
             }
 
             _log.LogInformation(

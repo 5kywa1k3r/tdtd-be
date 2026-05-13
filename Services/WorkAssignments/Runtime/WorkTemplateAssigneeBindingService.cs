@@ -1,4 +1,5 @@
 ﻿using MongoDB.Driver;
+using tdtd_be.Common.Errors;
 using tdtd_be.Data;
 using tdtd_be.Models;
 
@@ -16,7 +17,7 @@ public sealed class WorkTemplateAssigneeBindingService : IWorkTemplateAssigneeBi
     public async Task RebuildForAssignmentAsync(WorkAssignment assignment, string actorUserId, CancellationToken ct = default)
     {
         if (assignment is null)
-            throw new ArgumentNullException(nameof(assignment));
+            throw AppExceptionFactory.BadRequest(AppErrorCode.WORK_ASSIGNMENT_NODE_INVALID, new { field = nameof(assignment) });
 
         var now = DateTime.UtcNow;
         var activeAssigneeIds = (assignment.Assignees ?? new List<UserRef>())
@@ -61,6 +62,7 @@ public sealed class WorkTemplateAssigneeBindingService : IWorkTemplateAssigneeBi
                 .Set(x => x.DynamicFormTemplateId, assignment.DynamicFormTemplateId)
                 .Set(x => x.DynamicFormTemplateCode, assignment.DynamicFormTemplateCode)
                 .Set(x => x.DynamicFormTemplateName, assignment.DynamicFormTemplateName)
+                .Set(x => x.DynamicFormDataSourceRulesJson, assignment.DynamicFormDataSourceRulesJson)
                 .Set(x => x.AssigneeUserId, assignee.UserId)
                 .Set(x => x.AssigneeUsername, assignee.Username ?? string.Empty)
                 .Set(x => x.AssigneeFullName, assignee.FullName ?? string.Empty)

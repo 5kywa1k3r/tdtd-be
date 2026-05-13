@@ -92,8 +92,8 @@ public sealed class WorkAssignmentQueueJobService : IWorkAssignmentQueueJobServi
                             .Set(x => x.UpdatedByUserId, null),
                         cancellationToken: ct);
 
-                    await _docRoleReadModelProjection.RebuildReportPeriodAsync(period.Id, "system", ct);
                     await _sync.SyncFromAssignmentAsync(period.WorkAssignmentId, ct);
+                    await _docRoleReadModelProjection.RebuildReportPeriodAsync(period.Id, "system", ct);
                     changed++;
                 }
 

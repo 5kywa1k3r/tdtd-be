@@ -2,7 +2,7 @@
 
 /// <summary>
 /// Điều kiện tìm kiếm danh sách ngoài cùng của user,
-/// nhóm theo DynamicExcelId trong phạm vi 1 Work.
+/// nhóm theo DynamicFormTemplateId trong phạm vi 1 Work.
 /// </summary>
 public sealed class MyReportTemplateSearchRequest
 {
@@ -43,8 +43,8 @@ public sealed class MyReportTemplateSearchRequest
     /// <summary>
     /// Trường sắp xếp.
     /// Hỗ trợ:
-    /// - dynamicExcelCode
-    /// - dynamicExcelName
+    /// - dynamicFormTemplateCode
+    /// - dynamicFormTemplateName
     /// - latestUpdatedAtUtc
     /// - latestDueAtUtc
     /// - periodCount

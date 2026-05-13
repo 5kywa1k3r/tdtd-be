@@ -1,4 +1,6 @@
-﻿using tdtd_be.DTOs.Auth;
+using tdtd_be.Common.Auth;
+using tdtd_be.Common.Errors;
+using tdtd_be.DTOs.Auth;
 using tdtd_be.Models;
 using tdtd_be.Services.Common;
 
@@ -23,29 +25,31 @@ namespace tdtd_be.Services.Works
 
         public void EnsureCanCreateRoot(MeResponse me)
         {
-            if (me == null || string.IsNullOrWhiteSpace(me.Id))
-                throw new UnauthorizedAccessException("Bạn không có quyền tạo công việc.");
+            if (me == null ||
+                string.IsNullOrWhiteSpace(me.Id) ||
+                !RoleGuard.IsGeneratedManagementAccount(me))
+                throw AppExceptionFactory.Forbidden(AppErrorCode.WORK_CREATE_FORBIDDEN);
         }
 
         public async Task EnsureCanReadAsync(string workId, string userId, CancellationToken ct)
         {
             var ok = await _docRole.HasAnyRoleAsync(DocType.WORK, workId, userId, ct);
             if (!ok)
-                throw new UnauthorizedAccessException("Bạn không có quyền xem công việc này.");
+                throw AppExceptionFactory.Forbidden(AppErrorCode.WORK_READ_FORBIDDEN, new { workId });
         }
 
         public async Task EnsureCanUpdateRootAsync(string workId, string userId, CancellationToken ct)
         {
             var ok = await _docRole.HasRoleAsync(DocType.WORK, workId, userId, DocRoleType.OWNER, ct);
             if (!ok)
-                throw new UnauthorizedAccessException("Bạn không có quyền sửa thuộc tính chung của công việc.");
+                throw AppExceptionFactory.Forbidden(AppErrorCode.WORK_UPDATE_FORBIDDEN, new { workId });
         }
 
         public async Task EnsureCanDeleteRootAsync(string workId, string userId, CancellationToken ct)
         {
             var ok = await _docRole.HasRoleAsync(DocType.WORK, workId, userId, DocRoleType.OWNER, ct);
             if (!ok)
-                throw new UnauthorizedAccessException("Bạn không có quyền xóa công việc này.");
+                throw AppExceptionFactory.Forbidden(AppErrorCode.WORK_DELETE_FORBIDDEN, new { workId });
         }
     }
 }

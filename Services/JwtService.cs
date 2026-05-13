@@ -4,6 +4,7 @@ using Microsoft.IdentityModel.Tokens;
 using System.IdentityModel.Tokens.Jwt;
 using System.Security.Claims;
 using System.Text;
+using tdtd_be.Common.Errors;
 using tdtd_be.Models;
 using tdtd_be.Options;
 
@@ -19,7 +20,7 @@ namespace tdtd_be.Services
             _opt = opt.Value;
 
             if (string.IsNullOrWhiteSpace(_opt.Key))
-                throw new InvalidOperationException("Jwt:Key is required.");
+                throw AppExceptionFactory.Create(AppErrorCode.AUTH_CONFIG_INVALID, new { key = "Jwt:Key" });
 
             var keyBytes = Encoding.UTF8.GetBytes(_opt.Key);
             var key = new SymmetricSecurityKey(keyBytes);
@@ -47,6 +48,7 @@ namespace tdtd_be.Services
                 new("unitName", unitName ?? ""),
                 new("unitCode", unitCode ?? ""),
                 new("positionCode", u.PositionCode ?? ""),
+                new("accountKind", u.AccountKind ?? ""),
 
                 new("isDeleted", u.IsDeleted ? "true" : "false"),
 

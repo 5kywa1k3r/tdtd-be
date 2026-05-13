@@ -16,7 +16,7 @@ public sealed class AggregateTableRequest
     public string? PeriodKeyFrom { get; set; }
     public string? PeriodKeyTo { get; set; }
 
-    // APPROVED_ONLY | APPROVED_AND_SUBMITTED
+    // APPROVED_ONLY. Backend intentionally ignores submitted reports in aggregation.
     public string? SourceStatusMode { get; set; }
 
     public List<string>? SelectedUnitIds { get; set; }

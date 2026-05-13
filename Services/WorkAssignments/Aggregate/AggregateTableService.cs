@@ -1,12 +1,14 @@
 using System.Text.Json;
 using MongoDB.Driver;
 using tdtd_be.Common.Auth;
+using tdtd_be.Common.Errors;
 using tdtd_be.Data;
 using tdtd_be.DTOs.WorkAssignments.Aggregate;
 using tdtd_be.DTOs.WorkAssignments.AggregateTable;
 using tdtd_be.Models;
 using tdtd_be.Models.Enums;
 using tdtd_be.Models.Statistics;
+using tdtd_be.Services;
 
 namespace tdtd_be.Services.WorkAssignments.Aggregate;
 
@@ -37,7 +39,7 @@ public sealed class AggregateTableService : IAggregateTableService
 
         ValidateAggregateRequest(normalized);
 
-        var parent = await LoadAggregateParentAsync(normalized.ParentAssignmentId!, me.Id, ct);
+        await LoadAggregateParentAsync(normalized.ParentAssignmentId!, me.Id, ct);
         normalized.SelectedUnitIds = await ResolveSelectedUnitIdsAsync(normalized.SelectedUnitIds, ct);
 
         var assignments = await LoadAggregateChildrenAsync(
@@ -49,18 +51,27 @@ public sealed class AggregateTableService : IAggregateTableService
         if (assignments.Count == 0)
             return BuildEmptyAggregateResponse(normalized);
 
+        var dynamicExcelTemplate = await LoadDynamicExcelTemplateAsync(normalized.DynamicExcelId!, ct);
         var effectiveReports = await LoadAggregateReportsAsync(assignments, normalized, ct);
         var sources = BuildAggregateSources(assignments, effectiveReports);
 
         if (effectiveReports.Count == 0)
+        {
+            if (IsRecordTableTemplate(dynamicExcelTemplate, null))
+                return BuildEmptyRecordTableResponse(normalized, assignments[0], sources, dynamicExcelTemplate);
+
             return BuildEmptyAggregateResponse(normalized, assignments[0], sources);
+        }
+
+        if (IsRecordTableTemplate(dynamicExcelTemplate, effectiveReports[0]))
+            return BuildRecordTableResult(normalized, assignments, effectiveReports, sources, dynamicExcelTemplate);
 
         return normalized.AggregateMode switch
         {
             "SUM_BY_CELL" => BuildSumByCellResult(normalized, assignments, effectiveReports, sources),
             "HORIZONTAL_BY_USER" => BuildRowsByUserResult(normalized, assignments, effectiveReports, sources),
             "VERTICAL_BY_USER" => BuildColumnsByUserResult(normalized, assignments, effectiveReports, sources),
-            _ => throw new InvalidOperationException("AggregateMode không hợp lệ.")
+            _ => throw InvalidAggregateMode(normalized.AggregateMode)
         };
     }
 
@@ -80,7 +91,9 @@ public sealed class AggregateTableService : IAggregateTableService
                 x.Id == normalized.DynamicFormTemplateId &&
                 !x.IsDeleted)
             .FirstOrDefaultAsync(ct)
-            ?? throw new InvalidOperationException("Dynamic Form template khong ton tai.");
+            ?? throw AppExceptionFactory.NotFound(
+                AppErrorCode.DYNAMIC_FORM_TEMPLATE_NOT_FOUND_OR_UNPUBLISHED,
+                new { dynamicFormTemplateId = normalized.DynamicFormTemplateId });
 
         var contract = ResolveDynamicFormTableContract(template, normalized.BlockId, normalized.TableMode);
         var requestedMetricKeys = (normalized.MetricKeys ?? new List<string>())
@@ -96,7 +109,15 @@ public sealed class AggregateTableService : IAggregateTableService
                 .ToList();
 
         if (metrics.Count == 0)
-            throw new InvalidOperationException("Khong tim thay metricKey hop le trong block Dynamic Form.");
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_AGGREGATE_METRIC_KEY_NOT_FOUND,
+                new
+                {
+                    normalized.DynamicFormTemplateId,
+                    normalized.BlockId,
+                    normalized.TableMode,
+                    requestedMetricKeys
+                });
 
         normalized.SelectedUnitIds = await ResolveSelectedUnitIdsAsync(normalized.SelectedUnitIds, ct);
 
@@ -168,7 +189,7 @@ public sealed class AggregateTableService : IAggregateTableService
         => (value ?? "SINGLE_PERIOD").Trim().ToUpperInvariant();
 
     private static string NormalizeSourceStatusMode(string? value)
-        => (value ?? "APPROVED_ONLY").Trim().ToUpperInvariant();
+        => "APPROVED_ONLY";
 
     private static string NormalizeAggregateMode(string? value)
         => (value ?? "SUM_BY_CELL").Trim().ToUpperInvariant();
@@ -205,28 +226,28 @@ public sealed class AggregateTableService : IAggregateTableService
     private static void ValidateAggregateRequest(AggregateTableRequest req)
     {
         if (string.IsNullOrWhiteSpace(req.ParentAssignmentId))
-            throw new InvalidOperationException("Thiếu ParentAssignmentId.");
+            throw AppExceptionFactory.BadRequest(AppErrorCode.WORK_ASSIGNMENT_AGGREGATE_PARENT_ID_REQUIRED);
 
         if (string.IsNullOrWhiteSpace(req.DynamicExcelId))
-            throw new InvalidOperationException("Thiếu DynamicExcelId.");
+            throw AppExceptionFactory.BadRequest(AppErrorCode.WORK_ASSIGNMENT_AGGREGATE_DYNAMIC_EXCEL_ID_REQUIRED);
 
         if (req.AggregateMode is not ("SUM_BY_CELL" or "HORIZONTAL_BY_USER" or "VERTICAL_BY_USER"))
-            throw new InvalidOperationException("AggregateMode không hợp lệ.");
+            throw InvalidAggregateMode(req.AggregateMode);
 
         if (req.PeriodScopeMode == "SINGLE_PERIOD")
         {
             if (string.IsNullOrWhiteSpace(req.PeriodKey))
-                throw new InvalidOperationException("Thiếu PeriodKey.");
+                throw MissingPeriodKey("PeriodKey", req.PeriodScopeMode);
             return;
         }
 
         if (req.PeriodScopeMode == "PERIOD_RANGE")
         {
             if (string.IsNullOrWhiteSpace(req.PeriodKeyFrom))
-                throw new InvalidOperationException("Thiếu PeriodKeyFrom.");
+                throw MissingPeriodKey("PeriodKeyFrom", req.PeriodScopeMode);
 
             if (string.IsNullOrWhiteSpace(req.PeriodKeyTo))
-                throw new InvalidOperationException("Thiếu PeriodKeyTo.");
+                throw MissingPeriodKey("PeriodKeyTo", req.PeriodScopeMode);
 
             return;
         }
@@ -234,12 +255,12 @@ public sealed class AggregateTableService : IAggregateTableService
         if (req.PeriodScopeMode == "CUMULATIVE_TO_PERIOD")
         {
             if (string.IsNullOrWhiteSpace(req.PeriodKeyTo))
-                throw new InvalidOperationException("Thieu PeriodKeyTo.");
+                throw MissingPeriodKey("PeriodKeyTo", req.PeriodScopeMode);
             return;
         }
 
         if (req.PeriodScopeMode != "ALL_PERIODS")
-            throw new InvalidOperationException("PeriodScopeMode không hợp lệ.");
+            throw InvalidPeriodScopeMode(req.PeriodScopeMode);
     }
 
     private static DynamicFormAggregateRequest NormalizeDynamicFormRequest(DynamicFormAggregateRequest req)
@@ -281,31 +302,35 @@ public sealed class AggregateTableService : IAggregateTableService
     private static void ValidateDynamicFormRequest(DynamicFormAggregateRequest req)
     {
         if (string.IsNullOrWhiteSpace(req.ScopeAssignmentId))
-            throw new InvalidOperationException("Thieu ScopeAssignmentId.");
+            throw AppExceptionFactory.BadRequest(AppErrorCode.WORK_ASSIGNMENT_AGGREGATE_SCOPE_ID_REQUIRED);
 
         if (req.ScopeMode is not ("DIRECT_CHILDREN" or "SUBTREE"))
-            throw new InvalidOperationException("ScopeMode hien tai chi ho tro DIRECT_CHILDREN hoac SUBTREE.");
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_AGGREGATE_SCOPE_MODE_INVALID,
+                new { req.ScopeMode });
 
         if (string.IsNullOrWhiteSpace(req.DynamicFormTemplateId))
-            throw new InvalidOperationException("Thieu DynamicFormTemplateId.");
+            throw AppExceptionFactory.BadRequest(AppErrorCode.WORK_ASSIGNMENT_AGGREGATE_DYNAMIC_FORM_TEMPLATE_ID_REQUIRED);
 
         if (req.TableMode is not ("FIXED_GRID" or "APPEND_ROWS" or "APPEND_COLUMNS" or "MATRIX" or "SUMMARY_TEMPLATE"))
-            throw new InvalidOperationException("TableMode khong hop le.");
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_AGGREGATE_TABLE_MODE_INVALID,
+                new { req.TableMode });
 
         if (req.PeriodScopeMode == "SINGLE_PERIOD")
         {
             if (string.IsNullOrWhiteSpace(req.PeriodKey))
-                throw new InvalidOperationException("Thieu PeriodKey.");
+                throw MissingPeriodKey("PeriodKey", req.PeriodScopeMode);
             return;
         }
 
         if (req.PeriodScopeMode == "PERIOD_RANGE")
         {
             if (string.IsNullOrWhiteSpace(req.PeriodKeyFrom))
-                throw new InvalidOperationException("Thieu PeriodKeyFrom.");
+                throw MissingPeriodKey("PeriodKeyFrom", req.PeriodScopeMode);
 
             if (string.IsNullOrWhiteSpace(req.PeriodKeyTo))
-                throw new InvalidOperationException("Thieu PeriodKeyTo.");
+                throw MissingPeriodKey("PeriodKeyTo", req.PeriodScopeMode);
 
             return;
         }
@@ -313,13 +338,49 @@ public sealed class AggregateTableService : IAggregateTableService
         if (req.PeriodScopeMode == "CUMULATIVE_TO_PERIOD")
         {
             if (string.IsNullOrWhiteSpace(req.PeriodKeyTo))
-                throw new InvalidOperationException("Thieu PeriodKeyTo.");
+                throw MissingPeriodKey("PeriodKeyTo", req.PeriodScopeMode);
             return;
         }
 
         if (req.PeriodScopeMode != "ALL_PERIODS")
-            throw new InvalidOperationException("PeriodScopeMode khong hop le.");
+            throw InvalidPeriodScopeMode(req.PeriodScopeMode);
     }
+
+    private static AppException InvalidAggregateMode(string? aggregateMode)
+        => AppExceptionFactory.BadRequest(
+            AppErrorCode.WORK_ASSIGNMENT_AGGREGATE_MODE_INVALID,
+            new { aggregateMode });
+
+    private static AppException InvalidPeriodScopeMode(string? periodScopeMode)
+        => AppExceptionFactory.BadRequest(
+            AppErrorCode.WORK_ASSIGNMENT_AGGREGATE_PERIOD_SCOPE_INVALID,
+            new { periodScopeMode });
+
+    private static AppException MissingPeriodKey(string field, string? periodScopeMode)
+    {
+        var code = field switch
+        {
+            "PeriodKeyFrom" => AppErrorCode.WORK_ASSIGNMENT_AGGREGATE_PERIOD_KEY_FROM_REQUIRED,
+            "PeriodKeyTo" => AppErrorCode.WORK_ASSIGNMENT_AGGREGATE_PERIOD_KEY_TO_REQUIRED,
+            _ => AppErrorCode.WORK_ASSIGNMENT_AGGREGATE_PERIOD_KEY_REQUIRED
+        };
+
+        return AppExceptionFactory.BadRequest(code, new { field, periodScopeMode });
+    }
+
+    private static AppException DynamicFormBlockNotFound(string? dynamicFormTemplateId, string? blockId)
+        => AppExceptionFactory.NotFound(
+            AppErrorCode.DYNAMIC_FORM_BLOCK_NOT_FOUND,
+            new { dynamicFormTemplateId, blockId });
+
+    private static AppException DynamicFormTableContractInvalid(
+        string? dynamicFormTemplateId,
+        string blockId,
+        string tableMode,
+        string reason)
+        => AppExceptionFactory.BadRequest(
+            AppErrorCode.DYNAMIC_FORM_TABLE_CONTRACT_INVALID,
+            new { dynamicFormTemplateId, blockId, tableMode, reason });
 
     private async Task<WorkAssignment> LoadAggregateParentAsync(
         string parentAssignmentId,
@@ -329,13 +390,17 @@ public sealed class AggregateTableService : IAggregateTableService
         var parent = await _ctx.WorkAssignments
             .Find(x => x.Id == parentAssignmentId && !x.IsDeleted)
             .FirstOrDefaultAsync(ct)
-            ?? throw new InvalidOperationException("Không tìm thấy assignment gốc.");
+            ?? throw AppExceptionFactory.NotFound(
+                AppErrorCode.WORK_ASSIGNMENT_AGGREGATE_PARENT_NOT_FOUND,
+                new { parentAssignmentId });
 
         var canView = string.Equals(parent.CreatedByUserId, actorUserId, StringComparison.Ordinal)
             || (parent.LeaderWatcherUserIds?.Contains(actorUserId) ?? false);
 
         if (!canView)
-            throw new UnauthorizedAccessException("Bạn không có quyền xem tổng hợp này.");
+            throw AppExceptionFactory.Forbidden(
+                AppErrorCode.WORK_ASSIGNMENT_AGGREGATE_READ_FORBIDDEN,
+                new { parentAssignmentId, actorUserId });
 
         return parent;
     }
@@ -435,6 +500,14 @@ public sealed class AggregateTableService : IAggregateTableService
             .ToListAsync(ct);
     }
 
+    private async Task<DynamicExcelTemplate?> LoadDynamicExcelTemplateAsync(string dynamicExcelId, CancellationToken ct)
+    {
+        var template = await _ctx.DynamicExcelTemplates
+            .Find(x => x.Id == dynamicExcelId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct);
+        return template;
+    }
+
     private async Task<List<WorkAssignmentReport>> LoadDynamicFormAggregateReportsAsync(
         List<WorkAssignment> assignments,
         DynamicFormAggregateRequest req,
@@ -460,7 +533,11 @@ public sealed class AggregateTableService : IAggregateTableService
         var filter = Builders<WorkAssignmentReport>.Filter.And(
             Builders<WorkAssignmentReport>.Filter.In(x => x.WorkAssignmentId, assignmentIds),
             Builders<WorkAssignmentReport>.Filter.Eq(x => x.IsDeleted, false),
-            Builders<WorkAssignmentReport>.Filter.Eq(x => x.IsCurrent, true));
+            Builders<WorkAssignmentReport>.Filter.Eq(x => x.IsCurrent, true),
+            Builders<WorkAssignmentReport>.Filter.Ne(x => x.IsActive, false),
+            Builders<WorkAssignmentReport>.Filter.Ne(
+                x => x.CumulativeContributionMode,
+                WorkReportCumulativeContributionMode.Exclude));
 
         if (req.PeriodScopeMode == "SINGLE_PERIOD")
         {
@@ -504,7 +581,11 @@ public sealed class AggregateTableService : IAggregateTableService
             Builders<WorkAssignmentReport>.Filter.In(x => x.WorkAssignmentId, assignmentIds),
             Builders<WorkAssignmentReport>.Filter.Eq(x => x.DynamicFormTemplateId, req.DynamicFormTemplateId),
             Builders<WorkAssignmentReport>.Filter.Eq(x => x.IsDeleted, false),
-            Builders<WorkAssignmentReport>.Filter.Eq(x => x.IsCurrent, true));
+            Builders<WorkAssignmentReport>.Filter.Eq(x => x.IsCurrent, true),
+            Builders<WorkAssignmentReport>.Filter.Ne(x => x.IsActive, false),
+            Builders<WorkAssignmentReport>.Filter.Ne(
+                x => x.CumulativeContributionMode,
+                WorkReportCumulativeContributionMode.Exclude));
 
         if (req.PeriodScopeMode == "SINGLE_PERIOD")
         {
@@ -632,14 +713,14 @@ public sealed class AggregateTableService : IAggregateTableService
     private static List<DynamicFormAggregateColumnDto> BuildDynamicFormColumns()
         => new()
         {
-            new DynamicFormAggregateColumnDto { Key = "metricKey", Label = "Metric", Type = "text" },
-            new DynamicFormAggregateColumnDto { Key = "rowKey", Label = "Row", Type = "text" },
-            new DynamicFormAggregateColumnDto { Key = "columnKey", Label = "Column", Type = "text" },
-            new DynamicFormAggregateColumnDto { Key = "count", Label = "Count", Type = "number" },
-            new DynamicFormAggregateColumnDto { Key = "sum", Label = "Sum", Type = "number" },
-            new DynamicFormAggregateColumnDto { Key = "min", Label = "Min", Type = "number" },
-            new DynamicFormAggregateColumnDto { Key = "max", Label = "Max", Type = "number" },
-            new DynamicFormAggregateColumnDto { Key = "average", Label = "Average", Type = "number" },
+            new DynamicFormAggregateColumnDto { Key = "metricKey", Label = "Mã chỉ số", Type = "text" },
+            new DynamicFormAggregateColumnDto { Key = "rowKey", Label = "Dòng", Type = "text" },
+            new DynamicFormAggregateColumnDto { Key = "columnKey", Label = "Cột", Type = "text" },
+            new DynamicFormAggregateColumnDto { Key = "count", Label = "Số ô có dữ liệu", Type = "number" },
+            new DynamicFormAggregateColumnDto { Key = "sum", Label = "Tổng", Type = "number" },
+            new DynamicFormAggregateColumnDto { Key = "min", Label = "Nhỏ nhất", Type = "number" },
+            new DynamicFormAggregateColumnDto { Key = "max", Label = "Lớn nhất", Type = "number" },
+            new DynamicFormAggregateColumnDto { Key = "average", Label = "Trung bình", Type = "number" },
         };
 
     private async Task<List<DynamicFormAggregateRowDto>?> BuildDynamicFormProjectedMetricRowsAsync(
@@ -653,6 +734,7 @@ public sealed class AggregateTableService : IAggregateTableService
             return null;
 
         var reportIds = reports
+            .Where(report => ReportCanContributeAnyMetric(report, contract, metrics))
             .Select(x => x.Id)
             .Where(x => !string.IsNullOrWhiteSpace(x))
             .Distinct(StringComparer.Ordinal)
@@ -723,7 +805,9 @@ public sealed class AggregateTableService : IAggregateTableService
         CancellationToken ct)
     {
         var layout = contract.SummaryTemplate
-            ?? throw new InvalidOperationException("SUMMARY_TEMPLATE chua co outputLayout.");
+            ?? throw AppExceptionFactory.BadRequest(
+                AppErrorCode.DYNAMIC_FORM_SUMMARY_LAYOUT_REQUIRED,
+                new { req.DynamicFormTemplateId, req.BlockId, req.TableMode });
 
         if (assignments.Count == 0 || metrics.Count == 0)
             return new List<DynamicFormAggregateRowDto>();
@@ -898,10 +982,34 @@ public sealed class AggregateTableService : IAggregateTableService
 
         foreach (var report in reports)
         {
+            var policy = WorkReportCumulativeContributionPolicy.FromReport(report);
+            if (!policy.IncludesReport)
+                continue;
+
+            var allowedMetrics = metrics
+                .Where(metric => policy.ShouldIncludeTableMetric(
+                    contract.BlockId,
+                    metric.MetricKey,
+                    metric.RowKey,
+                    metric.ColumnKey,
+                    null))
+                .ToList();
+            if (allowedMetrics.Count == 0)
+                continue;
+
             var values = ResolveReportBlockValues(report, contract.BlockId, warnings);
-            foreach (var metric in metrics)
+            foreach (var metric in allowedMetrics)
             {
                 if (metric.Index < 0 || metric.Index >= values.Count)
+                    continue;
+
+                var sourceKey = $"index:{metric.Index}";
+                if (!policy.ShouldIncludeTableMetric(
+                        contract.BlockId,
+                        metric.MetricKey,
+                        metric.RowKey,
+                        metric.ColumnKey,
+                        sourceKey))
                     continue;
 
                 acc[metric.MetricKey].Add(values[metric.Index]);
@@ -927,6 +1035,10 @@ public sealed class AggregateTableService : IAggregateTableService
 
         foreach (var report in reports)
         {
+            var policy = WorkReportCumulativeContributionPolicy.FromReport(report);
+            if (!policy.IncludesReport)
+                continue;
+
             var block = ExtractReportTableBlock(report.TableValuesJson, contract.BlockId);
             if (block?.Rows is not { Count: > 0 })
             {
@@ -942,6 +1054,16 @@ public sealed class AggregateTableService : IAggregateTableService
                 foreach (var metric in metrics)
                 {
                     if (!row.Cells.TryGetValue(metric.ColumnKey, out var value))
+                        continue;
+
+                    var rowSource = NormalizeMetricPart(row.RowInstanceId, $"row:{row.RowOrder.GetValueOrDefault()}");
+                    var sourceKey = $"{rowSource}:{metric.ColumnKey}";
+                    if (!policy.ShouldIncludeTableMetric(
+                            contract.BlockId,
+                            metric.MetricKey,
+                            metric.RowKey,
+                            metric.ColumnKey,
+                            sourceKey))
                         continue;
 
                     acc[metric.MetricKey].Add(ToNullableDecimal(value));
@@ -968,6 +1090,10 @@ public sealed class AggregateTableService : IAggregateTableService
 
         foreach (var report in reports)
         {
+            var policy = WorkReportCumulativeContributionPolicy.FromReport(report);
+            if (!policy.IncludesReport)
+                continue;
+
             var block = ExtractReportTableBlock(report.TableValuesJson, contract.BlockId);
             if (block?.Columns is not { Count: > 0 })
             {
@@ -983,6 +1109,16 @@ public sealed class AggregateTableService : IAggregateTableService
                 foreach (var metric in metrics)
                 {
                     if (!column.Cells.TryGetValue(metric.RowKey, out var value))
+                        continue;
+
+                    var columnSource = NormalizeMetricPart(column.ColumnInstanceId, $"column:{column.ColumnOrder.GetValueOrDefault()}");
+                    var sourceKey = $"{columnSource}:{metric.RowKey}";
+                    if (!policy.ShouldIncludeTableMetric(
+                            contract.BlockId,
+                            metric.MetricKey,
+                            metric.RowKey,
+                            metric.ColumnKey,
+                            sourceKey))
                         continue;
 
                     acc[metric.MetricKey].Add(ToNullableDecimal(value));
@@ -1009,6 +1145,10 @@ public sealed class AggregateTableService : IAggregateTableService
 
         foreach (var report in reports)
         {
+            var policy = WorkReportCumulativeContributionPolicy.FromReport(report);
+            if (!policy.IncludesReport)
+                continue;
+
             var block = ExtractReportTableBlock(report.TableValuesJson, contract.BlockId);
             if (block?.Cells is not { Count: > 0 })
             {
@@ -1026,6 +1166,16 @@ public sealed class AggregateTableService : IAggregateTableService
                     : cell.MetricKey.Trim();
 
                 if (!acc.TryGetValue(metricKey, out var metricAcc))
+                    continue;
+
+                var rowKey = NormalizeMetricPart(cell.RowKey, "row");
+                var columnKey = NormalizeMetricPart(cell.ColumnKey, "column");
+                if (!policy.ShouldIncludeTableMetric(
+                        contract.BlockId,
+                        metricKey,
+                        rowKey,
+                        columnKey,
+                        metricKey))
                     continue;
 
                 metricAcc.Add(ToNullableDecimal(cell.Value));
@@ -1049,6 +1199,21 @@ public sealed class AggregateTableService : IAggregateTableService
 
         warnings.Add("Some reports are missing tableValuesJson block values; fallback Values1DJson was used.");
         return DeserializeValues1D(report.Values1DJson);
+    }
+
+    private static bool ReportCanContributeAnyMetric(
+        WorkAssignmentReport report,
+        DynamicFormTableContract contract,
+        List<MetricContract> metrics)
+    {
+        var policy = WorkReportCumulativeContributionPolicy.FromReport(report);
+        return policy.IncludesReport &&
+               metrics.Any(metric => policy.ShouldIncludeTableMetric(
+                   contract.BlockId,
+                   metric.MetricKey,
+                   metric.RowKey,
+                   metric.ColumnKey,
+                   null));
     }
 
     private static ReportTableValuesBlock? ExtractReportTableBlock(
@@ -1078,27 +1243,25 @@ public sealed class AggregateTableService : IAggregateTableService
         string? requestedBlockId,
         string? requestedTableMode)
     {
-        if (string.IsNullOrWhiteSpace(template.ExcelBlockJson))
-            throw new InvalidOperationException("Dynamic Form template chua co Excel block.");
-
-        DynamicFormExcelBlockJson? block;
-        try
-        {
-            block = JsonSerializer.Deserialize<DynamicFormExcelBlockJson>(template.ExcelBlockJson, JsonOptions);
-        }
-        catch (JsonException)
-        {
-            throw new InvalidOperationException("Excel block cua Dynamic Form khong hop le.");
-        }
-
+        var block = ResolveDynamicFormBlock(template, requestedBlockId);
         if (block is null)
-            throw new InvalidOperationException("Excel block cua Dynamic Form khong hop le.");
+        {
+            if (!string.IsNullOrWhiteSpace(requestedBlockId))
+                throw DynamicFormBlockNotFound(template.Id, requestedBlockId);
+
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.DYNAMIC_FORM_EXCEL_BLOCK_REQUIRED,
+                new { dynamicFormTemplateId = template.Id });
+        }
 
         var blockId = NormalizeBlockId(block.BlockId ?? block.Id ?? "excel_block");
-        if (!string.IsNullOrWhiteSpace(requestedBlockId) &&
-            !string.Equals(blockId, requestedBlockId.Trim(), StringComparison.Ordinal))
+        var requestedBlock = string.IsNullOrWhiteSpace(requestedBlockId)
+            ? null
+            : NormalizeBlockId(requestedBlockId);
+        if (requestedBlock is not null &&
+            !string.Equals(blockId, requestedBlock, StringComparison.Ordinal))
         {
-            throw new InvalidOperationException("BlockId khong thuoc Dynamic Form template.");
+            throw DynamicFormBlockNotFound(template.Id, requestedBlockId);
         }
 
         var tableMode = string.IsNullOrWhiteSpace(block.TableMode)
@@ -1108,15 +1271,22 @@ public sealed class AggregateTableService : IAggregateTableService
         if (!string.IsNullOrWhiteSpace(requestedTableMode) &&
             !string.Equals(tableMode, requestedTableMode.Trim().ToUpperInvariant(), StringComparison.Ordinal))
         {
-            throw new InvalidOperationException(
-                $"TableMode request {requestedTableMode.Trim().ToUpperInvariant()} khong khop voi Dynamic Form block {blockId} ({tableMode}).");
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.DYNAMIC_FORM_TABLE_MODE_MISMATCH,
+                new
+                {
+                    dynamicFormTemplateId = template.Id,
+                    blockId,
+                    requestedTableMode = requestedTableMode.Trim().ToUpperInvariant(),
+                    tableMode
+                });
         }
 
         if (tableMode == "APPEND_ROWS")
         {
             var appendRowMetrics = BuildAppendRowsMetricMap(blockId, block.W);
             if (appendRowMetrics.Count == 0)
-                throw new InvalidOperationException("Dynamic Form APPEND_ROWS block chua co width de tao columnKey.");
+                throw DynamicFormTableContractInvalid(template.Id, blockId, tableMode, "APPEND_ROWS_WIDTH_REQUIRED");
 
             return new DynamicFormTableContract(blockId, tableMode, appendRowMetrics);
         }
@@ -1125,7 +1295,7 @@ public sealed class AggregateTableService : IAggregateTableService
         {
             var appendColumnMetrics = BuildAppendColumnsMetricMap(blockId, block.H);
             if (appendColumnMetrics.Count == 0)
-                throw new InvalidOperationException("Dynamic Form APPEND_COLUMNS block chua co height de tao rowKey.");
+                throw DynamicFormTableContractInvalid(template.Id, blockId, tableMode, "APPEND_COLUMNS_HEIGHT_REQUIRED");
 
             return new DynamicFormTableContract(blockId, tableMode, appendColumnMetrics);
         }
@@ -1137,7 +1307,7 @@ public sealed class AggregateTableService : IAggregateTableService
                 matrixMap = BuildFallbackMetricMap(blockId, block.W, block.H);
 
             if (matrixMap.Count == 0)
-                throw new InvalidOperationException("Dynamic Form MATRIX block chua co indexMap hoac kich thuoc de tao metricKey.");
+                throw DynamicFormTableContractInvalid(template.Id, blockId, tableMode, "MATRIX_METRIC_MAP_REQUIRED");
 
             return new DynamicFormTableContract(blockId, tableMode, matrixMap);
         }
@@ -1147,15 +1317,16 @@ public sealed class AggregateTableService : IAggregateTableService
             var summaryTemplate = ResolveSummaryTemplateContract(block);
             var summaryMetrics = BuildSummaryTemplateMetricMap(summaryTemplate);
             if (summaryMetrics.Count == 0)
-                throw new InvalidOperationException("Dynamic Form SUMMARY_TEMPLATE chua co rowLayout.metrics.");
+                throw AppExceptionFactory.BadRequest(
+                    AppErrorCode.DYNAMIC_FORM_SUMMARY_METRICS_REQUIRED,
+                    new { dynamicFormTemplateId = template.Id, blockId, tableMode });
 
             return new DynamicFormTableContract(blockId, tableMode, summaryMetrics, summaryTemplate);
         }
 
         if (tableMode != "FIXED_GRID")
         {
-            throw new InvalidOperationException(
-                $"Dynamic Form block {blockId} co tableMode {tableMode}; runtime aggregate chua ho tro mode nay.");
+            throw DynamicFormTableContractInvalid(template.Id, blockId, tableMode, "TABLE_MODE_UNSUPPORTED");
         }
 
         var indexMap = NormalizeMetricMap(block.IndexMap, blockId);
@@ -1163,16 +1334,76 @@ public sealed class AggregateTableService : IAggregateTableService
             indexMap = BuildFallbackMetricMap(blockId, block.W, block.H);
 
         if (indexMap.Count == 0)
-            throw new InvalidOperationException("Dynamic Form FIXED_GRID block chua co indexMap.");
+            throw DynamicFormTableContractInvalid(template.Id, blockId, tableMode, "FIXED_GRID_METRIC_MAP_REQUIRED");
 
         return new DynamicFormTableContract(blockId, tableMode, indexMap);
+    }
+
+    private static DynamicFormExcelBlockJson? ResolveDynamicFormBlock(
+        DynamicFormTemplate template,
+        string? requestedBlockId)
+    {
+        var requested = string.IsNullOrWhiteSpace(requestedBlockId)
+            ? null
+            : NormalizeBlockId(requestedBlockId);
+
+        var blocks = ReadDynamicFormBlocks(template.BlocksJson);
+        if (blocks.Count > 0)
+        {
+            if (requested is null)
+                return blocks[0];
+
+            return blocks.FirstOrDefault(block =>
+                string.Equals(
+                    NormalizeBlockId(block.BlockId ?? block.Id ?? "excel_block"),
+                    requested,
+                    StringComparison.Ordinal));
+        }
+
+        if (string.IsNullOrWhiteSpace(template.ExcelBlockJson))
+            return null;
+
+        try
+        {
+            return JsonSerializer.Deserialize<DynamicFormExcelBlockJson>(
+                template.ExcelBlockJson,
+                JsonOptions);
+        }
+        catch (JsonException)
+        {
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.DYNAMIC_FORM_EXCEL_BLOCK_INVALID,
+                new { dynamicFormTemplateId = template.Id });
+        }
+    }
+
+    private static List<DynamicFormExcelBlockJson> ReadDynamicFormBlocks(string? blocksJson)
+    {
+        if (string.IsNullOrWhiteSpace(blocksJson))
+            return new List<DynamicFormExcelBlockJson>();
+
+        try
+        {
+            var blocks = JsonSerializer.Deserialize<List<DynamicFormExcelBlockJson>>(
+                blocksJson,
+                JsonOptions);
+
+            return blocks?
+                .Where(x => x is not null)
+                .ToList()
+                ?? new List<DynamicFormExcelBlockJson>();
+        }
+        catch (JsonException)
+        {
+            throw AppExceptionFactory.BadRequest(AppErrorCode.DYNAMIC_FORM_BLOCKS_JSON_INVALID);
+        }
     }
 
     private static SummaryTemplateContract ResolveSummaryTemplateContract(DynamicFormExcelBlockJson block)
     {
         var sourceBlockIdRaw = FirstNonBlank(block.SourceBlockId, block.OutputLayout?.SourceBlockId);
         if (string.IsNullOrWhiteSpace(sourceBlockIdRaw))
-            throw new InvalidOperationException("SUMMARY_TEMPLATE can sourceBlockId de render aggregate.");
+            throw AppExceptionFactory.BadRequest(AppErrorCode.DYNAMIC_FORM_SUMMARY_SOURCE_REQUIRED);
 
         var sourceBlockId = NormalizeBlockId(sourceBlockIdRaw);
         var sourceTableMode = NormalizeSourceTableMode(
@@ -1200,7 +1431,7 @@ public sealed class AggregateTableService : IAggregateTableService
             .ToList();
 
         if (rowLayout.Count == 0)
-            throw new InvalidOperationException("SUMMARY_TEMPLATE rowLayout.metrics khong duoc trong.");
+            throw AppExceptionFactory.BadRequest(AppErrorCode.DYNAMIC_FORM_SUMMARY_METRICS_REQUIRED);
 
         var rowsPerGroup = rowLayout.Sum(x => Math.Max(x.RowsPerUnit, x.Metrics.Count));
         return new SummaryTemplateContract(sourceBlockId, sourceTableMode, groupBy, rowLayout, Math.Max(1, rowsPerGroup));
@@ -1527,14 +1758,17 @@ public sealed class AggregateTableService : IAggregateTableService
         List<AggregateSourceRowDto> sources)
     {
         var (first, valueCount, includedPeriodKeys) = GetMeta(reports);
-        var rows = BuildGroupedRows(assignments, reports, valueCount);
+        var groupedRows = BuildGroupedRows(assignments, reports, valueCount);
+        var dataRowCount = Math.Max(0, first.DataRectR1 - first.DataRectR0 + 1);
+        var dataColumnCount = Math.Max(0, first.DataRectC1 - first.DataRectC0 + 1);
+        var rows = BuildTemplateRowsByUser(groupedRows, dataRowCount, dataColumnCount);
 
         return BuildResponse(
             req,
             assignments[0],
             first,
             includedPeriodKeys,
-            new List<string> { "userId", "userName", "fullName", "unitSymbol", "unitShortName" },
+            new List<string> { "user", "unit", "sourceRowNumber" },
             rows,
             sources,
             aggregateMode: "VERTICAL_BY_USER");
@@ -1560,6 +1794,7 @@ public sealed class AggregateTableService : IAggregateTableService
             {
                 row = new AggregateTableRowDto
                 {
+                    WorkAssignmentId = assignment?.Id ?? report.WorkAssignmentId,
                     UserId = userId,
                     UserName = assignee?.Username,
                     FullName = assignee?.FullName,
@@ -1580,6 +1815,204 @@ public sealed class AggregateTableService : IAggregateTableService
             .ThenBy(x => x.UserName ?? string.Empty, StringComparer.Ordinal)
             .ToList();
     }
+
+    private static List<AggregateTableRowDto> BuildTemplateRowsByUser(
+        List<AggregateTableRowDto> groupedRows,
+        int dataRowCount,
+        int dataColumnCount)
+    {
+        if (groupedRows.Count == 0 || dataRowCount <= 0 || dataColumnCount <= 0)
+            return groupedRows;
+
+        var rows = new List<AggregateTableRowDto>(groupedRows.Count * dataRowCount);
+        foreach (var group in groupedRows)
+        {
+            for (var rowIndex = 0; rowIndex < dataRowCount; rowIndex++)
+            {
+                var values = new List<decimal?>(dataColumnCount);
+                for (var columnIndex = 0; columnIndex < dataColumnCount; columnIndex++)
+                {
+                    var valueIndex = rowIndex * dataColumnCount + columnIndex;
+                    values.Add(valueIndex >= 0 && valueIndex < group.Values.Count
+                        ? group.Values[valueIndex]
+                        : null);
+                }
+
+                rows.Add(new AggregateTableRowDto
+                {
+                    WorkAssignmentId = group.WorkAssignmentId,
+                    UserId = group.UserId,
+                    UserName = group.UserName,
+                    FullName = group.FullName,
+                    UnitSymbol = group.UnitSymbol,
+                    UnitShortName = group.UnitShortName,
+                    SourceRowIndex = rowIndex,
+                    SourceRowNumber = rowIndex + 1,
+                    SourceRowKey = $"row_{rowIndex + 1}",
+                    Values = values,
+                });
+            }
+        }
+
+        return rows;
+    }
+
+    private static bool IsRecordTableTemplate(
+        DynamicExcelTemplate? template,
+        WorkAssignmentReport? report)
+    {
+        var kind = report?.DynamicExcelTableKind ?? template?.TableKind;
+        return string.Equals(kind?.Trim(), DynamicExcelTableKind.RecordTable, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static AggregateTableResponse BuildRecordTableResult(
+        AggregateTableRequest req,
+        List<WorkAssignment> assignments,
+        List<WorkAssignmentReport> reports,
+        List<AggregateSourceRowDto> sources,
+        DynamicExcelTemplate? template)
+    {
+        var first = reports[0];
+        var specJson = string.IsNullOrWhiteSpace(first.RecordTableSpecJson)
+            ? template?.RecordTableSpecJson
+            : first.RecordTableSpecJson;
+        var spec = DynamicExcelRecordTableRuntime.ParseSpec(specJson);
+        var assignmentMap = assignments.ToDictionary(x => x.Id, x => x, StringComparer.Ordinal);
+        var rows = new List<AggregateRecordTableRowDto>();
+
+        foreach (var report in reports)
+        {
+            assignmentMap.TryGetValue(report.WorkAssignmentId, out var assignment);
+            var assignee = assignment?.Assignees?.FirstOrDefault(x => x.UserId == report.AssigneeUserId)
+                           ?? assignment?.Assignees?.FirstOrDefault();
+
+            var recordRows = DynamicExcelRecordTableRuntime.ExtractRows(
+                report.TableValuesJson,
+                spec,
+                report.DynamicExcelTemplateId);
+
+            foreach (var record in recordRows)
+            {
+                var calculated = DynamicExcelRecordTableRuntime.BuildCalculatedValues(spec, record.Values);
+                var values = new Dictionary<string, object?>(StringComparer.Ordinal);
+                foreach (var column in spec.Columns)
+                {
+                    record.Values.TryGetValue(column.Key, out var value);
+                    values[column.Key] = DynamicExcelRecordTableRuntime.ToJsonFriendly(value);
+                }
+
+                foreach (var output in spec.CalculatedOutputs)
+                {
+                    calculated.TryGetValue(output.Key, out var value);
+                    values[output.Key] = DynamicExcelRecordTableRuntime.ToJsonFriendly(value);
+                }
+
+                rows.Add(new AggregateRecordTableRowDto
+                {
+                    ReportId = report.Id,
+                    WorkAssignmentId = assignment?.Id ?? report.WorkAssignmentId,
+                    UserId = report.AssigneeUserId ?? assignee?.UserId,
+                    UserName = assignee?.Username,
+                    FullName = assignee?.FullName,
+                    UnitSymbol = assignee?.UnitSymbol,
+                    UnitShortName = assignee?.UnitShortName,
+                    PeriodKey = report.PeriodKey,
+                    SourceRowIndex = record.RowIndex,
+                    SourceRowKey = record.RowKey,
+                    Values = values,
+                });
+            }
+        }
+
+        var includedPeriodKeys = reports
+            .Select(x => x.PeriodKey)
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Distinct(StringComparer.Ordinal)
+            .OrderBy(x => x, StringComparer.Ordinal)
+            .ToList();
+
+        return new AggregateTableResponse
+        {
+            DynamicExcelId = template?.Id ?? first.DynamicExcelTemplateId,
+            DynamicExcelCode = template?.Code ?? first.DynamicExcelTemplateCode,
+            DynamicExcelName = template?.Name ?? first.DynamicExcelTemplateName,
+            PeriodScopeMode = req.PeriodScopeMode,
+            PeriodKey = req.PeriodKey,
+            PeriodKeyFrom = req.PeriodKeyFrom,
+            PeriodKeyTo = req.PeriodKeyTo,
+            SelectedUnitIds = req.SelectedUnitIds ?? new List<string>(),
+            AggregateMode = "RECORD_TABLE_CONCAT",
+            PeriodCount = includedPeriodKeys.Count,
+            IncludedPeriodKeys = includedPeriodKeys,
+            DataRectR0 = 0,
+            DataRectC0 = 0,
+            DataRectR1 = 0,
+            DataRectC1 = 0,
+            W = 0,
+            H = 0,
+            MetaColumns = new List<string> { "periodKey", "user", "unit" },
+            Rows = new List<AggregateTableRowDto>(),
+            TableKind = DynamicExcelTableKind.RecordTable,
+            RecordOrientation = spec.Orientation,
+            RecordColumns = BuildRecordColumns(spec),
+            RecordRows = rows,
+            Warnings = rows.Count == 0
+                ? new List<string> { "Không có dòng dữ liệu phát sinh trong các báo cáo đã chọn." }
+                : new List<string>(),
+            Sources = sources,
+        };
+    }
+
+    private static AggregateTableResponse BuildEmptyRecordTableResponse(
+        AggregateTableRequest req,
+        WorkAssignment assignment,
+        List<AggregateSourceRowDto> sources,
+        DynamicExcelTemplate? template)
+    {
+        var columns = new List<AggregateRecordTableColumnDto>();
+        var orientation = "ROWS";
+        if (!string.IsNullOrWhiteSpace(template?.RecordTableSpecJson))
+        {
+            var spec = DynamicExcelRecordTableRuntime.ParseSpec(template.RecordTableSpecJson);
+            columns = BuildRecordColumns(spec);
+            orientation = spec.Orientation;
+        }
+
+        return new AggregateTableResponse
+        {
+            DynamicExcelId = template?.Id ?? assignment.DynamicExcelId,
+            DynamicExcelCode = template?.Code ?? assignment.DynamicExcelCode,
+            DynamicExcelName = template?.Name ?? assignment.DynamicExcelName,
+            PeriodScopeMode = req.PeriodScopeMode,
+            PeriodKey = req.PeriodKey,
+            PeriodKeyFrom = req.PeriodKeyFrom,
+            PeriodKeyTo = req.PeriodKeyTo,
+            SelectedUnitIds = req.SelectedUnitIds ?? new List<string>(),
+            AggregateMode = "RECORD_TABLE_CONCAT",
+            PeriodCount = 0,
+            IncludedPeriodKeys = new List<string>(),
+            MetaColumns = new List<string> { "periodKey", "user", "unit" },
+            Rows = new List<AggregateTableRowDto>(),
+            TableKind = DynamicExcelTableKind.RecordTable,
+            RecordOrientation = orientation,
+            RecordColumns = columns,
+            RecordRows = new List<AggregateRecordTableRowDto>(),
+            Warnings = new List<string> { "Không có báo cáo đã duyệt phù hợp với bộ lọc hiện tại." },
+            Sources = sources,
+        };
+    }
+
+    private static List<AggregateRecordTableColumnDto> BuildRecordColumns(DynamicExcelRecordTableRuntime.TableSpec spec)
+        => spec.Columns
+            .Concat(spec.CalculatedOutputs)
+            .Select(column => new AggregateRecordTableColumnDto
+            {
+                Key = column.Key,
+                Label = column.Label,
+                DataType = column.DataType,
+                IsCalculated = column.IsCalculated,
+            })
+            .ToList();
 
     private static AggregateTableResponse BuildResponse(
         AggregateTableRequest req,

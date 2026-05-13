@@ -36,14 +36,10 @@ public static class ScheduleWeekHelper
             DayOfWeek.Friday => ReportWeekdays.Friday,
             DayOfWeek.Saturday => ReportWeekdays.Saturday,
             DayOfWeek.Sunday => ReportWeekdays.Sunday,
-            _ => throw new InvalidOperationException("Thứ trong tuần không hợp lệ.")
+            _ => throw tdtd_be.Common.Errors.AppExceptionFactory.BadRequest(
+                tdtd_be.Common.Errors.AppErrorCode.COMMON_SCHEDULE_VALUE_INVALID,
+                new { field = "dayOfWeek", value = date.DayOfWeek })
         };
     }
 
-    public static string GetWeekPeriodKey(DateTime date)
-    {
-        var start = StartOfWeek(date);
-        var end = start.AddDays(6);
-        return $"{start:yyyyMMdd}_{end:yyyyMMdd}";
-    }
 }

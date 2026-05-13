@@ -13,6 +13,7 @@ public interface IDocRoleReadModelProjectionService
     Task RebuildWorkAssignmentsAsync(string workId, string byUserId, CancellationToken ct);
     Task RebuildReportPeriodAsync(string workReportPeriodId, string byUserId, CancellationToken ct);
     Task RebuildWorkReportPeriodsAsync(string workId, string byUserId, CancellationToken ct);
+    Task RebuildMyReportTemplateAsync(string workId, string dynamicFormTemplateId, string userId, string byUserId, CancellationToken ct);
     Task SoftDeleteByDocAsync(DocType docType, string docId, string byUserId, CancellationToken ct);
 }
 
@@ -178,6 +179,7 @@ public sealed class DocRoleReadModelProjectionService : IDocRoleReadModelProject
                     .Set(x => x.DynamicFormTemplateId, NullIfWhiteSpace(assignment.DynamicFormTemplateId))
                     .Set(x => x.DynamicFormTemplateCode, assignment.DynamicFormTemplateCode)
                     .Set(x => x.DynamicFormTemplateName, assignment.DynamicFormTemplateName)
+                    .Set(x => x.DynamicFormDataSourceRulesJson, assignment.DynamicFormDataSourceRulesJson)
                     .Set(x => x.AssignmentType, assignment.AssignmentType ?? string.Empty)
                     .Set(x => x.AggregationType, assignment.AggregationType ?? string.Empty)
                     .Set(x => x.Assignees, CloneUserRefs(assignment.Assignees))
@@ -302,6 +304,23 @@ public sealed class DocRoleReadModelProjectionService : IDocRoleReadModelProject
             await RebuildReportPeriodAsync(periodId, byUserId, ct);
     }
 
+    public async Task RebuildMyReportTemplateAsync(
+        string workId,
+        string dynamicFormTemplateId,
+        string userId,
+        string byUserId,
+        CancellationToken ct)
+    {
+        await RebuildMyReportTemplateListDocRoleAsync(
+            workId,
+            dynamicFormTemplateId,
+            userId,
+            null,
+            byUserId,
+            DateTime.UtcNow,
+            ct);
+    }
+
     public async Task SoftDeleteByDocAsync(DocType docType, string docId, string byUserId, CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(docId))
@@ -394,17 +413,6 @@ public sealed class DocRoleReadModelProjectionService : IDocRoleReadModelProject
             AddRole(map, watcher.UserId, DocRoleType.ASSIGNMENT_LEADER_WATCH, watcher);
         }
 
-        var assignmentReviewerIds = await _ctx.WorkTemplateAssignees
-            .Find(x =>
-                x.WorkAssignmentId == assignment.Id &&
-                !x.IsDeleted &&
-                x.CreatedByUserId != null)
-            .Project(x => x.CreatedByUserId)
-            .ToListAsync(ct);
-
-        foreach (var reviewerId in assignmentReviewerIds.Where(x => !string.IsNullOrWhiteSpace(x)))
-            AddRole(map, reviewerId, DocRoleType.ASSIGNMENT_BRANCH_VIEWER, null);
-
         if (!string.IsNullOrWhiteSpace(assignment.ParentAssignmentId))
         {
             var parent = await _ctx.WorkAssignments
@@ -421,16 +429,6 @@ public sealed class DocRoleReadModelProjectionService : IDocRoleReadModelProject
                     AddRole(map, parentAssignee.UserId, DocRoleType.ASSIGNMENT_BRANCH_VIEWER, parentAssignee);
                 }
 
-                var parentReviewerIds = await _ctx.WorkTemplateAssignees
-                    .Find(x =>
-                        x.WorkAssignmentId == parent.Id &&
-                        !x.IsDeleted &&
-                        x.CreatedByUserId != null)
-                    .Project(x => x.CreatedByUserId)
-                    .ToListAsync(ct);
-
-                foreach (var reviewerId in parentReviewerIds.Where(x => !string.IsNullOrWhiteSpace(x)))
-                    AddRole(map, reviewerId, DocRoleType.ASSIGNMENT_BRANCH_VIEWER, null);
             }
         }
 
@@ -442,7 +440,9 @@ public sealed class DocRoleReadModelProjectionService : IDocRoleReadModelProject
         if (!string.IsNullOrWhiteSpace(period.CurrentReportId))
         {
             var byId = await _ctx.WorkAssignmentReports
-                .Find(x => x.Id == period.CurrentReportId && !x.IsDeleted)
+                .Find(Builders<WorkAssignmentReport>.Filter.Eq(x => x.Id, period.CurrentReportId)
+                      & Builders<WorkAssignmentReport>.Filter.Eq(x => x.IsDeleted, false)
+                      & Builders<WorkAssignmentReport>.Filter.Ne(x => x.IsActive, false))
                 .FirstOrDefaultAsync(ct);
 
             if (byId is not null)
@@ -450,7 +450,10 @@ public sealed class DocRoleReadModelProjectionService : IDocRoleReadModelProject
         }
 
         return await _ctx.WorkAssignmentReports
-            .Find(x => x.WorkReportPeriodId == period.Id && x.IsCurrent && !x.IsDeleted)
+            .Find(Builders<WorkAssignmentReport>.Filter.Eq(x => x.WorkReportPeriodId, period.Id)
+                  & Builders<WorkAssignmentReport>.Filter.Eq(x => x.IsCurrent, true)
+                  & Builders<WorkAssignmentReport>.Filter.Ne(x => x.IsActive, false)
+                  & Builders<WorkAssignmentReport>.Filter.Eq(x => x.IsDeleted, false))
             .SortByDescending(x => x.UpdatedAtUtc)
             .FirstOrDefaultAsync(ct);
     }
@@ -482,7 +485,7 @@ public sealed class DocRoleReadModelProjectionService : IDocRoleReadModelProject
             .Set(x => x.AssignmentId, period.WorkAssignmentId)
             .Set(x => x.WorkTemplateAssigneeId, period.WorkTemplateAssigneeId)
             .Set(x => x.WorkReportPeriodId, period.Id)
-            .Set(x => x.CurrentReportId, NullIfWhiteSpace(period.CurrentReportId ?? report?.Id))
+            .Set(x => x.CurrentReportId, NullIfWhiteSpace(report?.Id))
             .Set(x => x.AssigneeUserId, period.AssigneeUserId)
             .Set(x => x.DynamicExcelId, period.DynamicExcelId)
             .Set(x => x.DynamicExcelCode, period.DynamicExcelCode ?? string.Empty)
@@ -502,7 +505,10 @@ public sealed class DocRoleReadModelProjectionService : IDocRoleReadModelProject
             .Set(x => x.PeriodStatus, period.Status)
             .Set(x => x.IsOverdue, period.IsOverdue)
             .Set(x => x.ReportStatus, report?.Status)
-            .Set(x => x.IsCurrentReport, report?.IsCurrent ?? false)
+            .Set(x => x.IsCurrentReport, report?.IsCurrent == true && report?.IsActive != false)
+            .Set(x => x.ReportIsActive, report is not null && report.IsActive != false)
+            .Set(x => x.ReportDeactivatedAtUtc, report?.DeactivatedAtUtc)
+            .Set(x => x.ReportDeactivationReason, report?.DeactivationReason)
             .Set(x => x.IsLateSubmission, report?.IsLateSubmission ?? false)
             .Set(x => x.VersionNo, report?.VersionNo ?? period.ReportVersionCount)
             .Set(x => x.LastSubmittedAtUtc, period.LastSubmittedAtUtc)
@@ -531,7 +537,7 @@ public sealed class DocRoleReadModelProjectionService : IDocRoleReadModelProject
 
         await RebuildMyReportTemplateListDocRoleAsync(
             period.WorkId,
-            period.DynamicExcelId,
+            period.DynamicFormTemplateId,
             period.AssigneeUserId,
             assignee,
             byUserId,
@@ -541,7 +547,7 @@ public sealed class DocRoleReadModelProjectionService : IDocRoleReadModelProject
 
     private async Task RebuildMyReportTemplateListDocRoleAsync(
         string workId,
-        string dynamicExcelId,
+        string? dynamicFormTemplateId,
         string userId,
         UserRef? user,
         string byUserId,
@@ -549,7 +555,7 @@ public sealed class DocRoleReadModelProjectionService : IDocRoleReadModelProject
         CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(workId) ||
-            string.IsNullOrWhiteSpace(dynamicExcelId) ||
+            string.IsNullOrWhiteSpace(dynamicFormTemplateId) ||
             string.IsNullOrWhiteSpace(userId))
             return;
 
@@ -557,13 +563,13 @@ public sealed class DocRoleReadModelProjectionService : IDocRoleReadModelProject
             .Find(x =>
                 x.UserId == userId &&
                 x.WorkId == workId &&
-                x.DynamicExcelId == dynamicExcelId &&
+                x.DynamicFormTemplateId == dynamicFormTemplateId &&
                 !x.IsDeleted)
             .ToListAsync(ct);
 
         var filter = Builders<MyReportTemplateListDocRole>.Filter.Eq(x => x.UserId, userId)
                      & Builders<MyReportTemplateListDocRole>.Filter.Eq(x => x.WorkId, workId)
-                     & Builders<MyReportTemplateListDocRole>.Filter.Eq(x => x.DynamicExcelId, dynamicExcelId);
+                     & Builders<MyReportTemplateListDocRole>.Filter.Eq(x => x.DynamicFormTemplateId, dynamicFormTemplateId);
 
         if (rows.Count == 0)
         {
@@ -579,17 +585,19 @@ public sealed class DocRoleReadModelProjectionService : IDocRoleReadModelProject
             .ThenByDescending(x => x.SortUpdatedAtUtc)
             .First();
 
+        user ??= latest.User;
+
         var update = Builders<MyReportTemplateListDocRole>.Update
             .Set(x => x.DocType, DocType.WORK_REPORT)
-            .Set(x => x.DocId, dynamicExcelId)
+            .Set(x => x.DocId, dynamicFormTemplateId)
             .Set(x => x.UserId, userId)
             .Set(x => x.User, user)
             .Set(x => x.Roles, new List<DocRoleType> { DocRoleType.ASSIGNEE })
             .Set(x => x.WorkId, workId)
-            .Set(x => x.DynamicExcelId, dynamicExcelId)
+            .Set(x => x.DynamicExcelId, NullIfWhiteSpace(latest.DynamicExcelId))
             .Set(x => x.DynamicExcelCode, latest.DynamicExcelCode)
             .Set(x => x.DynamicExcelName, latest.DynamicExcelName)
-            .Set(x => x.DynamicFormTemplateId, NullIfWhiteSpace(latest.DynamicFormTemplateId))
+            .Set(x => x.DynamicFormTemplateId, NullIfWhiteSpace(dynamicFormTemplateId))
             .Set(x => x.DynamicFormTemplateCode, latest.DynamicFormTemplateCode)
             .Set(x => x.DynamicFormTemplateName, latest.DynamicFormTemplateName)
             .Set(x => x.BindingCount, rows.Select(x => x.WorkTemplateAssigneeId).Distinct(StringComparer.Ordinal).Count())
@@ -623,11 +631,7 @@ public sealed class DocRoleReadModelProjectionService : IDocRoleReadModelProject
         DateTime now,
         CancellationToken ct)
     {
-        var reviewerIds = new[]
-            {
-                assignment.CreatedByUserId,
-                binding?.CreatedByUserId
-            }
+        var reviewerIds = new[] { assignment.CreatedByUserId }
             .Where(x => !string.IsNullOrWhiteSpace(x))
             .Select(x => x!)
             .Distinct(StringComparer.Ordinal)
@@ -657,7 +661,7 @@ public sealed class DocRoleReadModelProjectionService : IDocRoleReadModelProject
                 .Set(x => x.WorkId, period.WorkId)
                 .Set(x => x.AssignmentId, period.WorkAssignmentId)
                 .Set(x => x.WorkReportPeriodId, period.Id)
-                .Set(x => x.CurrentReportId, NullIfWhiteSpace(period.CurrentReportId ?? report?.Id))
+                .Set(x => x.CurrentReportId, NullIfWhiteSpace(report?.Id))
                 .Set(x => x.ReviewerUserId, reviewerUserId)
                 .Set(x => x.AssigneeUserId, period.AssigneeUserId)
                 .Set(x => x.AssigneeUserName, assignee?.Username)
@@ -683,6 +687,9 @@ public sealed class DocRoleReadModelProjectionService : IDocRoleReadModelProject
                 .Set(x => x.PeriodStatus, period.Status)
                 .Set(x => x.IsOverdue, WorkReportPeriodStatusHelper.IsOverdue(period.Status))
                 .Set(x => x.ReportStatus, report?.Status)
+                .Set(x => x.ReportIsActive, report is not null && report.IsActive != false)
+                .Set(x => x.ReportDeactivatedAtUtc, report?.DeactivatedAtUtc)
+                .Set(x => x.ReportDeactivationReason, report?.DeactivationReason)
                 .Set(x => x.SubmittedAtUtc, report?.SubmittedAtUtc ?? period.LastSubmittedAtUtc)
                 .Set(x => x.ApprovedAtUtc, report?.ApprovedAtUtc)
                 .Set(x => x.ReturnedAtUtc, report?.ReturnedAtUtc)
@@ -741,6 +748,7 @@ public sealed class DocRoleReadModelProjectionService : IDocRoleReadModelProject
             {
                 x.WorkId,
                 x.DynamicExcelId,
+                x.DynamicFormTemplateId,
                 x.UserId,
                 x.User
             })
@@ -753,12 +761,12 @@ public sealed class DocRoleReadModelProjectionService : IDocRoleReadModelProject
             cancellationToken: ct);
 
         foreach (var row in affectedTemplateRows
-                     .GroupBy(x => new { x.WorkId, x.DynamicExcelId, x.UserId })
+                     .GroupBy(x => new { x.WorkId, x.DynamicFormTemplateId, x.UserId })
                      .Select(g => g.First()))
         {
             await RebuildMyReportTemplateListDocRoleAsync(
                 row.WorkId,
-                row.DynamicExcelId,
+                row.DynamicFormTemplateId,
                 row.UserId,
                 row.User,
                 byUserId,

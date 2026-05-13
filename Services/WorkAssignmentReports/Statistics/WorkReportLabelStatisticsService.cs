@@ -6,6 +6,7 @@ using tdtd_be.Common.Auth;
 using tdtd_be.Data;
 using tdtd_be.DTOs.Statistics;
 using tdtd_be.Models;
+using tdtd_be.Models.Enums;
 using tdtd_be.Models.Statistics;
 
 namespace tdtd_be.Services.WorkAssignmentReports.Statistics;
@@ -33,8 +34,25 @@ public sealed class WorkReportLabelStatisticsService : IWorkReportLabelStatistic
         string? actorUserId,
         CancellationToken ct = default)
     {
-        if (string.IsNullOrWhiteSpace(reportId))
+        var aggregateKey = await RebuildValuesForReportAsync(reportId, actorUserId, ct);
+        if (aggregateKey is null)
             return;
+
+        await RebuildAggregatesForWorkPeriodAsync(
+            aggregateKey.WorkId,
+            aggregateKey.PeriodInstanceKey,
+            aggregateKey.DynamicFormTemplateId,
+            actorUserId,
+            ct);
+    }
+
+    public async Task<ReportStatisticAggregateKey?> RebuildValuesForReportAsync(
+        string reportId,
+        string? actorUserId,
+        CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(reportId))
+            return null;
 
         var report = await _ctx.WorkAssignmentReports
             .Find(x => x.Id == reportId && !x.IsDeleted)
@@ -44,7 +62,7 @@ public sealed class WorkReportLabelStatisticsService : IWorkReportLabelStatistic
         {
             await _ctx.WorkReportLabelStatValues
                 .DeleteManyAsync(x => x.WorkAssignmentReportId == reportId, ct);
-            return;
+            return null;
         }
 
         var assignment = await _ctx.WorkAssignments
@@ -55,8 +73,54 @@ public sealed class WorkReportLabelStatisticsService : IWorkReportLabelStatistic
             x => x.WorkAssignmentReportId == report.Id,
             ct);
 
+        if (report.IsActive == false || report.Status != WorkAssignmentReportStatus.Approved)
+        {
+            return new ReportStatisticAggregateKey(
+                report.WorkId,
+                report.PeriodInstanceKey,
+                report.DynamicFormTemplateId);
+        }
+
+        var contributionPolicy = WorkReportCumulativeContributionPolicy.FromReport(report);
+        if (!contributionPolicy.IncludesReport)
+        {
+            return new ReportStatisticAggregateKey(
+                report.WorkId,
+                report.PeriodInstanceKey,
+                report.DynamicFormTemplateId);
+        }
+
         var now = DateTime.UtcNow;
-        var rowLabels = ExtractRowLabels(report.TableValuesJson);
+        var rowLabels = ExtractRowLabels(report.TableValuesJson)
+            .Select(row => row with
+            {
+                LabelCodes = row.LabelCodes
+                    .Where(labelCode => contributionPolicy.ShouldIncludeLabel(
+                        row.BlockId,
+                        row.RowKey,
+                        row.Source,
+                        labelCode))
+                    .ToList()
+            })
+            .Where(row => row.LabelCodes.Count > 0)
+            .ToList();
+
+        if (rowLabels.Count > 0)
+        {
+            var activeLabelCodes = await LoadActiveLabelCodesAsync(
+                rowLabels.SelectMany(x => x.LabelCodes),
+                ct);
+            rowLabels = rowLabels
+                .Select(row => row with
+                {
+                    LabelCodes = row.LabelCodes
+                        .Where(activeLabelCodes.Contains)
+                        .ToList()
+                })
+                .Where(row => row.LabelCodes.Count > 0)
+                .ToList();
+        }
+
         if (rowLabels.Count > 0)
         {
             var ancestorAssignmentIds = ExtractAncestorAssignmentIds(assignment, report.WorkAssignmentId);
@@ -96,12 +160,30 @@ public sealed class WorkReportLabelStatisticsService : IWorkReportLabelStatistic
                 await _ctx.WorkReportLabelStatValues.InsertManyAsync(values, cancellationToken: ct);
         }
 
-        await RebuildAggregatesForWorkPeriodAsync(
+        return new ReportStatisticAggregateKey(
             report.WorkId,
             report.PeriodInstanceKey,
-            report.DynamicFormTemplateId,
-            actorUserId,
-            ct);
+            report.DynamicFormTemplateId);
+    }
+
+    private async Task<HashSet<string>> LoadActiveLabelCodesAsync(
+        IEnumerable<string> labelCodes,
+        CancellationToken ct)
+    {
+        var codes = labelCodes
+            .Select(NormalizeLabelCode)
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        if (codes.Count == 0)
+            return new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        var labels = await _ctx.Labels
+            .Find(x => codes.Contains(x.Code) && x.IsActive && !x.IsDeleted)
+            .Project(x => x.Code)
+            .ToListAsync(ct);
+
+        return labels.ToHashSet(StringComparer.OrdinalIgnoreCase);
     }
 
     public async Task RebuildAggregatesForWorkPeriodAsync(
@@ -241,6 +323,7 @@ public sealed class WorkReportLabelStatisticsService : IWorkReportLabelStatistic
                 LabelCode = x.LabelCode,
                 LabelName = label?.Name,
                 LabelColor = label?.Color,
+                LabelDataType = LabelDataTypes.Normalize(label?.DataType),
                 PeriodKey = x.PeriodKey,
                 PeriodInstanceKey = x.PeriodInstanceKey,
                 PeriodKind = x.PeriodKind,
@@ -333,18 +416,18 @@ public sealed class WorkReportLabelStatisticsService : IWorkReportLabelStatistic
         CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(req.WorkId))
-            throw new InvalidOperationException("Thiếu WorkId.");
+            throw ReportStatisticExceptions.WorkIdRequired("LABEL", req.WorkId);
 
         var scopeType = req.ScopeType?.Trim().ToUpperInvariant();
         if (scopeType is "ASSIGNMENT" or "ROOT")
         {
             if (string.IsNullOrWhiteSpace(req.ScopeId))
-                throw new InvalidOperationException("Thiếu ScopeId.");
+                throw ReportStatisticExceptions.ScopeIdRequired("LABEL", req.WorkId, scopeType, req.ScopeId);
 
             var assignment = await _ctx.WorkAssignments
                 .Find(x => x.Id == req.ScopeId && x.WorkId == req.WorkId && !x.IsDeleted)
                 .FirstOrDefaultAsync(ct)
-                ?? throw new InvalidOperationException("Không tìm thấy assignment thống kê.");
+                ?? throw ReportStatisticExceptions.AssignmentNotFound("LABEL", req.WorkId, scopeType, req.ScopeId);
 
             if (CanReadAssignment(assignment, actorUserId))
                 return;
@@ -363,7 +446,7 @@ public sealed class WorkReportLabelStatisticsService : IWorkReportLabelStatistic
                 return;
         }
 
-        throw new UnauthorizedAccessException("Bạn không có quyền xem thống kê nhãn này.");
+        throw ReportStatisticExceptions.ReadForbidden("LABEL", req.WorkId, scopeType, req.ScopeId, actorUserId);
     }
 
     private static bool CanReadAssignment(WorkAssignment assignment, string actorUserId)
@@ -375,14 +458,14 @@ public sealed class WorkReportLabelStatisticsService : IWorkReportLabelStatistic
         req ??= new LabelStatisticSummaryRequest();
         var workId = req.WorkId?.Trim();
         if (string.IsNullOrWhiteSpace(workId))
-            throw new InvalidOperationException("Thiếu WorkId.");
+            throw ReportStatisticExceptions.WorkIdRequired("LABEL", req.WorkId);
 
         var scopeType = string.IsNullOrWhiteSpace(req.ScopeType)
             ? "WORK"
             : req.ScopeType.Trim().ToUpperInvariant();
 
         if (scopeType is not ("WORK" or "ROOT" or "ASSIGNMENT"))
-            throw new InvalidOperationException("ScopeType không hợp lệ.");
+            throw ReportStatisticExceptions.ScopeTypeInvalid("LABEL", workId, req.ScopeType);
 
         var scopeId = string.IsNullOrWhiteSpace(req.ScopeId)
             ? (scopeType == "WORK" ? workId : null)
@@ -428,7 +511,7 @@ public sealed class WorkReportLabelStatisticsService : IWorkReportLabelStatistic
                     if (rowIndex < 0)
                         continue;
 
-                    var labelCodes = NormalizeLabelCodes(row.LabelCodes);
+                    var labelCodes = NormalizeLabelCodes(row.RowLabelCodes);
                     if (labelCodes.Count == 0)
                         continue;
 
@@ -547,7 +630,7 @@ public sealed class WorkReportLabelStatisticsService : IWorkReportLabelStatistic
         public string? SheetId { get; set; }
         public string? RowKey { get; set; }
         public int? RowIndex { get; set; }
-        public List<string>? LabelCodes { get; set; }
+        public List<string>? RowLabelCodes { get; set; }
         public string? Source { get; set; }
     }
 

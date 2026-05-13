@@ -2,6 +2,7 @@
 using System.Security.Claims;
 using System.Text;
 using Microsoft.IdentityModel.Tokens;
+using tdtd_be.Common.Errors;
 
 namespace tdtd_be.Uploads;
 
@@ -11,7 +12,10 @@ public sealed class UploadTokenService
 
     public UploadTokenService(IConfiguration cfg)
     {
-        var jwtKey = cfg["Jwt:Key"] ?? throw new Exception("Jwt:Key missing");
+        var jwtKey = cfg["Jwt:Key"];
+        if (string.IsNullOrWhiteSpace(jwtKey))
+            throw AppExceptionFactory.Create(AppErrorCode.AUTH_CONFIG_INVALID, new { key = "Jwt:Key", consumer = nameof(UploadTokenService) });
+
         _key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtKey));
     }
 

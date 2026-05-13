@@ -13,13 +13,12 @@ public sealed class CreateUserRequest
     [Required, MinLength(1), MaxLength(128)]
     public string FullName { get; set; } = default!;
 
-    [Required]
-    public string UnitId { get; set; } = default!;
+    public string? UnitId { get; set; }
 
     public List<string> Roles { get; set; } = new();
 
-    [Required, MinLength(1), MaxLength(80)]
-    public string PositionCode { get; set; } = default!;
+    [MaxLength(80)]
+    public string? PositionCode { get; set; }
 }
 
 public sealed class UpdateUserRequest
@@ -31,8 +30,8 @@ public sealed class UpdateUserRequest
     public List<string>? Roles { get; set; }
     public string? Note { get; set; }
 
-    [Required, MinLength(1), MaxLength(80)]
-    public string PositionCode { get; set; } = default!;
+    [MaxLength(80)]
+    public string? PositionCode { get; set; }
 }
 
 public sealed class ResetPasswordRequest
