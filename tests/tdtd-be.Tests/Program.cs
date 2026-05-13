@@ -29,6 +29,8 @@ var tests = new (string Name, Action Run)[]
     ("child missing assignment completed date defaults to parent assignment end", DefaultsChildCompletedDateToParentAssignmentEnd),
     ("periodic assignment date range caps occurrence validation", ValidatesPeriodicAssignmentDateRange),
     ("historical data approval resolves as normal approved", ResolvesHistoricalDataApprovalAsNormalApproved),
+    ("historical user-created period is data-only for progress", TreatsHistoricalUserCreatedPeriodAsDataOnly),
+    ("historical report source window matches aggregate period filters", MatchesHistoricalReportSourceWindowForAggregation),
     ("generated unit manager can create root work", AllowsGeneratedUnitManagerWorkCreate),
     ("generated level manager can create root work", AllowsGeneratedLevelManagerWorkCreate),
     ("management account usernames use unit symbol", ManagementAccountUsernamesUseUnitSymbol),
@@ -342,6 +344,60 @@ static void ResolvesHistoricalDataApprovalAsNormalApproved()
     AssertEqual(WorkReportPeriodStatus.Approved, status, "historical approved report should not remain overdue");
 }
 
+static void TreatsHistoricalUserCreatedPeriodAsDataOnly()
+{
+    var dataOnly = new WorkReportPeriod
+    {
+        PeriodKind = WorkReportPeriodKind.UserCreated,
+        IsHistoricalData = true
+    };
+
+    AssertFalse(
+        WorkAssignmentReportTemporalPolicy.ContributesToProgress(dataOnly),
+        "unlinked historical user-created period should not drive assignment progress");
+
+    var linked = new WorkReportPeriod
+    {
+        PeriodKind = WorkReportPeriodKind.UserCreated,
+        IsHistoricalData = true,
+        LinkedScheduledPeriodId = ObjectId(101)
+    };
+
+    AssertTrue(
+        WorkAssignmentReportTemporalPolicy.ContributesToProgress(linked),
+        "linked historical user-created period can still be treated as progress-contributing");
+}
+
+static void MatchesHistoricalReportSourceWindowForAggregation()
+{
+    var report = new WorkAssignmentReport
+    {
+        PeriodKind = WorkReportPeriodKind.UserCreated,
+        PeriodKey = "USER_CREATED:manual",
+        ReportDate = new DateTime(2026, 1, 10),
+        PeriodStart = new DateTime(2026, 1, 5),
+        PeriodEnd = new DateTime(2026, 1, 10),
+        CompletedDate = new DateTime(2026, 1, 10),
+        IsHistoricalData = true
+    };
+
+    AssertTrue(
+        WorkAssignmentReportTemporalPolicy.MatchesPeriodScope(report, "SINGLE_PERIOD", "20260107", null, null),
+        "single-period aggregate should include a custom-key historical report when the source window overlaps");
+    AssertFalse(
+        WorkAssignmentReportTemporalPolicy.MatchesPeriodScope(report, "SINGLE_PERIOD", "20260111", null, null),
+        "single-period aggregate should exclude dates outside the source window");
+    AssertTrue(
+        WorkAssignmentReportTemporalPolicy.MatchesPeriodScope(report, "PERIOD_RANGE", null, "20260101", "20260106"),
+        "period-range aggregate should include overlapping historical source windows");
+    AssertTrue(
+        WorkAssignmentReportTemporalPolicy.MatchesPeriodScope(report, "CUMULATIVE_TO_PERIOD", null, null, "20260105"),
+        "cumulative aggregate should include reports whose source window starts on or before the cutoff");
+    AssertFalse(
+        WorkAssignmentReportTemporalPolicy.MatchesPeriodScope(report, "CUMULATIVE_TO_PERIOD", null, null, "20260104"),
+        "cumulative aggregate should exclude reports whose source window starts after the cutoff");
+}
+
 static void AllowsGeneratedUnitManagerWorkCreate()
 {
     WorkPermission().EnsureCanCreateRoot(Me(
@@ -558,6 +614,36 @@ static void ValidatesDynamicFormFieldDisplayName()
         ]
         """,
         "FieldsJson");
+
+    InvokePrivateStatic<object?>(
+        serviceType,
+        "EnsureStatisticLabelTypeCompatibility",
+        """
+        [
+          { "id": "f4", "sectionId": "s1", "key": "approved_at", "type": "date", "name": "Ngày duyệt", "isStatistic": true, "statisticLabelCodes": ["approved_at"] }
+        ]
+        """,
+        null,
+        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["approved_at"] = LabelDataTypes.Date
+        });
+
+    AssertThrowsFromReflection(
+        AppErrorCode.DYNAMIC_FORM_LABEL_STATISTIC_TARGET_INVALID,
+        () => InvokePrivateStatic<object?>(
+            serviceType,
+            "EnsureStatisticLabelTypeCompatibility",
+            """
+            [
+              { "id": "f5", "sectionId": "s1", "key": "approved_at", "type": "date", "name": "Ngày duyệt", "isStatistic": true, "statisticLabelCodes": ["revenue"] }
+            ]
+            """,
+            null,
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["revenue"] = LabelDataTypes.Number
+            }));
 }
 
 static void ValidatesDynamicExcelRecordTableContract()

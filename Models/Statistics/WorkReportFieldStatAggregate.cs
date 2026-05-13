@@ -70,6 +70,25 @@ public sealed class WorkReportFieldStatAggregate : BaseEntity
     [BsonElement("periodKind")]
     public string PeriodKind { get; set; } = default!;
 
+    [BsonElement("periodAnchorDate")]
+    [BsonDateTimeOptions(Kind = DateTimeKind.Utc)]
+    public DateTime? PeriodAnchorDate { get; set; }
+
+    [BsonElement("periodStartDate")]
+    [BsonDateTimeOptions(Kind = DateTimeKind.Utc)]
+    public DateTime? PeriodStartDate { get; set; }
+
+    [BsonElement("periodEndDate")]
+    [BsonDateTimeOptions(Kind = DateTimeKind.Utc)]
+    public DateTime? PeriodEndDate { get; set; }
+
+    [BsonElement("completedDate")]
+    [BsonDateTimeOptions(Kind = DateTimeKind.Utc)]
+    public DateTime? CompletedDate { get; set; }
+
+    [BsonElement("isHistoricalData")]
+    public bool IsHistoricalData { get; set; }
+
     [BsonElement("reportStatus")]
     public int ReportStatus { get; set; }
 

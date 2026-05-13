@@ -10,6 +10,7 @@ using tdtd_be.DTOs.Statistics;
 using tdtd_be.Models;
 using tdtd_be.Models.Enums;
 using tdtd_be.Models.Statistics;
+using tdtd_be.Services.WorkAssignmentReports;
 
 namespace tdtd_be.Services.WorkAssignmentReports.Statistics;
 
@@ -104,6 +105,7 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
             var now = DateTime.UtcNow;
             var actorId = NormalizeObjectIdOrNull(actorUserId);
             var ancestorAssignmentIds = ExtractAncestorAssignmentIds(assignment, report.WorkAssignmentId);
+            var sourceWindow = WorkAssignmentReportTemporalPolicy.ResolveSourceWindow(report);
 
             var rows = values.Select(value => new WorkReportFieldStatValue
             {
@@ -133,6 +135,11 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
                 PeriodKey = report.PeriodKey,
                 PeriodInstanceKey = report.PeriodInstanceKey,
                 PeriodKind = report.PeriodKind,
+                PeriodAnchorDate = sourceWindow.PeriodAnchorDate,
+                PeriodStartDate = sourceWindow.PeriodStartDate,
+                PeriodEndDate = sourceWindow.PeriodEndDate,
+                CompletedDate = sourceWindow.CompletedDate,
+                IsHistoricalData = sourceWindow.IsHistoricalData,
                 ReportStatus = (int)report.Status,
                 CreatedAtUtc = now,
                 UpdatedAtUtc = now,
@@ -219,6 +226,11 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
                             PeriodKey = value.PeriodKey,
                             PeriodInstanceKey = value.PeriodInstanceKey,
                             PeriodKind = value.PeriodKind,
+                            PeriodAnchorDate = value.PeriodAnchorDate,
+                            PeriodStartDate = value.PeriodStartDate,
+                            PeriodEndDate = value.PeriodEndDate,
+                            CompletedDate = value.CompletedDate,
+                            IsHistoricalData = value.IsHistoricalData,
                             ReportStatus = value.ReportStatus,
                             CreatedAtUtc = now,
                             UpdatedAtUtc = now,

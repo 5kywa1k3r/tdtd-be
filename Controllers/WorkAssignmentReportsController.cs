@@ -99,6 +99,14 @@ public sealed class WorkAssignmentReportsController : ControllerBase
         return Ok(rs);
     }
 
+    [HttpPost("work-assignment-reports/{id}/draft/preview-dynamic-form-aggregate")]
+    public async Task<IActionResult> PreviewDynamicFormAggregateDraft([FromRoute] string id, [FromBody] ApplyDynamicFormAggregateDraftRequest req, CancellationToken ct)
+    {
+        var actorUserId = GetActorUserId();
+        var rs = await _service.PreviewDynamicFormAggregateDraftAsync(id, req, actorUserId, ct);
+        return Ok(rs);
+    }
+
     [HttpPost("work-assignment-reports/{id}/submit")]
     public async Task<IActionResult> Submit([FromRoute] string id, [FromBody] SubmitWorkAssignmentReportRequest req, CancellationToken ct)
     {

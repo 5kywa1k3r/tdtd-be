@@ -205,6 +205,14 @@ public sealed class AggregateTableService : IAggregateTableService
         return value.Trim();
     }
 
+    private static bool TryParseNormalizedDayKey(string? value, out DateTime date)
+        => DateTime.TryParseExact(
+            NormalizeDayKey(value),
+            "yyyyMMdd",
+            System.Globalization.CultureInfo.InvariantCulture,
+            System.Globalization.DateTimeStyles.None,
+            out date);
+
     private static List<string> NormalizeStringList(IEnumerable<string>? values)
         => (values ?? Array.Empty<string>())
             .Where(x => !string.IsNullOrWhiteSpace(x))
@@ -395,7 +403,8 @@ public sealed class AggregateTableService : IAggregateTableService
                 new { parentAssignmentId });
 
         var canView = string.Equals(parent.CreatedByUserId, actorUserId, StringComparison.Ordinal)
-            || (parent.LeaderWatcherUserIds?.Contains(actorUserId) ?? false);
+            || (parent.LeaderWatcherUserIds?.Contains(actorUserId) ?? false)
+            || (parent.Assignees?.Any(x => string.Equals(x.UserId, actorUserId, StringComparison.Ordinal)) ?? false);
 
         if (!canView)
             throw AppExceptionFactory.Forbidden(
@@ -539,19 +548,12 @@ public sealed class AggregateTableService : IAggregateTableService
                 x => x.CumulativeContributionMode,
                 WorkReportCumulativeContributionMode.Exclude));
 
-        if (req.PeriodScopeMode == "SINGLE_PERIOD")
-        {
-            filter &= Builders<WorkAssignmentReport>.Filter.Eq(x => x.PeriodKey, req.PeriodKey);
-        }
-        else if (req.PeriodScopeMode == "PERIOD_RANGE")
-        {
-            filter &= Builders<WorkAssignmentReport>.Filter.Gte(x => x.PeriodKey, req.PeriodKeyFrom);
-            filter &= Builders<WorkAssignmentReport>.Filter.Lte(x => x.PeriodKey, req.PeriodKeyTo);
-        }
-        else if (req.PeriodScopeMode == "CUMULATIVE_TO_PERIOD")
-        {
-            filter &= Builders<WorkAssignmentReport>.Filter.Lte(x => x.PeriodKey, req.PeriodKeyTo);
-        }
+        filter = AddReportPeriodScopeFilter(
+            filter,
+            req.PeriodScopeMode,
+            req.PeriodKey,
+            req.PeriodKeyFrom,
+            req.PeriodKeyTo);
 
         if (req.SourceStatusMode == "APPROVED_AND_SUBMITTED")
         {
@@ -587,19 +589,12 @@ public sealed class AggregateTableService : IAggregateTableService
                 x => x.CumulativeContributionMode,
                 WorkReportCumulativeContributionMode.Exclude));
 
-        if (req.PeriodScopeMode == "SINGLE_PERIOD")
-        {
-            filter &= Builders<WorkAssignmentReport>.Filter.Eq(x => x.PeriodKey, req.PeriodKey);
-        }
-        else if (req.PeriodScopeMode == "PERIOD_RANGE")
-        {
-            filter &= Builders<WorkAssignmentReport>.Filter.Gte(x => x.PeriodKey, req.PeriodKeyFrom);
-            filter &= Builders<WorkAssignmentReport>.Filter.Lte(x => x.PeriodKey, req.PeriodKeyTo);
-        }
-        else if (req.PeriodScopeMode == "CUMULATIVE_TO_PERIOD")
-        {
-            filter &= Builders<WorkAssignmentReport>.Filter.Lte(x => x.PeriodKey, req.PeriodKeyTo);
-        }
+        filter = AddReportPeriodScopeFilter(
+            filter,
+            req.PeriodScopeMode,
+            req.PeriodKey,
+            req.PeriodKeyFrom,
+            req.PeriodKeyTo);
 
         if (req.SourceStatusMode == "APPROVED_AND_SUBMITTED")
         {
@@ -616,6 +611,134 @@ public sealed class AggregateTableService : IAggregateTableService
             filter &= Builders<WorkAssignmentReport>.Filter.Eq(
                 x => x.Status,
                 WorkAssignmentReportStatus.Approved);
+        }
+
+        return filter;
+    }
+
+    private static FilterDefinition<WorkAssignmentReport> AddReportPeriodScopeFilter(
+        FilterDefinition<WorkAssignmentReport> filter,
+        string? periodScopeMode,
+        string? periodKey,
+        string? periodKeyFrom,
+        string? periodKeyTo)
+    {
+        var mode = (periodScopeMode ?? "ALL_PERIODS").Trim().ToUpperInvariant();
+        if (mode == "ALL_PERIODS")
+            return filter;
+
+        var fb = Builders<WorkAssignmentReport>.Filter;
+
+        if (mode == "SINGLE_PERIOD")
+        {
+            var key = NormalizeDayKey(periodKey);
+            if (TryParseNormalizedDayKey(key, out var date))
+            {
+                var window = fb.And(
+                    fb.Lte(x => x.PeriodStart, date.Date),
+                    fb.Gte(x => x.PeriodEnd, date.Date));
+                return filter & fb.Or(window, fb.Eq(x => x.PeriodKey, key));
+            }
+
+            return filter & fb.Eq(x => x.PeriodKey, key);
+        }
+
+        if (mode == "PERIOD_RANGE")
+        {
+            var fromKey = NormalizeDayKey(periodKeyFrom);
+            var toKey = NormalizeDayKey(periodKeyTo);
+            if (TryParseNormalizedDayKey(fromKey, out var from) &&
+                TryParseNormalizedDayKey(toKey, out var to))
+            {
+                if (to < from)
+                    (from, to) = (to, from);
+
+                var window = fb.And(
+                    fb.Lte(x => x.PeriodStart, to.Date),
+                    fb.Gte(x => x.PeriodEnd, from.Date));
+                var keyRange = fb.And(
+                    fb.Gte(x => x.PeriodKey, fromKey),
+                    fb.Lte(x => x.PeriodKey, toKey));
+                return filter & fb.Or(window, keyRange);
+            }
+
+            return filter & fb.Gte(x => x.PeriodKey, fromKey) & fb.Lte(x => x.PeriodKey, toKey);
+        }
+
+        if (mode == "CUMULATIVE_TO_PERIOD")
+        {
+            var toKey = NormalizeDayKey(periodKeyTo);
+            if (TryParseNormalizedDayKey(toKey, out var to))
+            {
+                var window = fb.Lte(x => x.PeriodStart, to.Date);
+                return filter & fb.Or(window, fb.Lte(x => x.PeriodKey, toKey));
+            }
+
+            return filter & fb.Lte(x => x.PeriodKey, toKey);
+        }
+
+        return filter;
+    }
+
+    private static FilterDefinition<WorkReportTableStatAggregate> AddTableAggregatePeriodScopeFilter(
+        FilterDefinition<WorkReportTableStatAggregate> filter,
+        string? periodScopeMode,
+        string? periodKey,
+        string? periodKeyFrom,
+        string? periodKeyTo)
+    {
+        var mode = (periodScopeMode ?? "ALL_PERIODS").Trim().ToUpperInvariant();
+        if (mode == "ALL_PERIODS")
+            return filter;
+
+        var fb = Builders<WorkReportTableStatAggregate>.Filter;
+
+        if (mode == "SINGLE_PERIOD")
+        {
+            var key = NormalizeDayKey(periodKey);
+            if (TryParseNormalizedDayKey(key, out var date))
+            {
+                var window = fb.And(
+                    fb.Lte(x => x.PeriodStartDate, date.Date),
+                    fb.Gte(x => x.PeriodEndDate, date.Date));
+                return filter & fb.Or(window, fb.Eq(x => x.PeriodKey, key));
+            }
+
+            return filter & fb.Eq(x => x.PeriodKey, key);
+        }
+
+        if (mode == "PERIOD_RANGE")
+        {
+            var fromKey = NormalizeDayKey(periodKeyFrom);
+            var toKey = NormalizeDayKey(periodKeyTo);
+            if (TryParseNormalizedDayKey(fromKey, out var from) &&
+                TryParseNormalizedDayKey(toKey, out var to))
+            {
+                if (to < from)
+                    (from, to) = (to, from);
+
+                var window = fb.And(
+                    fb.Lte(x => x.PeriodStartDate, to.Date),
+                    fb.Gte(x => x.PeriodEndDate, from.Date));
+                var keyRange = fb.And(
+                    fb.Gte(x => x.PeriodKey, fromKey),
+                    fb.Lte(x => x.PeriodKey, toKey));
+                return filter & fb.Or(window, keyRange);
+            }
+
+            return filter & fb.Gte(x => x.PeriodKey, fromKey) & fb.Lte(x => x.PeriodKey, toKey);
+        }
+
+        if (mode == "CUMULATIVE_TO_PERIOD")
+        {
+            var toKey = NormalizeDayKey(periodKeyTo);
+            if (TryParseNormalizedDayKey(toKey, out var to))
+            {
+                var window = fb.Lte(x => x.PeriodStartDate, to.Date);
+                return filter & fb.Or(window, fb.Lte(x => x.PeriodKey, toKey));
+            }
+
+            return filter & fb.Lte(x => x.PeriodKey, toKey);
         }
 
         return filter;
@@ -770,7 +893,7 @@ public sealed class AggregateTableService : IAggregateTableService
 
         if (reportIds.Any(x => !projectedReportIds.Contains(x)))
         {
-            warnings.Add("Some source reports do not have table metric projections yet; raw tableValuesJson fallback was used.");
+            warnings.Add("Một số báo cáo nguồn chưa có snapshot chỉ số bảng; hệ thống dùng dữ liệu bảng gốc để tổng hợp.");
             return null;
         }
 
@@ -786,8 +909,6 @@ public sealed class AggregateTableService : IAggregateTableService
 
             metricAcc.Add(value.Value);
         }
-
-        warnings.Add("Dynamic Form aggregate used work_report_table_stat_values projection.");
 
         return acc.Values
             .OrderBy(x => x.Metric.Index)
@@ -835,19 +956,12 @@ public sealed class AggregateTableService : IAggregateTableService
         if (!string.IsNullOrWhiteSpace(layout.SourceTableMode))
             filter &= fb.Eq(x => x.TableMode, layout.SourceTableMode);
 
-        if (req.PeriodScopeMode == "SINGLE_PERIOD")
-        {
-            filter &= fb.Eq(x => x.PeriodKey, req.PeriodKey);
-        }
-        else if (req.PeriodScopeMode == "PERIOD_RANGE")
-        {
-            filter &= fb.Gte(x => x.PeriodKey, req.PeriodKeyFrom);
-            filter &= fb.Lte(x => x.PeriodKey, req.PeriodKeyTo);
-        }
-        else if (req.PeriodScopeMode == "CUMULATIVE_TO_PERIOD")
-        {
-            filter &= fb.Lte(x => x.PeriodKey, req.PeriodKeyTo);
-        }
+        filter = AddTableAggregatePeriodScopeFilter(
+            filter,
+            req.PeriodScopeMode,
+            req.PeriodKey,
+            req.PeriodKeyFrom,
+            req.PeriodKeyTo);
 
         if (req.SourceStatusMode == "APPROVED_AND_SUBMITTED")
         {
@@ -870,16 +984,12 @@ public sealed class AggregateTableService : IAggregateTableService
 
         if (aggregates.Count == 0)
         {
-            warnings.Add("SUMMARY_TEMPLATE preview did not find projection aggregates for the selected scope/period.");
-        }
-        else
-        {
-            warnings.Add("SUMMARY_TEMPLATE preview used work_report_table_stat_aggregates projection.");
+            warnings.Add("Chưa có snapshot tổng hợp phù hợp với phạm vi hoặc kỳ đã chọn.");
         }
 
         if (layout.GroupBy.Any(x => x != "UNIT" && x != "ASSIGNMENT"))
         {
-            warnings.Add("SUMMARY_TEMPLATE preview currently renders assignment/unit rows; other groupBy values are preserved in the contract for later output/export work.");
+            warnings.Add("Preview hiện hiển thị theo đơn vị hoặc công việc; các nhóm khác vẫn được giữ trong cấu hình tổng hợp.");
         }
 
         var metricByKey = metrics.ToDictionary(x => x.MetricKey, x => x, StringComparer.Ordinal);
@@ -1042,7 +1152,7 @@ public sealed class AggregateTableService : IAggregateTableService
             var block = ExtractReportTableBlock(report.TableValuesJson, contract.BlockId);
             if (block?.Rows is not { Count: > 0 })
             {
-                warnings.Add("Some reports are missing APPEND_ROWS tableValuesJson rows; those reports were skipped for APPEND_ROWS aggregation.");
+                warnings.Add("Một số báo cáo thiếu dữ liệu dòng phát sinh nên đã được bỏ qua khi tổng hợp.");
                 continue;
             }
 
@@ -1097,7 +1207,7 @@ public sealed class AggregateTableService : IAggregateTableService
             var block = ExtractReportTableBlock(report.TableValuesJson, contract.BlockId);
             if (block?.Columns is not { Count: > 0 })
             {
-                warnings.Add("Some reports are missing APPEND_COLUMNS tableValuesJson columns; those reports were skipped for APPEND_COLUMNS aggregation.");
+                warnings.Add("Một số báo cáo thiếu dữ liệu cột phát sinh nên đã được bỏ qua khi tổng hợp.");
                 continue;
             }
 
@@ -1152,7 +1262,7 @@ public sealed class AggregateTableService : IAggregateTableService
             var block = ExtractReportTableBlock(report.TableValuesJson, contract.BlockId);
             if (block?.Cells is not { Count: > 0 })
             {
-                warnings.Add("Some reports are missing MATRIX tableValuesJson cells; those reports were skipped for MATRIX aggregation.");
+                warnings.Add("Một số báo cáo thiếu dữ liệu ô ma trận nên đã được bỏ qua khi tổng hợp.");
                 continue;
             }
 
@@ -1197,7 +1307,7 @@ public sealed class AggregateTableService : IAggregateTableService
         if (block?.Values1D is { Count: > 0 })
             return block.Values1D.Select(ToNullableDecimal).ToList();
 
-        warnings.Add("Some reports are missing tableValuesJson block values; fallback Values1DJson was used.");
+        warnings.Add("Một số báo cáo thiếu dữ liệu bảng theo block; hệ thống dùng dữ liệu ô cũ để tổng hợp.");
         return DeserializeValues1D(report.Values1DJson);
     }
 

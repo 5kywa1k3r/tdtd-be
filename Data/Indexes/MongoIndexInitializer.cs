@@ -2218,6 +2218,19 @@
                 }
             ), ct);
 
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_workReportLabelStatValues_work_window_label_status",
+                key: new BsonDocument
+                {
+                    { "workId", 1 },
+                    { "periodStartDate", 1 },
+                    { "periodEndDate", 1 },
+                    { "labelCode", 1 },
+                    { "reportStatus", 1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
+
         }
 
         private static async Task EnsureWorkReportLabelStatAggregatesAsync(
@@ -2273,6 +2286,21 @@
                     { "isDeleted", 1 }
                 }
             ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_workReportLabelStatAggregates_window_read",
+                key: new BsonDocument
+                {
+                    { "workId", 1 },
+                    { "scopeType", 1 },
+                    { "scopeId", 1 },
+                    { "periodStartDate", 1 },
+                    { "periodEndDate", 1 },
+                    { "labelCode", 1 },
+                    { "reportStatus", 1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
         }
 
         private static async Task EnsureWorkReportTableStatValuesAsync(
@@ -2320,6 +2348,21 @@
                     { "blockId", 1 },
                     { "metricKey", 1 },
                     { "periodInstanceKey", 1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_workReportTableStatValues_work_window_metric_status",
+                key: new BsonDocument
+                {
+                    { "workId", 1 },
+                    { "periodStartDate", 1 },
+                    { "periodEndDate", 1 },
+                    { "dynamicFormTemplateId", 1 },
+                    { "blockId", 1 },
+                    { "metricKey", 1 },
+                    { "reportStatus", 1 },
                     { "isDeleted", 1 }
                 }
             ), ct);
@@ -2381,6 +2424,23 @@
                     { "isDeleted", 1 }
                 }
             ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_workReportTableStatAggregates_window_read",
+                key: new BsonDocument
+                {
+                    { "workId", 1 },
+                    { "scopeType", 1 },
+                    { "scopeId", 1 },
+                    { "dynamicFormTemplateId", 1 },
+                    { "blockId", 1 },
+                    { "metricKey", 1 },
+                    { "periodStartDate", 1 },
+                    { "periodEndDate", 1 },
+                    { "reportStatus", 1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
         }
 
         private static async Task EnsureWorkReportFieldStatValuesAsync(
@@ -2426,6 +2486,21 @@
                     { "dynamicFormTemplateId", 1 },
                     { "fieldId", 1 },
                     { "periodInstanceKey", 1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_workReportFieldStatValues_work_window_field_status",
+                key: new BsonDocument
+                {
+                    { "workId", 1 },
+                    { "periodStartDate", 1 },
+                    { "periodEndDate", 1 },
+                    { "dynamicFormTemplateId", 1 },
+                    { "fieldId", 1 },
+                    { "bucketKey", 1 },
+                    { "reportStatus", 1 },
                     { "isDeleted", 1 }
                 }
             ), ct);
@@ -2483,6 +2558,23 @@
                     { "periodInstanceKey", 1 },
                     { "scopeType", 1 },
                     { "scopeId", 1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_workReportFieldStatAggregates_window_read",
+                key: new BsonDocument
+                {
+                    { "workId", 1 },
+                    { "scopeType", 1 },
+                    { "scopeId", 1 },
+                    { "dynamicFormTemplateId", 1 },
+                    { "fieldId", 1 },
+                    { "bucketKey", 1 },
+                    { "periodStartDate", 1 },
+                    { "periodEndDate", 1 },
+                    { "reportStatus", 1 },
                     { "isDeleted", 1 }
                 }
             ), ct);

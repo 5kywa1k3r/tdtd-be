@@ -1569,10 +1569,16 @@ public sealed class DynamicFormService : IDynamicFormService
 
         var found = await _ctx.Labels
             .Find(filter)
-            .Project(x => x.Code)
+            .Project(x => new { x.Code, x.DataType })
             .ToListAsync(ct);
 
-        var foundSet = new HashSet<string>(found, StringComparer.OrdinalIgnoreCase);
+        var foundTypes = found
+            .GroupBy(x => x.Code, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(
+                x => x.Key,
+                x => LabelDataTypes.Normalize(x.First().DataType),
+                StringComparer.OrdinalIgnoreCase);
+        var foundSet = new HashSet<string>(foundTypes.Keys, StringComparer.OrdinalIgnoreCase);
         var missing = codes
             .Where(code => !foundSet.Contains(code))
             .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
@@ -1583,6 +1589,8 @@ public sealed class DynamicFormService : IDynamicFormService
                 AppErrorCode.DYNAMIC_FORM_LABEL_NOT_FOUND_OR_INACTIVE,
                 "Nhan khong ton tai, inactive hoac ngoai pham vi.",
                 new { missing });
+
+        EnsureStatisticLabelTypeCompatibility(fieldsJson, blocksJson, foundTypes);
     }
 
     private static FilterDefinition<LabelCatalogItem> BuildLabelVisibilityFilter(MeResponse me)
@@ -1698,6 +1706,53 @@ public sealed class DynamicFormService : IDynamicFormService
                 MaxLabelStatisticTargetsPerForm,
                 targetCount,
                 $"Dynamic Form chi toi da {MaxLabelStatisticTargetsPerForm} field/column gan nhan thong ke.");
+        }
+    }
+
+    private static void EnsureStatisticLabelTypeCompatibility(
+        string? fieldsJson,
+        string? blocksJson,
+        IReadOnlyDictionary<string, string> labelDataTypes)
+    {
+        foreach (var target in ReadFieldStatisticTargets(fieldsJson))
+        {
+            if (string.IsNullOrWhiteSpace(target.ExpectedDataType))
+                continue;
+
+            if (!labelDataTypes.TryGetValue(target.LabelCode, out var actualDataType))
+                continue;
+
+            var expectedDataType = LabelDataTypes.Normalize(target.ExpectedDataType);
+            if (!string.Equals(actualDataType, expectedDataType, StringComparison.OrdinalIgnoreCase))
+                throw DynamicFormValidation(
+                    AppErrorCode.DYNAMIC_FORM_LABEL_STATISTIC_TARGET_INVALID,
+                    "Kieu du lieu cua nhan thong ke khong khop voi field.",
+                    new
+                    {
+                        target = target.Target,
+                        labelCode = target.LabelCode,
+                        expectedDataType,
+                        actualDataType
+                    });
+        }
+
+        foreach (var target in ReadExcelColumnStatisticTargets(blocksJson))
+        {
+            if (!labelDataTypes.TryGetValue(target.LabelCode, out var actualDataType))
+                continue;
+
+            var expectedDataType = LabelDataTypes.Number;
+            if (!string.Equals(actualDataType, expectedDataType, StringComparison.OrdinalIgnoreCase))
+                throw DynamicFormValidation(
+                    AppErrorCode.DYNAMIC_FORM_LABEL_STATISTIC_TARGET_INVALID,
+                    "Kieu du lieu cua nhan thong ke cot Excel dong phai la NUMBER.",
+                    new
+                    {
+                        target = target.Target,
+                        labelCode = target.LabelCode,
+                        expectedDataType,
+                        actualDataType
+                    });
         }
     }
 
@@ -1901,11 +1956,22 @@ public sealed class DynamicFormService : IDynamicFormService
             var fieldKey = ReadOptionalString(item, "key")
                            ?? ReadOptionalString(item, "id")
                            ?? "field";
+            var expectedDataType = MapFieldTypeToLabelDataType(ReadOptionalString(item, "type"));
 
             foreach (var label in labels)
-                yield return new LabelStatisticTarget(label, $"field:{fieldKey}");
+                yield return new LabelStatisticTarget(label, $"field:{fieldKey}", expectedDataType);
         }
     }
+
+    private static string MapFieldTypeToLabelDataType(string? fieldType)
+        => fieldType?.Trim() switch
+        {
+            "number" => LabelDataTypes.Number,
+            "date" => LabelDataTypes.Date,
+            "boolean" => LabelDataTypes.Boolean,
+            "longText" => LabelDataTypes.LongText,
+            _ => LabelDataTypes.ShortText
+        };
 
     private static int CountStatisticFields(string? fieldsJson)
     {
@@ -2134,7 +2200,10 @@ public sealed class DynamicFormService : IDynamicFormService
         targetsByLabel[labelCode] = target;
     }
 
-    private sealed record LabelStatisticTarget(string LabelCode, string Target);
+    private sealed record LabelStatisticTarget(
+        string LabelCode,
+        string Target,
+        string? ExpectedDataType = null);
 
     private static string[] NormalizeLabelCodes(string[]? labelCodes)
         => labelCodes?

@@ -104,6 +104,12 @@ public interface IWorkAssignmentReportService
         string currentUserId,
         CancellationToken ct = default);
 
+    Task<WorkAssignmentReportResponse> PreviewDynamicFormAggregateDraftAsync(
+        string id,
+        ApplyDynamicFormAggregateDraftRequest req,
+        string currentUserId,
+        CancellationToken ct = default);
+
     Task RefreshDynamicFormAggregateDependentsAsync(
         string sourceReportId,
         string currentUserId,

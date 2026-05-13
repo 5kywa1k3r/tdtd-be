@@ -7,6 +7,7 @@ using tdtd_be.Models;
 using tdtd_be.Models.Enums;
 using tdtd_be.Services.Common;
 using tdtd_be.Services.Common.Time;
+using tdtd_be.Services.WorkAssignmentReports;
 using tdtd_be.Services.WorkAssignments.Internal;
 
 namespace tdtd_be.Services.WorkAssignments.Progress;
@@ -387,9 +388,13 @@ public sealed class WorkAssignmentProgressService : IWorkAssignmentProgressServi
             .Find(x => x.WorkAssignmentId == assignment.Id && x.IsActive && !x.IsDeleted)
             .ToListAsync(ct);
 
-        if (materializedPeriods.Count > 0)
+        var progressPeriods = materializedPeriods
+            .Where(WorkAssignmentReportTemporalPolicy.ContributesToProgress)
+            .ToList();
+
+        if (progressPeriods.Count > 0)
         {
-            ApplyMaterializedPeriodFacts(facts, materializedPeriods, assignment, work, parent, nowUtc);
+            ApplyMaterializedPeriodFacts(facts, progressPeriods, assignment, work, parent, nowUtc);
             return facts;
         }
 
