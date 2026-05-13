@@ -4,6 +4,7 @@ using Hangfire.Mongo;
 using Hangfire.Mongo.Migration.Strategies;
 using Hangfire.Mongo.Migration.Strategies.Backup;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.IdentityModel.Tokens;
 using Microsoft.OpenApi.Models;
@@ -39,6 +40,7 @@ using tdtd_be.Services.WorkAssignments.Queue;
 using tdtd_be.Services.WorkAssignments.Review;
 using tdtd_be.Services.WorkAssignments.Runtime;
 using tdtd_be.Services.Notifications;
+using tdtd_be.Services.WorkDocuments;
 using tdtd_be.Services.Works;
 using tdtd_be.Uploads;
 using tusdotnet.Interfaces;
@@ -59,6 +61,17 @@ if (OperatingSystem.IsWindows()
 builder.Services.Configure<MongoOptions>(builder.Configuration.GetSection("Mongo"));
 builder.Services.Configure<JwtOptions>(builder.Configuration.GetSection("Jwt"));
 builder.Services.Configure<UploadOptions>(builder.Configuration.GetSection("Uploads"));
+builder.Services.Configure<ForwardedHeadersOptions>(opt =>
+{
+    opt.ForwardedHeaders =
+        ForwardedHeaders.XForwardedFor |
+        ForwardedHeaders.XForwardedProto |
+        ForwardedHeaders.XForwardedHost;
+
+    // Production runs behind nginx/Docker. The proxy address is not stable enough to whitelist here.
+    opt.KnownNetworks.Clear();
+    opt.KnownProxies.Clear();
+});
 
 // ================== mongo ==================
 builder.Services.AddSingleton<MongoDbContext>();
@@ -196,6 +209,7 @@ builder.Services.AddScoped<IWorkCodeGenerator, WorkCodeGenerator>();
 builder.Services.AddScoped<IWorkService, WorkService>();
 builder.Services.AddScoped<IWorkHistoryService, WorkHistoryService>();
 builder.Services.AddScoped<IWorkPermissionService, WorkPermissionService>();
+builder.Services.AddScoped<IWorkDocumentPermissionService, WorkDocumentPermissionService>();
 
 builder.Services.AddScoped<IWorkAssignmentLookupService, WorkAssignmentLookupService>();
 builder.Services.AddScoped<IDynamicExcelLookupService, DynamicExcelLookupService>();
@@ -361,6 +375,7 @@ builder.Services.AddSwaggerGen(c =>
 
 var app = builder.Build();
 
+app.UseForwardedHeaders();
 app.UseCors("fe");
 
 if (app.Environment.IsDevelopment())

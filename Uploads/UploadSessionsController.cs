@@ -1,5 +1,6 @@
 ﻿using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Options;
 using tdtd_be.Common.Auth;
 using tdtd_be.Common.Errors;
 
@@ -21,12 +22,18 @@ public sealed class UploadSessionsController : ControllerBase
     private readonly IConfiguration _cfg;
     private readonly UploadTokenService _uploadTokenSvc;
     private readonly MeAccessor _me;
+    private readonly UploadOptions _opt;
 
-    public UploadSessionsController(IConfiguration cfg, UploadTokenService uploadTokenSvc, MeAccessor me)
+    public UploadSessionsController(
+        IConfiguration cfg,
+        UploadTokenService uploadTokenSvc,
+        MeAccessor me,
+        IOptions<UploadOptions> opt)
     {
         _cfg = cfg;
         _uploadTokenSvc = uploadTokenSvc;
         _me = me;
+        _opt = opt.Value;
     }
 
     [Authorize]
@@ -58,8 +65,7 @@ public sealed class UploadSessionsController : ControllerBase
             ttlSeconds: ttl
         );
 
-        var apiBase = $"{Request.Scheme}://{Request.Host}";
-        var endpoint = $"{apiBase}/api/uploads";
+        var endpoint = UploadEndpointBuilder.BuildUploadsEndpoint(Request, _opt);
 
         // ✅ trả contract chuẩn cho FE
         return Ok(new

@@ -9,8 +9,11 @@ using tdtd_be.Models.Enums;
 using tdtd_be.Services;
 using tdtd_be.Services.WorkAssignmentReports;
 using tdtd_be.Services.WorkAssignments.Internal;
+using tdtd_be.Services.WorkDocuments;
 using tdtd_be.Services.Works;
+using tdtd_be.Uploads;
 using System.Reflection;
+using Microsoft.AspNetCore.Http;
 
 var tests = new (string Name, Action Run)[]
 {
@@ -43,6 +46,11 @@ var tests = new (string Name, Action Run)[]
     ("dynamic excel record table contract limits calculated outputs", LimitsDynamicExcelCalculatedOutputs),
     ("dynamic excel record table runtime accepts rows and calculates outputs", ValidatesDynamicExcelRecordTableRuntimeRows),
     ("dynamic excel record table runtime rejects invalid rows", RejectsInvalidDynamicExcelRecordTableRuntimeRows),
+    ("legacy work basis file resolves as work document", ResolvesLegacyWorkBasisFileAsWorkDocument),
+    ("assignment file resolves as assignment branch document", ResolvesAssignmentFileAsBranchDocument),
+    ("assignment document path resolves ancestors only", ResolvesAssignmentDocumentAncestorsFromPath),
+    ("upload endpoint uses public base url override", BuildsUploadEndpointFromPublicBaseUrl),
+    ("upload endpoint falls back to forwarded request scheme and host", BuildsUploadEndpointFromForwardedRequest),
 };
 
 var failures = new List<string>();
@@ -768,6 +776,85 @@ static void RejectsInvalidDynamicExcelRecordTableRuntimeRows()
             "report1"));
 }
 
+static void ResolvesLegacyWorkBasisFileAsWorkDocument()
+{
+    var workId = ObjectId(7);
+    var file = new FileDoc
+    {
+        Id = ObjectId(8),
+        SourceType = WorkDocumentConstants.SourceTypeWorkBasis,
+        SourceId = workId
+    };
+
+    var scope = WorkDocumentScopeResolver.Resolve(file);
+
+    AssertEqual(WorkDocumentConstants.ScopeWork, scope.Scope, "legacy work basis should become work-scope document");
+    AssertEqual(workId, scope.WorkId, "legacy work basis should use SourceId as work id");
+    AssertEqual<string?>(null, scope.AssignmentId, "legacy work basis should not have assignment id");
+}
+
+static void ResolvesAssignmentFileAsBranchDocument()
+{
+    var workId = ObjectId(7);
+    var assignmentId = ObjectId(8);
+    var file = new FileDoc
+    {
+        Id = ObjectId(9),
+        SourceType = WorkDocumentConstants.SourceTypeAssignmentDocument,
+        SourceId = assignmentId,
+        WorkId = workId,
+        AssignmentCode = "CV-001",
+        AssignmentPath = $"/{ObjectId(1)}/{assignmentId}"
+    };
+
+    var scope = WorkDocumentScopeResolver.Resolve(file);
+
+    AssertEqual(WorkDocumentConstants.ScopeAssignmentBranch, scope.Scope, "assignment source should become assignment-branch scope");
+    AssertEqual(workId, scope.WorkId, "assignment source should keep work id");
+    AssertEqual(assignmentId, scope.AssignmentId, "assignment source should use source id as assignment id fallback");
+    AssertEqual("CV-001", scope.AssignmentCode, "assignment code should be preserved");
+}
+
+static void ResolvesAssignmentDocumentAncestorsFromPath()
+{
+    var rootId = ObjectId(1);
+    var childId = ObjectId(2);
+    var assignmentId = ObjectId(3);
+    var siblingId = ObjectId(4);
+
+    var ids = WorkDocumentScopeResolver.ParseAssignmentPath($"/{rootId}/{childId}/{assignmentId}", assignmentId);
+
+    AssertSequenceEqual(
+        new[] { rootId, childId, assignmentId },
+        ids,
+        "assignment document readers should be resolved from the attachment node and ancestors only");
+    AssertFalse(ids.Contains(siblingId), "assignment document path should not include sibling branches");
+}
+
+static void BuildsUploadEndpointFromPublicBaseUrl()
+{
+    var request = new DefaultHttpContext().Request;
+    request.Scheme = "http";
+    request.Host = new HostString("internal:5080");
+
+    var endpoint = UploadEndpointBuilder.BuildUploadsEndpoint(
+        request,
+        new UploadOptions { PublicBaseUrl = "https://tdtd.conganthanhhoa.vn/api/" });
+
+    AssertEqual("https://tdtd.conganthanhhoa.vn/api/uploads", endpoint, "public base url should produce external HTTPS TUS endpoint");
+}
+
+static void BuildsUploadEndpointFromForwardedRequest()
+{
+    var request = new DefaultHttpContext().Request;
+    request.Scheme = "https";
+    request.Host = new HostString("tdtd.conganthanhhoa.vn");
+
+    var endpoint = UploadEndpointBuilder.BuildUploadsEndpoint(request, new UploadOptions());
+
+    AssertEqual("https://tdtd.conganthanhhoa.vn/api/uploads", endpoint, "forwarded request scheme and host should produce HTTPS TUS endpoint");
+}
+
 static Work WorkOwnedBy(string userId) => new()
 {
     Id = ObjectId(1),
@@ -862,6 +949,12 @@ static void AssertEqual<T>(T expected, T actual, string message)
 {
     if (!EqualityComparer<T>.Default.Equals(expected, actual))
         throw new InvalidOperationException($"{message}. Expected {expected}, got {actual}.");
+}
+
+static void AssertSequenceEqual<T>(IReadOnlyList<T> expected, IReadOnlyList<T> actual, string message)
+{
+    if (expected.Count != actual.Count || !expected.SequenceEqual(actual))
+        throw new InvalidOperationException($"{message}. Expected [{string.Join(", ", expected)}], got [{string.Join(", ", actual)}].");
 }
 
 static string UserId(int seed) => $"0000000000000000000000{seed:00}";

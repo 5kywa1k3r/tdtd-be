@@ -14,4 +14,7 @@ public sealed class UploadOptions
 
     // storage
     public string Bucket { get; set; } = "tdtd-attachments";
+
+    // Public origin used when API is behind a reverse proxy, e.g. https://tdtd.conganthanhhoa.vn.
+    public string? PublicBaseUrl { get; set; }
 }

@@ -11,6 +11,7 @@ using tdtd_be.DTOs.Works;
 using tdtd_be.Enum;
 using tdtd_be.Models;
 using tdtd_be.Services.Common;
+using tdtd_be.Services.WorkDocuments;
 
 namespace tdtd_be.Services.Works
 {
@@ -467,9 +468,16 @@ namespace tdtd_be.Services.Works
                     update: workUpdate,
                     cancellationToken: ct);
 
-                var fileFilter = Builders<FileDoc>.Filter.And(
-                    Builders<FileDoc>.Filter.Eq(x => x.SourceId, id),
-                    Builders<FileDoc>.Filter.Eq(x => x.IsDeleted, false)
+                var fileFb = Builders<FileDoc>.Filter;
+                var fileFilter = fileFb.And(
+                    fileFb.Or(
+                        fileFb.Eq(x => x.WorkId, id),
+                        fileFb.And(
+                            fileFb.Eq(x => x.SourceType, WorkDocumentConstants.SourceTypeWorkBasis),
+                            fileFb.Eq(x => x.SourceId, id)
+                        )
+                    ),
+                    fileFb.Eq(x => x.IsDeleted, false)
                 );
 
                 var fileUpdate = Builders<FileDoc>.Update

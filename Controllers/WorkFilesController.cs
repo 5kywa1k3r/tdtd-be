@@ -7,6 +7,7 @@ using tdtd_be.Common.Errors;
 using tdtd_be.Data;
 using tdtd_be.Models;
 using tdtd_be.Services.Common;
+using tdtd_be.Services.WorkDocuments;
 using tdtd_be.Services.Works;
 using tdtd_be.Uploads;
 
@@ -69,10 +70,25 @@ public sealed class WorksFilesController : ControllerBase
         await RequireWorkExistsAsync(workId, ct);
         await _permission.EnsureCanReadAsync(workId, me.Id, ct);
 
-        var rows = await _ctx.Files.Find(x =>
-                !x.IsDeleted &&
-                x.SourceId == workId &&
-                x.SourceType == SOURCE_TYPE_WORK_BASIS)
+        var fb = Builders<FileDoc>.Filter;
+        var workDocumentFilter = fb.Or(
+            fb.And(
+                fb.Eq(x => x.SourceId, workId),
+                fb.Eq(x => x.SourceType, SOURCE_TYPE_WORK_BASIS)
+            ),
+            fb.And(
+                fb.Eq(x => x.WorkId, workId),
+                fb.Eq(x => x.DocumentScope, WorkDocumentConstants.ScopeWork)
+            ),
+            fb.And(
+                fb.Eq(x => x.SourceId, workId),
+                fb.Eq(x => x.SourceType, WorkDocumentConstants.SourceTypeWorkDocument)
+            )
+        );
+
+        var rows = await _ctx.Files.Find(fb.And(
+                workDocumentFilter,
+                fb.Eq(x => x.IsDeleted, false)))
             .SortByDescending(x => x.CreatedAtUtc)
             .Project(x => new WorkFileRow(
                 x.Id,
@@ -113,8 +129,7 @@ public sealed class WorksFilesController : ControllerBase
             ttlSeconds: _opt.UploadTokenTtlSeconds
         );
 
-        var apiBase = $"{Request.Scheme}://{Request.Host}";
-        var endpoint = $"{apiBase}/api/uploads";
+        var endpoint = UploadEndpointBuilder.BuildUploadsEndpoint(Request, _opt);
 
         return Ok(new
         {
@@ -139,11 +154,24 @@ public sealed class WorksFilesController : ControllerBase
         if (string.IsNullOrWhiteSpace(fileId))
             throw AppExceptionFactory.BadRequest(AppErrorCode.UPLOAD_FILE_ID_REQUIRED);
 
-        var filter = Builders<FileDoc>.Filter.And(
-            Builders<FileDoc>.Filter.Eq(x => x.Id, fileId),
-            Builders<FileDoc>.Filter.Eq(x => x.SourceId, workId),
-            Builders<FileDoc>.Filter.Eq(x => x.SourceType, SOURCE_TYPE_WORK_BASIS),
-            Builders<FileDoc>.Filter.Eq(x => x.IsDeleted, false)
+        var fb = Builders<FileDoc>.Filter;
+        var filter = fb.And(
+            fb.Eq(x => x.Id, fileId),
+            fb.Or(
+                fb.And(
+                    fb.Eq(x => x.SourceId, workId),
+                    fb.Eq(x => x.SourceType, SOURCE_TYPE_WORK_BASIS)
+                ),
+                fb.And(
+                    fb.Eq(x => x.WorkId, workId),
+                    fb.Eq(x => x.DocumentScope, WorkDocumentConstants.ScopeWork)
+                ),
+                fb.And(
+                    fb.Eq(x => x.SourceId, workId),
+                    fb.Eq(x => x.SourceType, WorkDocumentConstants.SourceTypeWorkDocument)
+                )
+            ),
+            fb.Eq(x => x.IsDeleted, false)
         );
 
         var update = Builders<FileDoc>.Update

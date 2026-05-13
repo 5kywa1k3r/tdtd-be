@@ -399,6 +399,28 @@
                     { "isDeleted", 1 }
                 }
             ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_files_work_scope_createdAt_desc_isDeleted",
+                key: new BsonDocument
+                {
+                    { "workId", 1 },
+                    { "documentScope", 1 },
+                    { "createdAtUtc", -1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_files_work_assignment_createdAt_desc_isDeleted",
+                key: new BsonDocument
+                {
+                    { "workId", 1 },
+                    { "assignmentId", 1 },
+                    { "createdAtUtc", -1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
         }
 
         private static async Task EnsureDynamicExcelAsync(IMongoCollection<DynamicExcelTemplate> col, CancellationToken ct)

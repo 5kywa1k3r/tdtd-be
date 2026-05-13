@@ -5,6 +5,7 @@ using tdtd_be.Data.Infrastructure;
 namespace tdtd_be.Models;
 
 [BsonCollection("file_doc")]
+[BsonIgnoreExtraElements]
 public sealed class FileDoc: BaseEntity
 {
     [BsonId]
@@ -37,4 +38,21 @@ public sealed class FileDoc: BaseEntity
     // source trace
     public string SourceType { get; set; } = "UPLOAD"; // WORK/INDICATOR/EXCEL/...
     public string? SourceId { get; set; }
+
+    [BsonElement("workId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? WorkId { get; set; }
+
+    [BsonElement("assignmentId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? AssignmentId { get; set; }
+
+    [BsonElement("documentScope")]
+    public string? DocumentScope { get; set; }
+
+    [BsonElement("assignmentCode")]
+    public string? AssignmentCode { get; set; }
+
+    [BsonElement("assignmentPath")]
+    public string? AssignmentPath { get; set; }
 }

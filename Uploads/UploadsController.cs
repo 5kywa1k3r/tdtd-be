@@ -6,6 +6,7 @@ using tdtd_be.Common.Auth;
 using tdtd_be.Common.Errors;
 using tdtd_be.Data;
 using tdtd_be.Models;
+using tdtd_be.Services.WorkDocuments;
 using tdtd_be.Uploads;
 
 namespace tdtd_be.Controllers;
@@ -19,16 +20,19 @@ public sealed class UploadsController : ControllerBase
     private readonly UploadOptions _opt;
     private readonly MeAccessor _me;
     private readonly MongoDbContext _ctx;
+    private readonly IWorkDocumentPermissionService _documentPermission;
 
     public UploadsController(IMinioClient minio, IConfiguration cfg, MongoDbContext ctx,
         Microsoft.Extensions.Options.IOptions<UploadOptions> opt,
-        MeAccessor me)
+        MeAccessor me,
+        IWorkDocumentPermissionService documentPermission)
     {
         _minio = minio;
         _cfg = cfg;
         _ctx = ctx;
         _opt = opt.Value;
         _me = me;
+        _documentPermission = documentPermission;
 
     }
 
@@ -99,8 +103,7 @@ public sealed class UploadsController : ControllerBase
         if (doc == null)
             throw AppExceptionFactory.NotFound(AppErrorCode.UPLOAD_FILE_NOT_FOUND, new { fileId });
 
-        if (doc.CreatedByUserId != me.Id)
-            throw AppExceptionFactory.Forbidden(AppErrorCode.AUTH_FORBIDDEN, new { fileId });
+        await _documentPermission.EnsureCanReadFileAsync(doc, me.Id, ct);
 
         var ttl = ttlSeconds ?? _opt.PresignTtlSecondsDefault;
         ttl = Math.Clamp(ttl, 30, _opt.PresignTtlSecondsMax);

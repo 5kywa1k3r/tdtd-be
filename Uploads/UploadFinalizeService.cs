@@ -5,6 +5,7 @@ using MongoDB.Driver;
 using tdtd_be.Common.Errors;
 using tdtd_be.Data;
 using tdtd_be.Models;
+using tdtd_be.Services.WorkDocuments;
 using tusdotnet.Interfaces;
 using tusdotnet.Models;
 using tusdotnet.Models.Configuration;
@@ -59,6 +60,7 @@ public sealed class UploadFinalizeService
 
         var bucket = _opt.Bucket;
         var safeName = Sanitize(fileName);
+        var documentScope = await ResolveDocumentScopeAsync(payload, ctx.CancellationToken);
 
         // objectKey: không bắt đầu bằng "/" để tránh lỗi lặt vặt
         var objectKey = $"uploads/{sourceId}/{uploadId}/{safeName}".TrimStart('/');
@@ -128,6 +130,11 @@ public sealed class UploadFinalizeService
                 CreatedAtUtc = DateTime.UtcNow,
                 SourceType = payload.SourceType,
                 SourceId = sourceId,
+                WorkId = documentScope.WorkId,
+                AssignmentId = documentScope.AssignmentId,
+                DocumentScope = documentScope.Scope,
+                AssignmentCode = documentScope.AssignmentCode,
+                AssignmentPath = documentScope.AssignmentPath,
                 IsDeleted = false
             };
 
@@ -210,4 +217,50 @@ public sealed class UploadFinalizeService
 
     private static string Sanitize(string name)
         => name.Replace("\\", "_").Replace("/", "_").Trim();
+
+    private async Task<WorkDocumentScopeInfo> ResolveDocumentScopeAsync(UploadTokenPayload payload, CancellationToken ct)
+    {
+        var sourceType = payload.SourceType?.Trim() ?? "UPLOAD";
+        var sourceId = payload.SourceId?.Trim();
+
+        if (string.Equals(sourceType, WorkDocumentConstants.SourceTypeWorkDocument, StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(sourceType, WorkDocumentConstants.SourceTypeWorkBasis, StringComparison.OrdinalIgnoreCase))
+        {
+            var work = await _ctx.Works
+                .Find(x => x.Id == sourceId && !x.IsDeleted)
+                .FirstOrDefaultAsync(ct);
+
+            if (work is null)
+                throw AppExceptionFactory.NotFound(AppErrorCode.WORK_NOT_FOUND, new { workId = sourceId });
+
+            return new WorkDocumentScopeInfo(
+                WorkDocumentConstants.ScopeWork,
+                work.Id,
+                null,
+                null,
+                null);
+        }
+
+        if (string.Equals(sourceType, WorkDocumentConstants.SourceTypeAssignmentDocument, StringComparison.OrdinalIgnoreCase))
+        {
+            var assignment = await _ctx.WorkAssignments
+                .Find(x => x.Id == sourceId && x.IsActive && !x.IsDeleted)
+                .FirstOrDefaultAsync(ct);
+
+            if (assignment is null)
+                throw AppExceptionFactory.NotFound(AppErrorCode.WORK_ASSIGNMENT_NOT_FOUND, new { assignmentId = sourceId });
+
+            if (!string.Equals(assignment.CreatedByUserId, payload.UserId, StringComparison.Ordinal))
+                throw AppExceptionFactory.Forbidden(AppErrorCode.AUTH_FORBIDDEN, new { assignmentId = sourceId });
+
+            return new WorkDocumentScopeInfo(
+                WorkDocumentConstants.ScopeAssignmentBranch,
+                assignment.WorkId,
+                assignment.Id,
+                assignment.Code,
+                assignment.Path);
+        }
+
+        return new WorkDocumentScopeInfo(sourceType, null, null, null, null);
+    }
 }
