@@ -36,22 +36,22 @@ public static class HangfireRecurringJobRegistrar
         // Run every Sunday at configured local time; inside the jobs we guard to only execute on the last Sunday.
         var weeklySundayCron = $"{minute} {hour} * * 0";
 
-        RecurringJob.AddOrUpdate<IMinioFileDocCleanupJob>(
+        RecurringJob.AddOrUpdate<NonOverlappingRecurringJobRunner>(
             MinioCleanupJobId,
-            job => job.RunAsync(CancellationToken.None),
+            job => job.RunMinioCleanupAsync(CancellationToken.None),
             weeklySundayCron,
             new RecurringJobOptions { TimeZone = tz });
 
-        RecurringJob.AddOrUpdate<ITusTempCleanupJob>(
+        RecurringJob.AddOrUpdate<NonOverlappingRecurringJobRunner>(
             TusTempCleanupJobId,
-            job => job.RunAsync(CancellationToken.None),
+            job => job.RunTusTempCleanupAsync(CancellationToken.None),
             weeklySundayCron,
             new RecurringJobOptions { TimeZone = tz });
 
         var hangfireHistoryArchiveCron = cfg["HangfireHistoryArchive:Cron"] ?? "30 22 * * 0";
-        RecurringJob.AddOrUpdate<IHangfireHistoryArchiveJob>(
+        RecurringJob.AddOrUpdate<NonOverlappingRecurringJobRunner>(
             HangfireHistoryArchiveJobId,
-            job => job.RunAsync(CancellationToken.None),
+            job => job.RunHangfireHistoryArchiveAsync(CancellationToken.None),
             hangfireHistoryArchiveCron,
             new RecurringJobOptions { TimeZone = tz });
 
@@ -59,9 +59,9 @@ public static class HangfireRecurringJobRegistrar
         var queueMinute = Math.Clamp(cfg.GetValue<int?>("WorkAssignmentQueue:LocalMinute") ?? 10, 0, 59);
         var dailyQueueCron = $"{queueMinute} {queueHour} * * *";
 
-        RecurringJob.AddOrUpdate<IWorkAssignmentQueueJobService>(
+        RecurringJob.AddOrUpdate<NonOverlappingRecurringJobRunner>(
             WorkAssignmentQueueScanJobId,
-            job => job.ScanDuePeriodsAsync(CancellationToken.None),
+            job => job.RunWorkAssignmentQueueScanAsync(CancellationToken.None),
             dailyQueueCron,
             new RecurringJobOptions { TimeZone = tz });
 
@@ -75,16 +75,16 @@ public static class HangfireRecurringJobRegistrar
             1,
             200);
 
-        RecurringJob.AddOrUpdate<IWorkAssignmentMaterializeJobService>(
+        RecurringJob.AddOrUpdate<NonOverlappingRecurringJobRunner>(
             WorkAssignmentMaterializeJobId,
-            job => job.ProcessPendingJobsAsync(materializeMaxJobs, materializeBatchSize, CancellationToken.None),
+            job => job.ProcessWorkAssignmentMaterializeJobsAsync(materializeMaxJobs, materializeBatchSize, CancellationToken.None),
             materializeCron,
             new RecurringJobOptions { TimeZone = tz });
 
         var notificationDueCron = cfg["Notifications:DueScanCron"] ?? "*/5 * * * *";
-        RecurringJob.AddOrUpdate<INotificationDueScanJobService>(
+        RecurringJob.AddOrUpdate<NonOverlappingRecurringJobRunner>(
             NotificationDueScanJobId,
-            job => job.ScanDueNotificationsAsync(CancellationToken.None),
+            job => job.RunNotificationDueScanAsync(CancellationToken.None),
             notificationDueCron,
             new RecurringJobOptions { TimeZone = tz });
 
@@ -100,9 +100,9 @@ public static class HangfireRecurringJobRegistrar
                 1,
                 200);
 
-            RecurringJob.AddOrUpdate<IDocRoleReadModelProjectionRetryJobService>(
+            RecurringJob.AddOrUpdate<NonOverlappingRecurringJobRunner>(
                 DocRoleProjectionRetryJobId,
-                job => job.ProcessPendingJobsAsync(projectionRetryMaxJobs, CancellationToken.None),
+                job => job.ProcessDocRoleProjectionRetryJobsAsync(projectionRetryMaxJobs, CancellationToken.None),
                 projectionRetryCron,
                 new RecurringJobOptions { TimeZone = tz });
         }
@@ -121,15 +121,15 @@ public static class HangfireRecurringJobRegistrar
                 1,
                 200);
 
-            RecurringJob.AddOrUpdate<IDocRoleReadModelProjectionRetryJobService>(
+            RecurringJob.AddOrUpdate<NonOverlappingRecurringJobRunner>(
                 DocRoleProjectionRetryDayJobId,
-                job => job.ProcessPendingJobsAsync(projectionRetryDayMaxJobs, CancellationToken.None),
+                job => job.ProcessDocRoleProjectionRetryJobsAsync(projectionRetryDayMaxJobs, CancellationToken.None),
                 projectionRetryDayCron,
                 new RecurringJobOptions { TimeZone = tz });
 
-            RecurringJob.AddOrUpdate<IDocRoleReadModelProjectionRetryJobService>(
+            RecurringJob.AddOrUpdate<NonOverlappingRecurringJobRunner>(
                 DocRoleProjectionRetryNightJobId,
-                job => job.ProcessPendingJobsAsync(projectionRetryNightMaxJobs, CancellationToken.None),
+                job => job.ProcessDocRoleProjectionRetryJobsAsync(projectionRetryNightMaxJobs, CancellationToken.None),
                 projectionRetryNightCron,
                 new RecurringJobOptions { TimeZone = tz });
         }
@@ -140,9 +140,9 @@ public static class HangfireRecurringJobRegistrar
             1,
             200);
 
-        RecurringJob.AddOrUpdate<IUserActionLogService>(
+        RecurringJob.AddOrUpdate<NonOverlappingRecurringJobRunner>(
             UserActionLogRetryJobId,
-            job => job.ProcessPendingRetriesAsync(actionLogRetryMaxJobs, CancellationToken.None),
+            job => job.ProcessUserActionLogRetriesAsync(actionLogRetryMaxJobs, CancellationToken.None),
             actionLogRetryCron,
             new RecurringJobOptions { TimeZone = tz });
 
@@ -156,9 +156,9 @@ public static class HangfireRecurringJobRegistrar
             1,
             100);
 
-        RecurringJob.AddOrUpdate<IWorkReportStatisticRebuildJobService>(
+        RecurringJob.AddOrUpdate<NonOverlappingRecurringJobRunner>(
             DynamicFormStatisticRebuildJobId,
-            job => job.ProcessPendingJobsAsync(statisticRebuildMaxJobs, statisticRebuildBatchSize, CancellationToken.None),
+            job => job.ProcessDynamicFormStatisticRebuildJobsAsync(statisticRebuildMaxJobs, statisticRebuildBatchSize, CancellationToken.None),
             statisticRebuildCron,
             new RecurringJobOptions { TimeZone = tz });
 

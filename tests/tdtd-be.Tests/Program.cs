@@ -19,6 +19,8 @@ using tdtd_be.Uploads;
 using System.Reflection;
 using System.Text.Json;
 using Microsoft.AspNetCore.Http;
+using Hangfire;
+using tdtd_be.Jobs;
 
 var tests = new (string Name, Action Run)[]
 {
@@ -71,6 +73,7 @@ var tests = new (string Name, Action Run)[]
     ("assignment document path resolves ancestors only", ResolvesAssignmentDocumentAncestorsFromPath),
     ("upload endpoint uses public base url override", BuildsUploadEndpointFromPublicBaseUrl),
     ("upload endpoint falls back to forwarded request scheme and host", BuildsUploadEndpointFromForwardedRequest),
+    ("recurring job runner methods prevent overlap", RecurringJobRunnerMethodsPreventOverlap),
 };
 
 var failures = new List<string>();
@@ -320,6 +323,31 @@ static void BlocksAssignmentDueDateBeforeStart()
         () => WorkAssignmentScheduleHelper.ValidateRequest(
             WorkAssignmentScheduleHelper.NormalizeRequest(req),
             work));
+}
+
+static void RecurringJobRunnerMethodsPreventOverlap()
+{
+    var methodNames = new[]
+    {
+        nameof(NonOverlappingRecurringJobRunner.RunMinioCleanupAsync),
+        nameof(NonOverlappingRecurringJobRunner.RunTusTempCleanupAsync),
+        nameof(NonOverlappingRecurringJobRunner.RunHangfireHistoryArchiveAsync),
+        nameof(NonOverlappingRecurringJobRunner.RunWorkAssignmentQueueScanAsync),
+        nameof(NonOverlappingRecurringJobRunner.ProcessWorkAssignmentMaterializeJobsAsync),
+        nameof(NonOverlappingRecurringJobRunner.RunNotificationDueScanAsync),
+        nameof(NonOverlappingRecurringJobRunner.ProcessDocRoleProjectionRetryJobsAsync),
+        nameof(NonOverlappingRecurringJobRunner.ProcessUserActionLogRetriesAsync),
+        nameof(NonOverlappingRecurringJobRunner.ProcessDynamicFormStatisticRebuildJobsAsync)
+    };
+
+    foreach (var methodName in methodNames)
+    {
+        var method = typeof(NonOverlappingRecurringJobRunner).GetMethod(methodName)
+            ?? throw new InvalidOperationException($"Missing recurring job runner method {methodName}");
+
+        if (!method.GetCustomAttributes(typeof(DisableConcurrentExecutionAttribute), inherit: false).Any())
+            throw new InvalidOperationException($"Recurring job runner method {methodName} is missing overlap guard");
+    }
 }
 
 static void BlocksOnceDueBeforeAssignmentStart()

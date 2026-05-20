@@ -171,6 +171,7 @@ builder.Services.AddSingleton<IMinioObjectDeleter, MinioObjectDeleter>();
 builder.Services.AddScoped<IMinioFileDocCleanupJob, MinioFileDocCleanupJob>();
 builder.Services.AddScoped<ITusTempCleanupJob, TusTempCleanupJob>();
 builder.Services.AddScoped<IHangfireHistoryArchiveJob, HangfireHistoryArchiveJob>();
+builder.Services.AddScoped<NonOverlappingRecurringJobRunner>();
 
 // ================== core services ==================
 builder.Services.AddSingleton<IPasswordHasher<AppUser>, PasswordHasher<AppUser>>();
