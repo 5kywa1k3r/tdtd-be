@@ -129,18 +129,6 @@ public sealed class WorkReportStatisticRebuildJobService : IWorkReportStatisticR
         foreach (var id in templateMatches.Where(x => !string.IsNullOrWhiteSpace(x)))
             templateIds.Add(id);
 
-        var reportFilter = Builders<WorkAssignmentReport>.Filter.Eq(x => x.IsDeleted, false)
-            & Builders<WorkAssignmentReport>.Filter.Eq(x => x.IsCurrent, true)
-            & Builders<WorkAssignmentReport>.Filter.Ne(x => x.IsActive, false)
-            & Builders<WorkAssignmentReport>.Filter.Ne(x => x.DynamicFormTemplateId, null)
-            & Builders<WorkAssignmentReport>.Filter.Regex(x => x.TableValuesJson, labelLiteralRegex);
-
-        var reportTemplateIds = await _ctx.WorkAssignmentReports
-            .Distinct<BsonValue>("dynamicFormTemplateId", reportFilter)
-            .ToListAsync(ct);
-        foreach (var id in reportTemplateIds.Select(NormalizeObjectIdString).Where(x => !string.IsNullOrWhiteSpace(x)))
-            templateIds.Add(id!);
-
         if (templateIds.Count == 0)
             return Array.Empty<StatisticRebuildJobEnqueueResult>();
 
@@ -159,17 +147,6 @@ public sealed class WorkReportStatisticRebuildJobService : IWorkReportStatisticR
         }
 
         return results;
-    }
-
-    private static string? NormalizeObjectIdString(BsonValue? value)
-    {
-        if (value is null || value.IsBsonNull)
-            return null;
-        if (value.IsObjectId)
-            return value.AsObjectId.ToString();
-        if (value.IsString && ObjectId.TryParse(value.AsString, out _))
-            return value.AsString;
-        return null;
     }
 
     public async Task<int> ProcessPendingJobsAsync(

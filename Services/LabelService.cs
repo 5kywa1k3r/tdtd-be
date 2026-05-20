@@ -91,7 +91,7 @@ public sealed class LabelService : ILabelService
     public async Task<PagedResult<LabelRow>> SearchAsync(LabelSearchReq req, CancellationToken ct)
     {
         var me = _me.RequireMe();
-        req ??= new LabelSearchReq(null, null, null, null, null, null, null);
+        req ??= new LabelSearchReq(null, null, null, null, null, null, null, null);
 
         var page = Math.Max(0, req.Page);
         var pageSize = Math.Clamp(req.PageSize, 1, 100);
@@ -112,6 +112,9 @@ public sealed class LabelService : ILabelService
 
         if (!string.IsNullOrWhiteSpace(req.GroupCode))
             filter &= fb.Eq(x => x.GroupCode, NormalizeOptionalCode(req.GroupCode));
+
+        if (!string.IsNullOrWhiteSpace(req.Usage))
+            filter &= BuildUsageSearchFilter(NormalizeUsage(req.Usage, allowGenericFallback: false));
 
         if (!string.IsNullOrWhiteSpace(req.ScopeType))
             filter &= fb.Eq(x => x.ScopeType, NormalizeScopeType(req.ScopeType));
@@ -163,6 +166,7 @@ public sealed class LabelService : ILabelService
             Description = NormalizeOptionalText(req.Description),
             Color = NormalizeColor(req.Color),
             GroupCode = NormalizeOptionalCode(req.GroupCode),
+            Usage = NormalizeUsage(req.Usage),
             DataType = LabelDataTypes.Normalize(req.DataType),
             ScopeType = scope.scopeType,
             ScopeId = scope.scopeId,
@@ -206,6 +210,7 @@ public sealed class LabelService : ILabelService
 
         var name = NormalizeName(req.Name);
         var nextDataType = LabelDataTypes.Normalize(req.DataType);
+        var nextUsage = NormalizeUsage(req.Usage, LabelUsages.Normalize(doc.Usage, LabelUsages.Classification));
         var now = DateTime.UtcNow;
         var update = Builders<LabelCatalogItem>.Update
             .Set(x => x.Name, name)
@@ -213,6 +218,7 @@ public sealed class LabelService : ILabelService
             .Set(x => x.Description, NormalizeOptionalText(req.Description))
             .Set(x => x.Color, NormalizeColor(req.Color))
             .Set(x => x.GroupCode, NormalizeOptionalCode(req.GroupCode))
+            .Set(x => x.Usage, nextUsage)
             .Set(x => x.DataType, nextDataType)
             .Set(x => x.IsActive, req.IsActive)
             .Set(x => x.UpdatedAtUtc, now)
@@ -220,6 +226,7 @@ public sealed class LabelService : ILabelService
 
         await _ctx.Labels.UpdateOneAsync(x => x.Id == id && !x.IsDeleted, update, cancellationToken: ct);
         if (doc.IsActive != req.IsActive ||
+            !string.Equals(LabelUsages.Normalize(doc.Usage, LabelUsages.Classification), nextUsage, StringComparison.Ordinal) ||
             !string.Equals(LabelDataTypes.Normalize(doc.DataType), nextDataType, StringComparison.Ordinal))
         {
             await EnqueueLabelStatisticRebuildAsync(doc, me.Id, ct);
@@ -403,6 +410,7 @@ public sealed class LabelService : ILabelService
             x.Description,
             x.Color,
             x.GroupCode,
+            LabelUsages.Normalize(x.Usage, LabelUsages.Classification),
             LabelDataTypes.Normalize(x.DataType),
             x.ScopeType,
             x.ScopeId,
@@ -433,6 +441,7 @@ public sealed class LabelService : ILabelService
         {
             "code" => desc ? sort.Descending(x => x.Code) : sort.Ascending(x => x.Code),
             "groupcode" => desc ? sort.Descending(x => x.GroupCode) : sort.Ascending(x => x.GroupCode),
+            "usage" => desc ? sort.Descending(x => x.Usage) : sort.Ascending(x => x.Usage),
             "createdatutc" => desc ? sort.Descending(x => x.CreatedAtUtc) : sort.Ascending(x => x.CreatedAtUtc),
             "updatedatutc" => desc ? sort.Descending(x => x.UpdatedAtUtc) : sort.Ascending(x => x.UpdatedAtUtc),
             _ => desc ? sort.Descending(x => x.NameLower) : sort.Ascending(x => x.NameLower)
@@ -494,6 +503,23 @@ public sealed class LabelService : ILabelService
                 "Mau nhan phai la ma hex dang #RRGGBB.",
                 new { color });
         return color.ToUpperInvariant();
+    }
+
+    private static FilterDefinition<LabelCatalogItem> BuildUsageSearchFilter(string requestedUsage)
+    {
+        var fb = Builders<LabelCatalogItem>.Filter;
+        return fb.Eq(x => x.Usage, requestedUsage);
+    }
+
+    private static string NormalizeUsage(string? value, string fallback = LabelUsages.Classification, bool allowGenericFallback = true)
+    {
+        var usage = LabelUsages.Normalize(value, allowGenericFallback ? fallback : string.Empty);
+        if (usage == string.Empty)
+            throw LabelValidation(
+                AppErrorCode.LABEL_USAGE_INVALID,
+                "Muc dich su dung nhan khong hop le.",
+                new { usage = value });
+        return usage;
     }
 
     private static string NormalizeScopeType(string? value)

@@ -78,6 +78,9 @@
             var reviewReportListDocRoles = db.GetCollection<ReviewReportListDocRole>(opt.ReviewReportListDocRoleCollection);
             await EnsureReviewReportListDocRolesAsync(reviewReportListDocRoles, ct);
 
+            var reviewAssignmentSummaryDocRoles = db.GetCollection<ReviewAssignmentSummaryDocRole>(opt.ReviewAssignmentSummaryDocRoleCollection);
+            await EnsureReviewAssignmentSummaryDocRolesAsync(reviewAssignmentSummaryDocRoles, ct);
+
             var docRoleProjectionRetryJobs = db.GetCollection<DocRoleReadModelProjectionRetryJob>(opt.DocRoleReadModelProjectionRetryJobCollection);
             await EnsureDocRoleProjectionRetryJobsAsync(docRoleProjectionRetryJobs, ct);
 
@@ -104,6 +107,13 @@
             // WORK ASSIGNMENT REPORTS
             var workAssignmentReports = db.GetCollection<WorkAssignmentReport>(opt.WorkAssignmentReportCollection);
             await EnsureWorkAssignmentReportsAsync(workAssignmentReports, ct);
+
+            // WORK REPORT PAYLOADS
+            var workReportPayloads = db.GetCollection<WorkReportPayload>(opt.WorkReportPayloadCollection);
+            await EnsureWorkReportPayloadsAsync(workReportPayloads, ct);
+
+            var workReportTableValues = db.GetCollection<WorkReportTableValue>(opt.WorkReportTableValueCollection);
+            await EnsureWorkReportTableValuesAsync(workReportTableValues, ct);
 
             // WORK REPORT PERIODS
             var workReportPeriods = db.GetCollection<WorkReportPeriod>(opt.WorkReportPeriodCollection);
@@ -470,23 +480,6 @@
                 }
             ), ct);
 
-            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
-                name: "ix_dynamicExcel_labels_isDeleted",
-                key: new BsonDocument
-                {
-                    { "labels", 1 },
-                    { "isDeleted", 1 }
-                }
-            ), ct);
-
-            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
-                name: "ix_dynamicExcel_tableKind_isDeleted",
-                key: new BsonDocument
-                {
-                    { "tableKind", 1 },
-                    { "isDeleted", 1 }
-                }
-            ), ct);
         }
 
         private static async Task EnsureDynamicFormsAsync(IMongoCollection<DynamicFormTemplate> col, CancellationToken ct)
@@ -602,6 +595,7 @@
                 key: new BsonDocument
                 {
                     { "groupCode", 1 },
+                    { "usage", 1 },
                     { "dataType", 1 },
                     { "isActive", 1 },
                     { "isDeleted", 1 }
@@ -1127,6 +1121,111 @@
             ), ct);
         }
 
+        private static async Task EnsureReviewAssignmentSummaryDocRolesAsync(
+            IMongoCollection<ReviewAssignmentSummaryDocRole> col,
+            CancellationToken ct)
+        {
+            await MongoIndexPrecheckHelper.PrecheckUniqueByFieldsAsync(
+                col,
+                fields: new[] { "reviewerUserId", "workId", "assignmentId" },
+                matchFilter: new BsonDocument("isDeleted", false),
+                ct: ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ux_reviewAssignmentSummaryDocRoles_reviewer_work_assignment_active",
+                key: new BsonDocument
+                {
+                    { "reviewerUserId", 1 },
+                    { "workId", 1 },
+                    { "assignmentId", 1 }
+                },
+                unique: true,
+                partial: new BsonDocument("isDeleted", false)
+            ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_reviewAssignmentSummaryDocRoles_reviewer_work_due",
+                key: new BsonDocument
+                {
+                    { "reviewerUserId", 1 },
+                    { "workId", 1 },
+                    { "sortHasOverduePeriod", -1 },
+                    { "isDeleted", 1 },
+                    { "sortLatestDueAtUtc", -1 }
+                }
+            ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_reviewAssignmentSummaryDocRoles_reviewer_work_waiting_due",
+                key: new BsonDocument
+                {
+                    { "reviewerUserId", 1 },
+                    { "workId", 1 },
+                    { "waitingReviewCount", -1 },
+                    { "isDeleted", 1 },
+                    { "sortLatestDueAtUtc", -1 }
+                }
+            ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_reviewAssignmentSummaryDocRoles_reviewer_work_bucket_due",
+                key: new BsonDocument
+                {
+                    { "reviewerUserId", 1 },
+                    { "workId", 1 },
+                    { "reviewStatusBuckets", 1 },
+                    { "isDeleted", 1 },
+                    { "sortLatestDueAtUtc", -1 }
+                }
+            ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_reviewAssignmentSummaryDocRoles_reviewer_work_template_due",
+                key: new BsonDocument
+                {
+                    { "reviewerUserId", 1 },
+                    { "workId", 1 },
+                    { "dynamicExcelId", 1 },
+                    { "isDeleted", 1 },
+                    { "sortLatestDueAtUtc", -1 }
+                }
+            ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_reviewAssignmentSummaryDocRoles_reviewer_work_period_due",
+                key: new BsonDocument
+                {
+                    { "reviewerUserId", 1 },
+                    { "workId", 1 },
+                    { "periodKeys", 1 },
+                    { "isDeleted", 1 },
+                    { "sortLatestDueAtUtc", -1 }
+                }
+            ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_reviewAssignmentSummaryDocRoles_reviewer_work_assignee",
+                key: new BsonDocument
+                {
+                    { "reviewerUserId", 1 },
+                    { "workId", 1 },
+                    { "assigneeUserIds", 1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_reviewAssignmentSummaryDocRoles_reviewer_work_unit",
+                key: new BsonDocument
+                {
+                    { "reviewerUserId", 1 },
+                    { "workId", 1 },
+                    { "assigneeUnitIds", 1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
+        }
+
         private static async Task EnsureDocRoleProjectionRetryJobsAsync(
             IMongoCollection<DocRoleReadModelProjectionRetryJob> col,
             CancellationToken ct)
@@ -1247,6 +1346,35 @@
                     { "dynamicFormTemplateId", 1 },
                     { "isDeleted", 1 }
                 }
+            ), ct);
+
+            var activeDynamicFormAssignmentFilter = new BsonDocument
+            {
+                { "isDeleted", false },
+                { "isActive", true },
+                { "dynamicFormTemplateId", new BsonDocument
+                    {
+                        { "$type", "objectId" }
+                    }
+                }
+            };
+
+            await MongoIndexPrecheckHelper.PrecheckUniqueByFieldsAsync(
+                col,
+                fields: new[] { "workId", "parentAssignmentId", "dynamicFormTemplateId" },
+                matchFilter: activeDynamicFormAssignmentFilter,
+                ct: ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ux_workAssignments_sibling_dynamicForm_active",
+                key: new BsonDocument
+                {
+                    { "workId", 1 },
+                    { "parentAssignmentId", 1 },
+                    { "dynamicFormTemplateId", 1 }
+                },
+                unique: true,
+                partial: activeDynamicFormAssignmentFilter
             ), ct);
 
             await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
@@ -1620,6 +1748,90 @@
                     { "dueAtUtc", 1 },
                     { "status", 1 },
                     { "isDeleted", 1 }
+                }
+            ), ct);
+        }
+
+        private static async Task EnsureWorkReportPayloadsAsync(
+            IMongoCollection<WorkReportPayload> col,
+            CancellationToken ct)
+        {
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(
+                col,
+                new IndexSpec("ix_workReportPayloads_isDeleted", new BsonDocument("isDeleted", 1)),
+                ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ux_workReportPayloads_report_active",
+                key: new BsonDocument
+                {
+                    { "reportId", 1 }
+                },
+                unique: true,
+                partial: new BsonDocument
+                {
+                    { "isDeleted", false }
+                }
+            ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_workReportPayloads_report_revision",
+                key: new BsonDocument
+                {
+                    { "reportId", 1 },
+                    { "payloadRevision", 1 }
+                }
+            ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_workReportPayloads_status_updated",
+                key: new BsonDocument
+                {
+                    { "status", 1 },
+                    { "updatedAtUtc", -1 }
+                }
+            ), ct);
+        }
+
+        private static async Task EnsureWorkReportTableValuesAsync(
+            IMongoCollection<WorkReportTableValue> col,
+            CancellationToken ct)
+        {
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(
+                col,
+                new IndexSpec("ix_workReportTableValues_isDeleted", new BsonDocument("isDeleted", 1)),
+                ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ux_workReportTableValues_report_block_active",
+                key: new BsonDocument
+                {
+                    { "reportId", 1 },
+                    { "blockId", 1 }
+                },
+                unique: true,
+                partial: new BsonDocument
+                {
+                    { "isDeleted", false }
+                }
+            ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_workReportTableValues_report_revision_order",
+                key: new BsonDocument
+                {
+                    { "reportId", 1 },
+                    { "payloadRevision", 1 },
+                    { "blockOrder", 1 }
+                }
+            ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_workReportTableValues_block_report",
+                key: new BsonDocument
+                {
+                    { "blockId", 1 },
+                    { "reportId", 1 }
                 }
             ), ct);
         }
@@ -2231,6 +2443,32 @@
                 }
             ), ct);
 
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_workReportLabelStatValues_unit_period_status",
+                key: new BsonDocument
+                {
+                    { "workId", 1 },
+                    { "assigneeUnitId", 1 },
+                    { "assignmentIsActive", 1 },
+                    { "reportIsActive", 1 },
+                    { "periodInstanceKey", 1 },
+                    { "labelCode", 1 },
+                    { "reportStatus", 1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_workReportLabelStatValues_payload_freshness",
+                key: new BsonDocument
+                {
+                    { "workAssignmentReportId", 1 },
+                    { "sourcePayloadRevision", 1 },
+                    { "sourcePayloadHash", 1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
+
         }
 
         private static async Task EnsureWorkReportLabelStatAggregatesAsync(
@@ -2340,6 +2578,19 @@
             ), ct);
 
             await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_workReportTableStatValues_work_period_metric_label_status",
+                key: new BsonDocument
+                {
+                    { "workId", 1 },
+                    { "periodInstanceKey", 1 },
+                    { "dynamicFormTemplateId", 1 },
+                    { "metricLabelCode", 1 },
+                    { "reportStatus", 1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
                 name: "ix_workReportTableStatValues_assignment_metric_period",
                 key: new BsonDocument
                 {
@@ -2363,6 +2614,34 @@
                     { "blockId", 1 },
                     { "metricKey", 1 },
                     { "reportStatus", 1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_workReportTableStatValues_unit_period_status",
+                key: new BsonDocument
+                {
+                    { "workId", 1 },
+                    { "assigneeUnitId", 1 },
+                    { "assignmentIsActive", 1 },
+                    { "reportIsActive", 1 },
+                    { "periodInstanceKey", 1 },
+                    { "dynamicFormTemplateId", 1 },
+                    { "blockId", 1 },
+                    { "metricKey", 1 },
+                    { "reportStatus", 1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_workReportTableStatValues_payload_freshness",
+                key: new BsonDocument
+                {
+                    { "workAssignmentReportId", 1 },
+                    { "sourcePayloadRevision", 1 },
+                    { "sourcePayloadHash", 1 },
                     { "isDeleted", 1 }
                 }
             ), ct);
@@ -2418,6 +2697,20 @@
                     { "dynamicFormTemplateId", 1 },
                     { "blockId", 1 },
                     { "metricKey", 1 },
+                    { "periodInstanceKey", 1 },
+                    { "scopeType", 1 },
+                    { "scopeId", 1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_workReportTableStatAggregates_metric_label_read",
+                key: new BsonDocument
+                {
+                    { "workId", 1 },
+                    { "dynamicFormTemplateId", 1 },
+                    { "metricLabelCode", 1 },
                     { "periodInstanceKey", 1 },
                     { "scopeType", 1 },
                     { "scopeId", 1 },
@@ -2501,6 +2794,34 @@
                     { "fieldId", 1 },
                     { "bucketKey", 1 },
                     { "reportStatus", 1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_workReportFieldStatValues_unit_period_status",
+                key: new BsonDocument
+                {
+                    { "workId", 1 },
+                    { "assigneeUnitId", 1 },
+                    { "assignmentIsActive", 1 },
+                    { "reportIsActive", 1 },
+                    { "periodInstanceKey", 1 },
+                    { "dynamicFormTemplateId", 1 },
+                    { "fieldId", 1 },
+                    { "bucketKey", 1 },
+                    { "reportStatus", 1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_workReportFieldStatValues_payload_freshness",
+                key: new BsonDocument
+                {
+                    { "workAssignmentReportId", 1 },
+                    { "sourcePayloadRevision", 1 },
+                    { "sourcePayloadHash", 1 },
                     { "isDeleted", 1 }
                 }
             ), ct);

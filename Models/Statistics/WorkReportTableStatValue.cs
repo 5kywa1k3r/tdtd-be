@@ -20,6 +20,20 @@ public sealed class WorkReportTableStatValue : BaseEntity
     [BsonRepresentation(BsonType.ObjectId)]
     public string WorkAssignmentId { get; set; } = default!;
 
+    [BsonElement("assigneeUserId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? AssigneeUserId { get; set; }
+
+    [BsonElement("assigneeUnitId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? AssigneeUnitId { get; set; }
+
+    [BsonElement("assignmentIsActive")]
+    public bool AssignmentIsActive { get; set; }
+
+    [BsonElement("reportIsActive")]
+    public bool ReportIsActive { get; set; } = true;
+
     [BsonElement("rootAssignmentId")]
     [BsonRepresentation(BsonType.ObjectId)]
     public string? RootAssignmentId { get; set; }
@@ -59,6 +73,9 @@ public sealed class WorkReportTableStatValue : BaseEntity
     [BsonElement("metricKey")]
     public string MetricKey { get; set; } = default!;
 
+    [BsonElement("metricLabelCode")]
+    public string? MetricLabelCode { get; set; }
+
     [BsonElement("rowKey")]
     public string RowKey { get; set; } = default!;
 
@@ -67,6 +84,25 @@ public sealed class WorkReportTableStatValue : BaseEntity
 
     [BsonElement("sourceKey")]
     public string SourceKey { get; set; } = default!;
+
+    [BsonElement("dataType")]
+    public string DataType { get; set; } = "NUMBER";
+
+    [BsonElement("bucketKey")]
+    public string? BucketKey { get; set; }
+
+    [BsonElement("bucketLabel")]
+    public string? BucketLabel { get; set; }
+
+    [BsonElement("textValue")]
+    public string? TextValue { get; set; }
+
+    [BsonElement("booleanValue")]
+    public bool? BooleanValue { get; set; }
+
+    [BsonElement("dateValue")]
+    [BsonDateTimeOptions(Kind = DateTimeKind.Utc)]
+    public DateTime? DateValue { get; set; }
 
     [BsonElement("periodKey")]
     public string PeriodKey { get; set; } = default!;
@@ -101,4 +137,10 @@ public sealed class WorkReportTableStatValue : BaseEntity
 
     [BsonElement("value")]
     public decimal Value { get; set; }
+
+    [BsonElement("sourcePayloadRevision")]
+    public int SourcePayloadRevision { get; set; }
+
+    [BsonElement("sourcePayloadHash")]
+    public string? SourcePayloadHash { get; set; }
 }

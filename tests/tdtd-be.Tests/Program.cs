@@ -1,6 +1,7 @@
 using tdtd_be.Common.Auth;
 using tdtd_be.Common.Errors;
 using tdtd_be.DTOs.Auth;
+using tdtd_be.DTOs.DynamicExcel;
 using tdtd_be.DTOs.WorkAssignments;
 using tdtd_be.DTOs.WorkAssignments.AggregateTable;
 using tdtd_be.Enum;
@@ -8,25 +9,38 @@ using tdtd_be.Models;
 using tdtd_be.Models.Enums;
 using tdtd_be.Services;
 using tdtd_be.Services.WorkAssignmentReports;
+using tdtd_be.Services.WorkAssignmentReports.Payloads;
+using tdtd_be.Services.WorkAssignmentReports.Statistics;
+using tdtd_be.Services.WorkAssignments.Domain;
 using tdtd_be.Services.WorkAssignments.Internal;
 using tdtd_be.Services.WorkDocuments;
 using tdtd_be.Services.Works;
 using tdtd_be.Uploads;
 using System.Reflection;
+using System.Text.Json;
 using Microsoft.AspNetCore.Http;
 
 var tests = new (string Name, Action Run)[]
 {
-    ("root owner can create an assignment assigned to themself", AllowsRootOwnerSelfAssignment),
+    ("root owner can create an assignment assigned to another user", AllowsRootOwnerAssignmentToAnotherUser),
+    ("root owner cannot create an assignment assigned to themself", BlocksRootOwnerSelfAssignment),
     ("root non-owner cannot create even when assigning to themself", BlocksRootNonOwnerSelfAssignment),
-    ("parent owner can create a child assignment assigned to themself", AllowsParentOwnerSelfAssignment),
-    ("direct parent assignee can create a child assignment assigned to themself", AllowsDirectAssigneeSelfAssignment),
+    ("parent owner can create a child assignment assigned to another user", AllowsParentOwnerAssignmentToAnotherUser),
+    ("parent owner cannot create a child assignment assigned to themself", BlocksParentOwnerSelfAssignment),
+    ("direct parent assignee cannot create a child assignment assigned to themself", BlocksDirectAssigneeSelfAssignment),
     ("unrelated actor cannot create a child assignment even when assigning to themself", BlocksUnrelatedChildSelfAssignment),
+    ("unit manager can assign peer unit manager", AllowsUnitManagerPeerUnitManagerAssignment),
+    ("unit manager can assign descendant unit manager", AllowsUnitManagerDescendantUnitManagerAssignment),
+    ("unit manager cannot assign normal user before final unit", BlocksUnitManagerNormalUserBeforeFinalUnit),
+    ("final unit manager can assign normal user in own unit", AllowsFinalUnitManagerOwnUnitNormalUserAssignment),
+    ("unit manager cannot assign normal user outside own final unit", BlocksUnitManagerNormalUserOutsideOwnUnit),
     ("blank actor is rejected before scope evaluation", BlocksBlankActor),
-    ("assignment completed date cannot be before start date", BlocksAssignmentCompletedBeforeStart),
+    ("assignment due date cannot be before start date", BlocksAssignmentDueDateBeforeStart),
+    ("once assignment due date cannot be before assignment start", BlocksOnceDueBeforeAssignmentStart),
+    ("periodic schedule start must stay inside assignment date range", BlocksPeriodicScheduleStartOutsideAssignmentRange),
     ("missing assignment start defaults to current date", DefaultsMissingAssignmentStartToCurrentDate),
-    ("root missing assignment completed date defaults to work due date", DefaultsRootCompletedDateToWorkDueDate),
-    ("child missing assignment completed date defaults to parent assignment end", DefaultsChildCompletedDateToParentAssignmentEnd),
+    ("root missing assignment due date defaults to work due date", DefaultsRootDueDateToWorkDueDate),
+    ("child missing assignment due date defaults to parent assignment due date", DefaultsChildDueDateToParentDueDate),
     ("periodic assignment date range caps occurrence validation", ValidatesPeriodicAssignmentDateRange),
     ("historical data approval resolves as normal approved", ResolvesHistoricalDataApprovalAsNormalApproved),
     ("historical user-created period is data-only for progress", TreatsHistoricalUserCreatedPeriodAsDataOnly),
@@ -43,11 +57,15 @@ var tests = new (string Name, Action Run)[]
     ("report contribution policy can exclude table metrics and labels", ExcludesMappedTableAndLabelTargetsOnly),
     ("aggregate draft partial mapping clears previous target cells", ClearsPreviousAggregateDraftTargetCells),
     ("dynamic form field display name is separated from statistic labels", ValidatesDynamicFormFieldDisplayName),
-    ("dynamic excel record table contract accepts typed calculated outputs and rules", ValidatesDynamicExcelRecordTableContract),
-    ("dynamic excel record table contract rejects upstream calculated outputs", BlocksDynamicExcelCalculatedOutputAsUpstreamData),
-    ("dynamic excel record table contract limits calculated outputs", LimitsDynamicExcelCalculatedOutputs),
-    ("dynamic excel record table runtime accepts rows and calculates outputs", ValidatesDynamicExcelRecordTableRuntimeRows),
-    ("dynamic excel record table runtime rejects invalid rows", RejectsInvalidDynamicExcelRecordTableRuntimeRows),
+    ("dynamic form section title is required", BlocksBlankDynamicFormSectionTitle),
+    ("short text field statistics bucket by trimmed value", BucketsShortTextFieldStatistics),
+    ("stat projection accepts verified external payload snapshot", AcceptsVerifiedExternalPayloadForStatisticProjection),
+    ("stat projection rejects embedded payload fallback", RejectsEmbeddedPayloadForStatisticProjection),
+    ("stat projection rejects unverified external payload hash", RejectsUnverifiedExternalPayloadHashForStatisticProjection),
+    ("auto approve condition normalizes and matches report fields", MatchesAutoApproveCondition),
+    ("dynamic form table target labels use dynamic excel default type", ValidatesDynamicFormTableTargetDefaultDataType),
+    ("dynamic form metric label targets validate range type and uniqueness", ValidatesDynamicFormMetricLabelTargets),
+    ("dynamic excel numeric grid validates spec metadata", ValidatesDynamicExcelNumericGridSpecMetadata),
     ("legacy work basis file resolves as work document", ResolvesLegacyWorkBasisFileAsWorkDocument),
     ("assignment file resolves as assignment branch document", ResolvesAssignmentFileAsBranchDocument),
     ("assignment document path resolves ancestors only", ResolvesAssignmentDocumentAncestorsFromPath),
@@ -82,7 +100,7 @@ if (failures.Count > 0)
 Console.WriteLine();
 Console.WriteLine($"{tests.Length} test(s) passed.");
 
-static void AllowsRootOwnerSelfAssignment()
+static void AllowsRootOwnerAssignmentToAnotherUser()
 {
     var actorId = UserId(1);
     var work = WorkOwnedBy(actorId);
@@ -91,7 +109,21 @@ static void AllowsRootOwnerSelfAssignment()
         work,
         parent: null,
         actorUserId: actorId,
-        assigneeUserIds: new[] { actorId });
+        assigneeUserIds: new[] { UserId(2) });
+}
+
+static void BlocksRootOwnerSelfAssignment()
+{
+    var actorId = UserId(1);
+    var work = WorkOwnedBy(actorId);
+
+    AssertThrows(
+        AppErrorCode.WORK_ASSIGNMENT_SELF_ASSIGNMENT_NOT_ALLOWED,
+        () => WorkAssignmentCreateScopeGuard.EnsureCanCreateWithinScope(
+            work,
+            parent: null,
+            actorUserId: actorId,
+            assigneeUserIds: new[] { actorId }));
 }
 
 static void BlocksRootNonOwnerSelfAssignment()
@@ -108,7 +140,7 @@ static void BlocksRootNonOwnerSelfAssignment()
             assigneeUserIds: new[] { actorId }));
 }
 
-static void AllowsParentOwnerSelfAssignment()
+static void AllowsParentOwnerAssignmentToAnotherUser()
 {
     var actorId = UserId(3);
     var work = WorkOwnedBy(UserId(1));
@@ -118,10 +150,25 @@ static void AllowsParentOwnerSelfAssignment()
         work,
         parent,
         actorUserId: actorId,
-        assigneeUserIds: new[] { actorId });
+        assigneeUserIds: new[] { UserId(6) });
 }
 
-static void AllowsDirectAssigneeSelfAssignment()
+static void BlocksParentOwnerSelfAssignment()
+{
+    var actorId = UserId(3);
+    var work = WorkOwnedBy(UserId(1));
+    var parent = ParentAssignment(createdByUserId: actorId);
+
+    AssertThrows(
+        AppErrorCode.WORK_ASSIGNMENT_SELF_ASSIGNMENT_NOT_ALLOWED,
+        () => WorkAssignmentCreateScopeGuard.EnsureCanCreateWithinScope(
+            work,
+            parent,
+            actorUserId: actorId,
+            assigneeUserIds: new[] { actorId }));
+}
+
+static void BlocksDirectAssigneeSelfAssignment()
 {
     var actorId = UserId(4);
     var work = WorkOwnedBy(UserId(1));
@@ -129,11 +176,13 @@ static void AllowsDirectAssigneeSelfAssignment()
         createdByUserId: UserId(1),
         assigneeUserIds: new[] { actorId });
 
-    WorkAssignmentCreateScopeGuard.EnsureCanCreateWithinScope(
-        work,
-        parent,
-        actorUserId: actorId,
-        assigneeUserIds: new[] { actorId });
+    AssertThrows(
+        AppErrorCode.WORK_ASSIGNMENT_SELF_ASSIGNMENT_NOT_ALLOWED,
+        () => WorkAssignmentCreateScopeGuard.EnsureCanCreateWithinScope(
+            work,
+            parent,
+            actorUserId: actorId,
+            assigneeUserIds: new[] { actorId }));
 }
 
 static void BlocksUnrelatedChildSelfAssignment()
@@ -153,6 +202,89 @@ static void BlocksUnrelatedChildSelfAssignment()
             assigneeUserIds: new[] { actorId }));
 }
 
+static void AllowsUnitManagerPeerUnitManagerAssignment()
+{
+    var parentUnitId = ObjectId(1);
+    var actorUnit = TestUnit(2, "001001", 2, parentUnitId);
+    var peerUnit = TestUnit(3, "001002", 2, parentUnitId);
+    var actor = TestUser(1, "mu_actor", ManagementAccountKind.UnitManager, actorUnit.Id);
+    var peerManager = TestUser(2, "mu_peer", ManagementAccountKind.UnitManager, peerUnit.Id);
+    var units = UnitMap(actorUnit, peerUnit);
+
+    WorkAssignmentTargetScopeValidator.EnsureCanAssignTargets(
+        actor,
+        actorUnit,
+        new[] { peerManager },
+        units,
+        actorUnitHasAssignableDescendants: true);
+}
+
+static void AllowsUnitManagerDescendantUnitManagerAssignment()
+{
+    var actorUnit = TestUnit(4, "002", 1, parentUnitId: null);
+    var childUnit = TestUnit(5, "002001", 2, actorUnit.Id);
+    var actor = TestUser(3, "mu_actor", ManagementAccountKind.UnitManager, actorUnit.Id);
+    var childManager = TestUser(4, "mu_child", ManagementAccountKind.UnitManager, childUnit.Id);
+    var units = UnitMap(actorUnit, childUnit);
+
+    WorkAssignmentTargetScopeValidator.EnsureCanAssignTargets(
+        actor,
+        actorUnit,
+        new[] { childManager },
+        units,
+        actorUnitHasAssignableDescendants: true);
+}
+
+static void BlocksUnitManagerNormalUserBeforeFinalUnit()
+{
+    var actorUnit = TestUnit(6, "003", 1, parentUnitId: null);
+    var actor = TestUser(5, "mu_actor", ManagementAccountKind.UnitManager, actorUnit.Id);
+    var staff = TestUser(6, "staff", ManagementAccountKind.NormalUser, actorUnit.Id);
+    var units = UnitMap(actorUnit);
+
+    AssertThrows(
+        AppErrorCode.WORK_ASSIGNMENT_ASSIGNEE_SCOPE_INVALID,
+        () => WorkAssignmentTargetScopeValidator.EnsureCanAssignTargets(
+            actor,
+            actorUnit,
+            new[] { staff },
+            units,
+            actorUnitHasAssignableDescendants: true));
+}
+
+static void AllowsFinalUnitManagerOwnUnitNormalUserAssignment()
+{
+    var actorUnit = TestUnit(7, "004001", 2, parentUnitId: ObjectId(7));
+    var actor = TestUser(7, "mu_actor", ManagementAccountKind.UnitManager, actorUnit.Id);
+    var staff = TestUser(8, "staff", ManagementAccountKind.NormalUser, actorUnit.Id);
+    var units = UnitMap(actorUnit);
+
+    WorkAssignmentTargetScopeValidator.EnsureCanAssignTargets(
+        actor,
+        actorUnit,
+        new[] { staff },
+        units,
+        actorUnitHasAssignableDescendants: false);
+}
+
+static void BlocksUnitManagerNormalUserOutsideOwnUnit()
+{
+    var actorUnit = TestUnit(8, "005001", 2, parentUnitId: ObjectId(8));
+    var otherUnit = TestUnit(9, "005002", 2, ObjectId(8));
+    var actor = TestUser(9, "mu_actor", ManagementAccountKind.UnitManager, actorUnit.Id);
+    var staff = TestUser(10, "staff", ManagementAccountKind.NormalUser, otherUnit.Id);
+    var units = UnitMap(actorUnit, otherUnit);
+
+    AssertThrows(
+        AppErrorCode.WORK_ASSIGNMENT_ASSIGNEE_SCOPE_INVALID,
+        () => WorkAssignmentTargetScopeValidator.EnsureCanAssignTargets(
+            actor,
+            actorUnit,
+            new[] { staff },
+            units,
+            actorUnitHasAssignableDescendants: false));
+}
+
 static void BlocksBlankActor()
 {
     var work = WorkOwnedBy(UserId(1));
@@ -166,7 +298,7 @@ static void BlocksBlankActor()
             assigneeUserIds: Array.Empty<string>()));
 }
 
-static void BlocksAssignmentCompletedBeforeStart()
+static void BlocksAssignmentDueDateBeforeStart()
 {
     var work = WorkWithDateRange(
         new DateTime(2026, 1, 1),
@@ -179,12 +311,67 @@ static void BlocksAssignmentCompletedBeforeStart()
         AggregationType = WorkAggregationTypes.Matrix,
         AssigneeUserIds = new List<string> { UserId(1) },
         StartDate = new DateTime(2026, 5, 10),
-        CompletedDate = new DateTime(2026, 5, 9),
+        DueDate = new DateTime(2026, 5, 9),
         DueAtUtc = new DateTime(2026, 5, 10)
     };
 
     AssertThrows(
         AppErrorCode.WORK_ASSIGNMENT_COMPLETED_BEFORE_START,
+        () => WorkAssignmentScheduleHelper.ValidateRequest(
+            WorkAssignmentScheduleHelper.NormalizeRequest(req),
+            work));
+}
+
+static void BlocksOnceDueBeforeAssignmentStart()
+{
+    var work = WorkWithDateRange(
+        new DateTime(2026, 1, 1),
+        new DateTime(2026, 12, 31));
+
+    var req = new SaveWorkAssignmentRequest
+    {
+        DynamicFormTemplateId = ObjectId(15),
+        AssignmentType = WorkAssignmentTypes.Once,
+        AggregationType = WorkAggregationTypes.Matrix,
+        AssigneeUserIds = new List<string> { UserId(1) },
+        StartDate = new DateTime(2026, 5, 10),
+        DueDate = new DateTime(2026, 5, 31),
+        DueAtUtc = new DateTime(2026, 5, 9, 23, 59, 59, DateTimeKind.Utc)
+    };
+
+    AssertThrows(
+        AppErrorCode.WORK_ASSIGNMENT_ONCE_DUE_BEFORE_ASSIGNMENT_START,
+        () => WorkAssignmentScheduleHelper.ValidateRequest(
+            WorkAssignmentScheduleHelper.NormalizeRequest(req),
+            work));
+}
+
+static void BlocksPeriodicScheduleStartOutsideAssignmentRange()
+{
+    var work = WorkWithDateRange(
+        new DateTime(2026, 1, 1),
+        new DateTime(2026, 12, 31));
+
+    var req = new SaveWorkAssignmentRequest
+    {
+        DynamicFormTemplateId = ObjectId(16),
+        AssignmentType = WorkAssignmentTypes.PeriodicReport,
+        AggregationType = WorkAggregationTypes.Matrix,
+        AssigneeUserIds = new List<string> { UserId(2) },
+        StartDate = new DateTime(2026, 5, 10),
+        DueDate = new DateTime(2026, 5, 31),
+        Schedule = new AssignmentScheduleDto(
+            CycleType: ReportCycleTypes.Weekly,
+            StartDate: new DateTime(2026, 5, 9),
+            WeekDays: new List<int> { 2 },
+            MonthDays: null,
+            QuarterDays: null,
+            SemiAnnualDays: null,
+            Note: null)
+    };
+
+    AssertThrows(
+        AppErrorCode.WORK_ASSIGNMENT_PERIODIC_START_OUT_OF_RANGE,
         () => WorkAssignmentScheduleHelper.ValidateRequest(
             WorkAssignmentScheduleHelper.NormalizeRequest(req),
             work));
@@ -218,7 +405,7 @@ static void DefaultsMissingAssignmentStartToCurrentDate()
     AssertEqual(now.Date, effective.StartDate, "missing start date should default to current date");
 }
 
-static void DefaultsRootCompletedDateToWorkDueDate()
+static void DefaultsRootDueDateToWorkDueDate()
 {
     var workDueDate = new DateTime(2026, 5, 31);
     var work = WorkWithDates(
@@ -251,19 +438,20 @@ static void DefaultsRootCompletedDateToWorkDueDate()
 
     WorkAssignmentScheduleHelper.ValidateRequest(effective, work);
 
-    AssertEqual(workDueDate, effective.CompletedDate, "root completed date should default to work due date");
+    AssertEqual(workDueDate, effective.DueDate, "root due date should default to work due date");
+    AssertEqual<DateTime?>(null, effective.CompletedDate, "completion date should stay empty until explicit completion");
     AssertEqual(new DateTime(2026, 5, 1), effective.Schedule?.StartDate, "schedule start should keep assignment start date");
 }
 
-static void DefaultsChildCompletedDateToParentAssignmentEnd()
+static void DefaultsChildDueDateToParentDueDate()
 {
-    var parentEndDate = new DateTime(2026, 6, 30);
+    var parentDueDate = new DateTime(2026, 6, 30);
     var work = WorkWithDates(
         startDate: new DateTime(2026, 1, 1),
         endDate: null,
         dueDate: new DateTime(2026, 12, 31));
     var parent = ParentAssignment(createdByUserId: UserId(1));
-    parent.CompletedDate = parentEndDate;
+    parent.DueDate = parentDueDate;
 
     var req = new SaveWorkAssignmentRequest
     {
@@ -290,7 +478,8 @@ static void DefaultsChildCompletedDateToParentAssignmentEnd()
 
     WorkAssignmentScheduleHelper.ValidateRequest(effective, work);
 
-    AssertEqual(parentEndDate, effective.CompletedDate, "child completed date should default to parent assignment end");
+    AssertEqual(parentDueDate, effective.DueDate, "child due date should default to parent assignment due date");
+    AssertEqual<DateTime?>(null, effective.CompletedDate, "completion date should stay empty until explicit completion");
 }
 
 static void ValidatesPeriodicAssignmentDateRange()
@@ -306,7 +495,7 @@ static void ValidatesPeriodicAssignmentDateRange()
         AggregationType = WorkAggregationTypes.Matrix,
         AssigneeUserIds = new List<string> { UserId(2) },
         StartDate = new DateTime(2026, 5, 1),
-        CompletedDate = new DateTime(2026, 5, 31),
+        DueDate = new DateTime(2026, 5, 31),
         Schedule = new AssignmentScheduleDto(
             CycleType: ReportCycleTypes.Weekly,
             StartDate: null,
@@ -589,6 +778,40 @@ static void ValidatesDynamicFormFieldDisplayName()
         ]
         """);
 
+    var normalizedAliases = InvokePrivateStatic<string?>(
+        serviceType,
+        "NormalizeFieldDisplayAliases",
+        """
+        [
+          { "id": "f1", "sectionId": "s1", "key": "revenue", "type": "number", "displayName": "Doanh thu", "label": "Doanh thu", "isStatistic": true, "statisticLabelCodes": ["revenue"] }
+        ]
+        """);
+    using var normalizedAliasDoc = JsonDocument.Parse(normalizedAliases!);
+    var normalizedAliasField = normalizedAliasDoc.RootElement[0];
+    AssertEqual("Doanh thu", normalizedAliasField.GetProperty("name").GetString(), "field display alias should be stored as name");
+    AssertFalse(normalizedAliasField.TryGetProperty("displayName", out _), "displayName alias should not be stored");
+    AssertFalse(normalizedAliasField.TryGetProperty("label", out _), "label alias should not be stored");
+
+    var normalizedKeys = InvokePrivateStatic<string?>(
+        serviceType,
+        "NormalizeFieldPayload",
+        """
+        [
+          { "id": "f1", "sectionId": "s1", "type": "number", "name": "Doanh thu" },
+          { "id": "f2", "sectionId": "s1", "type": "number", "name": "Chi phí", "key": "total" },
+          { "id": "f3", "sectionId": "s1", "type": "number", "name": "Lợi nhuận", "key": "total" }
+        ]
+        """,
+        """
+        [
+          { "id": "f1", "sectionId": "s1", "type": "number", "name": "Doanh thu", "key": "old_revenue" }
+        ]
+        """);
+    using var normalizedKeyDoc = JsonDocument.Parse(normalizedKeys!);
+    AssertEqual("old_revenue", normalizedKeyDoc.RootElement[0].GetProperty("key").GetString(), "existing field key should be retained when UI omits it");
+    AssertEqual("total", normalizedKeyDoc.RootElement[1].GetProperty("key").GetString(), "first requested field key should be kept");
+    AssertEqual("total_2", normalizedKeyDoc.RootElement[2].GetProperty("key").GetString(), "duplicate field key should be made unique");
+
     AssertThrowsFromReflection(
         AppErrorCode.DYNAMIC_FORM_FIELD_NAME_INVALID,
         () => InvokePrivateStatic<object?>(
@@ -627,6 +850,10 @@ static void ValidatesDynamicFormFieldDisplayName()
         new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
         {
             ["approved_at"] = LabelDataTypes.Date
+        },
+        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["approved_at"] = LabelUsages.Statistic
         });
 
     AssertThrowsFromReflection(
@@ -643,223 +870,604 @@ static void ValidatesDynamicFormFieldDisplayName()
             new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
             {
                 ["revenue"] = LabelDataTypes.Number
+            },
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["revenue"] = LabelUsages.Statistic
+            }));
+
+    AssertThrowsFromReflection(
+        AppErrorCode.DYNAMIC_FORM_LABEL_STATISTIC_TARGET_INVALID,
+        () => InvokePrivateStatic<object?>(
+            serviceType,
+            "EnsureStatisticLabelTypeCompatibility",
+            """
+            [
+              { "id": "f6", "sectionId": "s1", "key": "revenue", "type": "number", "name": "Doanh thu", "isStatistic": true, "statisticLabelCodes": ["revenue"] }
+            ]
+            """,
+            null,
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["revenue"] = LabelDataTypes.Number
+            },
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["revenue"] = LabelUsages.Classification
+            }));
+
+    InvokePrivateStatic<object?>(
+        serviceType,
+        "EnsureTableTargetLabelTypeCompatibility",
+        null,
+        """
+        [
+          {
+            "blockId": "b1",
+            "allowedRowLabelCodes": ["budget"],
+            "rowLabelDefaults": [
+              { "rowIndex": 1, "rowLabelCodes": ["budget"] }
+            ]
+          }
+        ]
+        """,
+        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["budget"] = LabelDataTypes.Number
+        },
+        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["budget"] = LabelUsages.TableTarget
+        });
+
+    AssertThrowsFromReflection(
+        AppErrorCode.DYNAMIC_FORM_LABEL_STATISTIC_TARGET_INVALID,
+        () => InvokePrivateStatic<object?>(
+            serviceType,
+            "EnsureTableTargetLabelTypeCompatibility",
+            null,
+            """
+            [
+              {
+                "blockId": "b1",
+                "allowedRowLabelCodes": ["budget"]
+              }
+            ]
+            """,
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["budget"] = LabelDataTypes.Number
+            },
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["budget"] = LabelUsages.Classification
+            }));
+
+    AssertThrowsFromReflection(
+        AppErrorCode.DYNAMIC_FORM_LABEL_STATISTIC_TARGET_INVALID,
+        () => InvokePrivateStatic<object?>(
+            serviceType,
+            "EnsureTableTargetLabelTypeCompatibility",
+            null,
+            """
+            [
+              {
+                "blockId": "b1",
+                "rowLabelDefaults": [
+                  { "rowIndex": 1, "rowLabelCodes": ["budget"] }
+                ]
+              }
+            ]
+            """,
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["budget"] = LabelDataTypes.ShortText
+            },
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["budget"] = LabelUsages.TableTarget
             }));
 }
 
-static void ValidatesDynamicExcelRecordTableContract()
+static void BucketsShortTextFieldStatistics()
 {
-    DynamicExcelRecordTableContractValidator.Validate(
+    var serviceType = typeof(WorkReportFieldStatisticsService);
+
+    var fields = InvokePrivateStatic<object>(
+        serviceType,
+        "ExtractStatisticFields",
+        """
+        [
+          { "id": "f_short", "sectionId": "s1", "key": "phan_loai_ngan", "type": "shortText", "name": "Phan loai ngan", "isStatistic": true, "statisticLabelCodes": ["short_label"] }
+        ]
+        """);
+
+    var values = InvokePrivateStatic<object>(
+        serviceType,
+        "ExtractFieldValues",
+        """
+        { "values": { "f_short": "  Nhom A  " } }
+        """,
+        fields);
+
+    var rows = ((System.Collections.IEnumerable)values).Cast<object>().ToList();
+    AssertEqual(1, rows.Count, "shortText should produce one statistic value row");
+    AssertEqual("Nhom A", GetReflectedProperty<string>(rows[0], "BucketKey"), "shortText bucket key should be the trimmed value");
+    AssertEqual("Nhom A", GetReflectedProperty<string>(rows[0], "BucketLabel"), "shortText bucket label should be the trimmed value");
+    AssertEqual("TEXT_BUCKET", GetReflectedProperty<string>(rows[0], "ValueKind"), "shortText should be stored as a text bucket statistic");
+}
+
+static void AcceptsVerifiedExternalPayloadForStatisticProjection()
+{
+    var report = ReadyPayloadReport();
+    var payload = MatchingPayloadSnapshot(
+        report,
+        isExternalPayload: true,
+        payloadHashVerified: true);
+
+    WorkReportPayloadConsistency.EnsureSnapshotFreshForStatisticProjection(report, payload);
+}
+
+static void RejectsEmbeddedPayloadForStatisticProjection()
+{
+    var report = ReadyPayloadReport();
+    var payload = MatchingPayloadSnapshot(
+        report,
+        isExternalPayload: false,
+        payloadHashVerified: true);
+
+    AssertThrows(
+        AppErrorCode.WORK_ASSIGNMENT_REPORT_PAYLOAD_NOT_READY,
+        () => WorkReportPayloadConsistency.EnsureSnapshotFreshForStatisticProjection(report, payload));
+}
+
+static void RejectsUnverifiedExternalPayloadHashForStatisticProjection()
+{
+    var report = ReadyPayloadReport();
+    var payload = MatchingPayloadSnapshot(
+        report,
+        isExternalPayload: true,
+        payloadHashVerified: false);
+
+    AssertThrows(
+        AppErrorCode.WORK_ASSIGNMENT_REPORT_PAYLOAD_NOT_READY,
+        () => WorkReportPayloadConsistency.EnsureSnapshotFreshForStatisticProjection(report, payload));
+}
+
+static void BlocksBlankDynamicFormSectionTitle()
+{
+    var serviceType = typeof(DynamicFormService);
+
+    AssertThrowsFromReflection(
+        AppErrorCode.DYNAMIC_FORM_SECTION_CONFIG_INVALID,
+        () => InvokePrivateStatic<string>(
+            serviceType,
+            "NormalizeBlocksForSections",
+            """
+            [
+              { "id": "s1", "title": " " }
+            ]
+            """,
+            "[]"));
+}
+
+static void MatchesAutoApproveCondition()
+{
+    var fieldsJson = """
+    [
+      { "id": "f_status", "sectionId": "s1", "key": "ket_qua", "type": "singleSelect", "name": "Ket qua" },
+      { "id": "f_score", "sectionId": "s1", "key": "diem", "type": "number", "name": "Diem" },
+      { "id": "f_tags", "sectionId": "s1", "key": "nhom", "type": "multiSelect", "name": "Nhom" },
+      { "id": "f_notes", "sectionId": "s1", "key": "ghi_chu", "type": "longText", "name": "Ghi chu" },
+      { "id": "f_list", "sectionId": "s1", "key": "danh_sach", "type": "stringList", "name": "Danh sach" }
+    ]
+    """;
+
+    var conditionJson = WorkAssignmentAutoApproveConditionNormalizer.NormalizeOrNull(
+        """
+        { "enabled": true, "fieldKey": "ket_qua", "operator": "eq", "value": "PASS" }
+        """,
+        fieldsJson);
+
+    AssertTrue(!string.IsNullOrWhiteSpace(conditionJson), "condition should normalize");
+    AssertTrue(
+        WorkAssignmentAutoApproveConditionNormalizer.Matches(
+            conditionJson,
+            """{ "values": { "f_status": "PASS", "f_score": 8 } }"""),
+        "matching option code should auto approve");
+    AssertFalse(
+        WorkAssignmentAutoApproveConditionNormalizer.Matches(
+            conditionJson,
+            """{ "values": { "f_status": "FAIL", "f_score": 8 } }"""),
+        "non-matching option code should not auto approve");
+
+    var scoreConditionJson = WorkAssignmentAutoApproveConditionNormalizer.NormalizeOrNull(
+        """
+        { "enabled": true, "fieldKey": "diem", "operator": "gte", "value": 7 }
+        """,
+        fieldsJson);
+    AssertTrue(
+        WorkAssignmentAutoApproveConditionNormalizer.Matches(
+            scoreConditionJson,
+            """{ "values": { "diem": "7.5" } }"""),
+        "numeric compare should support field key fallback and string values");
+
+    var tagConditionJson = WorkAssignmentAutoApproveConditionNormalizer.NormalizeOrNull(
+        """
+        { "enabled": true, "fieldKey": "nhom", "operator": "contains", "value": "A" }
+        """,
+        fieldsJson);
+    AssertTrue(
+        WorkAssignmentAutoApproveConditionNormalizer.Matches(
+            tagConditionJson,
+            """{ "values": { "nhom": ["B", "A"] } }"""),
+        "multi select condition should match contained option codes");
+
+    AssertThrows(
+        AppErrorCode.COMMON_VALIDATION_FAILED,
+        () => WorkAssignmentAutoApproveConditionNormalizer.NormalizeOrNull(
+            """
+            { "enabled": true, "fieldKey": "ghi_chu", "operator": "contains", "value": "x" }
+            """,
+            fieldsJson));
+    AssertThrows(
+        AppErrorCode.COMMON_VALIDATION_FAILED,
+        () => WorkAssignmentAutoApproveConditionNormalizer.NormalizeOrNull(
+            """
+            { "enabled": true, "fieldKey": "danh_sach", "operator": "contains", "value": "x" }
+            """,
+            fieldsJson));
+}
+
+static void ValidatesDynamicFormTableTargetDefaultDataType()
+{
+    var serviceType = typeof(DynamicFormService);
+
+    InvokePrivateStatic<object?>(
+        serviceType,
+        "EnsureTableTargetLabelTypeCompatibility",
+        null,
+        """
+        [
+          {
+            "blockId": "b1",
+            "defaultDataType": "DATE",
+            "allowedRowLabelCodes": ["deadline"]
+          }
+        ]
+        """,
+        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["deadline"] = LabelDataTypes.Date
+        },
+        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["deadline"] = LabelUsages.TableTarget
+        });
+
+    AssertThrowsFromReflection(
+        AppErrorCode.DYNAMIC_FORM_LABEL_STATISTIC_TARGET_INVALID,
+        () => InvokePrivateStatic<object?>(
+            serviceType,
+            "EnsureTableTargetLabelTypeCompatibility",
+            null,
+            """
+            [
+              {
+                "blockId": "b1",
+                "defaultDataType": "DATE",
+                "allowedRowLabelCodes": ["deadline"]
+              }
+            ]
+            """,
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["deadline"] = LabelDataTypes.Number
+            },
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["deadline"] = LabelUsages.TableTarget
+            }));
+}
+
+static void ValidatesDynamicFormMetricLabelTargets()
+{
+    var serviceType = typeof(DynamicFormService);
+    const string validBlocksJson = """
+    [
+      {
+        "blockId": "b1",
+        "excelSpecKind": "TOP",
+        "dataRect": { "r0": 1, "c0": 0, "r1": 2, "c1": 1 },
+        "defaultDataType": "NUMBER",
+        "dataTypeOverrides": [
+          { "scope": "COLUMN", "index": 1, "dataType": "DATE" }
+        ],
+        "metricLabelTargets": [
+          { "range": { "r0": 1, "c0": 1, "r1": 2, "c1": 1 }, "statisticLabelCode": "deadline" }
+        ]
+      }
+    ]
+    """;
+
+    InvokePrivateStatic<object?>(
+        serviceType,
+        "EnsureStatisticLabelTypeCompatibility",
+        null,
+        validBlocksJson,
+        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["deadline"] = LabelDataTypes.Date
+        },
+        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["deadline"] = LabelUsages.Statistic
+        });
+
+    AssertThrowsFromReflection(
+        AppErrorCode.DYNAMIC_FORM_LABEL_STATISTIC_TARGET_INVALID,
+        () => InvokePrivateStatic<object?>(
+            serviceType,
+            "EnsureStatisticLabelTypeCompatibility",
+            null,
+            validBlocksJson,
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["deadline"] = LabelDataTypes.Number
+            },
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["deadline"] = LabelUsages.Statistic
+            }));
+
+    AssertThrowsFromReflection(
+        AppErrorCode.DYNAMIC_FORM_LABEL_STATISTIC_TARGET_CONFLICT,
+        () => InvokePrivateStatic<object?>(
+            serviceType,
+            "EnsureUniqueLabelStatisticTargets",
+            """
+            [
+              { "id": "f1", "sectionId": "s1", "key": "deadline", "type": "date", "name": "Deadline", "isStatistic": true, "statisticLabelCodes": ["deadline"] }
+            ]
+            """,
+            validBlocksJson));
+
+    AssertThrowsFromReflection(
+        AppErrorCode.DYNAMIC_FORM_LABEL_STATISTIC_TARGET_INVALID,
+        () => InvokePrivateStatic<object?>(
+            serviceType,
+            "EnsureTableStatisticContract",
+            """
+            {
+              "blockId": "b1",
+              "excelSpecKind": "TOP",
+              "dataRect": { "r0": 1, "c0": 0, "r1": 2, "c1": 1 },
+              "defaultDataType": "NUMBER",
+              "dataTypeOverrides": [
+                { "scope": "COLUMN", "index": 1, "dataType": "DATE" }
+              ],
+              "metricLabelTargets": [
+                { "range": { "r0": 1, "c0": 0, "r1": 1, "c1": 1 }, "statisticLabelCode": "mixed" }
+              ]
+            }
+            """,
+            "ExcelBlockJson"));
+}
+
+static void ValidatesDynamicExcelNumericGridSpecMetadata()
+{
+    var serviceType = typeof(DynamicExcelService);
+    const string workbookJson = """
+    [
+      { "row": 20, "column": 10, "data": [] }
+    ]
+    """;
+
+    InvokePrivateStatic<object?>(
+        serviceType,
+        "ValidateDynamicExcelPayloadCore",
+        "Mau so",
+        "FIXED_GRID",
+        workbookJson,
         """
         {
-          "orientation": "ROWS",
-          "columns": [
-            { "key": "ho_so", "label": "Hồ sơ", "dataType": "text" },
-            { "key": "sl_x", "label": "Số lượng đối tượng X", "dataType": "number" },
-            { "key": "sl_y", "label": "Số lượng đối tượng Y", "dataType": "number" },
-            { "key": "ngay_mo", "label": "Ngày mở", "dataType": "date" },
-            { "key": "ngay_ket_thuc", "label": "Ngày kết thúc", "dataType": "date" }
+          "kind": "TOP",
+          "topRows": 1,
+          "topCols": 3,
+          "dataRows": 2,
+          "dataTypeOverrides": [
+            { "scope": "COLUMN", "index": 1, "dataType": "DATE" }
+          ]
+        }
+        """,
+        new DynamicExcelDataRectDto(1, 0, 2, 2),
+        3,
+        2);
+
+    InvokePrivateStatic<object?>(
+        serviceType,
+        "ValidateDynamicExcelPayloadCore",
+        "Mau lua chon",
+        "FIXED_GRID",
+        workbookJson,
+        """
+        {
+          "kind": "TOP",
+          "topRows": 1,
+          "topCols": 3,
+          "dataRows": 2,
+          "defaultDataType": "SHORT_TEXT",
+          "defaultOptions": [
+            { "code": "A", "label": "Lua chon A" },
+            { "code": "B", "label": "Lua chon B" }
           ],
-          "calculatedColumns": [
+          "dataTypeOverrides": [
+            { "scope": "COLUMN", "index": 1, "dataType": "BOOLEAN" }
+          ]
+        }
+        """,
+        new DynamicExcelDataRectDto(1, 0, 2, 2),
+        3,
+        2);
+
+    AssertThrowsFromReflection(
+        AppErrorCode.COMMON_VALIDATION_FAILED,
+        () => InvokePrivateStatic<object?>(
+            serviceType,
+            "ValidateDynamicExcelPayloadCore",
+            "Mau so",
+            "FIXED_GRID",
+            workbookJson,
+            """
+            { "kind": "TOP", "topRows": 1, "topCols": 3, "dataRows": 2 }
+            """,
+            new DynamicExcelDataRectDto(0, 0, 1, 2),
+            3,
+            2));
+
+    AssertThrowsFromReflection(
+        AppErrorCode.COMMON_VALIDATION_FAILED,
+        () => InvokePrivateStatic<object?>(
+            serviceType,
+            "ValidateDynamicExcelPayloadCore",
+            "Mau so",
+            "FIXED_GRID",
+            workbookJson,
+            """
             {
-              "key": "tong_doi_tuong",
-              "label": "Tổng đối tượng",
-              "dataType": "number",
-              "expression": { "op": "add", "args": [ { "col": "sl_x" }, { "col": "sl_y" } ] }
-            },
-            {
-              "key": "so_ngay_xu_ly",
-              "label": "Số ngày xử lý",
-              "dataType": "number",
-              "expression": { "op": "dateDiffDays", "args": [ { "col": "ngay_mo" }, { "col": "ngay_ket_thuc" } ] }
+              "kind": "TOP",
+              "topRows": 1,
+              "topCols": 3,
+              "dataRows": 2,
+              "defaultDataType": "LONG_TEXT"
             }
-          ],
-          "validationRules": [
+            """,
+            new DynamicExcelDataRectDto(1, 0, 2, 2),
+            3,
+            2));
+
+    InvokePrivateStatic<object?>(
+        serviceType,
+        "ValidateDynamicExcelPayloadCore",
+        "Mau van ban ngan",
+        "FIXED_GRID",
+        workbookJson,
+        """
+        {
+          "kind": "TOP",
+          "topRows": 1,
+          "topCols": 3,
+          "dataRows": 2,
+          "defaultDataType": "SHORT_TEXT",
+          "defaultOptions": [
+            { "code": "DAT", "label": "Dat" },
+            { "code": "CHUA_DAT", "label": "Chua dat" }
+          ]
+        }
+        """,
+        new DynamicExcelDataRectDto(1, 0, 2, 2),
+        3,
+        2);
+
+    InvokePrivateStatic<object?>(
+        serviceType,
+        "ValidateDynamicExcelPayloadCore",
+        "Mau chon nhieu",
+        "FIXED_GRID",
+        workbookJson,
+        """
+        {
+          "kind": "TOP",
+          "topRows": 1,
+          "topCols": 3,
+          "dataRows": 2,
+          "dataTypeOverrides": [
             {
-              "key": "ngay_ket_thuc_sau_ngay_mo",
-              "message": "Ngày kết thúc không được trước ngày mở.",
-              "condition": { "op": "gte", "args": [ { "col": "ngay_ket_thuc" }, { "col": "ngay_mo" } ] }
-            },
-            {
-              "key": "sl_x_khong_lon_hon_sl_y",
-              "message": "Số lượng X không được lớn hơn số lượng Y.",
-              "condition": { "op": "lte", "args": [ { "col": "sl_x" }, { "col": "sl_y" } ] }
+              "scope": "COLUMN",
+              "index": 1,
+              "dataType": "MULTI_SELECT",
+              "options": [
+                { "code": "PV01", "label": "PV01" },
+                { "code": "PX01", "label": "PX01" },
+                { "code": "PA06", "label": "PA06" }
+              ]
             }
           ]
         }
-        """);
-}
+        """,
+        new DynamicExcelDataRectDto(1, 0, 2, 2),
+        3,
+        2);
 
-static void BlocksDynamicExcelCalculatedOutputAsUpstreamData()
-{
-    AssertThrows(
+    AssertThrowsFromReflection(
         AppErrorCode.COMMON_VALIDATION_FAILED,
-        () => DynamicExcelRecordTableContractValidator.Validate(
+        () => InvokePrivateStatic<object?>(
+            serviceType,
+            "ValidateDynamicExcelPayloadCore",
+            "Mau lua chon",
+            "FIXED_GRID",
+            workbookJson,
             """
             {
-              "columns": [
-                { "key": "sl_x", "label": "Số lượng X", "dataType": "number" },
-                { "key": "sl_y", "label": "Số lượng Y", "dataType": "number" }
-              ],
-              "calculatedColumns": [
-                {
-                  "key": "tong",
-                  "label": "Tổng",
-                  "dataType": "number",
-                  "includeInUpstream": true,
-                  "expression": { "op": "add", "args": [ { "col": "sl_x" }, { "col": "sl_y" } ] }
-                }
-              ]
-            }
-            """));
-}
-
-static void LimitsDynamicExcelCalculatedOutputs()
-{
-    AssertThrows(
-        AppErrorCode.COMMON_VALIDATION_FAILED,
-        () => DynamicExcelRecordTableContractValidator.Validate(
-            """
-            {
-              "columns": [
-                { "key": "sl_x", "label": "Số lượng X", "dataType": "number" },
-                { "key": "sl_y", "label": "Số lượng Y", "dataType": "number" }
-              ],
-              "calculatedColumns": [
-                { "key": "c01", "label": "C01", "dataType": "number", "expression": { "op": "add", "args": [ { "col": "sl_x" }, { "col": "sl_y" } ] } },
-                { "key": "c02", "label": "C02", "dataType": "number", "expression": { "op": "add", "args": [ { "col": "sl_x" }, { "col": "sl_y" } ] } },
-                { "key": "c03", "label": "C03", "dataType": "number", "expression": { "op": "add", "args": [ { "col": "sl_x" }, { "col": "sl_y" } ] } },
-                { "key": "c04", "label": "C04", "dataType": "number", "expression": { "op": "add", "args": [ { "col": "sl_x" }, { "col": "sl_y" } ] } },
-                { "key": "c05", "label": "C05", "dataType": "number", "expression": { "op": "add", "args": [ { "col": "sl_x" }, { "col": "sl_y" } ] } },
-                { "key": "c06", "label": "C06", "dataType": "number", "expression": { "op": "add", "args": [ { "col": "sl_x" }, { "col": "sl_y" } ] } },
-                { "key": "c07", "label": "C07", "dataType": "number", "expression": { "op": "add", "args": [ { "col": "sl_x" }, { "col": "sl_y" } ] } },
-                { "key": "c08", "label": "C08", "dataType": "number", "expression": { "op": "add", "args": [ { "col": "sl_x" }, { "col": "sl_y" } ] } },
-                { "key": "c09", "label": "C09", "dataType": "number", "expression": { "op": "add", "args": [ { "col": "sl_x" }, { "col": "sl_y" } ] } },
-                { "key": "c10", "label": "C10", "dataType": "number", "expression": { "op": "add", "args": [ { "col": "sl_x" }, { "col": "sl_y" } ] } },
-                { "key": "c11", "label": "C11", "dataType": "number", "expression": { "op": "add", "args": [ { "col": "sl_x" }, { "col": "sl_y" } ] } }
-              ]
-            }
-            """));
-}
-
-static void ValidatesDynamicExcelRecordTableRuntimeRows()
-{
-    const string specJson = """
-    {
-      "columns": [
-        { "key": "ho_so", "label": "Hồ sơ", "dataType": "text", "required": true },
-        { "key": "sl_x", "label": "Số lượng X", "dataType": "number" },
-        { "key": "sl_y", "label": "Số lượng Y", "dataType": "number" },
-        { "key": "ngay_mo", "label": "Ngày mở", "dataType": "date" },
-        { "key": "ngay_ket_thuc", "label": "Ngày kết thúc", "dataType": "date" }
-      ],
-      "calculatedColumns": [
-        {
-          "key": "tong",
-          "label": "Tổng",
-          "dataType": "number",
-          "expression": { "op": "add", "args": [ { "col": "sl_x" }, { "col": "sl_y" } ] }
-        }
-      ],
-      "validationRules": [
-        {
-          "key": "x_khong_lon_hon_y",
-          "condition": { "op": "lte", "args": [ { "col": "sl_x" }, { "col": "sl_y" } ] }
-        }
-      ]
-    }
-    """;
-
-    const string tableValuesJson = """
-    {
-      "blocks": [
-        {
-          "blockId": "excel_tpl",
-          "dynamicExcelTemplateId": "tpl1",
-          "tableKind": "RECORD_TABLE",
-          "records": [
-            {
-              "rowKey": "row_1",
-              "values": {
-                "ho_so": "A",
-                "sl_x": 2,
-                "sl_y": 3,
-                "ngay_mo": "2026-05-01",
-                "ngay_ket_thuc": "2026-05-02"
-              }
-            }
-          ]
-        }
-      ]
-    }
-    """;
-
-    DynamicExcelRecordTableRuntime.ValidateTableValues(tableValuesJson, specJson, "tpl1", "report1");
-    var spec = DynamicExcelRecordTableRuntime.ParseSpec(specJson);
-    var row = DynamicExcelRecordTableRuntime.ExtractRows(tableValuesJson, spec, "tpl1").Single();
-    var calculated = DynamicExcelRecordTableRuntime.BuildCalculatedValues(spec, row.Values);
-    if (!Equals(calculated["tong"], 5m))
-        throw new Exception("Expected tong calculated output to equal 5.");
-}
-
-static void RejectsInvalidDynamicExcelRecordTableRuntimeRows()
-{
-    const string specJson = """
-    {
-      "columns": [
-        { "key": "ho_so", "label": "Hồ sơ", "dataType": "text", "required": true },
-        { "key": "sl_x", "label": "Số lượng X", "dataType": "number" },
-        { "key": "sl_y", "label": "Số lượng Y", "dataType": "number" }
-      ],
-      "calculatedColumns": [
-        {
-          "key": "tong",
-          "label": "Tổng",
-          "dataType": "number",
-          "expression": { "op": "add", "args": [ { "col": "sl_x" }, { "col": "sl_y" } ] }
-        }
-      ],
-      "validationRules": [
-        {
-          "key": "x_khong_lon_hon_y",
-          "condition": { "op": "lte", "args": [ { "col": "sl_x" }, { "col": "sl_y" } ] }
-        }
-      ]
-    }
-    """;
-
-    AssertThrows(
-        AppErrorCode.COMMON_VALIDATION_FAILED,
-        () => DynamicExcelRecordTableRuntime.ValidateTableValues(
-            """
-            {
-              "records": [
-                {
-                  "rowKey": "row_1",
-                  "values": { "ho_so": "A", "sl_x": 5, "sl_y": 3 }
-                }
+              "kind": "TOP",
+              "topRows": 1,
+              "topCols": 3,
+              "dataRows": 2,
+              "dataTypeOverrides": [
+                { "scope": "COLUMN", "index": 1, "dataType": "STRING_LIST" }
               ]
             }
             """,
-            specJson,
-            "tpl1",
-            "report1"));
+            new DynamicExcelDataRectDto(1, 0, 2, 2),
+            3,
+            2));
 
-    AssertThrows(
+    AssertThrowsFromReflection(
         AppErrorCode.COMMON_VALIDATION_FAILED,
-        () => DynamicExcelRecordTableRuntime.ValidateTableValues(
+        () => InvokePrivateStatic<object?>(
+            serviceType,
+            "ValidateDynamicExcelPayloadCore",
+            "Mau so",
+            "FIXED_GRID",
+            workbookJson,
             """
             {
-              "records": [
-                {
-                  "rowKey": "row_1",
-                  "values": { "ho_so": "A", "sl_x": 2, "sl_y": 3, "tong": 5 }
-                }
+              "kind": "TOP",
+              "topRows": 1,
+              "topCols": 3,
+              "dataRows": 2,
+              "dataTypeOverrides": [
+                { "scope": "ROW", "index": 1, "dataType": "DATE" }
               ]
             }
             """,
-            specJson,
-            "tpl1",
-            "report1"));
+            new DynamicExcelDataRectDto(1, 0, 2, 2),
+            3,
+            2));
+
+    AssertThrowsFromReflection(
+        AppErrorCode.COMMON_VALIDATION_FAILED,
+        () => InvokePrivateStatic<object?>(
+            serviceType,
+            "ValidateDynamicExcelPayloadCore",
+            "Mau ma tran",
+            "FIXED_GRID",
+            workbookJson,
+            """
+            {
+              "kind": "MATRIX",
+              "topRows": 1,
+              "topCols": 3,
+              "leftRows": 2,
+              "leftCols": 1,
+              "dataTypeOverrides": [
+                { "scope": "RANGE", "r0": 0, "c0": 1, "r1": 1, "c1": 2, "dataType": "DATE" }
+              ]
+            }
+            """,
+            new DynamicExcelDataRectDto(1, 1, 2, 3),
+            3,
+            2));
 }
 
 static void ResolvesLegacyWorkBasisFileAsWorkDocument()
@@ -974,6 +1582,57 @@ static WorkAssignment ParentAssignment(string createdByUserId, IEnumerable<strin
         .ToList()
 };
 
+static WorkAssignmentReport ReadyPayloadReport() => new()
+{
+    Id = ObjectId(51),
+    WorkId = ObjectId(52),
+    WorkAssignmentId = ObjectId(53),
+    WorkReportPeriodId = ObjectId(54),
+    Values1DJson = "[]",
+    PayloadRevision = 3,
+    PayloadHash = "payload_hash_3",
+    PayloadStatus = WorkReportPayloadStatus.Ready,
+    PayloadSizeBytes = 128,
+    IsActive = true
+};
+
+static WorkReportPayloadSnapshot MatchingPayloadSnapshot(
+    WorkAssignmentReport report,
+    bool isExternalPayload,
+    bool payloadHashVerified)
+    => new(
+        Values1DJson: report.Values1DJson,
+        FieldValuesJson: report.FieldValuesJson,
+        TableValuesJson: report.TableValuesJson,
+        SummarySourceJson: report.SummarySourceJson,
+        PayloadRevision: report.PayloadRevision,
+        PayloadHash: report.PayloadHash,
+        PayloadSizeBytes: report.PayloadSizeBytes,
+        PayloadStatus: report.PayloadStatus,
+        IsExternalPayload: isExternalPayload,
+        PayloadHashVerified: payloadHashVerified);
+
+static Unit TestUnit(int seed, string code, int level, string? parentUnitId) => new()
+{
+    Id = ObjectId(seed),
+    Code = code,
+    Level = level,
+    ParentUnitId = parentUnitId,
+    FullName = $"Unit {seed}"
+};
+
+static AppUser TestUser(int seed, string username, string accountKind, string unitId) => new()
+{
+    Id = UserId(seed),
+    Username = username,
+    FullName = username,
+    AccountKind = accountKind,
+    UnitId = unitId
+};
+
+static IReadOnlyDictionary<string, Unit> UnitMap(params Unit[] units)
+    => units.ToDictionary(x => x.Id, x => x, StringComparer.Ordinal);
+
 static void AssertThrows(AppErrorCode expectedCode, Action action)
 {
     try
@@ -1017,6 +1676,15 @@ static T InvokePrivateStatic<T>(Type type, string name, params object?[] args)
 
     var result = method.Invoke(null, args);
     return result is null ? default! : (T)result;
+}
+
+static T? GetReflectedProperty<T>(object source, string name)
+{
+    var property = source.GetType().GetProperty(name, BindingFlags.Instance | BindingFlags.Public)
+        ?? throw new InvalidOperationException($"{source.GetType().Name}.{name} property was not found.");
+
+    var value = property.GetValue(source);
+    return value is null ? default : (T)value;
 }
 
 static void AssertTrue(bool condition, string message)

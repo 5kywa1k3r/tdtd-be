@@ -20,6 +20,20 @@ public sealed class WorkReportLabelStatValue : BaseEntity
     [BsonRepresentation(BsonType.ObjectId)]
     public string WorkAssignmentId { get; set; } = default!;
 
+    [BsonElement("assigneeUserId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? AssigneeUserId { get; set; }
+
+    [BsonElement("assigneeUnitId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? AssigneeUnitId { get; set; }
+
+    [BsonElement("assignmentIsActive")]
+    public bool AssignmentIsActive { get; set; }
+
+    [BsonElement("reportIsActive")]
+    public bool ReportIsActive { get; set; } = true;
+
     [BsonElement("rootAssignmentId")]
     [BsonRepresentation(BsonType.ObjectId)]
     public string? RootAssignmentId { get; set; }
@@ -98,4 +112,10 @@ public sealed class WorkReportLabelStatValue : BaseEntity
 
     [BsonElement("source")]
     public string Source { get; set; } = "ROW_LABEL";
+
+    [BsonElement("sourcePayloadRevision")]
+    public int SourcePayloadRevision { get; set; }
+
+    [BsonElement("sourcePayloadHash")]
+    public string? SourcePayloadHash { get; set; }
 }

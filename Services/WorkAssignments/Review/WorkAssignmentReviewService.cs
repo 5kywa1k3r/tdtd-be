@@ -13,7 +13,9 @@ using tdtd_be.Models;
 using tdtd_be.Models.Enums;
 using tdtd_be.Services.Common;
 using tdtd_be.Services.WorkAssignmentReports;
+using tdtd_be.Services.WorkAssignmentReports.Payloads;
 using tdtd_be.Services.WorkAssignmentReports.Statistics;
+using tdtd_be.Services.WorkAssignments.Domain;
 using tdtd_be.Services.WorkAssignments.Internal;
 using tdtd_be.Services.WorkAssignments.Queue;
 using tdtd_be.Services.WorkAssignments.Runtime;
@@ -227,6 +229,7 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
     public async Task ApproveReportAsync(string reportId, ApproveReportRequest req, CancellationToken ct)
     {
         var me = _me.RequireMe();
+        req ??= new ApproveReportRequest();
 
         var report = await _ctx.WorkAssignmentReports
             .Find(x => x.Id == reportId && !x.IsDeleted)
@@ -236,11 +239,16 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
         EnsureReportIsActive(report);
         EnsureNotSelfReview(report, me.Id);
 
-        if (report.Status != WorkAssignmentReportStatus.Submitted)
+        var confirmsAutoApproval = report.Status == WorkAssignmentReportStatus.Approved &&
+                                   WorkAssignmentAutoApprovalState.CanReporterWithdraw(report);
+
+        if (report.Status != WorkAssignmentReportStatus.Submitted && !confirmsAutoApproval)
             throw InvalidReportStatus(
                 AppErrorCode.WORK_ASSIGNMENT_REPORT_APPROVE_STATUS_INVALID,
                 report,
                 WorkAssignmentReportStatus.Submitted);
+
+        WorkReportPayloadConsistency.EnsureReadyForStatisticProjection(report);
 
         var assignment = await _ctx.WorkAssignments
             .Find(x => x.Id == report.WorkAssignmentId && !x.IsDeleted)
@@ -255,7 +263,98 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
         await EnsurePreviousReportsApprovedAsync(period, ct);
 
         var now = DateTime.UtcNow;
+        if (confirmsAutoApproval)
+        {
+            var reviewerComment = string.IsNullOrWhiteSpace(req.Comment)
+                ? report.ReviewerComment
+                : req.Comment.Trim();
+
+            await _ctx.WorkAssignmentReports.UpdateOneAsync(
+                x => x.Id == report.Id,
+                Builders<WorkAssignmentReport>.Update
+                    .Set(x => x.ReviewerComment, reviewerComment)
+                    .Set(x => x.ApprovedAtUtc, now)
+                    .Set(x => x.ApprovedByUserId, me.Id)
+                    .Set(x => x.AutoApprovalConfirmedAtUtc, now)
+                    .Set(x => x.AutoApprovalConfirmedByUserId, me.Id)
+                    .Set(x => x.UpdatedAtUtc, now)
+                    .Set(x => x.UpdatedByUserId, me.Id),
+                cancellationToken: ct);
+
+            report.ReviewerComment = reviewerComment;
+            report.ApprovedAtUtc = now;
+            report.ApprovedByUserId = me.Id;
+            report.AutoApprovalConfirmedAtUtc = now;
+            report.AutoApprovalConfirmedByUserId = me.Id;
+            report.UpdatedAtUtc = now;
+            report.UpdatedByUserId = me.Id;
+
+            if (period is not null)
+            {
+                await _ctx.WorkReportPeriods.UpdateOneAsync(
+                    x => x.Id == period.Id && !x.IsDeleted,
+                    Builders<WorkReportPeriod>.Update
+                        .Set(x => x.LastReviewedAtUtc, now)
+                        .Set(x => x.ReviewerComment, reviewerComment)
+                        .Set(x => x.UpdatedAtUtc, now)
+                        .Set(x => x.UpdatedByUserId, me.Id),
+                    cancellationToken: ct);
+
+                period.LastReviewedAtUtc = now;
+                period.ReviewerComment = reviewerComment;
+                period.UpdatedAtUtc = now;
+                period.UpdatedByUserId = me.Id;
+
+                await FinalizeReviewReportStatusOperationAsync(
+                    "REVIEW_CONFIRM_AUTO_APPROVE",
+                    report,
+                    period,
+                    WorkAssignmentReportStatus.Approved.ToString(),
+                    WorkAssignmentReportStatus.Approved.ToString(),
+                    me.Id,
+                    upsertQueue: false,
+                    disableQueue: true,
+                    ct);
+            }
+
+            await InsertReportLogAsync(
+                report.WorkId,
+                report.WorkAssignmentId,
+                report.WorkReportPeriodId,
+                report.Id,
+                "Xác nhận tự duyệt",
+                WorkAssignmentReportStatus.Approved.ToString(),
+                WorkAssignmentReportStatus.Approved.ToString(),
+                me.Id,
+                "AUTO_APPROVE_CONFIRMED",
+                reviewerComment,
+                ct);
+
+            await _userActionLog.RecordAsync(new UserActionLogSeed
+            {
+                Action = UserActionLogActions.ReportApproved,
+                Scope = "report",
+                ActorUserId = me.Id,
+                WorkId = report.WorkId,
+                WorkAssignmentId = report.WorkAssignmentId,
+                WorkReportPeriodId = report.WorkReportPeriodId,
+                WorkAssignmentReportId = report.Id,
+                TargetUserId = report.AssigneeUserId,
+                Summary = $"Confirmed auto approved report {report.PeriodInstanceKey}",
+                Data = new Dictionary<string, string>
+                {
+                    { "fromStatus", WorkAssignmentReportStatus.Approved.ToString() },
+                    { "toStatus", WorkAssignmentReportStatus.Approved.ToString() },
+                    { "autoApprovalConfirmed", true.ToString() }
+                },
+                OccurredAtUtc = now
+            }, CancellationToken.None);
+
+            return;
+        }
+
         var isHistoricalApproval = report.IsHistoricalData;
+        var confirmsPreviouslyAutoApprovedReport = WorkAssignmentAutoApprovalState.IsAutoApproved(report);
 
         if (isHistoricalApproval && !req.ConfirmHistoricalDataApproval)
             throw AppExceptionFactory.BadRequest(
@@ -272,6 +371,8 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
                 .Set(x => x.HistoricalDataApprovedByUserId, isHistoricalApproval ? me.Id : report.HistoricalDataApprovedByUserId)
                 .Set(x => x.ApprovedAtUtc, now)
                 .Set(x => x.ApprovedByUserId, me.Id)
+                .Set(x => x.AutoApprovalConfirmedAtUtc, confirmsPreviouslyAutoApprovedReport ? now : report.AutoApprovalConfirmedAtUtc)
+                .Set(x => x.AutoApprovalConfirmedByUserId, confirmsPreviouslyAutoApprovedReport ? me.Id : report.AutoApprovalConfirmedByUserId)
                 .Set(x => x.UpdatedAtUtc, now)
                 .Set(x => x.UpdatedByUserId, me.Id),
             cancellationToken: ct);
@@ -286,6 +387,11 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
         }
         report.ApprovedAtUtc = now;
         report.ApprovedByUserId = me.Id;
+        if (confirmsPreviouslyAutoApprovedReport)
+        {
+            report.AutoApprovalConfirmedAtUtc = now;
+            report.AutoApprovalConfirmedByUserId = me.Id;
+        }
         report.UpdatedAtUtc = now;
         report.UpdatedByUserId = me.Id;
 
@@ -402,6 +508,11 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
                 .Set(x => x.ReturnedByUserId, me.Id)
                 .Set(x => x.ApprovedAtUtc, (DateTime?)null)
                 .Set(x => x.ApprovedByUserId, (string?)null)
+                .Set(x => x.AutoApprovedAtUtc, (DateTime?)null)
+                .Set(x => x.AutoApprovedByUserId, (string?)null)
+                .Set(x => x.AutoApproveConditionSnapshotJson, (string?)null)
+                .Set(x => x.AutoApprovalConfirmedAtUtc, (DateTime?)null)
+                .Set(x => x.AutoApprovalConfirmedByUserId, (string?)null)
                 .Set(x => x.UpdatedAtUtc, now)
                 .Set(x => x.UpdatedByUserId, me.Id),
             cancellationToken: ct);
@@ -412,6 +523,11 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
         report.ReturnedByUserId = me.Id;
         report.ApprovedAtUtc = null;
         report.ApprovedByUserId = null;
+        report.AutoApprovedAtUtc = null;
+        report.AutoApprovedByUserId = null;
+        report.AutoApproveConditionSnapshotJson = null;
+        report.AutoApprovalConfirmedAtUtc = null;
+        report.AutoApprovalConfirmedByUserId = null;
         report.UpdatedAtUtc = now;
         report.UpdatedByUserId = me.Id;
 
@@ -533,6 +649,8 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
                 .Set(x => x.ReviewerComment, req.Comment)
                 .Set(x => x.ApprovedAtUtc, (DateTime?)null)
                 .Set(x => x.ApprovedByUserId, (string?)null)
+                .Set(x => x.AutoApprovalConfirmedAtUtc, (DateTime?)null)
+                .Set(x => x.AutoApprovalConfirmedByUserId, (string?)null)
                 .Set(x => x.UpdatedAtUtc, now)
                 .Set(x => x.UpdatedByUserId, me.Id),
             cancellationToken: ct);
@@ -542,6 +660,8 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
         report.ReviewerComment = req.Comment;
         report.ApprovedAtUtc = null;
         report.ApprovedByUserId = null;
+        report.AutoApprovalConfirmedAtUtc = null;
+        report.AutoApprovalConfirmedByUserId = null;
         report.UpdatedAtUtc = now;
         report.UpdatedByUserId = me.Id;
 
@@ -994,6 +1114,30 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
             reviewerUserId);
     }
 
+    private async Task EnsureReviewAssignmentSummaryDocRolesForUserWorkAsync(
+        string workId,
+        string reviewerUserId,
+        CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(workId) || string.IsNullOrWhiteSpace(reviewerUserId))
+            return;
+
+        var hasProjectedRows = await _ctx.ReviewAssignmentSummaryDocRoles
+            .Find(x =>
+                x.WorkId == workId &&
+                x.ReviewerUserId == reviewerUserId &&
+                !x.IsDeleted)
+            .AnyAsync(ct);
+
+        if (hasProjectedRows)
+            return;
+
+        _log.LogWarning(
+            "Review assignment summary projection missing. workId={workId} reviewerUserId={reviewerUserId}. Returning current projection only; run internal DocRole repair/backfill if source data exists.",
+            workId,
+            reviewerUserId);
+    }
+
     private static FilterDefinition<ReviewReportListDocRole> BuildReviewReportListTextFilter(
         string q,
         FilterDefinitionBuilder<ReviewReportListDocRole> fb)
@@ -1008,6 +1152,25 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
             fb.Regex(x => x.AssigneeUnitName, qRegex),
             fb.Regex(x => x.AssigneeUnitShortName, qRegex),
             fb.Regex(x => x.PeriodKey, qRegex));
+    }
+
+    private static FilterDefinition<ReviewAssignmentSummaryDocRole> BuildReviewAssignmentSummaryTextFilter(
+        string q,
+        FilterDefinitionBuilder<ReviewAssignmentSummaryDocRole> fb)
+    {
+        var qRegex = new BsonRegularExpression(q.Trim(), "i");
+
+        return fb.Or(
+            fb.Regex(x => x.DynamicExcelCode, qRegex),
+            fb.Regex(x => x.DynamicExcelName, qRegex),
+            fb.Regex(x => x.FirstAssigneeUserName, qRegex),
+            fb.Regex(x => x.FirstAssigneeFullName, qRegex),
+            fb.Regex(x => x.FirstAssigneeUnitShortName, qRegex),
+            fb.Regex("assignees.username", qRegex),
+            fb.Regex("assignees.fullName", qRegex),
+            fb.Regex("assignees.unitName", qRegex),
+            fb.Regex("assignees.unitShortName", qRegex),
+            fb.Regex("periodKeys", qRegex));
     }
 
     private static FilterDefinition<ReviewReportListDocRole> BuildReviewReportUserTypeFilter(
@@ -1068,6 +1231,12 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
             ReportDeactivationReason = x.ReportDeactivationReason,
             SubmittedAtUtc = x.SubmittedAtUtc,
             ApprovedAtUtc = x.ApprovedAtUtc,
+            AutoApproved = x.AutoApproved,
+            AutoApprovedAtUtc = x.AutoApprovedAtUtc,
+            AutoApprovedByUserId = x.AutoApprovedByUserId,
+            AutoApprovalLocked = x.AutoApprovalLocked,
+            AutoApprovalConfirmedAtUtc = x.AutoApprovalConfirmedAtUtc,
+            AutoApprovalConfirmedByUserId = x.AutoApprovalConfirmedByUserId,
             ReturnedAtUtc = x.ReturnedAtUtc,
             ReturnReason = x.ReturnReason,
             ReviewerComment = x.ReviewerComment,
@@ -1080,6 +1249,45 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
             EvaluationCode = null,
             EvaluationLabel = null,
             WorstPeriodStatus = x.WorstPeriodStatus,
+            WorstOverdueReasonCode = x.WorstOverdueReasonCode,
+            WorstOverdueReasonLabel = x.WorstOverdueReasonLabel
+        };
+
+    private static ReviewSummaryRowDto MapToReviewSummaryRow(ReviewAssignmentSummaryDocRole x)
+        => new()
+        {
+            AssignmentId = x.AssignmentId,
+            WorkId = x.WorkId,
+
+            DynamicExcelId = x.DynamicExcelId,
+            DynamicExcelCode = x.DynamicExcelCode,
+            DynamicExcelName = x.DynamicExcelName,
+
+            Assignees = (x.Assignees ?? new List<UserRef>())
+                .Select(a => new ReviewSummaryAssigneeDto
+                {
+                    UserId = a.UserId,
+                    UserName = a.Username,
+                    FullName = a.FullName,
+                    UnitId = a.UnitId,
+                    UnitName = a.UnitName,
+                    UnitShortName = a.UnitShortName
+                })
+                .ToList(),
+
+            ProgressStatus = x.ProgressStatus,
+            ProgressStatusUpdatedAtUtc = x.ProgressStatusUpdatedAtUtc,
+
+            LatestPeriodKey = x.LatestPeriodKey,
+            LatestPeriodStatus = x.LatestPeriodStatus.HasValue ? (int)x.LatestPeriodStatus.Value : null,
+            LatestDueAtUtc = x.LatestDueAtUtc,
+            HasAnyDuePeriod = x.HasAnyDuePeriod,
+            HasOverduePeriod = x.HasOverduePeriod,
+
+            EvaluationCode = x.EvaluationCode,
+            EvaluationLabel = x.EvaluationLabel,
+
+            WorstPeriodStatus = x.WorstPeriodStatus.HasValue ? (int)x.WorstPeriodStatus.Value : null,
             WorstOverdueReasonCode = x.WorstOverdueReasonCode,
             WorstOverdueReasonLabel = x.WorstOverdueReasonLabel
         };
@@ -1148,11 +1356,11 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
         var page = req.Page < 0 ? 0 : req.Page;
         var pageSize = req.PageSize <= 0 ? 20 : req.PageSize;
 
-        await EnsureReviewReportListDocRolesForUserWorkAsync(req.WorkId, me.Id, ct);
+        await EnsureReviewAssignmentSummaryDocRolesForUserWorkAsync(req.WorkId, me.Id, ct);
 
         var reqAssigneeUserIds = GetAssigneeUserIds(req);
         var reqAssigneeUnitIds = GetAssigneeUnitIds(req);
-        var fb = Builders<ReviewReportListDocRole>.Filter;
+        var fb = Builders<ReviewAssignmentSummaryDocRole>.Filter;
         var filter = fb.Eq(x => x.ReviewerUserId, me.Id)
                      & fb.Eq(x => x.WorkId, req.WorkId)
                      & fb.Eq(x => x.IsDeleted, false);
@@ -1161,112 +1369,42 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
             filter &= fb.Eq(x => x.DynamicExcelId, req.DynamicExcelId.Trim());
 
         if (!string.IsNullOrWhiteSpace(req.PeriodKey))
-            filter &= fb.Eq(x => x.PeriodKey, req.PeriodKey.Trim());
+            filter &= fb.AnyEq(x => x.PeriodKeys, req.PeriodKey.Trim());
 
         if (reqAssigneeUserIds.Count > 0)
-            filter &= fb.In(x => x.AssigneeUserId, reqAssigneeUserIds);
+            filter &= fb.AnyIn(x => x.AssigneeUserIds, reqAssigneeUserIds);
 
         if (reqAssigneeUnitIds.Count > 0)
-            filter &= fb.In(x => x.AssigneeUnitId, reqAssigneeUnitIds);
+            filter &= fb.AnyIn(x => x.AssigneeUnitIds, reqAssigneeUnitIds);
 
         if (req.WaitingReviewOnly == true)
         {
-            filter &= fb.Eq(x => x.WaitingReview, true);
+            filter &= fb.Gt(x => x.WaitingReviewCount, 0);
         }
         else if (WorkReportPeriodStatusHelper.ShouldFilterReviewBucket(req.ReviewStatusBucket))
         {
-            filter &= fb.Eq(
-                x => x.ReviewStatusBucket,
+            filter &= fb.AnyEq(
+                x => x.ReviewStatusBuckets,
                 WorkReportPeriodStatusHelper.NormalizeReviewBucket(req.ReviewStatusBucket));
         }
 
         if (!string.IsNullOrWhiteSpace(req.Q))
-            filter &= BuildReviewReportListTextFilter(req.Q, fb);
+            filter &= BuildReviewAssignmentSummaryTextFilter(req.Q, fb);
 
-        var readRows = await _ctx.ReviewReportListDocRoles
+        var total = await _ctx.ReviewAssignmentSummaryDocRoles.CountDocumentsAsync(filter, cancellationToken: ct);
+        var rows = await _ctx.ReviewAssignmentSummaryDocRoles
             .Find(filter)
-            .SortBy(x => x.AssignmentId)
-            .ThenByDescending(x => x.SortDueAtUtc)
-            .ThenByDescending(x => x.SortUpdatedAtUtc)
+            .SortByDescending(x => x.SortHasOverduePeriod)
+            .ThenByDescending(x => x.SortLatestDueAtUtc)
+            .ThenBy(x => x.FirstAssigneeUnitShortName)
+            .ThenBy(x => x.FirstAssigneeFullName)
+            .Skip(page * pageSize)
+            .Limit(pageSize)
             .ToListAsync(ct);
 
-        var rows = readRows
-            .GroupBy(x => x.AssignmentId, StringComparer.Ordinal)
-            .Select(g =>
-            {
-                var groupRows = g.ToList();
-                var latestPeriod = groupRows
-                    .OrderByDescending(p => p.DueAtUtc ?? p.SortUpdatedAtUtc)
-                    .ThenByDescending(p => p.SortUpdatedAtUtc)
-                    .FirstOrDefault();
+        var resultRows = rows.Select(MapToReviewSummaryRow).ToList();
 
-                var worstPeriod = groupRows
-                    .OrderByDescending(p => p.ReviewRank)
-                    .ThenByDescending(p => p.DueAtUtc ?? p.SortUpdatedAtUtc)
-                    .FirstOrDefault();
-
-                var assignees = groupRows
-                    .Where(a => !string.IsNullOrWhiteSpace(a.AssigneeUserId))
-                    .Select(a => new ReviewSummaryAssigneeDto
-                    {
-                        UserId = a.AssigneeUserId,
-                        UserName = a.AssigneeUserName,
-                        FullName = a.AssigneeFullName,
-                        UnitId = a.AssigneeUnitId,
-                        UnitName = a.AssigneeUnitName,
-                        UnitShortName = a.AssigneeUnitShortName,
-                    })
-                    .GroupBy(
-                        a => a.UserId,
-                        StringComparer.Ordinal)
-                    .Select(g => g.First())
-                    .OrderBy(a => a.UnitShortName ?? string.Empty)
-                    .ThenBy(a => a.FullName ?? string.Empty)
-                    .ThenBy(a => a.UserName ?? string.Empty)
-                    .ToList();
-
-                return new ReviewSummaryRowDto
-                {
-                    AssignmentId = g.Key,
-                    WorkId = latestPeriod?.WorkId ?? req.WorkId,
-
-                    DynamicExcelId = latestPeriod?.DynamicExcelId ?? string.Empty,
-                    DynamicExcelCode = latestPeriod?.DynamicExcelCode ?? string.Empty,
-                    DynamicExcelName = latestPeriod?.DynamicExcelName ?? string.Empty,
-
-                    Assignees = assignees,
-
-                    ProgressStatus = latestPeriod?.ProgressStatus ?? 0,
-                    ProgressStatusUpdatedAtUtc = latestPeriod?.ProgressStatusUpdatedAtUtc,
-
-                    LatestPeriodKey = latestPeriod?.PeriodKey,
-                    LatestPeriodStatus = latestPeriod is null ? null : (int)latestPeriod.PeriodStatus,
-                    LatestDueAtUtc = latestPeriod?.DueAtUtc,
-                    HasAnyDuePeriod = groupRows.Count > 0,
-                    HasOverduePeriod = groupRows.Any(p => p.IsOverdue),
-
-                    EvaluationCode = null,
-                    EvaluationLabel = null,
-
-                    WorstPeriodStatus = worstPeriod is null ? null : (int)worstPeriod.PeriodStatus,
-                    WorstOverdueReasonCode = latestPeriod?.WorstOverdueReasonCode,
-                    WorstOverdueReasonLabel = latestPeriod?.WorstOverdueReasonLabel
-                };
-            })
-            .ToList();
-
-        var total = rows.Count;
-
-        var paged = rows
-            .OrderByDescending(x => x.HasOverduePeriod)
-            .ThenByDescending(x => x.LatestDueAtUtc)
-            .ThenBy(x => x.Assignees.FirstOrDefault()?.UnitShortName ?? string.Empty)
-            .ThenBy(x => x.Assignees.FirstOrDefault()?.FullName ?? string.Empty)
-            .Skip(page * pageSize)
-            .Take(pageSize)
-            .ToList();
-
-        return new PagedResult<ReviewSummaryRowDto>(paged, total, page, pageSize);
+        return new PagedResult<ReviewSummaryRowDto>(resultRows, total, page, pageSize);
     }
 
     private static WorkReportPeriodStatus ResolveApprovedPeriodStatus(
@@ -1873,7 +2011,12 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
             await _statusSync.SyncFromAssignmentAsync(report.WorkAssignmentId, ct);
             await _docRoleReadModelProjection.RebuildReportPeriodAsync(period.Id, actorUserId, ct);
             if (forceRebuildStatistics || ShouldRebuildApprovedStatistics(fromStatus, toStatus))
+            {
+                if (string.Equals(toStatus, WorkAssignmentReportStatus.Approved.ToString(), StringComparison.OrdinalIgnoreCase))
+                    WorkReportPayloadConsistency.EnsureReadyForStatisticProjection(report);
+
                 await RebuildReportStatisticsAsync(report, actorUserId, ct);
+            }
 
             _log.LogInformation(
                 "WorkAssignment review report status operation completed. operation={operation} reportId={reportId} periodId={periodId} assignmentId={assignmentId} workId={workId} fromStatus={fromStatus} toStatus={toStatus}",

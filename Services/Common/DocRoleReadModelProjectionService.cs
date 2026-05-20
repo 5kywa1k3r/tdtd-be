@@ -3,6 +3,7 @@ using MongoDB.Bson;
 using tdtd_be.Data;
 using tdtd_be.Models;
 using tdtd_be.Models.Enums;
+using tdtd_be.Services.WorkAssignments.Domain;
 
 namespace tdtd_be.Services.Common;
 
@@ -80,6 +81,9 @@ public sealed class DocRoleReadModelProjectionService : IDocRoleReadModelProject
                     .Set(x => x.WorstEvaluationCode, work.WorstEvaluationCode)
                     .Set(x => x.WorstEvaluationLabel, work.WorstEvaluationLabel)
                     .Set(x => x.DueDate, work.DueDate)
+                    .Set(x => x.CompletedDate, work.CompletedDate)
+                    .Set(x => x.CompletedAtUtc, work.CompletedAtUtc)
+                    .Set(x => x.CompletedByUserId, NullIfWhiteSpace(work.CompletedByUserId))
                     .Set(x => x.WorkCreatedAtUtc, work.CreatedAtUtc)
                     .Set(x => x.IsDeleted, false)
                     .Set(x => x.DeletedAtUtc, (DateTime?)null)
@@ -180,6 +184,7 @@ public sealed class DocRoleReadModelProjectionService : IDocRoleReadModelProject
                     .Set(x => x.DynamicFormTemplateCode, assignment.DynamicFormTemplateCode)
                     .Set(x => x.DynamicFormTemplateName, assignment.DynamicFormTemplateName)
                     .Set(x => x.DynamicFormDataSourceRulesJson, assignment.DynamicFormDataSourceRulesJson)
+                    .Set(x => x.AutoApproveConditionJson, assignment.AutoApproveConditionJson)
                     .Set(x => x.AssignmentType, assignment.AssignmentType ?? string.Empty)
                     .Set(x => x.AggregationType, assignment.AggregationType ?? string.Empty)
                     .Set(x => x.Assignees, CloneUserRefs(assignment.Assignees))
@@ -188,7 +193,10 @@ public sealed class DocRoleReadModelProjectionService : IDocRoleReadModelProject
                     .Set(x => x.IsActive, assignment.IsActive)
                     .Set(x => x.AllowUserCreatedReports, assignment.AllowUserCreatedReports)
                     .Set(x => x.StartDate, assignment.StartDate)
+                    .Set(x => x.DueDate, assignment.DueDate)
                     .Set(x => x.CompletedDate, assignment.CompletedDate)
+                    .Set(x => x.CompletedAtUtc, assignment.CompletedAtUtc)
+                    .Set(x => x.CompletedByUserId, NullIfWhiteSpace(assignment.CompletedByUserId))
                     .Set(x => x.AssignmentCreatedByUserId, assignment.CreatedByUserId)
                     .Set(x => x.AssigneeUserIds, assigneeUserIds)
                     .Set(x => x.AssigneeUnitIds, assigneeUnitIds)
@@ -522,6 +530,12 @@ public sealed class DocRoleReadModelProjectionService : IDocRoleReadModelProject
             .Set(x => x.LastSubmittedAtUtc, period.LastSubmittedAtUtc)
             .Set(x => x.ReturnedAtUtc, report?.ReturnedAtUtc)
             .Set(x => x.ApprovedAtUtc, report?.ApprovedAtUtc)
+            .Set(x => x.AutoApproved, WorkAssignmentAutoApprovalState.IsAutoApproved(report))
+            .Set(x => x.AutoApprovedAtUtc, report?.AutoApprovedAtUtc)
+            .Set(x => x.AutoApprovedByUserId, NullIfWhiteSpace(report?.AutoApprovedByUserId))
+            .Set(x => x.AutoApprovalLocked, WorkAssignmentAutoApprovalState.IsLocked(report))
+            .Set(x => x.AutoApprovalConfirmedAtUtc, report?.AutoApprovalConfirmedAtUtc)
+            .Set(x => x.AutoApprovalConfirmedByUserId, NullIfWhiteSpace(report?.AutoApprovalConfirmedByUserId))
             .Set(x => x.SortUpdatedAtUtc, sortUpdatedAtUtc)
             .Set(x => x.SourceCreatedAtUtc, sourceCreatedAtUtc)
             .Set(x => x.IsDeleted, false)
@@ -652,6 +666,12 @@ public sealed class DocRoleReadModelProjectionService : IDocRoleReadModelProject
                 & Builders<ReviewReportListDocRole>.Filter.Eq(x => x.IsDeleted, false),
                 BuildSoftDeleteUpdate<ReviewReportListDocRole>(byUserId, now),
                 cancellationToken: ct);
+
+            await _ctx.ReviewAssignmentSummaryDocRoles.UpdateManyAsync(
+                Builders<ReviewAssignmentSummaryDocRole>.Filter.Eq(x => x.AssignmentId, period.WorkAssignmentId)
+                & Builders<ReviewAssignmentSummaryDocRole>.Filter.Eq(x => x.IsDeleted, false),
+                BuildSoftDeleteUpdate<ReviewAssignmentSummaryDocRole>(byUserId, now),
+                cancellationToken: ct);
             return;
         }
 
@@ -706,6 +726,12 @@ public sealed class DocRoleReadModelProjectionService : IDocRoleReadModelProject
                 .Set(x => x.ReportDeactivationReason, report?.DeactivationReason)
                 .Set(x => x.SubmittedAtUtc, report?.SubmittedAtUtc ?? period.LastSubmittedAtUtc)
                 .Set(x => x.ApprovedAtUtc, report?.ApprovedAtUtc)
+                .Set(x => x.AutoApproved, WorkAssignmentAutoApprovalState.IsAutoApproved(report))
+                .Set(x => x.AutoApprovedAtUtc, report?.AutoApprovedAtUtc)
+                .Set(x => x.AutoApprovedByUserId, NullIfWhiteSpace(report?.AutoApprovedByUserId))
+                .Set(x => x.AutoApprovalLocked, WorkAssignmentAutoApprovalState.IsLocked(report))
+                .Set(x => x.AutoApprovalConfirmedAtUtc, report?.AutoApprovalConfirmedAtUtc)
+                .Set(x => x.AutoApprovalConfirmedByUserId, NullIfWhiteSpace(report?.AutoApprovalConfirmedByUserId))
                 .Set(x => x.ReturnedAtUtc, report?.ReturnedAtUtc)
                 .Set(x => x.ReturnReason, report?.ReturnReason ?? period.ReturnReason)
                 .Set(x => x.ReviewerComment, report?.ReviewerComment ?? period.ReviewerComment)
@@ -751,11 +777,184 @@ public sealed class DocRoleReadModelProjectionService : IDocRoleReadModelProject
             staleFilter,
             BuildSoftDeleteUpdate<ReviewReportListDocRole>(byUserId, now),
             cancellationToken: ct);
+
+        foreach (var reviewerUserId in reviewerIds)
+        {
+            await RebuildReviewAssignmentSummaryDocRoleAsync(
+                period.WorkId,
+                period.WorkAssignmentId,
+                reviewerUserId,
+                byUserId,
+                now,
+                ct);
+        }
+
+        await _ctx.ReviewAssignmentSummaryDocRoles.UpdateManyAsync(
+            Builders<ReviewAssignmentSummaryDocRole>.Filter.Eq(x => x.AssignmentId, period.WorkAssignmentId)
+            & Builders<ReviewAssignmentSummaryDocRole>.Filter.Eq(x => x.IsDeleted, false)
+            & Builders<ReviewAssignmentSummaryDocRole>.Filter.Nin(x => x.ReviewerUserId, reviewerIds),
+            BuildSoftDeleteUpdate<ReviewAssignmentSummaryDocRole>(byUserId, now),
+            cancellationToken: ct);
     }
+
+    private async Task RebuildReviewAssignmentSummaryDocRoleAsync(
+        string workId,
+        string assignmentId,
+        string reviewerUserId,
+        string byUserId,
+        DateTime now,
+        CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(workId) ||
+            string.IsNullOrWhiteSpace(assignmentId) ||
+            string.IsNullOrWhiteSpace(reviewerUserId))
+            return;
+
+        var filter = Builders<ReviewAssignmentSummaryDocRole>.Filter.Eq(x => x.ReviewerUserId, reviewerUserId)
+                     & Builders<ReviewAssignmentSummaryDocRole>.Filter.Eq(x => x.WorkId, workId)
+                     & Builders<ReviewAssignmentSummaryDocRole>.Filter.Eq(x => x.AssignmentId, assignmentId);
+
+        var reportRows = await _ctx.ReviewReportListDocRoles
+            .Find(x =>
+                x.ReviewerUserId == reviewerUserId &&
+                x.WorkId == workId &&
+                x.AssignmentId == assignmentId &&
+                !x.IsDeleted)
+            .ToListAsync(ct);
+
+        if (reportRows.Count == 0)
+        {
+            await _ctx.ReviewAssignmentSummaryDocRoles.UpdateManyAsync(
+                filter & Builders<ReviewAssignmentSummaryDocRole>.Filter.Eq(x => x.IsDeleted, false),
+                BuildSoftDeleteUpdate<ReviewAssignmentSummaryDocRole>(byUserId, now),
+                cancellationToken: ct);
+            return;
+        }
+
+        var latestPeriod = reportRows
+            .OrderByDescending(x => x.DueAtUtc ?? x.SortUpdatedAtUtc)
+            .ThenByDescending(x => x.SortUpdatedAtUtc)
+            .First();
+        var worstPeriod = reportRows
+            .OrderByDescending(x => x.ReviewRank)
+            .ThenByDescending(x => x.DueAtUtc ?? x.SortUpdatedAtUtc)
+            .ThenByDescending(x => x.SortUpdatedAtUtc)
+            .First();
+        var assignees = BuildReviewSummaryAssignees(reportRows);
+        var firstAssignee = assignees
+            .OrderBy(x => x.UnitShortName ?? string.Empty)
+            .ThenBy(x => x.FullName ?? string.Empty)
+            .ThenBy(x => x.Username ?? string.Empty)
+            .FirstOrDefault();
+        var periodKeys = reportRows
+            .Select(x => x.PeriodKey)
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+        var reviewBuckets = reportRows
+            .Select(x => x.ReviewStatusBucket)
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        var auditUserId = NormalizeAuditUserId(byUserId);
+
+        var update = Builders<ReviewAssignmentSummaryDocRole>.Update
+            .Set(x => x.DocType, DocType.WORK_ASSIGNMENT)
+            .Set(x => x.DocId, assignmentId)
+            .Set(x => x.UserId, reviewerUserId)
+            .Set(x => x.User, null)
+            .Set(x => x.Roles, new List<DocRoleType> { DocRoleType.ASSIGNER })
+            .Set(x => x.WorkId, workId)
+            .Set(x => x.AssignmentId, assignmentId)
+            .Set(x => x.ReviewerUserId, reviewerUserId)
+            .Set(x => x.DynamicExcelId, latestPeriod.DynamicExcelId)
+            .Set(x => x.DynamicExcelCode, latestPeriod.DynamicExcelCode)
+            .Set(x => x.DynamicExcelName, latestPeriod.DynamicExcelName)
+            .Set(x => x.DynamicFormTemplateId, NullIfWhiteSpace(latestPeriod.DynamicFormTemplateId))
+            .Set(x => x.DynamicFormTemplateCode, latestPeriod.DynamicFormTemplateCode)
+            .Set(x => x.DynamicFormTemplateName, latestPeriod.DynamicFormTemplateName)
+            .Set(x => x.Assignees, assignees)
+            .Set(x => x.AssigneeUserIds, assignees.Select(x => x.UserId).Distinct(StringComparer.Ordinal).ToList())
+            .Set(x => x.AssigneeUnitIds, assignees.Select(x => x.UnitId).Where(x => !string.IsNullOrWhiteSpace(x)).Select(x => x!).Distinct(StringComparer.Ordinal).ToList())
+            .Set(x => x.FirstAssigneeUserName, firstAssignee?.Username)
+            .Set(x => x.FirstAssigneeFullName, firstAssignee?.FullName)
+            .Set(x => x.FirstAssigneeUnitShortName, firstAssignee?.UnitShortName)
+            .Set(x => x.ProgressStatus, latestPeriod.ProgressStatus)
+            .Set(x => x.ProgressStatusUpdatedAtUtc, latestPeriod.ProgressStatusUpdatedAtUtc)
+            .Set(x => x.PeriodCount, reportRows.Count)
+            .Set(x => x.PeriodKeys, periodKeys)
+            .Set(x => x.ReportCount, reportRows.Count(x => !string.IsNullOrWhiteSpace(x.CurrentReportId)))
+            .Set(x => x.LatestPeriodId, latestPeriod.WorkReportPeriodId)
+            .Set(x => x.LatestPeriodKey, latestPeriod.PeriodKey)
+            .Set(x => x.LatestPeriodStatus, latestPeriod.PeriodStatus)
+            .Set(x => x.LatestDueAtUtc, latestPeriod.DueAtUtc)
+            .Set(x => x.LatestReportId, NullIfWhiteSpace(latestPeriod.CurrentReportId))
+            .Set(x => x.LatestUpdatedAtUtc, latestPeriod.SortUpdatedAtUtc)
+            .Set(x => x.HasAnyDuePeriod, reportRows.Count > 0)
+            .Set(x => x.HasOverduePeriod, reportRows.Any(x => x.IsOverdue))
+            .Set(x => x.OverdueCount, reportRows.Count(x => x.IsOverdue))
+            .Set(x => x.WaitingReviewCount, reportRows.Count(x => x.WaitingReview))
+            .Set(x => x.ReturnedCount, reportRows.Count(x => x.Returned))
+            .Set(x => x.ReviewStatusBuckets, reviewBuckets)
+            .Set(x => x.WorstReviewStatusBucket, worstPeriod.ReviewStatusBucket)
+            .Set(x => x.WorstReviewRank, worstPeriod.ReviewRank)
+            .Set(x => x.WorstPeriodStatus, worstPeriod.PeriodStatus)
+            .Set(x => x.WorstOverdueReasonCode, worstPeriod.WorstOverdueReasonCode)
+            .Set(x => x.WorstOverdueReasonLabel, worstPeriod.WorstOverdueReasonLabel)
+            .Set(x => x.EvaluationCode, null)
+            .Set(x => x.EvaluationLabel, null)
+            .Set(x => x.SortHasOverduePeriod, reportRows.Any(x => x.IsOverdue))
+            .Set(x => x.SortLatestDueAtUtc, latestPeriod.DueAtUtc)
+            .Set(x => x.SortUpdatedAtUtc, reportRows.Max(x => x.SortUpdatedAtUtc))
+            .Set(x => x.IsDeleted, false)
+            .Set(x => x.DeletedAtUtc, (DateTime?)null)
+            .Set(x => x.DeletedByUserId, null)
+            .Set(x => x.UpdatedAtUtc, now)
+            .Set(x => x.UpdatedByUserId, auditUserId)
+            .SetOnInsert(x => x.CreatedAtUtc, now)
+            .SetOnInsert(x => x.CreatedByUserId, auditUserId);
+
+        await _ctx.ReviewAssignmentSummaryDocRoles.UpdateOneAsync(
+            filter,
+            update,
+            new UpdateOptions { IsUpsert = true },
+            ct);
+    }
+
+    private static List<UserRef> BuildReviewSummaryAssignees(IEnumerable<ReviewReportListDocRole> reportRows)
+        => reportRows
+            .Where(x => !string.IsNullOrWhiteSpace(x.AssigneeUserId))
+            .GroupBy(x => x.AssigneeUserId, StringComparer.Ordinal)
+            .Select(g =>
+            {
+                var row = g.First();
+                return new UserRef
+                {
+                    UserId = row.AssigneeUserId,
+                    Username = row.AssigneeUserName,
+                    FullName = row.AssigneeFullName,
+                    UnitId = row.AssigneeUnitId,
+                    UnitName = row.AssigneeUnitName,
+                    UnitShortName = row.AssigneeUnitShortName
+                };
+            })
+            .OrderBy(x => x.UnitShortName ?? string.Empty)
+            .ThenBy(x => x.FullName ?? string.Empty)
+            .ThenBy(x => x.Username ?? string.Empty)
+            .ToList();
 
     private async Task SoftDeleteReportReadModelsByPeriodAsync(string workReportPeriodId, string byUserId, CancellationToken ct)
     {
         var now = DateTime.UtcNow;
+        var affectedReviewRows = await _ctx.ReviewReportListDocRoles
+            .Find(x => x.WorkReportPeriodId == workReportPeriodId && !x.IsDeleted)
+            .Project(x => new
+            {
+                x.WorkId,
+                x.AssignmentId,
+                x.ReviewerUserId
+            })
+            .ToListAsync(ct);
         var affectedTemplateRows = await _ctx.MyReportPeriodListDocRoles
             .Find(x => x.WorkReportPeriodId == workReportPeriodId && !x.IsDeleted)
             .Project(x => new
@@ -793,6 +992,23 @@ public sealed class DocRoleReadModelProjectionService : IDocRoleReadModelProject
             & Builders<ReviewReportListDocRole>.Filter.Eq(x => x.IsDeleted, false),
             BuildSoftDeleteUpdate<ReviewReportListDocRole>(byUserId, now),
             cancellationToken: ct);
+
+        foreach (var row in affectedReviewRows
+                     .Where(x =>
+                         !string.IsNullOrWhiteSpace(x.WorkId) &&
+                         !string.IsNullOrWhiteSpace(x.AssignmentId) &&
+                         !string.IsNullOrWhiteSpace(x.ReviewerUserId))
+                     .GroupBy(x => new { x.WorkId, x.AssignmentId, x.ReviewerUserId })
+                     .Select(g => g.Key))
+        {
+            await RebuildReviewAssignmentSummaryDocRoleAsync(
+                row.WorkId,
+                row.AssignmentId,
+                row.ReviewerUserId,
+                byUserId,
+                now,
+                ct);
+        }
     }
 
     private static UpdateDefinition<T> BuildSoftDeleteUpdate<T>(string byUserId, DateTime now)

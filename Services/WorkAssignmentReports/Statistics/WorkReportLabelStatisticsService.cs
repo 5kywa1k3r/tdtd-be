@@ -9,6 +9,7 @@ using tdtd_be.Models;
 using tdtd_be.Models.Enums;
 using tdtd_be.Models.Statistics;
 using tdtd_be.Services.WorkAssignmentReports;
+using tdtd_be.Services.WorkAssignmentReports.Payloads;
 
 namespace tdtd_be.Services.WorkAssignmentReports.Statistics;
 
@@ -23,11 +24,16 @@ public sealed class WorkReportLabelStatisticsService : IWorkReportLabelStatistic
 
     private readonly MongoDbContext _ctx;
     private readonly MeAccessor _me;
+    private readonly IWorkReportPayloadReader _payloadReader;
 
-    public WorkReportLabelStatisticsService(MongoDbContext ctx, MeAccessor me)
+    public WorkReportLabelStatisticsService(
+        MongoDbContext ctx,
+        MeAccessor me,
+        IWorkReportPayloadReader payloadReader)
     {
         _ctx = ctx;
         _me = me;
+        _payloadReader = payloadReader;
     }
 
     public async Task RebuildForReportAsync(
@@ -69,6 +75,9 @@ public sealed class WorkReportLabelStatisticsService : IWorkReportLabelStatistic
         var assignment = await _ctx.WorkAssignments
             .Find(x => x.Id == report.WorkAssignmentId && !x.IsDeleted)
             .FirstOrDefaultAsync(ct);
+        var period = await _ctx.WorkReportPeriods
+            .Find(x => x.Id == report.WorkReportPeriodId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct);
 
         await _ctx.WorkReportLabelStatValues.DeleteManyAsync(
             x => x.WorkAssignmentReportId == report.Id,
@@ -92,7 +101,10 @@ public sealed class WorkReportLabelStatisticsService : IWorkReportLabelStatistic
         }
 
         var now = DateTime.UtcNow;
-        var rowLabels = ExtractRowLabels(report.TableValuesJson)
+        WorkReportPayloadConsistency.EnsureReadyForStatisticProjection(report);
+        var payload = await _payloadReader.LoadReportPayloadAsync(report, ct);
+        WorkReportPayloadConsistency.EnsureSnapshotFreshForStatisticProjection(report, payload);
+        var rowLabels = ExtractRowLabels(payload.TableValuesJson)
             .Select(row => row with
             {
                 LabelCodes = row.LabelCodes
@@ -126,12 +138,17 @@ public sealed class WorkReportLabelStatisticsService : IWorkReportLabelStatistic
         {
             var ancestorAssignmentIds = ExtractAncestorAssignmentIds(assignment, report.WorkAssignmentId);
             var sourceWindow = WorkAssignmentReportTemporalPolicy.ResolveSourceWindow(report);
+            var projectionContext = WorkReportStatisticProjectionContextBuilder.From(report, assignment, period, payload);
             var values = rowLabels.SelectMany(row =>
                 row.LabelCodes.Select(labelCode => new WorkReportLabelStatValue
                 {
                     Id = ObjectId.GenerateNewId().ToString(),
                     WorkId = report.WorkId,
                     WorkAssignmentId = report.WorkAssignmentId,
+                    AssigneeUserId = projectionContext.AssigneeUserId,
+                    AssigneeUnitId = projectionContext.AssigneeUnitId,
+                    AssignmentIsActive = projectionContext.AssignmentIsActive,
+                    ReportIsActive = projectionContext.ReportIsActive,
                     RootAssignmentId = assignment?.RootAssignmentId,
                     AncestorAssignmentIds = ancestorAssignmentIds,
                     WorkReportPeriodId = report.WorkReportPeriodId,
@@ -155,6 +172,8 @@ public sealed class WorkReportLabelStatisticsService : IWorkReportLabelStatistic
                     RowIndex = row.RowIndex,
                     LabelCode = labelCode,
                     Source = row.Source,
+                    SourcePayloadRevision = projectionContext.SourcePayloadRevision,
+                    SourcePayloadHash = projectionContext.SourcePayloadHash,
                     CreatedAtUtc = now,
                     UpdatedAtUtc = now,
                     CreatedByUserId = NormalizeObjectIdOrNull(actorUserId),

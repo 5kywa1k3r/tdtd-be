@@ -68,6 +68,16 @@ public sealed class WorkListDocRole : DocRoleReadModelBase
     [BsonElement("dueDate")]
     public DateTime? DueDate { get; set; }
 
+    [BsonElement("completedDate")]
+    public DateTime? CompletedDate { get; set; }
+
+    [BsonElement("completedAtUtc")]
+    public DateTime? CompletedAtUtc { get; set; }
+
+    [BsonElement("completedByUserId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? CompletedByUserId { get; set; }
+
     [BsonElement("workCreatedAtUtc")]
     public DateTime WorkCreatedAtUtc { get; set; }
 }
@@ -123,6 +133,9 @@ public sealed class AssignmentListDocRole : DocRoleReadModelBase
     [BsonElement("dynamicFormDataSourceRulesJson")]
     public string? DynamicFormDataSourceRulesJson { get; set; }
 
+    [BsonElement("autoApproveConditionJson")]
+    public string? AutoApproveConditionJson { get; set; }
+
     [BsonElement("assignmentType")]
     public string AssignmentType { get; set; } = string.Empty;
 
@@ -147,8 +160,18 @@ public sealed class AssignmentListDocRole : DocRoleReadModelBase
     [BsonElement("startDate")]
     public DateTime? StartDate { get; set; }
 
+    [BsonElement("dueDate")]
+    public DateTime? DueDate { get; set; }
+
     [BsonElement("completedDate")]
     public DateTime? CompletedDate { get; set; }
+
+    [BsonElement("completedAtUtc")]
+    public DateTime? CompletedAtUtc { get; set; }
+
+    [BsonElement("completedByUserId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? CompletedByUserId { get; set; }
 
     [BsonElement("assignmentCreatedByUserId")]
     [BsonRepresentation(BsonType.ObjectId)]
@@ -423,6 +446,26 @@ public sealed class MyReportPeriodListDocRole : DocRoleReadModelBase
     [BsonElement("approvedAtUtc")]
     public DateTime? ApprovedAtUtc { get; set; }
 
+    [BsonElement("autoApproved")]
+    public bool AutoApproved { get; set; }
+
+    [BsonElement("autoApprovedAtUtc")]
+    public DateTime? AutoApprovedAtUtc { get; set; }
+
+    [BsonElement("autoApprovedByUserId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? AutoApprovedByUserId { get; set; }
+
+    [BsonElement("autoApprovalLocked")]
+    public bool AutoApprovalLocked { get; set; }
+
+    [BsonElement("autoApprovalConfirmedAtUtc")]
+    public DateTime? AutoApprovalConfirmedAtUtc { get; set; }
+
+    [BsonElement("autoApprovalConfirmedByUserId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? AutoApprovalConfirmedByUserId { get; set; }
+
     [BsonElement("sortUpdatedAtUtc")]
     public DateTime SortUpdatedAtUtc { get; set; }
 
@@ -564,6 +607,26 @@ public sealed class ReviewReportListDocRole : DocRoleReadModelBase
     [BsonElement("approvedAtUtc")]
     public DateTime? ApprovedAtUtc { get; set; }
 
+    [BsonElement("autoApproved")]
+    public bool AutoApproved { get; set; }
+
+    [BsonElement("autoApprovedAtUtc")]
+    public DateTime? AutoApprovedAtUtc { get; set; }
+
+    [BsonElement("autoApprovedByUserId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? AutoApprovedByUserId { get; set; }
+
+    [BsonElement("autoApprovalLocked")]
+    public bool AutoApprovalLocked { get; set; }
+
+    [BsonElement("autoApprovalConfirmedAtUtc")]
+    public DateTime? AutoApprovalConfirmedAtUtc { get; set; }
+
+    [BsonElement("autoApprovalConfirmedByUserId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? AutoApprovalConfirmedByUserId { get; set; }
+
     [BsonElement("returnedAtUtc")]
     public DateTime? ReturnedAtUtc { get; set; }
 
@@ -608,6 +671,145 @@ public sealed class ReviewReportListDocRole : DocRoleReadModelBase
 
     [BsonElement("sortDueAtUtc")]
     public DateTime? SortDueAtUtc { get; set; }
+
+    [BsonElement("sortUpdatedAtUtc")]
+    public DateTime SortUpdatedAtUtc { get; set; }
+}
+
+[BsonIgnoreExtraElements]
+public sealed class ReviewAssignmentSummaryDocRole : DocRoleReadModelBase
+{
+    [BsonElement("workId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string WorkId { get; set; } = default!;
+
+    [BsonElement("assignmentId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string AssignmentId { get; set; } = default!;
+
+    [BsonElement("reviewerUserId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string ReviewerUserId { get; set; } = default!;
+
+    [BsonElement("dynamicExcelId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string DynamicExcelId { get; set; } = default!;
+
+    [BsonElement("dynamicExcelCode")]
+    public string DynamicExcelCode { get; set; } = string.Empty;
+
+    [BsonElement("dynamicExcelName")]
+    public string DynamicExcelName { get; set; } = string.Empty;
+
+    [BsonElement("dynamicFormTemplateId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? DynamicFormTemplateId { get; set; }
+
+    [BsonElement("dynamicFormTemplateCode")]
+    public string? DynamicFormTemplateCode { get; set; }
+
+    [BsonElement("dynamicFormTemplateName")]
+    public string? DynamicFormTemplateName { get; set; }
+
+    [BsonElement("assignees")]
+    public List<UserRef> Assignees { get; set; } = new();
+
+    [BsonElement("assigneeUserIds")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public List<string> AssigneeUserIds { get; set; } = new();
+
+    [BsonElement("assigneeUnitIds")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public List<string> AssigneeUnitIds { get; set; } = new();
+
+    [BsonElement("firstAssigneeUserName")]
+    public string? FirstAssigneeUserName { get; set; }
+
+    [BsonElement("firstAssigneeFullName")]
+    public string? FirstAssigneeFullName { get; set; }
+
+    [BsonElement("firstAssigneeUnitShortName")]
+    public string? FirstAssigneeUnitShortName { get; set; }
+
+    [BsonElement("progressStatus")]
+    public int ProgressStatus { get; set; }
+
+    [BsonElement("progressStatusUpdatedAtUtc")]
+    public DateTime? ProgressStatusUpdatedAtUtc { get; set; }
+
+    [BsonElement("periodCount")]
+    public int PeriodCount { get; set; }
+
+    [BsonElement("periodKeys")]
+    public List<string> PeriodKeys { get; set; } = new();
+
+    [BsonElement("reportCount")]
+    public int ReportCount { get; set; }
+
+    [BsonElement("latestPeriodId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? LatestPeriodId { get; set; }
+
+    [BsonElement("latestPeriodKey")]
+    public string? LatestPeriodKey { get; set; }
+
+    [BsonElement("latestPeriodStatus")]
+    public WorkReportPeriodStatus? LatestPeriodStatus { get; set; }
+
+    [BsonElement("latestDueAtUtc")]
+    public DateTime? LatestDueAtUtc { get; set; }
+
+    [BsonElement("latestReportId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? LatestReportId { get; set; }
+
+    [BsonElement("latestUpdatedAtUtc")]
+    public DateTime? LatestUpdatedAtUtc { get; set; }
+
+    [BsonElement("hasAnyDuePeriod")]
+    public bool HasAnyDuePeriod { get; set; }
+
+    [BsonElement("hasOverduePeriod")]
+    public bool HasOverduePeriod { get; set; }
+
+    [BsonElement("overdueCount")]
+    public int OverdueCount { get; set; }
+
+    [BsonElement("waitingReviewCount")]
+    public int WaitingReviewCount { get; set; }
+
+    [BsonElement("returnedCount")]
+    public int ReturnedCount { get; set; }
+
+    [BsonElement("reviewStatusBuckets")]
+    public List<string> ReviewStatusBuckets { get; set; } = new();
+
+    [BsonElement("worstReviewStatusBucket")]
+    public string? WorstReviewStatusBucket { get; set; }
+
+    [BsonElement("worstReviewRank")]
+    public int WorstReviewRank { get; set; }
+
+    [BsonElement("worstPeriodStatus")]
+    public WorkReportPeriodStatus? WorstPeriodStatus { get; set; }
+
+    [BsonElement("worstOverdueReasonCode")]
+    public string? WorstOverdueReasonCode { get; set; }
+
+    [BsonElement("worstOverdueReasonLabel")]
+    public string? WorstOverdueReasonLabel { get; set; }
+
+    [BsonElement("evaluationCode")]
+    public string? EvaluationCode { get; set; }
+
+    [BsonElement("evaluationLabel")]
+    public string? EvaluationLabel { get; set; }
+
+    [BsonElement("sortHasOverduePeriod")]
+    public bool SortHasOverduePeriod { get; set; }
+
+    [BsonElement("sortLatestDueAtUtc")]
+    public DateTime? SortLatestDueAtUtc { get; set; }
 
     [BsonElement("sortUpdatedAtUtc")]
     public DateTime SortUpdatedAtUtc { get; set; }

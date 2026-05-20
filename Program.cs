@@ -30,6 +30,7 @@ using tdtd_be.Services.Common;
 using tdtd_be.Services.EvaluationTemplates;
 using tdtd_be.Services.WorkAssignmentReports;
 using tdtd_be.Services.WorkAssignmentReports.Statistics;
+using tdtd_be.Services.WorkAssignmentReports.Payloads;
 using tdtd_be.Services.WorkAssignments;
 using tdtd_be.Services.WorkAssignments.Aggregate;
 using tdtd_be.Services.WorkAssignments.Domain;
@@ -221,6 +222,10 @@ builder.Services.AddScoped<IWorkAssignmentService, WorkAssignmentService>();
 builder.Services.AddScoped<IWorkAssignmentHandoverService, WorkAssignmentHandoverService>();
 
 builder.Services.AddScoped<IWorkAssignmentReportService, WorkAssignmentReportService>();
+builder.Services.AddScoped<WorkReportPayloadService>();
+builder.Services.AddScoped<IWorkReportPayloadReader>(sp => sp.GetRequiredService<WorkReportPayloadService>());
+builder.Services.AddScoped<IWorkReportPayloadWriter>(sp => sp.GetRequiredService<WorkReportPayloadService>());
+builder.Services.AddScoped<IWorkReportPayloadDiagnosticsService, WorkReportPayloadDiagnosticsService>();
 builder.Services.AddScoped<IWorkReportLabelStatisticsService, WorkReportLabelStatisticsService>();
 builder.Services.AddScoped<IWorkReportTableStatisticsService, WorkReportTableStatisticsService>();
 builder.Services.AddScoped<IWorkReportFieldStatisticsService, WorkReportFieldStatisticsService>();

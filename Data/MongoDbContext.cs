@@ -31,8 +31,11 @@ namespace tdtd_be.Data
         public IMongoCollection<MyReportTemplateListDocRole> MyReportTemplateListDocRoles { get; }
         public IMongoCollection<MyReportPeriodListDocRole> MyReportPeriodListDocRoles { get; }
         public IMongoCollection<ReviewReportListDocRole> ReviewReportListDocRoles { get; }
+        public IMongoCollection<ReviewAssignmentSummaryDocRole> ReviewAssignmentSummaryDocRoles { get; }
         public IMongoCollection<DocRoleReadModelProjectionRetryJob> DocRoleReadModelProjectionRetryJobs { get; }
         public IMongoCollection<WorkAssignmentReport> WorkAssignmentReports { get; }
+        public IMongoCollection<WorkReportPayload> WorkReportPayloads { get; }
+        public IMongoCollection<WorkReportTableValue> WorkReportTableValues { get; }
         public IMongoCollection<WorkReportPeriod> WorkReportPeriods { get; }
         public IMongoCollection<WorkAssignmentReportLog> WorkAssignmentReportLogs { get; }
         public IMongoCollection<WorkAssignmentHandoverHistory> WorkAssignmentHandoverHistories { get; }
@@ -79,8 +82,11 @@ namespace tdtd_be.Data
             MyReportTemplateListDocRoles = Db.GetCollection<MyReportTemplateListDocRole>(o.MyReportTemplateListDocRoleCollection);
             MyReportPeriodListDocRoles = Db.GetCollection<MyReportPeriodListDocRole>(o.MyReportPeriodListDocRoleCollection);
             ReviewReportListDocRoles = Db.GetCollection<ReviewReportListDocRole>(o.ReviewReportListDocRoleCollection);
+            ReviewAssignmentSummaryDocRoles = Db.GetCollection<ReviewAssignmentSummaryDocRole>(o.ReviewAssignmentSummaryDocRoleCollection);
             DocRoleReadModelProjectionRetryJobs = Db.GetCollection<DocRoleReadModelProjectionRetryJob>(o.DocRoleReadModelProjectionRetryJobCollection);
             WorkAssignmentReports = Db.GetCollection<WorkAssignmentReport>(o.WorkAssignmentReportCollection);
+            WorkReportPayloads = Db.GetCollection<WorkReportPayload>(o.WorkReportPayloadCollection);
+            WorkReportTableValues = Db.GetCollection<WorkReportTableValue>(o.WorkReportTableValueCollection);
             WorkReportPeriods = Db.GetCollection<WorkReportPeriod>(o.WorkReportPeriodCollection);
             WorkAssignmentReportLogs = Db.GetCollection<WorkAssignmentReportLog>(o.WorkAssignmentReportLogCollection);
             WorkAssignmentHandoverHistories = Db.GetCollection<WorkAssignmentHandoverHistory>(o.WorkAssignmentHandoverHistoryCollection);

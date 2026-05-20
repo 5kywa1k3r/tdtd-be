@@ -110,6 +110,23 @@ public sealed class WorkAssignmentReport : BaseEntity
     [BsonRepresentation(BsonType.ObjectId)]
     public string? ApprovedByUserId { get; set; }
 
+    [BsonElement("autoApprovedAtUtc")]
+    public DateTime? AutoApprovedAtUtc { get; set; }
+
+    [BsonElement("autoApprovedByUserId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? AutoApprovedByUserId { get; set; }
+
+    [BsonElement("autoApproveConditionSnapshotJson")]
+    public string? AutoApproveConditionSnapshotJson { get; set; }
+
+    [BsonElement("autoApprovalConfirmedAtUtc")]
+    public DateTime? AutoApprovalConfirmedAtUtc { get; set; }
+
+    [BsonElement("autoApprovalConfirmedByUserId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? AutoApprovalConfirmedByUserId { get; set; }
+
     [BsonElement("data")]
     public object? Data { get; set; }
 
@@ -125,12 +142,6 @@ public sealed class WorkAssignmentReport : BaseEntity
 
     [BsonElement("dynamicExcelTemplateName")]
     public string DynamicExcelTemplateName { get; set; } = default!;
-
-    [BsonElement("dynamicExcelTableKind")]
-    public string DynamicExcelTableKind { get; set; } = global::tdtd_be.Models.DynamicExcelTableKind.NumericGrid;
-
-    [BsonElement("recordTableSpecJson")]
-    public string? RecordTableSpecJson { get; set; }
 
     [BsonElement("specJson")]
     public string SpecJson { get; set; } = default!;
@@ -173,6 +184,22 @@ public sealed class WorkAssignmentReport : BaseEntity
 
     [BsonElement("summarySourceJson")]
     public string? SummarySourceJson { get; set; }
+
+    [BsonElement("payloadRevision")]
+    public int PayloadRevision { get; set; }
+
+    [BsonElement("payloadHash")]
+    public string? PayloadHash { get; set; }
+
+    [BsonElement("payloadSizeBytes")]
+    public long PayloadSizeBytes { get; set; }
+
+    [BsonElement("payloadStatus")]
+    public string? PayloadStatus { get; set; }
+
+    [BsonElement("payloadUpdatedAtUtc")]
+    [BsonDateTimeOptions(Kind = DateTimeKind.Utc)]
+    public DateTime? PayloadUpdatedAtUtc { get; set; }
 
     [BsonElement("aggregateSourceReportIds")]
     public List<string> AggregateSourceReportIds { get; set; } = new();

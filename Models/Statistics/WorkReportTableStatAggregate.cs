@@ -50,11 +50,23 @@ public sealed class WorkReportTableStatAggregate : BaseEntity
     [BsonElement("metricKey")]
     public string MetricKey { get; set; } = default!;
 
+    [BsonElement("metricLabelCode")]
+    public string? MetricLabelCode { get; set; }
+
     [BsonElement("rowKey")]
     public string RowKey { get; set; } = default!;
 
     [BsonElement("columnKey")]
     public string ColumnKey { get; set; } = default!;
+
+    [BsonElement("dataType")]
+    public string DataType { get; set; } = "NUMBER";
+
+    [BsonElement("bucketKey")]
+    public string? BucketKey { get; set; }
+
+    [BsonElement("bucketLabel")]
+    public string? BucketLabel { get; set; }
 
     [BsonElement("periodKey")]
     public string PeriodKey { get; set; } = default!;
@@ -93,6 +105,9 @@ public sealed class WorkReportTableStatAggregate : BaseEntity
     [BsonElement("sum")]
     public decimal Sum { get; set; }
 
+    [BsonElement("numericValueCount")]
+    public long NumericValueCount { get; set; }
+
     [BsonElement("min")]
     public decimal? Min { get; set; }
 
@@ -101,4 +116,18 @@ public sealed class WorkReportTableStatAggregate : BaseEntity
 
     [BsonElement("reportCount")]
     public long ReportCount { get; set; }
+
+    [BsonElement("trueCount")]
+    public long TrueCount { get; set; }
+
+    [BsonElement("falseCount")]
+    public long FalseCount { get; set; }
+
+    [BsonElement("earliestDateUtc")]
+    [BsonDateTimeOptions(Kind = DateTimeKind.Utc)]
+    public DateTime? EarliestDateUtc { get; set; }
+
+    [BsonElement("latestDateUtc")]
+    [BsonDateTimeOptions(Kind = DateTimeKind.Utc)]
+    public DateTime? LatestDateUtc { get; set; }
 }

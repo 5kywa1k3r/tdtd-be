@@ -117,6 +117,10 @@ public sealed class WorkReportFieldStatAggregate : BaseEntity
     [BsonDateTimeOptions(Kind = DateTimeKind.Utc)]
     public DateTime? LatestDateUtc { get; set; }
 
+    [BsonElement("earliestDateUtc")]
+    [BsonDateTimeOptions(Kind = DateTimeKind.Utc)]
+    public DateTime? EarliestDateUtc { get; set; }
+
     [BsonElement("reportCount")]
     public long ReportCount { get; set; }
 }

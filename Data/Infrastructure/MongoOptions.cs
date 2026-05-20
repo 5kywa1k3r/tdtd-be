@@ -26,8 +26,11 @@
         public string MyReportTemplateListDocRoleCollection { get; set; } = "my_report_template_list_doc_roles";
         public string MyReportPeriodListDocRoleCollection { get; set; } = "my_report_period_list_doc_roles";
         public string ReviewReportListDocRoleCollection { get; set; } = "review_report_list_doc_roles";
+        public string ReviewAssignmentSummaryDocRoleCollection { get; set; } = "review_assignment_summary_doc_roles";
         public string DocRoleReadModelProjectionRetryJobCollection { get; set; } = "docrole_read_model_projection_retry_jobs";
         public string WorkAssignmentReportCollection { get; set; } = "work_assignment_report";
+        public string WorkReportPayloadCollection { get; set; } = "work_report_payloads";
+        public string WorkReportTableValueCollection { get; set; } = "work_report_table_values";
         public string WorkReportPeriodCollection { get; set; } = "work_report_periods";
         public string WorkAssignmentReportLogCollection { get; set; } = "work_assignment_report_logs";
         public string WorkAssignmentHandoverHistoryCollection { get; set; } = "work_assignment_handover_histories";

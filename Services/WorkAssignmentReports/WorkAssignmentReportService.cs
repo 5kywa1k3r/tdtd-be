@@ -22,6 +22,7 @@ using tdtd_be.Services.WorkAssignments.Internal;
 using tdtd_be.Services.WorkAssignments.Aggregate;
 using tdtd_be.Services.WorkAssignments.Queue;
 using tdtd_be.Services.WorkAssignments.Runtime;
+using tdtd_be.Services.WorkAssignmentReports.Payloads;
 using tdtd_be.Services.WorkAssignmentReports.Statistics;
 
 namespace tdtd_be.Services.WorkAssignmentReports;
@@ -29,6 +30,17 @@ namespace tdtd_be.Services.WorkAssignmentReports;
 public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
 {
     private static readonly Regex LabelCodeRegex = new("^[a-z0-9][a-z0-9_.-]{0,63}$", RegexOptions.Compiled);
+    private static readonly Regex RuntimeFullDateRegex = new(@"^(\d{2})/(\d{2})/(\d{4})$", RegexOptions.Compiled);
+    private static readonly Regex RuntimeMonthDateRegex = new(@"^(\d{2})/(\d{4})$", RegexOptions.Compiled);
+    private static readonly Regex RuntimeYearDateRegex = new(@"^(\d{4})$", RegexOptions.Compiled);
+    private const string RuntimeDataTypeNumber = "NUMBER";
+    private const string RuntimeDataTypeDate = "DATE";
+    private const string RuntimeDataTypeFullDate = "FULL_DATE";
+    private const string RuntimeDataTypeBoolean = "BOOLEAN";
+    private const string RuntimeDataTypeShortText = "SHORT_TEXT";
+    private const string RuntimeDataTypeShortTextList = "SHORT_TEXT_LIST";
+    private const string RuntimeDataTypeLongText = "LONG_TEXT";
+    private const string RuntimeDataTypeStringList = "STRING_LIST";
 
     private readonly MongoDbContext _ctx;
     private readonly IWorkAssignmentQueueService _queueService;
@@ -38,6 +50,8 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
     private readonly IDocRoleReadModelFreshnessService _docRoleReadModelFreshness;
     private readonly IWorkStatusOperationLogService _statusLog;
     private readonly IUserActionLogService _userActionLog;
+    private readonly IWorkReportPayloadReader _payloadReader;
+    private readonly IWorkReportPayloadWriter _payloadWriter;
     private readonly IWorkReportLabelStatisticsService _labelStatistics;
     private readonly IWorkReportTableStatisticsService _tableStatistics;
     private readonly IWorkReportFieldStatisticsService _fieldStatistics;
@@ -58,6 +72,8 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         IDocRoleReadModelFreshnessService docRoleReadModelFreshness,
         IWorkStatusOperationLogService statusLog,
         IUserActionLogService userActionLog,
+        IWorkReportPayloadReader payloadReader,
+        IWorkReportPayloadWriter payloadWriter,
         IWorkReportLabelStatisticsService labelStatistics,
         IWorkReportTableStatisticsService tableStatistics,
         IWorkReportFieldStatisticsService fieldStatistics,
@@ -72,6 +88,8 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         _docRoleReadModelFreshness = docRoleReadModelFreshness;
         _statusLog = statusLog;
         _userActionLog = userActionLog;
+        _payloadReader = payloadReader;
+        _payloadWriter = payloadWriter;
         _labelStatistics = labelStatistics;
         _tableStatistics = tableStatistics;
         _fieldStatistics = fieldStatistics;
@@ -367,6 +385,22 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                 .Find(x => x.Id == dynamicExcelId && !x.IsDeleted)
                 .FirstOrDefaultAsync(ct);
 
+        var assignmentIds = periods
+            .Select(x => x.WorkAssignmentId)
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+
+        var assignments = assignmentIds.Count == 0
+            ? new List<WorkAssignment>()
+            : await _ctx.WorkAssignments
+                .Find(x => assignmentIds.Contains(x.Id) && !x.IsDeleted)
+                .ToListAsync(ct);
+
+        var assignmentById = assignments
+            .Where(x => !string.IsNullOrWhiteSpace(x.Id))
+            .ToDictionary(x => x.Id!, StringComparer.Ordinal);
+
         return new MyReportTemplateDetailResponse
         {
             WorkId = workId,
@@ -379,7 +413,12 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             WorkTemplateAssigneeId = primaryBinding.Id,
             WorkAssignmentId = primaryBinding.WorkAssignmentId,
             TemplateSnapshotJson = template is null ? string.Empty : JsonSerializer.Serialize(BuildTemplateSnapshot(template), _jsonOptions),
-            Periods = periods.Select(MapToPeriodRow).ToList()
+            Periods = periods
+                .Select(x => MapToPeriodRow(
+                    x,
+                    assignmentById.TryGetValue(x.WorkAssignmentId, out var assignment) ? assignment : null,
+                    DateTime.UtcNow))
+                .ToList()
         };
     }
 
@@ -400,7 +439,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         if (period is null)
             throw ReportPeriodNotFound(workReportPeriodId);
 
-        await EnsurePeriodAccessAsync(period, actorUserId, ct);
+        var periodAccess = await EnsurePeriodAccessAsync(period, actorUserId, ct);
 
         if (period.AssigneeUserId != actorUserId)
             throw AppExceptionFactory.Forbidden(
@@ -427,6 +466,8 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                 return await MapToResponseAsync(existed, period, ct);
             }
         }
+
+        await EnsureReportMutationScopeOpenAsync(periodAccess.assignment, actorUserId, ct);
 
         var created = await CreateDraftForPeriodAsync(period, actorUserId, ct);
         await FinalizeReportStatusOperationAsync(
@@ -523,6 +564,8 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                 AppErrorCode.WORK_ASSIGNMENT_REPORT_ASSIGNMENT_INACTIVE,
                 new { workAssignmentId, bindingId = binding.Id, actorUserId });
 
+        await EnsureReportMutationScopeOpenAsync(assignment, actorUserId, ct);
+
         WorkReportPeriod? linkedScheduledPeriod = null;
         if (!string.IsNullOrWhiteSpace(req.LinkedScheduledPeriodId))
         {
@@ -550,10 +593,25 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         var periodStart = NormalizeDate(req.PeriodStart) ?? reportDate;
         var periodEnd = NormalizeDate(req.PeriodEnd) ?? reportDate;
         var startedDate = NormalizeDate(req.StartedDate ?? periodStart);
-        var completedDate = NormalizeDate(req.CompletedDate);
         EnsureReportDateRange(periodStart, periodEnd, "PeriodStart", "PeriodEnd");
-        EnsureReportDateRange(startedDate, completedDate, "StartedDate", "CompletedDate");
         var isHistoricalData = IsHistoricalReportData(reportDate, periodStart, periodEnd, now);
+        var completedDatePolicy = ResolveReportCompletedDatePolicy(
+            assignment,
+            report: null,
+            period: new WorkReportPeriod
+            {
+                PeriodKind = WorkReportPeriodKind.UserCreated,
+                ReportDate = reportDate,
+                PeriodStart = periodStart,
+                PeriodEnd = periodEnd
+            },
+            now: now);
+        var completedDate = ValidateReportCompletedDateInput(
+            completedDatePolicy,
+            NormalizeDate(req.CompletedDate),
+            new { workAssignmentId, actorUserId, reportDate, periodStart, periodEnd },
+            requireWhenMissing: false);
+        EnsureReportDateRange(startedDate, completedDate, "StartedDate", "CompletedDate");
         var periodInstanceKey = $"USER_CREATED:{ObjectId.GenerateNewId()}";
 
         var period = new WorkReportPeriod
@@ -630,6 +688,8 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             throw AppExceptionFactory.Forbidden(
                 AppErrorCode.WORK_ASSIGNMENT_REPORT_DELETE_FORBIDDEN,
                 ReportDetails(entity, actorUserId));
+
+        await EnsureReportMutationScopeOpenAsync(reportAccess.assignment, actorUserId, ct);
 
         if (entity.Status == WorkAssignmentReportStatus.Approved)
             throw AppExceptionFactory.BadRequest(
@@ -849,12 +909,15 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         if (entity is null)
             throw ReportNotFound(id);
         EnsureReportIsActive(entity);
+        await HydrateReportPayloadAsync(entity, ct);
 
         var reportAccess = await EnsureReportAccessAsync(entity, actorUserId, ct);
         if (!reportAccess.isAssignee || entity.AssigneeUserId != actorUserId)
             throw AppExceptionFactory.Forbidden(
                 AppErrorCode.WORK_ASSIGNMENT_REPORT_SAVE_FORBIDDEN,
                 ReportDetails(entity, actorUserId));
+
+        await EnsureReportMutationScopeOpenAsync(reportAccess.assignment, actorUserId, ct);
 
         if (entity.Status != WorkAssignmentReportStatus.Draft)
             throw InvalidReportStatus(
@@ -872,6 +935,18 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         var now = DateTime.UtcNow;
         var fromStatus = entity.Status;
         var nextStatus = WorkAssignmentReportStatus.Draft;
+        var period = await _ctx.WorkReportPeriods
+            .Find(x => x.Id == entity.WorkReportPeriodId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct);
+        var completedDatePolicy = ResolveReportCompletedDatePolicy(reportAccess.assignment, entity, period, now);
+        var startedDate = NormalizeDate(req.StartedDate) ?? entity.StartedDate ?? entity.PeriodStart ?? entity.ReportDate;
+        var requestedCompletedDate = NormalizeDate(req.CompletedDate);
+        var completedDate = ValidateReportCompletedDateInput(
+            completedDatePolicy,
+            completedDatePolicy.CanEditCompletedDate ? requestedCompletedDate ?? entity.CompletedDate : requestedCompletedDate,
+            ReportDetails(entity, actorUserId),
+            requireWhenMissing: false);
+        EnsureReportDateRange(startedDate, completedDate, "StartedDate", "CompletedDate");
         var nextDataOrigin = ResolveReportDataOrigin(req.DataOrigin, entity.DataOrigin);
         var nextContributionMode = ResolveCumulativeContributionMode(
             req.CumulativeContributionMode,
@@ -895,10 +970,14 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             entity,
             acceptsReportDataPayload ? req.TableValuesJson : entity.TableValuesJson,
             ct);
-        await ValidateRuntimeRecordTableAsync(
-            entity,
-            acceptsReportDataPayload ? req.TableValuesJson : entity.TableValuesJson,
-            ct);
+        if (acceptsReportDataPayload)
+            await ValidateRuntimeDataPayloadAsync(
+                entity,
+                req.Values1D,
+                req.FieldValuesJson,
+                req.TableValuesJson,
+                validateRequiredFields: false,
+                ct);
 
         var values1DJson = acceptsReportDataPayload
             ? JsonSerializer.Serialize(req.Values1D, _jsonOptions)
@@ -917,6 +996,15 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         var nextAggregateSourceUpdatedAtUtc = nextAggregateSources.IsAggregate
             ? (acceptsReportDataPayload ? now : entity.AggregateSourceUpdatedAtUtc)
             : null;
+        var payloadResult = await _payloadWriter.SaveReportPayloadAsync(
+            entity,
+            values1DJson,
+            fieldValuesJson,
+            tableValuesJson,
+            nextSummarySourceJson,
+            actorUserId,
+            now,
+            ct);
 
         await _ctx.WorkAssignmentReports.UpdateOneAsync(
             x => x.Id == id && !x.IsDeleted,
@@ -924,6 +1012,11 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                 .Set(x => x.Values1DJson, values1DJson)
                 .Set(x => x.FieldValuesJson, fieldValuesJson)
                 .Set(x => x.TableValuesJson, tableValuesJson)
+                .Set(x => x.PayloadRevision, payloadResult.PayloadRevision)
+                .Set(x => x.PayloadHash, payloadResult.PayloadHash)
+                .Set(x => x.PayloadSizeBytes, payloadResult.PayloadSizeBytes)
+                .Set(x => x.PayloadStatus, payloadResult.PayloadStatus)
+                .Set(x => x.PayloadUpdatedAtUtc, now)
                 .Set(x => x.DataOrigin, nextDataOrigin)
                 .Set(x => x.CumulativeContributionMode, nextContributionMode)
                 .Set(x => x.CumulativeContributionPolicyJson, nextContributionPolicyJson)
@@ -939,6 +1032,8 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                 .Set(x => x.ReportReason, req.ReportReason)
                 .Set(x => x.Difficulties, req.Difficulties)
                 .Set(x => x.ProposedSolution, req.ProposedSolution)
+                .Set(x => x.StartedDate, startedDate)
+                .Set(x => x.CompletedDate, completedDate)
                 .Set(x => x.LateReason, req.LateReason)
                 .Set(x => x.Status, nextStatus)
                 .Set(x => x.CreatedByUserId, string.IsNullOrWhiteSpace(entity.CreatedByUserId) ? actorUserId : entity.CreatedByUserId)
@@ -949,6 +1044,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         entity.Values1DJson = values1DJson;
         entity.FieldValuesJson = fieldValuesJson;
         entity.TableValuesJson = tableValuesJson;
+        ApplyPayloadMetadata(entity, payloadResult, now);
         entity.DataOrigin = nextDataOrigin;
         entity.CumulativeContributionMode = nextContributionMode;
         entity.CumulativeContributionPolicyJson = nextContributionPolicyJson;
@@ -964,15 +1060,13 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         entity.ReportReason = req.ReportReason;
         entity.Difficulties = req.Difficulties;
         entity.ProposedSolution = req.ProposedSolution;
+        entity.StartedDate = startedDate;
+        entity.CompletedDate = completedDate;
         entity.LateReason = req.LateReason;
         entity.Status = nextStatus;
         entity.CreatedByUserId = string.IsNullOrWhiteSpace(entity.CreatedByUserId) ? actorUserId : entity.CreatedByUserId;
         entity.UpdatedAtUtc = now;
         entity.UpdatedByUserId = actorUserId;
-
-        var period = await _ctx.WorkReportPeriods
-            .Find(x => x.Id == entity.WorkReportPeriodId && !x.IsDeleted)
-            .FirstOrDefaultAsync(ct);
 
         if (period is not null)
         {
@@ -988,6 +1082,8 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                     .Set(x => x.ReportReason, req.ReportReason)
                     .Set(x => x.Difficulties, req.Difficulties)
                     .Set(x => x.ProposedSolution, req.ProposedSolution)
+                    .Set(x => x.StartedDate, startedDate)
+                    .Set(x => x.CompletedDate, completedDate)
                     .Set(x => x.LateReason, req.LateReason)
                     .Set(x => x.UpdatedAtUtc, now)
                     .Set(x => x.UpdatedByUserId, actorUserId),
@@ -1000,6 +1096,8 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             period.ReportReason = req.ReportReason;
             period.Difficulties = req.Difficulties;
             period.ProposedSolution = req.ProposedSolution;
+            period.StartedDate = startedDate;
+            period.CompletedDate = completedDate;
             period.LateReason = req.LateReason;
             period.UpdatedAtUtc = now;
             period.UpdatedByUserId = actorUserId;
@@ -1061,6 +1159,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         if (entity is null)
             throw ReportNotFound(id);
         EnsureReportIsActive(entity);
+        await HydrateReportPayloadAsync(entity, ct);
 
         var reportAccess = await EnsureReportAccessAsync(entity, actorUserId, ct);
         if (!reportAccess.isAssignee || entity.AssigneeUserId != actorUserId)
@@ -1084,7 +1183,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
 
         var saveReq = new SaveWorkAssignmentReportDraftRequest
         {
-            Values1D = projection.TopLevelValues,
+            Values1D = projection.TopLevelValues.Select(x => (object?)x).ToList(),
             FieldValuesJson = entity.FieldValuesJson,
             TableValuesJson = projection.TableValuesJson,
             DataOrigin = projection.DataOrigin,
@@ -1125,6 +1224,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         if (entity is null)
             throw ReportNotFound(id);
         EnsureReportIsActive(entity);
+        await HydrateReportPayloadAsync(entity, ct);
 
         var reportAccess = await EnsureReportAccessAsync(entity, actorUserId, ct);
         if (!reportAccess.isAssignee || entity.AssigneeUserId != actorUserId)
@@ -1163,6 +1263,8 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         entity.AggregateRefreshError = null;
         entity.UpdatedAtUtc = now;
         entity.UpdatedByUserId = actorUserId;
+        entity.PayloadRevision = 0;
+        entity.PayloadStatus = null;
 
         var period = await _ctx.WorkReportPeriods
             .Find(x => x.Id == entity.WorkReportPeriodId && !x.IsDeleted)
@@ -1297,12 +1399,15 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         if (entity is null)
             throw ReportNotFound(id);
         EnsureReportIsActive(entity);
+        await HydrateReportPayloadAsync(entity, ct);
 
         var reportAccess = await EnsureReportAccessAsync(entity, actorUserId, ct);
         if (!reportAccess.isAssignee || entity.AssigneeUserId != actorUserId)
             throw AppExceptionFactory.Forbidden(
                 AppErrorCode.WORK_ASSIGNMENT_REPORT_SUBMIT_FORBIDDEN,
                 ReportDetails(entity, actorUserId));
+
+        await EnsureReportMutationScopeOpenAsync(reportAccess.assignment, actorUserId, ct);
 
         if (entity.Status != WorkAssignmentReportStatus.Draft)
             throw InvalidReportStatus(
@@ -1350,10 +1455,14 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             entity,
             acceptsReportDataPayload ? req.TableValuesJson ?? entity.TableValuesJson : entity.TableValuesJson,
             ct);
-        await ValidateRuntimeRecordTableAsync(
-            entity,
-            acceptsReportDataPayload ? req.TableValuesJson ?? entity.TableValuesJson : entity.TableValuesJson,
-            ct);
+        if (acceptsReportDataPayload)
+            await ValidateRuntimeDataPayloadAsync(
+                entity,
+                req.Values1D is { Count: > 0 } ? req.Values1D : DeserializeRawValues1D(entity.Values1DJson),
+                req.FieldValuesJson ?? entity.FieldValuesJson,
+                req.TableValuesJson ?? entity.TableValuesJson,
+                validateRequiredFields: true,
+                ct);
 
         if (acceptsReportDataPayload)
         {
@@ -1398,14 +1507,14 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
 
         var isLate = entity.DueAtUtc.HasValue && now > entity.DueAtUtc.Value;
         var isHistoricalData = IsHistoricalReportData(entity, period, now);
+        var completedDatePolicy = ResolveReportCompletedDatePolicy(reportAccess.assignment, entity, period, now);
         var startedDate = NormalizeDate(req.StartedDate) ?? entity.StartedDate ?? entity.PeriodStart ?? entity.ReportDate;
-        var completedDate = NormalizeDate(req.CompletedDate) ?? entity.CompletedDate;
-        if (isHistoricalData && !completedDate.HasValue)
-            throw AppExceptionFactory.BadRequest(
-                AppErrorCode.WORK_ASSIGNMENT_REPORT_HISTORICAL_COMPLETED_DATE_REQUIRED,
-                ReportDetails(entity, actorUserId));
-
-        completedDate ??= now.Date;
+        var requestedCompletedDate = NormalizeDate(req.CompletedDate);
+        var completedDate = ValidateReportCompletedDateInput(
+            completedDatePolicy,
+            completedDatePolicy.CanEditCompletedDate ? requestedCompletedDate ?? entity.CompletedDate : requestedCompletedDate,
+            ReportDetails(entity, actorUserId),
+            requireWhenMissing: true);
         EnsureReportDateRange(startedDate, completedDate, "StartedDate", "CompletedDate");
         var lateReason = string.IsNullOrWhiteSpace(req.LateReason) ? entity.LateReason : req.LateReason?.Trim();
 
@@ -1414,7 +1523,26 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                 AppErrorCode.WORK_ASSIGNMENT_REPORT_LATE_REASON_REQUIRED,
                 ReportDetails(entity, actorUserId));
 
-        entity.Status = WorkAssignmentReportStatus.Submitted;
+        var autoApproveActorUserId = ResolveAutoApproveActorUserId(reportAccess.assignment, actorUserId);
+        var autoApproveMatches =
+            !isHistoricalData &&
+            WorkAssignmentAutoApproveConditionNormalizer.Matches(
+                reportAccess.assignment.AutoApproveConditionJson,
+                entity.FieldValuesJson);
+        var previousOpenPeriod = autoApproveMatches
+            ? await FindPreviousOpenPeriodAsync(period, ct)
+            : null;
+        if (previousOpenPeriod is not null)
+            autoApproveMatches = false;
+
+        var nextStatus = autoApproveMatches
+            ? WorkAssignmentReportStatus.Approved
+            : WorkAssignmentReportStatus.Submitted;
+        var autoApproveComment = autoApproveMatches
+            ? WorkAssignmentAutoApprovalState.AutoApproveReviewerComment
+            : null;
+
+        entity.Status = nextStatus;
         entity.CurrentProgressStatus = req.CurrentProgressStatus ?? entity.CurrentProgressStatus;
         entity.ReportReason = req.ReportReason ?? entity.ReportReason;
         entity.Difficulties = req.Difficulties ?? entity.Difficulties;
@@ -1428,9 +1556,27 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         entity.SubmittedByUserId = actorUserId;
         entity.ReturnedAtUtc = null;
         entity.ReturnedByUserId = null;
+        entity.ReviewerComment = autoApproveMatches ? autoApproveComment : entity.ReviewerComment;
+        entity.ApprovedAtUtc = autoApproveMatches ? now : entity.ApprovedAtUtc;
+        entity.ApprovedByUserId = autoApproveMatches ? autoApproveActorUserId : entity.ApprovedByUserId;
+        entity.AutoApprovedAtUtc = autoApproveMatches ? now : null;
+        entity.AutoApprovedByUserId = autoApproveMatches ? autoApproveActorUserId : null;
+        entity.AutoApproveConditionSnapshotJson = autoApproveMatches ? reportAccess.assignment.AutoApproveConditionJson : null;
+        entity.AutoApprovalConfirmedAtUtc = null;
+        entity.AutoApprovalConfirmedByUserId = null;
         entity.CreatedByUserId = string.IsNullOrWhiteSpace(entity.CreatedByUserId) ? actorUserId : entity.CreatedByUserId;
         entity.UpdatedAtUtc = now;
-        entity.UpdatedByUserId = actorUserId;
+        entity.UpdatedByUserId = autoApproveMatches ? autoApproveActorUserId : actorUserId;
+        var payloadResult = await _payloadWriter.SaveReportPayloadAsync(
+            entity,
+            entity.Values1DJson,
+            entity.FieldValuesJson,
+            entity.TableValuesJson,
+            entity.SummarySourceJson,
+            entity.UpdatedByUserId,
+            now,
+            ct);
+        ApplyPayloadMetadata(entity, payloadResult, now);
 
         await _ctx.WorkAssignmentReports.UpdateOneAsync(
             x => x.Id == id && !x.IsDeleted,
@@ -1438,6 +1584,11 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                 .Set(x => x.Values1DJson, entity.Values1DJson)
                 .Set(x => x.FieldValuesJson, entity.FieldValuesJson)
                 .Set(x => x.TableValuesJson, entity.TableValuesJson)
+                .Set(x => x.PayloadRevision, entity.PayloadRevision)
+                .Set(x => x.PayloadHash, entity.PayloadHash)
+                .Set(x => x.PayloadSizeBytes, entity.PayloadSizeBytes)
+                .Set(x => x.PayloadStatus, entity.PayloadStatus)
+                .Set(x => x.PayloadUpdatedAtUtc, entity.PayloadUpdatedAtUtc)
                 .Set(x => x.DataOrigin, entity.DataOrigin)
                 .Set(x => x.CumulativeContributionMode, entity.CumulativeContributionMode)
                 .Set(x => x.CumulativeContributionPolicyJson, entity.CumulativeContributionPolicyJson)
@@ -1463,6 +1614,14 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                 .Set(x => x.SubmittedByUserId, entity.SubmittedByUserId)
                 .Set(x => x.ReturnedAtUtc, (DateTime?)null)
                 .Set(x => x.ReturnedByUserId, (string?)null)
+                .Set(x => x.ReviewerComment, entity.ReviewerComment)
+                .Set(x => x.ApprovedAtUtc, entity.ApprovedAtUtc)
+                .Set(x => x.ApprovedByUserId, entity.ApprovedByUserId)
+                .Set(x => x.AutoApprovedAtUtc, entity.AutoApprovedAtUtc)
+                .Set(x => x.AutoApprovedByUserId, entity.AutoApprovedByUserId)
+                .Set(x => x.AutoApproveConditionSnapshotJson, entity.AutoApproveConditionSnapshotJson)
+                .Set(x => x.AutoApprovalConfirmedAtUtc, entity.AutoApprovalConfirmedAtUtc)
+                .Set(x => x.AutoApprovalConfirmedByUserId, entity.AutoApprovalConfirmedByUserId)
                 .Set(x => x.CreatedByUserId, string.IsNullOrWhiteSpace(entity.CreatedByUserId) ? actorUserId : entity.CreatedByUserId)
                 .Set(x => x.UpdatedAtUtc, entity.UpdatedAtUtc)
                 .Set(x => x.UpdatedByUserId, entity.UpdatedByUserId),
@@ -1470,7 +1629,9 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
 
         if (period is not null)
         {
-            var periodStatus = WorkReportPeriodStatusHelper.ResolveSubmittedStatus(period.DueAtUtc, now);
+            var periodStatus = autoApproveMatches
+                ? ResolveApprovedPeriodStatus(period, entity, now)
+                : WorkReportPeriodStatusHelper.ResolveSubmittedStatus(period.DueAtUtc, now);
 
             await _ctx.WorkReportPeriods.UpdateOneAsync(
                 x => x.Id == period.Id && !x.IsDeleted,
@@ -1488,8 +1649,11 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                     .Set(x => x.IsHistoricalData, entity.IsHistoricalData)
                     .Set(x => x.LateReason, entity.LateReason)
                     .Set(x => x.RequiresLateReason, isLate)
+                    .Set(x => x.LastReviewedAtUtc, autoApproveMatches ? now : period.LastReviewedAtUtc)
+                    .Set(x => x.ReviewerComment, autoApproveMatches ? autoApproveComment : period.ReviewerComment)
+                    .Set(x => x.AcceptedLateReason, autoApproveMatches ? lateReason : period.AcceptedLateReason)
                     .Set(x => x.UpdatedAtUtc, now)
-                    .Set(x => x.UpdatedByUserId, actorUserId),
+                    .Set(x => x.UpdatedByUserId, autoApproveMatches ? autoApproveActorUserId : actorUserId),
                 cancellationToken: ct);
 
             period.Status = periodStatus;
@@ -1505,8 +1669,11 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             period.IsHistoricalData = entity.IsHistoricalData;
             period.LateReason = entity.LateReason;
             period.RequiresLateReason = isLate;
+            period.LastReviewedAtUtc = autoApproveMatches ? now : period.LastReviewedAtUtc;
+            period.ReviewerComment = autoApproveMatches ? autoApproveComment : period.ReviewerComment;
+            period.AcceptedLateReason = autoApproveMatches ? lateReason : period.AcceptedLateReason;
             period.UpdatedAtUtc = now;
-            period.UpdatedByUserId = actorUserId;
+            period.UpdatedByUserId = autoApproveMatches ? autoApproveActorUserId : actorUserId;
         }
 
         await InsertLogAsync(
@@ -1523,17 +1690,34 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             snapshotJson: null,
             ct: ct);
 
-        if (period is not null)
+        if (autoApproveMatches)
+        {
+            await InsertLogAsync(
+                workId: entity.WorkId,
+                workAssignmentId: entity.WorkAssignmentId,
+                workReportPeriodId: entity.WorkReportPeriodId,
+                workAssignmentReportId: entity.Id,
+                action: "AUTO_APPROVE",
+                fromStatus: WorkAssignmentReportStatus.Submitted.ToString(),
+                toStatus: WorkAssignmentReportStatus.Approved.ToString(),
+                actionByUserId: autoApproveActorUserId,
+                reason: "AUTO_APPROVE_CONDITION",
+                comment: autoApproveComment,
+                snapshotJson: reportAccess.assignment.AutoApproveConditionJson,
+                ct: ct);
+        }
+
+        if (period is not null || autoApproveMatches)
         {
             await FinalizeReportStatusOperationAsync(
-                "SUBMIT",
+                autoApproveMatches ? "SUBMIT_AUTO_APPROVE" : "SUBMIT",
                 entity,
                 period,
                 fromStatus.ToString(),
-                WorkAssignmentReportStatus.Submitted.ToString(),
-                actorUserId,
-                upsertQueue: true,
-                disableQueue: false,
+                nextStatus.ToString(),
+                autoApproveMatches ? autoApproveActorUserId : actorUserId,
+                upsertQueue: !autoApproveMatches,
+                disableQueue: autoApproveMatches && period is not null,
                 rebuildProjection: true,
                 syncAssignment: true,
                 ct);
@@ -1564,12 +1748,36 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             Data = new Dictionary<string, string>
             {
                 { "fromStatus", fromStatus.ToString() },
-                { "toStatus", WorkAssignmentReportStatus.Submitted.ToString() },
+                { "toStatus", nextStatus.ToString() },
                 { "isLateSubmission", isLate.ToString() },
-                { "isHistoricalData", isHistoricalData.ToString() }
+                { "isHistoricalData", isHistoricalData.ToString() },
+                { "autoApproved", autoApproveMatches.ToString() }
             },
             OccurredAtUtc = now
         }, CancellationToken.None);
+
+        if (autoApproveMatches)
+        {
+            await _userActionLog.RecordAsync(new UserActionLogSeed
+            {
+                Action = UserActionLogActions.ReportApproved,
+                Scope = "report",
+                ActorUserId = autoApproveActorUserId,
+                WorkId = entity.WorkId,
+                WorkAssignmentId = entity.WorkAssignmentId,
+                WorkReportPeriodId = entity.WorkReportPeriodId,
+                WorkAssignmentReportId = entity.Id,
+                TargetUserId = entity.AssigneeUserId,
+                Summary = $"Auto approved report {entity.PeriodInstanceKey}",
+                Data = new Dictionary<string, string>
+                {
+                    { "fromStatus", WorkAssignmentReportStatus.Submitted.ToString() },
+                    { "toStatus", WorkAssignmentReportStatus.Approved.ToString() },
+                    { "autoApproved", true.ToString() }
+                },
+                OccurredAtUtc = now
+            }, CancellationToken.None);
+        }
 
         return await MapToResponseAsync(entity, period, ct);
     }
@@ -1682,10 +1890,14 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                 WorkAssignmentReportStatus.Submitted,
                 actorUserId);
 
+        WorkReportPayloadConsistency.EnsureReadyForStatisticProjection(entity);
+
         var assignment = await _ctx.WorkAssignments
             .Find(x => x.Id == entity.WorkAssignmentId && !x.IsDeleted)
             .FirstOrDefaultAsync(ct)
             ?? throw ReportAssignmentNotFound(entity.WorkAssignmentId);
+
+        await EnsureReportMutationScopeOpenAsync(assignment, actorUserId, ct);
 
         await LoadReviewNodeAsync(assignment, actorUserId, ct);
 
@@ -1871,6 +2083,8 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             .FirstOrDefaultAsync(ct)
             ?? throw ReportAssignmentNotFound(entity.WorkAssignmentId);
 
+        await EnsureReportMutationScopeOpenAsync(assignment, actorUserId, ct);
+
         await LoadReviewNodeAsync(assignment, actorUserId, ct);
 
         var now = DateTime.UtcNow;
@@ -1886,6 +2100,11 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                 .Set(x => x.ReturnedByUserId, actorUserId)
                 .Set(x => x.ApprovedAtUtc, (DateTime?)null)
                 .Set(x => x.ApprovedByUserId, (string?)null)
+                .Set(x => x.AutoApprovedAtUtc, (DateTime?)null)
+                .Set(x => x.AutoApprovedByUserId, (string?)null)
+                .Set(x => x.AutoApproveConditionSnapshotJson, (string?)null)
+                .Set(x => x.AutoApprovalConfirmedAtUtc, (DateTime?)null)
+                .Set(x => x.AutoApprovalConfirmedByUserId, (string?)null)
                 .Set(x => x.UpdatedAtUtc, now)
                 .Set(x => x.UpdatedByUserId, actorUserId),
             cancellationToken: ct);
@@ -1897,6 +2116,11 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         entity.ReturnedByUserId = actorUserId;
         entity.ApprovedAtUtc = null;
         entity.ApprovedByUserId = null;
+        entity.AutoApprovedAtUtc = null;
+        entity.AutoApprovedByUserId = null;
+        entity.AutoApproveConditionSnapshotJson = null;
+        entity.AutoApprovalConfirmedAtUtc = null;
+        entity.AutoApprovalConfirmedByUserId = null;
         entity.UpdatedAtUtc = now;
         entity.UpdatedByUserId = actorUserId;
 
@@ -2002,17 +2226,35 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                 AppErrorCode.WORK_ASSIGNMENT_REPORT_WITHDRAW_FORBIDDEN,
                 ReportDetails(entity, actorUserId));
 
-        if (entity.Status != WorkAssignmentReportStatus.Submitted)
+        var assignment = await _ctx.WorkAssignments
+            .Find(x => x.Id == entity.WorkAssignmentId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct)
+            ?? throw ReportAssignmentNotFound(entity.WorkAssignmentId);
+
+        await EnsureReportMutationScopeOpenAsync(assignment, actorUserId, ct);
+
+        var withdrawsAutoApproved = entity.Status == WorkAssignmentReportStatus.Approved &&
+                                    WorkAssignmentAutoApprovalState.CanReporterWithdraw(entity);
+
+        if (entity.Status != WorkAssignmentReportStatus.Submitted && !withdrawsAutoApproved)
             throw InvalidReportStatus(
                 AppErrorCode.WORK_ASSIGNMENT_REPORT_WITHDRAW_STATUS_INVALID,
                 entity,
                 WorkAssignmentReportStatus.Submitted,
                 actorUserId);
 
+        var period = await _ctx.WorkReportPeriods
+            .Find(x => x.Id == entity.WorkReportPeriodId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct);
+
+        if (withdrawsAutoApproved)
+            await EnsureNoLaterApprovedReportsAsync(period, ct);
+
         var now = DateTime.UtcNow;
         var withdrawReason = string.IsNullOrWhiteSpace(req.ReturnReason)
             ? null
             : req.ReturnReason.Trim();
+        var fromStatus = entity.Status;
 
         await _ctx.WorkAssignmentReports.UpdateOneAsync(
             x => x.Id == id && !x.IsDeleted,
@@ -2021,6 +2263,13 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                 .Set(x => x.ReturnReason, withdrawReason)
                 .Set(x => x.ReturnedAtUtc, (DateTime?)null)
                 .Set(x => x.ReturnedByUserId, (string?)null)
+                .Set(x => x.ApprovedAtUtc, (DateTime?)null)
+                .Set(x => x.ApprovedByUserId, (string?)null)
+                .Set(x => x.AutoApprovedAtUtc, (DateTime?)null)
+                .Set(x => x.AutoApprovedByUserId, (string?)null)
+                .Set(x => x.AutoApproveConditionSnapshotJson, (string?)null)
+                .Set(x => x.AutoApprovalConfirmedAtUtc, (DateTime?)null)
+                .Set(x => x.AutoApprovalConfirmedByUserId, (string?)null)
                 .Set(x => x.UpdatedAtUtc, now)
                 .Set(x => x.UpdatedByUserId, actorUserId),
             cancellationToken: ct);
@@ -2029,28 +2278,46 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         entity.ReturnReason = withdrawReason;
         entity.ReturnedAtUtc = null;
         entity.ReturnedByUserId = null;
+        entity.ApprovedAtUtc = null;
+        entity.ApprovedByUserId = null;
+        entity.AutoApprovedAtUtc = null;
+        entity.AutoApprovedByUserId = null;
+        entity.AutoApproveConditionSnapshotJson = null;
+        entity.AutoApprovalConfirmedAtUtc = null;
+        entity.AutoApprovalConfirmedByUserId = null;
         entity.UpdatedAtUtc = now;
         entity.UpdatedByUserId = actorUserId;
-
-        var period = await _ctx.WorkReportPeriods
-            .Find(x => x.Id == entity.WorkReportPeriodId && !x.IsDeleted)
-            .FirstOrDefaultAsync(ct);
 
         if (period is not null)
         {
             var nextPeriodStatus = WorkReportPeriodStatusHelper.ResolveDraftStatus(period.DueAtUtc, now);
+            var periodUpdate = Builders<WorkReportPeriod>.Update
+                .Set(x => x.Status, nextPeriodStatus)
+                .Set(x => x.IsOverdue, WorkReportPeriodStatusHelper.IsOverdue(nextPeriodStatus))
+                .Set(x => x.UpdatedAtUtc, now)
+                .Set(x => x.UpdatedByUserId, actorUserId);
+
+            if (withdrawsAutoApproved)
+            {
+                periodUpdate = periodUpdate
+                    .Set(x => x.LastReviewedAtUtc, (DateTime?)null)
+                    .Set(x => x.ReviewerComment, (string?)null)
+                    .Set(x => x.AcceptedLateReason, (string?)null);
+            }
 
             await _ctx.WorkReportPeriods.UpdateOneAsync(
                 x => x.Id == period.Id && !x.IsDeleted,
-                Builders<WorkReportPeriod>.Update
-                    .Set(x => x.Status, nextPeriodStatus)
-                    .Set(x => x.IsOverdue, WorkReportPeriodStatusHelper.IsOverdue(nextPeriodStatus))
-                    .Set(x => x.UpdatedAtUtc, now)
-                    .Set(x => x.UpdatedByUserId, actorUserId),
+                periodUpdate,
                 cancellationToken: ct);
 
             period.Status = nextPeriodStatus;
             period.IsOverdue = WorkReportPeriodStatusHelper.IsOverdue(nextPeriodStatus);
+            if (withdrawsAutoApproved)
+            {
+                period.LastReviewedAtUtc = null;
+                period.ReviewerComment = null;
+                period.AcceptedLateReason = null;
+            }
             period.UpdatedAtUtc = now;
             period.UpdatedByUserId = actorUserId;
 
@@ -2062,7 +2329,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             workReportPeriodId: entity.WorkReportPeriodId,
             workAssignmentReportId: entity.Id,
             action: "Thu hồi báo cáo",
-            fromStatus: WorkAssignmentReportStatus.Submitted.ToString(),
+            fromStatus: fromStatus.ToString(),
             toStatus: WorkAssignmentReportStatus.Draft.ToString(),
             actionByUserId: actorUserId,
             reason: withdrawReason,
@@ -2071,10 +2338,10 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             ct: ct);
 
         await FinalizeReportStatusOperationAsync(
-            "WITHDRAW_SUBMITTED",
+            withdrawsAutoApproved ? "WITHDRAW_AUTO_APPROVED" : "WITHDRAW_SUBMITTED",
             entity,
             period,
-            WorkAssignmentReportStatus.Submitted.ToString(),
+            fromStatus.ToString(),
             WorkAssignmentReportStatus.Draft.ToString(),
             actorUserId,
             upsertQueue: period is not null,
@@ -2110,6 +2377,8 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                 AppErrorCode.WORK_ASSIGNMENT_REPORT_ASSIGNMENT_INACTIVE,
                 PeriodDetails(period, actorUserId));
 
+        await EnsureReportMutationScopeOpenAsync(assignment, actorUserId, ct);
+
         var template = await _ctx.DynamicExcelTemplates
             .Find(x => x.Id == period.DynamicExcelId && !x.IsDeleted)
             .FirstOrDefaultAsync(ct);
@@ -2140,6 +2409,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
 
         var entity = new WorkAssignmentReport
         {
+            Id = ObjectId.GenerateNewId().ToString(),
             WorkId = period.WorkId,
             WorkAssignmentId = period.WorkAssignmentId,
             WorkReportPeriodId = period.Id,
@@ -2170,8 +2440,6 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             DynamicExcelTemplateId = template.Id,
             DynamicExcelTemplateCode = template.Code,
             DynamicExcelTemplateName = template.Name,
-            DynamicExcelTableKind = NormalizeDynamicExcelTableKind(template.TableKind),
-            RecordTableSpecJson = template.RecordTableSpecJson,
             SpecJson = template.SpecJson,
 
             DataRectR0 = template.DataRectR0,
@@ -2195,6 +2463,17 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             UpdatedByUserId = actorUserId,
             IsDeleted = false
         };
+
+        var payloadResult = await _payloadWriter.SaveReportPayloadAsync(
+            entity,
+            entity.Values1DJson,
+            entity.FieldValuesJson,
+            entity.TableValuesJson,
+            entity.SummarySourceJson,
+            actorUserId,
+            now,
+            ct);
+        ApplyPayloadMetadata(entity, payloadResult, now);
 
         await _ctx.WorkAssignmentReports.InsertOneAsync(entity, cancellationToken: ct);
 
@@ -2255,11 +2534,12 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             .Distinct(StringComparer.Ordinal)
             .ToList();
 
-        var activeCodes = await _ctx.Labels
+        var activeLabels = await _ctx.Labels
             .Find(x => labelCodes.Contains(x.Code) && x.IsActive && !x.IsDeleted)
-            .Project(x => x.Code)
+            .Project(x => new { x.Code, x.Usage, x.DataType })
             .ToListAsync(ct);
 
+        var activeCodes = activeLabels.Select(x => x.Code).ToList();
         var missingCodes = labelCodes
             .Except(activeCodes, StringComparer.Ordinal)
             .ToList();
@@ -2275,6 +2555,28 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                     labelCodes = missingCodes.Take(20).ToArray()
                 });
 
+        var invalidUsageCodes = activeLabels
+            .Where(x => !LabelUsages.CanUseAsTableTarget(x.Usage))
+            .Select(x => x.Code)
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+
+        var labelsByCode = activeLabels
+            .GroupBy(x => x.Code, StringComparer.Ordinal)
+            .ToDictionary(x => x.Key, x => x.First(), StringComparer.Ordinal);
+
+        if (invalidUsageCodes.Count > 0)
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_LABEL_NOT_ALLOWED,
+                new
+                {
+                    reportId = report.Id,
+                    workAssignmentId = report.WorkAssignmentId,
+                    dynamicFormTemplateId = report.DynamicFormTemplateId,
+                    expectedUsage = LabelUsages.TableTarget,
+                    invalidUsageCodes = invalidUsageCodes.Take(20).ToArray()
+                });
+
         if (string.IsNullOrWhiteSpace(report.DynamicFormTemplateId))
             return;
 
@@ -2284,15 +2586,36 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
 
         var allowedByBlock = BuildAllowedRowLabelsByBlock(form, report);
         if (allowedByBlock.Count == 0)
-            return;
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_LABEL_NOT_ALLOWED,
+                new
+                {
+                    reportId = report.Id,
+                    workAssignmentId = report.WorkAssignmentId,
+                    dynamicFormTemplateId = report.DynamicFormTemplateId,
+                    reason = "Runtime row labels require a block allowedRowLabelCodes allowlist.",
+                    labelCodes = labelCodes.Take(20).ToArray()
+                });
 
         foreach (var row in rows)
         {
-            if (!allowedByBlock.TryGetValue(row.BlockId, out var allowed) || allowed.Count == 0)
-                continue;
+            if (!allowedByBlock.TryGetValue(row.BlockId, out var allowed) || allowed.Codes.Count == 0)
+            {
+                throw AppExceptionFactory.BadRequest(
+                    AppErrorCode.WORK_ASSIGNMENT_REPORT_LABEL_NOT_ALLOWED,
+                    new
+                    {
+                        reportId = report.Id,
+                        workAssignmentId = report.WorkAssignmentId,
+                        dynamicFormTemplateId = report.DynamicFormTemplateId,
+                        blockId = row.BlockId,
+                        reason = "Runtime row labels require a block allowedRowLabelCodes allowlist.",
+                        labelCodes = row.LabelCodes.Take(20).ToArray()
+                    });
+            }
 
             var disallowed = row.LabelCodes
-                .Where(code => !allowed.Contains(code))
+                .Where(code => !allowed.Codes.Contains(code))
                 .Distinct(StringComparer.Ordinal)
                 .ToList();
 
@@ -2307,36 +2630,931 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                         blockId = row.BlockId,
                         labelCodes = disallowed.Take(20).ToArray()
                     });
+
+            if (string.IsNullOrWhiteSpace(allowed.DataType))
+                throw AppExceptionFactory.BadRequest(
+                    AppErrorCode.WORK_ASSIGNMENT_REPORT_LABEL_NOT_ALLOWED,
+                    new
+                    {
+                        reportId = report.Id,
+                        workAssignmentId = report.WorkAssignmentId,
+                        dynamicFormTemplateId = report.DynamicFormTemplateId,
+                        blockId = row.BlockId,
+                        reason = "Runtime row labels require rowLabelDataType/targetDataType on the Dynamic Excel block.",
+                        labelCodes = row.LabelCodes.Take(20).ToArray()
+                    });
+
+            var expectedDataType = LabelDataTypes.Normalize(allowed.DataType);
+            var invalidTypeCodes = row.LabelCodes
+                .Where(code => labelsByCode.TryGetValue(code, out var label)
+                               && !string.Equals(
+                                   LabelDataTypes.Normalize(label.DataType),
+                                   expectedDataType,
+                                   StringComparison.Ordinal))
+                .Distinct(StringComparer.Ordinal)
+                .ToList();
+
+            if (invalidTypeCodes.Count > 0)
+                throw AppExceptionFactory.BadRequest(
+                    AppErrorCode.WORK_ASSIGNMENT_REPORT_LABEL_NOT_ALLOWED,
+                    new
+                    {
+                        reportId = report.Id,
+                        workAssignmentId = report.WorkAssignmentId,
+                        dynamicFormTemplateId = report.DynamicFormTemplateId,
+                        blockId = row.BlockId,
+                        expectedUsage = LabelUsages.TableTarget,
+                        expectedDataType,
+                        invalidTypeCodes = invalidTypeCodes.Take(20).ToArray()
+                    });
         }
     }
 
-    private async Task ValidateRuntimeRecordTableAsync(
+    private async Task ValidateRuntimeDataPayloadAsync(
         WorkAssignmentReport report,
+        IReadOnlyList<object?>? values1D,
+        string? fieldValuesJson,
         string? tableValuesJson,
+        bool validateRequiredFields,
         CancellationToken ct)
     {
-        if (!string.Equals(
-                NormalizeDynamicExcelTableKind(report.DynamicExcelTableKind),
-                DynamicExcelTableKind.RecordTable,
-                StringComparison.Ordinal))
-        {
+        ValidateTopLevelRuntimeValues(report, values1D ?? Array.Empty<object?>());
+
+        if (string.IsNullOrWhiteSpace(report.DynamicFormTemplateId))
             return;
-        }
 
-        var specJson = report.RecordTableSpecJson;
-        if (string.IsNullOrWhiteSpace(specJson))
+        var form = await _ctx.DynamicFormTemplates
+            .Find(x => x.Id == report.DynamicFormTemplateId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct);
+        if (form is null)
+            return;
+
+        ValidateDynamicFieldRuntimeValues(report, form, fieldValuesJson, validateRequiredFields);
+        ValidateDynamicTableRuntimeValues(report, form, tableValuesJson);
+    }
+
+    private static void ValidateTopLevelRuntimeValues(
+        WorkAssignmentReport report,
+        IReadOnlyList<object?> values1D)
+    {
+        var expectedLength = report.W * report.H;
+        if (values1D.Count != expectedLength)
+            throw InvalidReportValues(report, expectedLength, values1D.Count);
+
+        using var specDocument = TryParseRuntimeJsonObject(report.SpecJson);
+        var spec = specDocument?.RootElement;
+
+        for (var index = 0; index < values1D.Count; index++)
         {
-            var template = await _ctx.DynamicExcelTemplates
-                .Find(x => x.Id == report.DynamicExcelTemplateId && !x.IsDeleted)
-                .FirstOrDefaultAsync(ct);
-            specJson = template?.RecordTableSpecJson;
+            var r = report.DataRectR0 + index / Math.Max(1, report.W);
+            var c = report.DataRectC0 + index % Math.Max(1, report.W);
+            var cellContract = spec.HasValue
+                ? ResolveRuntimeCellContract(spec.Value, r, c)
+                : new RuntimeCellContract(RuntimeDataTypeNumber, Array.Empty<RuntimeOption>());
+
+            if (IsRuntimeValueValid(values1D[index], cellContract.DataType, cellContract.Options))
+                continue;
+
+            throw InvalidReportRuntimeValue(
+                report,
+                "values1D",
+                null,
+                null,
+                r,
+                c,
+                cellContract.DataType,
+                values1D[index]);
+        }
+    }
+
+    private static void ValidateDynamicFieldRuntimeValues(
+        WorkAssignmentReport report,
+        DynamicFormTemplate form,
+        string? fieldValuesJson,
+        bool validateRequiredFields)
+    {
+        var fields = ReadRuntimeFields(form.FieldsJson);
+        if (fields.Count == 0)
+            return;
+
+        var values = ReadRuntimeFieldValues(report, fieldValuesJson);
+        foreach (var field in fields)
+        {
+            var hasValue = values.TryGetValue(field.Id, out var value);
+            if (!hasValue && !string.IsNullOrWhiteSpace(field.Key))
+                hasValue = values.TryGetValue(field.Key, out value);
+
+            if (validateRequiredFields && field.Required && (!hasValue || IsBlankRuntimeValue(value)))
+            {
+                throw InvalidReportRuntimeValue(
+                    report,
+                    "fieldValuesJson",
+                    field.DisplayName,
+                    null,
+                    null,
+                    null,
+                    field.DataType,
+                    null,
+                    "required");
+            }
+
+            if (!hasValue || IsRuntimeValueValid(value, field.DataType, field.Options))
+                continue;
+
+            throw InvalidReportRuntimeValue(
+                report,
+                "fieldValuesJson",
+                field.DisplayName,
+                null,
+                null,
+                null,
+                field.DataType,
+                value);
+        }
+    }
+
+    private static void ValidateDynamicTableRuntimeValues(
+        WorkAssignmentReport report,
+        DynamicFormTemplate form,
+        string? tableValuesJson)
+    {
+        if (string.IsNullOrWhiteSpace(tableValuesJson))
+            return;
+
+        var contracts = ReadRuntimeTableBlocks(form);
+        try
+        {
+            using var document = JsonDocument.Parse(tableValuesJson);
+            if (document.RootElement.ValueKind != JsonValueKind.Object)
+                throw RuntimeTableValuesInvalid(report, "tableValuesJson must be a JSON object.");
+
+            if (!TryGetJsonProperty(document.RootElement, "blocks", out var blocks) ||
+                blocks.ValueKind != JsonValueKind.Array)
+            {
+                return;
+            }
+
+            foreach (var block in blocks.EnumerateArray())
+            {
+                if (block.ValueKind != JsonValueKind.Object)
+                    continue;
+
+                if (!TryGetJsonProperty(block, "values1D", out var values) ||
+                    values.ValueKind != JsonValueKind.Array)
+                {
+                    continue;
+                }
+
+                var blockId = NormalizeBlockId(ReadJsonString(block, "blockId") ?? ReadJsonString(block, "id"));
+                var contract = contracts.TryGetValue(blockId, out var known)
+                    ? known
+                    : ParseRuntimeTableBlock(block);
+                if (contract is null)
+                    continue;
+
+                var expectedLength = contract.W * contract.H;
+                var actualLength = values.GetArrayLength();
+                if (actualLength != expectedLength)
+                    throw RuntimeTableValuesInvalid(
+                        report,
+                        $"Block {blockId} values1D length does not match block dimensions.",
+                        new { blockId, expectedLength, actualLength });
+
+                var index = 0;
+                foreach (var value in values.EnumerateArray())
+                {
+                    var r = contract.DataRect.R0 + index / Math.Max(1, contract.W);
+                    var c = contract.DataRect.C0 + index % Math.Max(1, contract.W);
+                    var cellContract = ResolveRuntimeCellContract(contract.Block, r, c);
+                    if (!IsRuntimeValueValid(value, cellContract.DataType, cellContract.Options))
+                    {
+                        throw InvalidReportRuntimeValue(
+                            report,
+                            "tableValuesJson",
+                            null,
+                            blockId,
+                            r,
+                            c,
+                            cellContract.DataType,
+                            value);
+                    }
+
+                    index++;
+                }
+            }
+        }
+        catch (JsonException ex)
+        {
+            throw RuntimeTableValuesInvalid(report, ex.Message);
+        }
+    }
+
+    private static List<RuntimeFieldContract> ReadRuntimeFields(string? fieldsJson)
+    {
+        if (string.IsNullOrWhiteSpace(fieldsJson))
+            return new List<RuntimeFieldContract>();
+
+        try
+        {
+            using var document = JsonDocument.Parse(fieldsJson);
+            if (document.RootElement.ValueKind != JsonValueKind.Array)
+                return new List<RuntimeFieldContract>();
+
+            var result = new List<RuntimeFieldContract>();
+            foreach (var item in document.RootElement.EnumerateArray())
+            {
+                if (item.ValueKind != JsonValueKind.Object)
+                    continue;
+
+                var id = ReadJsonString(item, "id") ?? ReadJsonString(item, "key");
+                var key = ReadJsonString(item, "key") ?? id ?? string.Empty;
+                if (string.IsNullOrWhiteSpace(id))
+                    continue;
+
+                var displayName =
+                    ReadJsonString(item, "name") ??
+                    ReadJsonString(item, "displayName") ??
+                    ReadJsonString(item, "label") ??
+                    key;
+
+                result.Add(new RuntimeFieldContract(
+                    id.Trim(),
+                    key.Trim(),
+                    string.IsNullOrWhiteSpace(displayName) ? key.Trim() : displayName.Trim(),
+                    NormalizeRuntimeFieldDataType(ReadJsonString(item, "type")),
+                    ReadJsonBool(item, "required") == true,
+                    ReadRuntimeOptions(item)));
+            }
+
+            return result;
+        }
+        catch (JsonException)
+        {
+            return new List<RuntimeFieldContract>();
+        }
+    }
+
+    private static Dictionary<string, JsonElement> ReadRuntimeFieldValues(
+        WorkAssignmentReport report,
+        string? fieldValuesJson)
+    {
+        var result = new Dictionary<string, JsonElement>(StringComparer.Ordinal);
+        if (string.IsNullOrWhiteSpace(fieldValuesJson))
+            return result;
+
+        try
+        {
+            using var document = JsonDocument.Parse(fieldValuesJson);
+            if (document.RootElement.ValueKind != JsonValueKind.Object)
+                throw InvalidReportRuntimePayload(report, "fieldValuesJson", "fieldValuesJson must be a JSON object.");
+
+            var root = document.RootElement;
+            if (TryGetJsonProperty(root, "values", out var valuesRoot))
+                root = valuesRoot;
+
+            if (root.ValueKind != JsonValueKind.Object)
+                throw InvalidReportRuntimePayload(report, "fieldValuesJson.values", "values must be a JSON object.");
+
+            foreach (var property in root.EnumerateObject())
+                result[property.Name] = property.Value.Clone();
+
+            return result;
+        }
+        catch (JsonException ex)
+        {
+            throw InvalidReportRuntimePayload(report, "fieldValuesJson", ex.Message);
+        }
+    }
+
+    private static RuntimeOption[] ReadRuntimeOptions(JsonElement owner)
+    {
+        if (!TryGetJsonProperty(owner, "options", out var options) || options.ValueKind != JsonValueKind.Array)
+            return Array.Empty<RuntimeOption>();
+
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var rows = new List<RuntimeOption>();
+        foreach (var item in options.EnumerateArray())
+        {
+            var code = item.ValueKind switch
+            {
+                JsonValueKind.String => item.GetString()?.Trim(),
+                JsonValueKind.Object => ReadJsonString(item, "code")
+                                        ?? ReadJsonString(item, "value")
+                                        ?? ReadJsonString(item, "id"),
+                _ => null
+            };
+            if (string.IsNullOrWhiteSpace(code) || !seen.Add(code))
+                continue;
+
+            var label = item.ValueKind == JsonValueKind.Object
+                ? ReadJsonString(item, "label")
+                  ?? ReadJsonString(item, "name")
+                  ?? ReadJsonString(item, "text")
+                  ?? code
+                : code;
+
+            rows.Add(new RuntimeOption(code, string.IsNullOrWhiteSpace(label) ? code : label));
         }
 
-        DynamicExcelRecordTableRuntime.ValidateTableValues(
-            tableValuesJson,
-            specJson,
-            report.DynamicExcelTemplateId,
-            report.Id);
+        return rows.ToArray();
+    }
+
+    private static Dictionary<string, RuntimeTableBlockContract> ReadRuntimeTableBlocks(
+        DynamicFormTemplate form)
+    {
+        var result = new Dictionary<string, RuntimeTableBlockContract>(StringComparer.Ordinal);
+        foreach (var block in ReadRuntimeBlockElements(form.BlocksJson)
+                     .Concat(ReadRuntimeBlockElements(form.ExcelBlockJson)))
+        {
+            var contract = ParseRuntimeTableBlock(block);
+            if (contract is not null && !result.ContainsKey(contract.BlockId))
+                result[contract.BlockId] = contract;
+        }
+
+        return result;
+    }
+
+    private static List<JsonElement> ReadRuntimeBlockElements(string? json)
+    {
+        if (string.IsNullOrWhiteSpace(json))
+            return new List<JsonElement>();
+
+        try
+        {
+            using var document = JsonDocument.Parse(json);
+            if (document.RootElement.ValueKind == JsonValueKind.Array)
+            {
+                return document.RootElement
+                    .EnumerateArray()
+                    .Where(item => item.ValueKind == JsonValueKind.Object)
+                    .Select(item => item.Clone())
+                    .ToList();
+            }
+
+            return document.RootElement.ValueKind == JsonValueKind.Object
+                ? new List<JsonElement> { document.RootElement.Clone() }
+                : new List<JsonElement>();
+        }
+        catch (JsonException)
+        {
+            return new List<JsonElement>();
+        }
+    }
+
+    private static RuntimeTableBlockContract? ParseRuntimeTableBlock(JsonElement block)
+    {
+        if (block.ValueKind != JsonValueKind.Object)
+            return null;
+
+        var dataRect = ReadRuntimeDataRect(block);
+        var w = ReadJsonInt(block, "w") ?? ReadJsonInt(block, "W") ?? RuntimeRectWidth(dataRect);
+        var h = ReadJsonInt(block, "h") ?? ReadJsonInt(block, "H") ?? RuntimeRectHeight(dataRect);
+        if (w <= 0 || h <= 0)
+            return null;
+
+        if (RuntimeRectWidth(dataRect) <= 0 || RuntimeRectHeight(dataRect) <= 0)
+            dataRect = new RuntimeDataRect(0, 0, Math.Max(0, h - 1), Math.Max(0, w - 1));
+
+        return new RuntimeTableBlockContract(
+            NormalizeBlockId(ReadJsonString(block, "blockId") ?? ReadJsonString(block, "id")),
+            w,
+            h,
+            dataRect,
+            block.Clone());
+    }
+
+    private static RuntimeDataRect ReadRuntimeDataRect(JsonElement block)
+    {
+        var node = TryGetJsonProperty(block, "dataRect", out var dataRect) &&
+                   dataRect.ValueKind == JsonValueKind.Object
+            ? dataRect
+            : block;
+
+        var r0 = ReadJsonInt(node, "r0") ?? ReadJsonInt(node, "R0") ?? 0;
+        var c0 = ReadJsonInt(node, "c0") ?? ReadJsonInt(node, "C0") ?? 0;
+        var r1 = ReadJsonInt(node, "r1") ?? ReadJsonInt(node, "R1") ?? -1;
+        var c1 = ReadJsonInt(node, "c1") ?? ReadJsonInt(node, "C1") ?? -1;
+        return new RuntimeDataRect(r0, c0, r1, c1);
+    }
+
+    private static int RuntimeRectWidth(RuntimeDataRect rect)
+        => rect.C1 >= rect.C0 ? rect.C1 - rect.C0 + 1 : 0;
+
+    private static int RuntimeRectHeight(RuntimeDataRect rect)
+        => rect.R1 >= rect.R0 ? rect.R1 - rect.R0 + 1 : 0;
+
+    private static RuntimeCellContract ResolveRuntimeCellContract(JsonElement specOrBlock, int rowIndex, int columnIndex)
+    {
+        var kind = (ReadJsonString(specOrBlock, "kind") ??
+                    ReadJsonString(specOrBlock, "excelSpecKind") ??
+                    ReadJsonString(specOrBlock, "sourceKind"))
+            ?.Trim()
+            .ToUpperInvariant();
+        var dataType = NormalizeRuntimeDataType(
+            ReadJsonString(specOrBlock, "defaultDataType") ??
+            ReadJsonString(specOrBlock, "dataType"));
+        var options = ReadRuntimeOptions(specOrBlock, "defaultOptions");
+
+        if (!TryGetJsonProperty(specOrBlock, "dataTypeOverrides", out var overrides) ||
+            overrides.ValueKind != JsonValueKind.Array)
+        {
+            return new RuntimeCellContract(dataType, options);
+        }
+
+        foreach (var item in overrides.EnumerateArray())
+        {
+            if (item.ValueKind != JsonValueKind.Object)
+                continue;
+
+            var scope = ReadJsonString(item, "scope")?.Trim().ToUpperInvariant();
+            var applies =
+                kind == "TOP" && scope == "COLUMN" && ReadJsonInt(item, "index") == columnIndex ||
+                kind == "LEFT" && scope == "ROW" && ReadJsonInt(item, "index") == rowIndex ||
+                kind == "MATRIX" && scope == "RANGE" && RuntimeRangeContains(item, rowIndex, columnIndex);
+
+            if (applies)
+            {
+                dataType = NormalizeRuntimeDataType(ReadJsonString(item, "dataType"));
+                options = ReadRuntimeOptions(item, "options");
+            }
+        }
+
+        return new RuntimeCellContract(dataType, options);
+    }
+
+    private static RuntimeOption[] ReadRuntimeOptions(JsonElement owner, string propertyName)
+    {
+        if (!TryGetJsonProperty(owner, propertyName, out var options) || options.ValueKind != JsonValueKind.Array)
+            return Array.Empty<RuntimeOption>();
+
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var rows = new List<RuntimeOption>();
+        foreach (var item in options.EnumerateArray())
+        {
+            var code = item.ValueKind switch
+            {
+                JsonValueKind.String => item.GetString()?.Trim(),
+                JsonValueKind.Object => ReadJsonString(item, "code")
+                                        ?? ReadJsonString(item, "value")
+                                        ?? ReadJsonString(item, "id"),
+                _ => null
+            };
+            if (string.IsNullOrWhiteSpace(code) || !seen.Add(code))
+                continue;
+
+            var label = item.ValueKind == JsonValueKind.Object
+                ? ReadJsonString(item, "label")
+                  ?? ReadJsonString(item, "name")
+                  ?? ReadJsonString(item, "text")
+                  ?? code
+                : code;
+
+            rows.Add(new RuntimeOption(code, string.IsNullOrWhiteSpace(label) ? code : label));
+        }
+
+        return rows.ToArray();
+    }
+
+    private static bool RuntimeRangeContains(JsonElement item, int rowIndex, int columnIndex)
+    {
+        var r0 = ReadJsonInt(item, "r0") ?? ReadJsonInt(item, "R0");
+        var c0 = ReadJsonInt(item, "c0") ?? ReadJsonInt(item, "C0");
+        var r1 = ReadJsonInt(item, "r1") ?? ReadJsonInt(item, "R1");
+        var c1 = ReadJsonInt(item, "c1") ?? ReadJsonInt(item, "C1");
+        return r0.HasValue && c0.HasValue && r1.HasValue && c1.HasValue &&
+               rowIndex >= r0.Value && rowIndex <= r1.Value &&
+               columnIndex >= c0.Value && columnIndex <= c1.Value;
+    }
+
+    private static string NormalizeRuntimeFieldDataType(string? fieldType)
+        => fieldType?.Trim() switch
+        {
+            "number" => RuntimeDataTypeNumber,
+            "date" => RuntimeDataTypeDate,
+            "fullDate" => RuntimeDataTypeFullDate,
+            "boolean" => RuntimeDataTypeBoolean,
+            "longText" => RuntimeDataTypeStringList,
+            "stringList" => RuntimeDataTypeStringList,
+            "singleSelect" => RuntimeDataTypeShortText,
+            "multiSelect" => RuntimeDataTypeShortTextList,
+            _ => RuntimeDataTypeShortText
+        };
+
+    private static string NormalizeRuntimeDataType(string? value)
+    {
+        var normalized = value?.Trim().ToUpperInvariant();
+        return normalized switch
+        {
+            RuntimeDataTypeNumber or "DECIMAL" or "NUMERIC" => RuntimeDataTypeNumber,
+            RuntimeDataTypeDate => RuntimeDataTypeDate,
+            RuntimeDataTypeFullDate or "FULLDATE" or "STRICT_DATE" => RuntimeDataTypeFullDate,
+            RuntimeDataTypeBoolean or "BOOL" => RuntimeDataTypeBoolean,
+            RuntimeDataTypeShortText or "TEXT" or "STRING" or "SHORTTEXT" => RuntimeDataTypeShortText,
+            RuntimeDataTypeLongText or "LONGTEXT" => RuntimeDataTypeStringList,
+            RuntimeDataTypeStringList or "STRINGLIST" => RuntimeDataTypeStringList,
+            RuntimeDataTypeShortTextList or "MULTI_SELECT" or "MULTISELECT" => RuntimeDataTypeShortTextList,
+            _ => RuntimeDataTypeNumber
+        };
+    }
+
+    private static bool IsRuntimeValueValid(
+        object? value,
+        string dataType,
+        IReadOnlyCollection<RuntimeOption>? options = null)
+    {
+        if (IsBlankRuntimeValue(value))
+            return true;
+
+        if (value is JsonElement element)
+            return IsJsonRuntimeValueValid(element, dataType, options);
+
+        return dataType switch
+        {
+            RuntimeDataTypeNumber => IsRuntimeNumber(value),
+            RuntimeDataTypeDate => value is string text && IsRuntimeDateTextValid(text, requireFullDate: false),
+            RuntimeDataTypeFullDate => value is string text && IsRuntimeDateTextValid(text, requireFullDate: true),
+            RuntimeDataTypeBoolean => value is bool ||
+                                      IsRuntimeZeroOrOneNumber(value) ||
+                                      value is string text && TryParseRuntimeBooleanText(text, out _),
+            RuntimeDataTypeShortText => IsRuntimeShortTextValueValid(value, options),
+            RuntimeDataTypeShortTextList => IsRuntimeShortTextListValueValid(value, options),
+            RuntimeDataTypeStringList or RuntimeDataTypeLongText => IsRuntimeFreeStringListValueValid(value),
+            _ => true
+        };
+    }
+
+    private static bool IsJsonRuntimeValueValid(
+        JsonElement value,
+        string dataType,
+        IReadOnlyCollection<RuntimeOption>? options = null)
+    {
+        if (IsBlankJsonElement(value))
+            return true;
+
+        return dataType switch
+        {
+            RuntimeDataTypeNumber => value.ValueKind == JsonValueKind.Number ||
+                                     value.ValueKind == JsonValueKind.String && IsRuntimeNumberText(value.GetString()),
+            RuntimeDataTypeDate => value.ValueKind == JsonValueKind.String &&
+                                   IsRuntimeDateTextValid(value.GetString(), requireFullDate: false),
+            RuntimeDataTypeFullDate => value.ValueKind == JsonValueKind.String &&
+                                       IsRuntimeDateTextValid(value.GetString(), requireFullDate: true),
+            RuntimeDataTypeBoolean => value.ValueKind is JsonValueKind.True or JsonValueKind.False ||
+                                      value.ValueKind == JsonValueKind.Number && IsRuntimeZeroOrOneNumber(value) ||
+                                      value.ValueKind == JsonValueKind.String && TryParseRuntimeBooleanText(value.GetString(), out _),
+            RuntimeDataTypeShortText => IsRuntimeShortTextJsonValid(value, options),
+            RuntimeDataTypeShortTextList => IsRuntimeShortTextListJsonValid(value, options),
+            RuntimeDataTypeStringList or RuntimeDataTypeLongText => IsRuntimeFreeStringListJsonValid(value),
+            _ => true
+        };
+    }
+
+    private static bool IsRuntimeShortTextValueValid(
+        object? value,
+        IReadOnlyCollection<RuntimeOption>? options)
+    {
+        if (value is string text)
+            return RuntimeOptionContains(options, text);
+
+        if (value is JsonElement element)
+            return IsRuntimeShortTextJsonValid(element, options);
+
+        return false;
+    }
+
+    private static bool IsRuntimeShortTextJsonValid(
+        JsonElement value,
+        IReadOnlyCollection<RuntimeOption>? options)
+    {
+        return value.ValueKind == JsonValueKind.String &&
+               RuntimeOptionContains(options, value.GetString());
+    }
+
+    private static bool IsRuntimeShortTextListValueValid(
+        object? value,
+        IReadOnlyCollection<RuntimeOption>? options)
+    {
+        if (value is IEnumerable<string> list)
+            return list.All(item => RuntimeOptionContains(options, item));
+
+        if (value is JsonElement element)
+            return IsRuntimeShortTextListJsonValid(element, options);
+
+        return false;
+    }
+
+    private static bool IsRuntimeShortTextListJsonValid(
+        JsonElement value,
+        IReadOnlyCollection<RuntimeOption>? options)
+    {
+        return value.ValueKind == JsonValueKind.Array &&
+               value.EnumerateArray().All(item =>
+                   item.ValueKind == JsonValueKind.String &&
+                   RuntimeOptionContains(options, item.GetString()));
+    }
+
+    private static bool IsRuntimeFreeStringListValueValid(object? value)
+    {
+        if (value is string)
+            return true;
+        if (value is IEnumerable<string>)
+            return true;
+        if (value is JsonElement element)
+            return IsRuntimeFreeStringListJsonValid(element);
+        return false;
+    }
+
+    private static bool IsRuntimeFreeStringListJsonValid(JsonElement value)
+    {
+        if (value.ValueKind == JsonValueKind.String)
+            return true;
+
+        return value.ValueKind == JsonValueKind.Array &&
+               value.EnumerateArray().All(item => item.ValueKind == JsonValueKind.String);
+    }
+
+    private static bool RuntimeOptionContains(
+        IReadOnlyCollection<RuntimeOption>? options,
+        string? value)
+    {
+        if (options is null || options.Count == 0 || string.IsNullOrWhiteSpace(value))
+            return false;
+
+        var normalized = value.Trim();
+        return options.Any(option =>
+            string.Equals(option.Code, normalized, StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(option.Label, normalized, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static bool IsBlankRuntimeValue(object? value)
+        => value switch
+        {
+            null => true,
+            string text => string.IsNullOrWhiteSpace(text),
+            JsonElement element => IsBlankJsonElement(element),
+            _ => false
+        };
+
+    private static bool IsBlankJsonElement(JsonElement value)
+        => value.ValueKind switch
+        {
+            JsonValueKind.Undefined or JsonValueKind.Null => true,
+            JsonValueKind.String => string.IsNullOrWhiteSpace(value.GetString()),
+            JsonValueKind.Array => !value.EnumerateArray().Any(item =>
+                item.ValueKind != JsonValueKind.String || !string.IsNullOrWhiteSpace(item.GetString())),
+            _ => false
+        };
+
+    private static bool IsRuntimeNumber(object? value)
+        => value switch
+        {
+            byte or sbyte or short or ushort or int or uint or long or ulong or decimal => true,
+            float f => float.IsFinite(f),
+            double d => double.IsFinite(d),
+            string text => IsRuntimeNumberText(text),
+            JsonElement element => IsJsonRuntimeValueValid(element, RuntimeDataTypeNumber),
+            _ => false
+        };
+
+    private static bool IsRuntimeNumberText(string? text)
+        => !string.IsNullOrWhiteSpace(text) &&
+           decimal.TryParse(text.Trim(), NumberStyles.Number, CultureInfo.InvariantCulture, out _);
+
+    private static bool IsRuntimeZeroOrOneNumber(object? value)
+    {
+        if (value is JsonElement element)
+        {
+            if (element.ValueKind == JsonValueKind.Number && element.TryGetDecimal(out var n))
+                return n == 0m || n == 1m;
+            return false;
+        }
+
+        if (!IsRuntimeNumber(value))
+            return false;
+
+        var text = Convert.ToString(value, CultureInfo.InvariantCulture);
+        return decimal.TryParse(text, NumberStyles.Number, CultureInfo.InvariantCulture, out var parsed) &&
+               (parsed == 0m || parsed == 1m);
+    }
+
+    private static bool TryParseRuntimeBooleanText(string? text, out bool value)
+    {
+        var normalized = text?.Trim().ToLowerInvariant();
+        if (normalized is "true" or "1" or "yes" or "y" or "co" or "có")
+        {
+            value = true;
+            return true;
+        }
+
+        if (normalized is "false" or "0" or "no" or "n" or "khong" or "không")
+        {
+            value = false;
+            return true;
+        }
+
+        value = false;
+        return false;
+    }
+
+    private static bool IsRuntimeDateTextValid(string? text, bool requireFullDate)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return true;
+
+        var trimmed = text.Trim();
+        var full = RuntimeFullDateRegex.Match(trimmed);
+        if (full.Success)
+        {
+            var day = int.Parse(full.Groups[1].Value, CultureInfo.InvariantCulture);
+            var month = int.Parse(full.Groups[2].Value, CultureInfo.InvariantCulture);
+            var year = int.Parse(full.Groups[3].Value, CultureInfo.InvariantCulture);
+            return IsRuntimeDatePartValid(year, month, day);
+        }
+
+        if (requireFullDate)
+            return false;
+
+        var monthOnly = RuntimeMonthDateRegex.Match(trimmed);
+        if (monthOnly.Success)
+        {
+            var month = int.Parse(monthOnly.Groups[1].Value, CultureInfo.InvariantCulture);
+            var year = int.Parse(monthOnly.Groups[2].Value, CultureInfo.InvariantCulture);
+            return IsRuntimeYearValid(year) && month is >= 1 and <= 12;
+        }
+
+        var yearOnly = RuntimeYearDateRegex.Match(trimmed);
+        return yearOnly.Success &&
+               IsRuntimeYearValid(int.Parse(yearOnly.Groups[1].Value, CultureInfo.InvariantCulture));
+    }
+
+    private static bool IsRuntimeDatePartValid(int year, int month, int day)
+        => IsRuntimeYearValid(year) &&
+           month is >= 1 and <= 12 &&
+           day >= 1 &&
+           day <= DateTime.DaysInMonth(year, month);
+
+    private static bool IsRuntimeYearValid(int year)
+        => year is >= 1 and <= 9999;
+
+    private static JsonDocument? TryParseRuntimeJsonObject(string? json)
+    {
+        if (string.IsNullOrWhiteSpace(json))
+            return null;
+
+        try
+        {
+            var document = JsonDocument.Parse(json);
+            if (document.RootElement.ValueKind == JsonValueKind.Object)
+                return document;
+
+            document.Dispose();
+            return null;
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
+    private static List<object?> DeserializeRawValues1D(string? json)
+    {
+        if (string.IsNullOrWhiteSpace(json))
+            return new List<object?>();
+
+        try
+        {
+            using var document = JsonDocument.Parse(json);
+            if (document.RootElement.ValueKind != JsonValueKind.Array)
+                return new List<object?>();
+
+            return document.RootElement.EnumerateArray().Select(ToRuntimeObject).ToList();
+        }
+        catch (JsonException)
+        {
+            return new List<object?>();
+        }
+    }
+
+    private static object? ToRuntimeObject(JsonElement value)
+        => value.ValueKind switch
+        {
+            JsonValueKind.Null or JsonValueKind.Undefined => null,
+            JsonValueKind.String => value.GetString(),
+            JsonValueKind.Number when value.TryGetDecimal(out var number) => number,
+            JsonValueKind.True => true,
+            JsonValueKind.False => false,
+            _ => value.Clone()
+        };
+
+    private static AppException InvalidReportRuntimeValue(
+        WorkAssignmentReport report,
+        string scope,
+        string? fieldName,
+        string? blockId,
+        int? rowIndex,
+        int? columnIndex,
+        string dataType,
+        object? value,
+        string? reason = null)
+        => AppExceptionFactory.BadRequest(
+            AppErrorCode.WORK_ASSIGNMENT_REPORT_VALUES_INVALID,
+            new
+            {
+                reportId = report.Id,
+                report.WorkId,
+                report.WorkAssignmentId,
+                report.WorkReportPeriodId,
+                report.DynamicFormTemplateId,
+                scope,
+                fieldName,
+                blockId,
+                rowIndex,
+                columnIndex,
+                cellRef = rowIndex.HasValue && columnIndex.HasValue ? RuntimeCellRef(rowIndex.Value, columnIndex.Value) : null,
+                dataType,
+                expectedFormat = RuntimeDataTypeFormat(dataType),
+                reason,
+                value = RuntimeDebugValue(value)
+            });
+
+    private static AppException InvalidReportRuntimePayload(
+        WorkAssignmentReport report,
+        string scope,
+        string reason)
+        => AppExceptionFactory.BadRequest(
+            AppErrorCode.WORK_ASSIGNMENT_REPORT_VALUES_INVALID,
+            new
+            {
+                reportId = report.Id,
+                report.WorkId,
+                report.WorkAssignmentId,
+                report.WorkReportPeriodId,
+                report.DynamicFormTemplateId,
+                scope,
+                reason
+            });
+
+    private static AppException RuntimeTableValuesInvalid(
+        WorkAssignmentReport report,
+        string reason,
+        object? extra = null)
+        => AppExceptionFactory.BadRequest(
+            AppErrorCode.WORK_ASSIGNMENT_REPORT_TABLE_VALUES_JSON_INVALID,
+            new
+            {
+                reportId = report.Id,
+                report.WorkId,
+                report.WorkAssignmentId,
+                report.WorkReportPeriodId,
+                report.DynamicFormTemplateId,
+                reason,
+                extra
+            });
+
+    private static string RuntimeDataTypeFormat(string dataType)
+        => dataType switch
+        {
+            RuntimeDataTypeDate => "dd/MM/yyyy, MM/yyyy hoặc yyyy",
+            RuntimeDataTypeFullDate => "dd/MM/yyyy",
+            RuntimeDataTypeNumber => "number",
+            RuntimeDataTypeBoolean => "true/false hoặc 1/0",
+            RuntimeDataTypeShortText => "mã enum SHORT_TEXT",
+            RuntimeDataTypeShortTextList => "mảng mã enum MULTI_SELECT",
+            RuntimeDataTypeStringList or RuntimeDataTypeLongText => "string[]",
+            _ => dataType
+        };
+
+    private static object? RuntimeDebugValue(object? value)
+    {
+        if (value is not JsonElement element)
+            return value;
+
+        return element.ValueKind switch
+        {
+            JsonValueKind.String => element.GetString(),
+            JsonValueKind.Number => element.GetRawText(),
+            JsonValueKind.True => true,
+            JsonValueKind.False => false,
+            JsonValueKind.Null or JsonValueKind.Undefined => null,
+            _ => element.GetRawText()
+        };
+    }
+
+    private static string RuntimeCellRef(int rowIndex, int columnIndex)
+        => $"{RuntimeColumnRef(columnIndex)}{rowIndex + 1}";
+
+    private static string RuntimeColumnRef(int columnIndex)
+    {
+        var text = string.Empty;
+        var n = Math.Max(0, columnIndex) + 1;
+        while (n > 0)
+        {
+            var mod = (n - 1) % 26;
+            text = (char)('A' + mod) + text;
+            n = (n - 1) / 26;
+        }
+
+        return text;
     }
 
     private static List<RuntimeRowLabelPayload> ExtractRuntimeRowLabelPayloads(
@@ -2400,11 +3618,11 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         }
     }
 
-    private static Dictionary<string, HashSet<string>> BuildAllowedRowLabelsByBlock(
+    private static Dictionary<string, AllowedRowLabelConfig> BuildAllowedRowLabelsByBlock(
         DynamicFormTemplate? form,
         WorkAssignmentReport report)
     {
-        var result = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
+        var result = new Dictionary<string, AllowedRowLabelConfig>(StringComparer.Ordinal);
         if (form is null)
             return result;
 
@@ -2415,7 +3633,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
 
     private static void AddAllowedRowLabelsFromJson(
         string? json,
-        Dictionary<string, HashSet<string>> target,
+        Dictionary<string, AllowedRowLabelConfig> target,
         WorkAssignmentReport report)
     {
         if (string.IsNullOrWhiteSpace(json))
@@ -2442,7 +3660,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
 
     private static void AddAllowedRowLabelsFromBlock(
         JsonElement block,
-        Dictionary<string, HashSet<string>> target,
+        Dictionary<string, AllowedRowLabelConfig> target,
         WorkAssignmentReport report)
     {
         if (block.ValueKind != JsonValueKind.Object)
@@ -2458,14 +3676,34 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         if (codes.Count == 0)
             return;
 
-        if (!target.TryGetValue(blockId, out var set))
+        var dataType = ResolveAllowedRowLabelDataType(block, report);
+        if (!target.TryGetValue(blockId, out var config))
         {
-            set = new HashSet<string>(StringComparer.Ordinal);
-            target[blockId] = set;
+            config = new AllowedRowLabelConfig(new HashSet<string>(StringComparer.Ordinal), dataType);
+            target[blockId] = config;
+        }
+        else if (string.IsNullOrWhiteSpace(config.DataType) && !string.IsNullOrWhiteSpace(dataType))
+        {
+            target[blockId] = config with { DataType = dataType };
         }
 
         foreach (var code in codes)
-            set.Add(code);
+            target[blockId].Codes.Add(code);
+    }
+
+    private static string? ResolveAllowedRowLabelDataType(JsonElement block, WorkAssignmentReport report)
+    {
+        var explicitType = ReadJsonString(block, "rowLabelDataType")
+                           ?? ReadJsonString(block, "rowLabelTargetDataType")
+                           ?? ReadJsonString(block, "targetDataType")
+                           ?? ReadJsonString(block, "labelDataType")
+                           ?? ReadJsonString(block, "defaultDataType")
+                           ?? ReadJsonString(block, "dataType");
+
+        if (!string.IsNullOrWhiteSpace(explicitType))
+            return LabelDataTypes.Normalize(explicitType);
+
+        return LabelDataTypes.Number;
     }
 
     private static bool TryGetJsonProperty(JsonElement element, string name, out JsonElement value)
@@ -2554,6 +3792,12 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                     dynamicFormTemplateId = x.DynamicFormTemplateId
                 });
 
+        var assignment = await _ctx.WorkAssignments
+            .Find(a => a.Id == x.WorkAssignmentId && !a.IsDeleted)
+            .FirstOrDefaultAsync(ct);
+        var completedDatePolicy = ResolveReportCompletedDatePolicy(assignment, x, period, DateTime.UtcNow);
+        var payload = await _payloadReader.LoadReportPayloadAsync(x, ct);
+
         return new WorkAssignmentReportResponse
         {
             Id = x.Id,
@@ -2569,6 +3813,11 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             LinkedScheduledPeriodId = x.LinkedScheduledPeriodId ?? period?.LinkedScheduledPeriodId,
             StartedDate = x.StartedDate ?? period?.StartedDate,
             CompletedDate = x.CompletedDate ?? period?.CompletedDate,
+            CanEditCompletedDate = completedDatePolicy.CanEditCompletedDate,
+            RequiresCompletedDate = completedDatePolicy.RequiresCompletedDate,
+            CompletedDateMin = completedDatePolicy.CompletedDateMin,
+            CompletedDateMax = completedDatePolicy.CompletedDateMax,
+            CompletedDatePolicyReason = completedDatePolicy.Reason,
             IsHistoricalData = x.IsHistoricalData || period?.IsHistoricalData == true,
             HistoricalDataApproved = x.HistoricalDataApproved || period?.HistoricalDataApproved == true,
             HistoricalDataApprovedAtUtc = x.HistoricalDataApprovedAtUtc ?? period?.HistoricalDataApprovedAtUtc,
@@ -2585,10 +3834,6 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             DynamicExcelTemplateId = x.DynamicExcelTemplateId,
             DynamicExcelTemplateCode = x.DynamicExcelTemplateCode,
             DynamicExcelTemplateName = x.DynamicExcelTemplateName,
-            TableKind = NormalizeDynamicExcelTableKind(x.DynamicExcelTableKind ?? template.TableKind),
-            RecordTableSpecJson = string.IsNullOrWhiteSpace(x.RecordTableSpecJson)
-                ? template.RecordTableSpecJson
-                : x.RecordTableSpecJson,
             DynamicFormTemplateId = x.DynamicFormTemplateId ?? period?.DynamicFormTemplateId,
             DynamicFormTemplateCode = x.DynamicFormTemplateCode ?? period?.DynamicFormTemplateCode,
             DynamicFormTemplateName = x.DynamicFormTemplateName ?? period?.DynamicFormTemplateName,
@@ -2601,13 +3846,13 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             W = x.W,
             H = x.H,
 
-            Values1DJson = x.Values1DJson,
-            FieldValuesJson = x.FieldValuesJson,
-            TableValuesJson = x.TableValuesJson,
+            Values1DJson = payload.Values1DJson,
+            FieldValuesJson = payload.FieldValuesJson,
+            TableValuesJson = payload.TableValuesJson,
             DataOrigin = WorkReportDataOrigin.Normalize(x.DataOrigin),
             CumulativeContributionMode = WorkReportCumulativeContributionMode.Normalize(x.CumulativeContributionMode),
             CumulativeContributionPolicyJson = x.CumulativeContributionPolicyJson,
-            SummarySourceJson = x.SummarySourceJson,
+            SummarySourceJson = payload.SummarySourceJson,
             AggregateSourceReportIds = x.AggregateSourceReportIds ?? new List<string>(),
             AggregateSourceAssignmentIds = x.AggregateSourceAssignmentIds ?? new List<string>(),
             AggregateSourceUpdatedAtUtc = x.AggregateSourceUpdatedAtUtc,
@@ -2643,13 +3888,45 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             ReturnedByUserId = x.ReturnedByUserId,
             ApprovedAtUtc = x.ApprovedAtUtc,
             ApprovedByUserId = x.ApprovedByUserId,
+            AutoApproved = WorkAssignmentAutoApprovalState.IsAutoApproved(x),
+            AutoApprovedAtUtc = x.AutoApprovedAtUtc,
+            AutoApprovedByUserId = x.AutoApprovedByUserId,
+            AutoApproveConditionSnapshotJson = x.AutoApproveConditionSnapshotJson,
+            AutoApprovalLocked = WorkAssignmentAutoApprovalState.IsLocked(x),
+            AutoApprovalConfirmedAtUtc = x.AutoApprovalConfirmedAtUtc,
+            AutoApprovalConfirmedByUserId = x.AutoApprovalConfirmedByUserId,
 
             CreatedAtUtc = x.CreatedAtUtc,
             UpdatedAtUtc = x.UpdatedAtUtc
         };
     }
 
+    private async Task HydrateReportPayloadAsync(
+        WorkAssignmentReport report,
+        CancellationToken ct)
+    {
+        var payload = await _payloadReader.LoadReportPayloadAsync(report, ct);
+        report.Values1DJson = payload.Values1DJson;
+        report.FieldValuesJson = payload.FieldValuesJson;
+        report.TableValuesJson = payload.TableValuesJson;
+        report.SummarySourceJson = payload.SummarySourceJson;
+    }
+
+    private static void ApplyPayloadMetadata(
+        WorkAssignmentReport report,
+        WorkReportPayloadWriteResult result,
+        DateTime updatedAtUtc)
+    {
+        report.PayloadRevision = result.PayloadRevision;
+        report.PayloadHash = result.PayloadHash;
+        report.PayloadSizeBytes = result.PayloadSizeBytes;
+        report.PayloadStatus = result.PayloadStatus;
+        report.PayloadUpdatedAtUtc = updatedAtUtc;
+    }
+
     private sealed record RuntimeRowLabelPayload(string BlockId, List<string> LabelCodes);
+
+    private sealed record AllowedRowLabelConfig(HashSet<string> Codes, string? DataType);
 
     private async Task InsertLogAsync(
         string workId,
@@ -2725,6 +4002,9 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
 
             if (ShouldRebuildApprovedStatistics(fromStatus, toStatus))
             {
+                if (string.Equals(toStatus, WorkAssignmentReportStatus.Approved.ToString(), StringComparison.OrdinalIgnoreCase))
+                    WorkReportPayloadConsistency.EnsureReadyForStatisticProjection(report);
+
                 await _labelStatistics.RebuildForReportAsync(report.Id, actorUserId, ct);
                 await _tableStatistics.RebuildForReportAsync(report.Id, actorUserId, ct);
                 await _fieldStatistics.RebuildForReportAsync(report.Id, actorUserId, ct);
@@ -3413,12 +4693,26 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             clearExisting);
         var sourceSnapshot = ExtractAggregateSourceSnapshot(summarySourceJson);
         var now = DateTime.UtcNow;
+        var payloadResult = await _payloadWriter.SaveReportPayloadAsync(
+            report,
+            values1DJson,
+            report.FieldValuesJson,
+            tableValuesJson,
+            summarySourceJson,
+            actorUserId,
+            now,
+            ct);
 
         await _ctx.WorkAssignmentReports.UpdateOneAsync(
             x => x.Id == report.Id && !x.IsDeleted,
             Builders<WorkAssignmentReport>.Update
                 .Set(x => x.Values1DJson, values1DJson)
                 .Set(x => x.TableValuesJson, tableValuesJson)
+                .Set(x => x.PayloadRevision, payloadResult.PayloadRevision)
+                .Set(x => x.PayloadHash, payloadResult.PayloadHash)
+                .Set(x => x.PayloadSizeBytes, payloadResult.PayloadSizeBytes)
+                .Set(x => x.PayloadStatus, payloadResult.PayloadStatus)
+                .Set(x => x.PayloadUpdatedAtUtc, now)
                 .Set(x => x.DataOrigin, dataOrigin)
                 .Set(x => x.CumulativeContributionMode, WorkReportDataOrigin.DefaultContributionMode(dataOrigin))
                 .Set(x => x.CumulativeContributionPolicyJson, contributionPolicyJson)
@@ -3436,6 +4730,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
 
         report.Values1DJson = values1DJson;
         report.TableValuesJson = tableValuesJson;
+        ApplyPayloadMetadata(report, payloadResult, now);
         report.DataOrigin = dataOrigin;
         report.CumulativeContributionMode = WorkReportDataOrigin.DefaultContributionMode(dataOrigin);
         report.CumulativeContributionPolicyJson = contributionPolicyJson;
@@ -3611,6 +4906,115 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
     private static DateTime? NormalizeDate(DateTime? value)
         => WorkAssignmentReportHistoricalDataHelper.NormalizeDate(value);
 
+    private sealed record ReportCompletedDatePolicy(
+        bool CanEditCompletedDate,
+        bool RequiresCompletedDate,
+        DateTime? CompletedDateMin,
+        DateTime? CompletedDateMax,
+        string Reason);
+
+    private static ReportCompletedDatePolicy ResolveReportCompletedDatePolicy(
+        WorkAssignment? assignment,
+        WorkAssignmentReport? report,
+        WorkReportPeriod? period,
+        DateTime now)
+    {
+        if (assignment is null)
+            return new ReportCompletedDatePolicy(false, false, null, null, "ASSIGNMENT_NOT_FOUND");
+
+        var periodKind = NormalizePeriodKind(report?.PeriodKind ?? period?.PeriodKind);
+        var reportDate = NormalizeDate(report?.ReportDate ?? period?.ReportDate);
+        var sourceStart = NormalizeDate(report?.PeriodStart ?? period?.PeriodStart ?? reportDate);
+        var sourceEnd = NormalizeDate(report?.PeriodEnd ?? period?.PeriodEnd ?? reportDate ?? sourceStart);
+
+        if (sourceStart.HasValue && sourceEnd.HasValue && sourceEnd.Value < sourceStart.Value)
+            (sourceStart, sourceEnd) = (sourceEnd, sourceStart);
+
+        if (WorkAssignmentReportHistoricalDataHelper.IsHistoricalUserCreatedData(
+                periodKind,
+                reportDate,
+                sourceStart,
+                sourceEnd,
+                now))
+        {
+            var min = sourceStart ?? reportDate ?? sourceEnd;
+            var max = sourceEnd ?? reportDate ?? sourceStart ?? now.Date;
+            return new ReportCompletedDatePolicy(
+                true,
+                true,
+                min,
+                max,
+                "USER_CREATED_HISTORICAL");
+        }
+
+        if (WorkReportPeriodKind.IsUserCreated(periodKind))
+            return new ReportCompletedDatePolicy(false, false, null, null, "USER_CREATED_CURRENT");
+
+        var assignmentCreatedDate = assignment.CreatedAtUtc == default
+            ? now.Date
+            : assignment.CreatedAtUtc.Date;
+        var assignmentStartDate = NormalizeDate(assignment.StartDate) ?? assignmentCreatedDate;
+
+        if (assignmentStartDate >= assignmentCreatedDate ||
+            !sourceStart.HasValue ||
+            !sourceEnd.HasValue ||
+            sourceEnd.Value < assignmentStartDate ||
+            sourceStart.Value > assignmentCreatedDate)
+        {
+            return new ReportCompletedDatePolicy(false, false, null, null, "SCHEDULED_CURRENT");
+        }
+
+        var minDate = sourceStart.Value > assignmentStartDate
+            ? sourceStart.Value
+            : assignmentStartDate;
+        var maxDate = sourceEnd.Value < assignmentCreatedDate
+            ? sourceEnd.Value
+            : assignmentCreatedDate;
+
+        if (maxDate < minDate)
+            return new ReportCompletedDatePolicy(false, false, null, null, "SCHEDULED_CURRENT");
+
+        return new ReportCompletedDatePolicy(
+            true,
+            false,
+            minDate,
+            maxDate,
+            "ASSIGNMENT_BACKFILL_PERIOD");
+    }
+
+    private static DateTime? ValidateReportCompletedDateInput(
+        ReportCompletedDatePolicy policy,
+        DateTime? completedDate,
+        object details,
+        bool requireWhenMissing)
+    {
+        var normalized = NormalizeDate(completedDate);
+        if (!normalized.HasValue)
+        {
+            if (requireWhenMissing && policy.RequiresCompletedDate)
+                throw AppExceptionFactory.BadRequest(
+                    AppErrorCode.WORK_ASSIGNMENT_REPORT_HISTORICAL_COMPLETED_DATE_REQUIRED,
+                    details);
+
+            return null;
+        }
+
+        if (!policy.CanEditCompletedDate)
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_COMPLETED_DATE_NOT_ALLOWED,
+                new { completedDate = normalized, policy, details });
+
+        if ((policy.CompletedDateMin.HasValue && normalized.Value < policy.CompletedDateMin.Value.Date) ||
+            (policy.CompletedDateMax.HasValue && normalized.Value > policy.CompletedDateMax.Value.Date))
+        {
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_COMPLETED_DATE_OUT_OF_RANGE,
+                new { completedDate = normalized, policy, details });
+        }
+
+        return normalized.Value;
+    }
+
     private static void EnsureReportDateRange(
         DateTime? start,
         DateTime? end,
@@ -3664,7 +5068,67 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         return WorkAssignmentReportHistoricalDataHelper.ResolveApprovedPeriodStatus(period, report, now);
     }
 
+    private static string ResolveAutoApproveActorUserId(
+        WorkAssignment assignment,
+        string fallbackUserId)
+        => string.IsNullOrWhiteSpace(assignment.CreatedByUserId)
+            ? fallbackUserId
+            : assignment.CreatedByUserId;
+
     private async Task EnsurePreviousReportsApprovedAsync(
+        WorkReportPeriod? period,
+        CancellationToken ct)
+    {
+        if (period is null)
+            return;
+
+        var previousOpenPeriod = await FindPreviousOpenPeriodAsync(period, ct);
+        if (previousOpenPeriod is null)
+            return;
+
+        throw AppExceptionFactory.Create(
+            AppErrorCode.WORK_ASSIGNMENT_REPORT_PREVIOUS_PERIOD_OPEN,
+            new
+            {
+                periodId = period.Id,
+                periodInstanceKey = period.PeriodInstanceKey,
+                previousPeriodId = previousOpenPeriod.Id,
+                previousPeriodInstanceKey = previousOpenPeriod.PeriodInstanceKey,
+                previousPeriodStatus = previousOpenPeriod.Status
+            });
+    }
+
+    private async Task<WorkReportPeriod?> FindPreviousOpenPeriodAsync(
+        WorkReportPeriod? period,
+        CancellationToken ct)
+    {
+        if (period is null)
+            return null;
+
+        var fb = Builders<WorkReportPeriod>.Filter;
+        var filter = fb.Eq(x => x.WorkAssignmentId, period.WorkAssignmentId)
+                     & fb.Eq(x => x.AssigneeUserId, period.AssigneeUserId)
+                     & fb.Eq(x => x.PeriodKind, period.PeriodKind)
+                     & fb.Eq(x => x.IsDeleted, false)
+                     & fb.Ne(x => x.Id, period.Id);
+
+        if (!string.IsNullOrWhiteSpace(period.DynamicFormTemplateId))
+            filter &= fb.Eq(x => x.DynamicFormTemplateId, period.DynamicFormTemplateId);
+        else if (!string.IsNullOrWhiteSpace(period.DynamicExcelId))
+            filter &= fb.Eq(x => x.DynamicExcelId, period.DynamicExcelId);
+
+        var candidates = await _ctx.WorkReportPeriods
+            .Find(filter)
+            .ToListAsync(ct);
+
+        return candidates
+            .Where(candidate => ComparePeriodOrder(candidate, period) < 0)
+            .Where(candidate => !WorkReportPeriodStatusHelper.IsTerminal(candidate.Status))
+            .OrderBy(ResolvePeriodOrder)
+            .FirstOrDefault();
+    }
+
+    private async Task EnsureNoLaterApprovedReportsAsync(
         WorkReportPeriod? period,
         CancellationToken ct)
     {
@@ -3687,22 +5151,22 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             .Find(filter)
             .ToListAsync(ct);
 
-        var previousOpenPeriod = candidates
-            .Where(candidate => ComparePeriodOrder(candidate, period) < 0)
-            .Where(candidate => !WorkReportPeriodStatusHelper.IsTerminal(candidate.Status))
+        var laterApprovedPeriod = candidates
+            .Where(candidate => ComparePeriodOrder(candidate, period) > 0)
+            .Where(candidate => WorkReportPeriodStatusHelper.IsTerminal(candidate.Status))
             .OrderBy(ResolvePeriodOrder)
             .FirstOrDefault();
 
-        if (previousOpenPeriod is not null)
+        if (laterApprovedPeriod is not null)
             throw AppExceptionFactory.Create(
-                AppErrorCode.WORK_ASSIGNMENT_REPORT_PREVIOUS_PERIOD_OPEN,
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_LATER_PERIOD_APPROVED,
                 new
                 {
                     periodId = period.Id,
                     periodInstanceKey = period.PeriodInstanceKey,
-                    previousPeriodId = previousOpenPeriod.Id,
-                    previousPeriodInstanceKey = previousOpenPeriod.PeriodInstanceKey,
-                    previousPeriodStatus = previousOpenPeriod.Status
+                    laterPeriodId = laterApprovedPeriod.Id,
+                    laterPeriodInstanceKey = laterApprovedPeriod.PeriodInstanceKey,
+                    laterPeriodStatus = laterApprovedPeriod.Status
                 });
     }
 
@@ -3746,8 +5210,6 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             Code = template.Code,
             Name = template.Name,
             SpecJson = template.SpecJson,
-            TableKind = NormalizeDynamicExcelTableKind(template.TableKind),
-            RecordTableSpecJson = template.RecordTableSpecJson,
             RawWorkbookDataJson = template.RawWorkbookDataJson,
             DataRectR0 = template.DataRectR0,
             DataRectC0 = template.DataRectC0,
@@ -3766,6 +5228,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             StartDate = assignment.Schedule?.StartDate,
             AssignmentStartDate = assignment.StartDate,
             AssignmentCompletedDate = assignment.CompletedDate,
+            AssignmentDueDate = assignment.DueDate,
             WeekDays = assignment.Schedule?.WeekDays?.ToArray() ?? Array.Empty<int>(),
             MonthDays = assignment.Schedule?.MonthDays?.ToArray() ?? Array.Empty<int>(),
             QuarterDays = assignment.Schedule?.QuarterDays?.ToArray() ?? Array.Empty<int>(),
@@ -3781,13 +5244,13 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         return Enumerable.Range(0, len).Select(_ => (decimal?)null).ToList();
     }
 
-    private static string NormalizeDynamicExcelTableKind(string? value)
-        => string.Equals(value?.Trim(), DynamicExcelTableKind.RecordTable, StringComparison.OrdinalIgnoreCase)
-            ? DynamicExcelTableKind.RecordTable
-            : DynamicExcelTableKind.NumericGrid;
-
-    private static WorkReportPeriodRow MapToPeriodRow(WorkReportPeriod x)
+    private static WorkReportPeriodRow MapToPeriodRow(
+        WorkReportPeriod x,
+        WorkAssignment? assignment,
+        DateTime now)
     {
+        var completedDatePolicy = ResolveReportCompletedDatePolicy(assignment, null, x, now);
+
         return new WorkReportPeriodRow
         {
             Id = x.Id,
@@ -3806,6 +5269,11 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             LinkedScheduledPeriodId = x.LinkedScheduledPeriodId,
             StartedDate = x.StartedDate,
             CompletedDate = x.CompletedDate,
+            CanEditCompletedDate = completedDatePolicy.CanEditCompletedDate,
+            RequiresCompletedDate = completedDatePolicy.RequiresCompletedDate,
+            CompletedDateMin = completedDatePolicy.CompletedDateMin,
+            CompletedDateMax = completedDatePolicy.CompletedDateMax,
+            CompletedDatePolicyReason = completedDatePolicy.Reason,
             IsHistoricalData = x.IsHistoricalData,
             HistoricalDataApproved = x.HistoricalDataApproved,
             HistoricalDataApprovedAtUtc = x.HistoricalDataApprovedAtUtc,
@@ -3883,6 +5351,12 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             SubmittedByUserId = x.SubmittedByUserId,
             ApprovedAtUtc = x.ApprovedAtUtc,
             ApprovedByUserId = x.ApprovedByUserId,
+            AutoApproved = WorkAssignmentAutoApprovalState.IsAutoApproved(x),
+            AutoApprovedAtUtc = x.AutoApprovedAtUtc,
+            AutoApprovedByUserId = x.AutoApprovedByUserId,
+            AutoApprovalLocked = WorkAssignmentAutoApprovalState.IsLocked(x),
+            AutoApprovalConfirmedAtUtc = x.AutoApprovalConfirmedAtUtc,
+            AutoApprovalConfirmedByUserId = x.AutoApprovalConfirmedByUserId,
             CreatedAtUtc = x.CreatedAtUtc,
             UpdatedAtUtc = x.UpdatedAtUtc
         };
@@ -3938,6 +5412,12 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             ReturnReason = null,
             ApprovedAtUtc = x.ApprovedAtUtc,
             ApprovedByUserId = null,
+            AutoApproved = x.AutoApproved,
+            AutoApprovedAtUtc = x.AutoApprovedAtUtc,
+            AutoApprovedByUserId = x.AutoApprovedByUserId,
+            AutoApprovalLocked = x.AutoApprovalLocked,
+            AutoApprovalConfirmedAtUtc = x.AutoApprovalConfirmedAtUtc,
+            AutoApprovalConfirmedByUserId = x.AutoApprovalConfirmedByUserId,
             CreatedAtUtc = x.SourceCreatedAtUtc,
             UpdatedAtUtc = x.SortUpdatedAtUtc
         };
@@ -3956,6 +5436,62 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             throw AppExceptionFactory.BadRequest(
                 AppErrorCode.WORK_ASSIGNMENT_REPORT_INACTIVE,
                 ReportDetails(report));
+    }
+
+    private async Task EnsureReportMutationScopeOpenAsync(
+        WorkAssignment assignment,
+        string actorUserId,
+        CancellationToken ct)
+    {
+        var work = await _ctx.Works
+            .Find(x => x.Id == assignment.WorkId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct);
+
+        if (work is null ||
+            work.CompletedAtUtc.HasValue ||
+            work.Status == WorkStatus.S3 ||
+            IsAssignmentManuallyCompleted(assignment))
+        {
+            throw AppExceptionFactory.Create(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_SCOPE_COMPLETED_LOCKED,
+                new { assignmentId = assignment.Id, assignment.WorkId, actorUserId });
+        }
+
+        var ancestorIds = ResolveAncestorIds(assignment);
+        if (ancestorIds.Count == 0)
+            return;
+
+        var hasCompletedAncestor = await _ctx.WorkAssignments
+            .Find(x =>
+                ancestorIds.Contains(x.Id) &&
+                x.WorkId == assignment.WorkId &&
+                !x.IsDeleted &&
+                (x.CompletedAtUtc != null ||
+                 (x.ProgressStatus == (int)WorkAssignmentProgressStatus.Completed && x.CompletedDate != null)))
+            .Limit(1)
+            .AnyAsync(ct);
+
+        if (hasCompletedAncestor)
+            throw AppExceptionFactory.Create(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_SCOPE_COMPLETED_LOCKED,
+                new { assignmentId = assignment.Id, assignment.WorkId, actorUserId });
+    }
+
+    private static bool IsAssignmentManuallyCompleted(WorkAssignment assignment)
+        => assignment.CompletedAtUtc.HasValue ||
+           (assignment.ProgressStatus == (int)WorkAssignmentProgressStatus.Completed &&
+            assignment.CompletedDate.HasValue);
+
+    private static List<string> ResolveAncestorIds(WorkAssignment assignment)
+    {
+        if (string.IsNullOrWhiteSpace(assignment.Path))
+            return new List<string>();
+
+        return assignment.Path
+            .Split('/', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Where(x => !string.Equals(x, assignment.Id, StringComparison.Ordinal))
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
     }
 
     private static AppException ReportWorkIdRequired(string? workId)
@@ -4501,7 +6037,10 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
 
         try
         {
-            return JsonSerializer.Deserialize<List<decimal?>>(json, _jsonOptions) ?? new List<decimal?>();
+            using var document = JsonDocument.Parse(json);
+            return document.RootElement.ValueKind == JsonValueKind.Array
+                ? document.RootElement.EnumerateArray().Select(ToNullableDecimal).ToList()
+                : new List<decimal?>();
         }
         catch (JsonException)
         {
@@ -4976,6 +6515,35 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         string? TargetBlockId,
         bool? ClearExistingValues,
         List<int> TargetIndexes);
+
+    private readonly record struct RuntimeDataRect(
+        int R0,
+        int C0,
+        int R1,
+        int C1);
+
+    private sealed record RuntimeFieldContract(
+        string Id,
+        string Key,
+        string DisplayName,
+        string DataType,
+        bool Required,
+        RuntimeOption[] Options);
+
+    private sealed record RuntimeOption(
+        string Code,
+        string Label);
+
+    private sealed record RuntimeCellContract(
+        string DataType,
+        RuntimeOption[] Options);
+
+    private sealed record RuntimeTableBlockContract(
+        string BlockId,
+        int W,
+        int H,
+        RuntimeDataRect DataRect,
+        JsonElement Block);
 
     private sealed record DynamicFormAggregateDraftProjection(
         List<decimal?> TopLevelValues,

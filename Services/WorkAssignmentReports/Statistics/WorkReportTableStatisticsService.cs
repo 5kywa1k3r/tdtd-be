@@ -1,4 +1,6 @@
+using System.Globalization;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using MongoDB.Bson;
 using MongoDB.Driver;
 using tdtd_be.Common.Auth;
@@ -8,11 +10,15 @@ using tdtd_be.Models;
 using tdtd_be.Models.Enums;
 using tdtd_be.Models.Statistics;
 using tdtd_be.Services.WorkAssignmentReports;
+using tdtd_be.Services.WorkAssignmentReports.Payloads;
 
 namespace tdtd_be.Services.WorkAssignmentReports.Statistics;
 
 public sealed class WorkReportTableStatisticsService : IWorkReportTableStatisticsService
 {
+    private const int ShortTextBucketMaxLength = 200;
+    private static readonly Regex LabelCodeRegex = new("^[a-z0-9][a-z0-9_.-]{0,63}$", RegexOptions.Compiled);
+
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
         PropertyNameCaseInsensitive = true
@@ -20,11 +26,16 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
 
     private readonly MongoDbContext _ctx;
     private readonly MeAccessor _me;
+    private readonly IWorkReportPayloadReader _payloadReader;
 
-    public WorkReportTableStatisticsService(MongoDbContext ctx, MeAccessor me)
+    public WorkReportTableStatisticsService(
+        MongoDbContext ctx,
+        MeAccessor me,
+        IWorkReportPayloadReader payloadReader)
     {
         _ctx = ctx;
         _me = me;
+        _payloadReader = payloadReader;
     }
 
     public async Task RebuildForReportAsync(
@@ -66,6 +77,9 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
         var assignment = await _ctx.WorkAssignments
             .Find(x => x.Id == report.WorkAssignmentId && !x.IsDeleted)
             .FirstOrDefaultAsync(ct);
+        var period = await _ctx.WorkReportPeriods
+            .Find(x => x.Id == report.WorkReportPeriodId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct);
 
         await _ctx.WorkReportTableStatValues.DeleteManyAsync(
             x => x.WorkAssignmentReportId == report.Id,
@@ -88,7 +102,11 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
                 report.DynamicFormTemplateId);
         }
 
-        var metricValues = ExtractMetricValues(report.TableValuesJson)
+        var metricTargets = await LoadMetricTargetMapAsync(report.DynamicFormTemplateId, ct);
+        WorkReportPayloadConsistency.EnsureReadyForStatisticProjection(report);
+        var payload = await _payloadReader.LoadReportPayloadAsync(report, ct);
+        WorkReportPayloadConsistency.EnsureSnapshotFreshForStatisticProjection(report, payload);
+        var metricValues = ExtractMetricValues(payload.TableValuesJson, metricTargets)
             .Where(value => contributionPolicy.ShouldIncludeTableMetric(
                 value.BlockId,
                 value.MetricKey,
@@ -102,12 +120,17 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
             var actorId = NormalizeObjectIdOrNull(actorUserId);
             var ancestorAssignmentIds = ExtractAncestorAssignmentIds(assignment, report.WorkAssignmentId);
             var sourceWindow = WorkAssignmentReportTemporalPolicy.ResolveSourceWindow(report);
+            var projectionContext = WorkReportStatisticProjectionContextBuilder.From(report, assignment, period, payload);
 
             var rows = metricValues.Select(value => new WorkReportTableStatValue
             {
                 Id = ObjectId.GenerateNewId().ToString(),
                 WorkId = report.WorkId,
                 WorkAssignmentId = report.WorkAssignmentId,
+                AssigneeUserId = projectionContext.AssigneeUserId,
+                AssigneeUnitId = projectionContext.AssigneeUnitId,
+                AssignmentIsActive = projectionContext.AssignmentIsActive,
+                ReportIsActive = projectionContext.ReportIsActive,
                 RootAssignmentId = assignment?.RootAssignmentId,
                 AncestorAssignmentIds = ancestorAssignmentIds,
                 WorkReportPeriodId = report.WorkReportPeriodId,
@@ -119,9 +142,20 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
                 BlockId = value.BlockId,
                 TableMode = value.TableMode,
                 MetricKey = value.MetricKey,
+                MetricLabelCode = metricTargets.LabelByMetric.TryGetValue(
+                    BuildMetricLabelMapKey(value.BlockId, value.MetricKey),
+                    out var metricLabelCode)
+                    ? metricLabelCode
+                    : null,
                 RowKey = value.RowKey,
                 ColumnKey = value.ColumnKey,
                 SourceKey = value.SourceKey,
+                DataType = value.DataType,
+                BucketKey = value.BucketKey,
+                BucketLabel = value.BucketLabel,
+                TextValue = value.TextValue,
+                BooleanValue = value.BooleanValue,
+                DateValue = value.DateValue,
                 PeriodKey = report.PeriodKey,
                 PeriodInstanceKey = report.PeriodInstanceKey,
                 PeriodKind = report.PeriodKind,
@@ -131,7 +165,9 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
                 CompletedDate = sourceWindow.CompletedDate,
                 IsHistoricalData = sourceWindow.IsHistoricalData,
                 ReportStatus = (int)report.Status,
-                Value = value.Value,
+                Value = value.NumberValue ?? 0m,
+                SourcePayloadRevision = projectionContext.SourcePayloadRevision,
+                SourcePayloadHash = projectionContext.SourcePayloadHash,
                 CreatedAtUtc = now,
                 UpdatedAtUtc = now,
                 CreatedByUserId = actorId,
@@ -191,6 +227,9 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
                     value.BlockId,
                     value.TableMode,
                     value.MetricKey,
+                    value.MetricLabelCode,
+                    value.DataType,
+                    value.BucketKey,
                     value.PeriodInstanceKey,
                     value.ReportStatus);
 
@@ -212,8 +251,12 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
                             BlockId = value.BlockId,
                             TableMode = value.TableMode,
                             MetricKey = value.MetricKey,
+                            MetricLabelCode = value.MetricLabelCode,
                             RowKey = value.RowKey,
                             ColumnKey = value.ColumnKey,
+                            DataType = NormalizeDataType(value.DataType),
+                            BucketKey = value.BucketKey,
+                            BucketLabel = value.BucketLabel,
                             PeriodKey = value.PeriodKey,
                             PeriodInstanceKey = value.PeriodInstanceKey,
                             PeriodKind = value.PeriodKind,
@@ -332,17 +375,26 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
             BlockId = x.BlockId,
             TableMode = x.TableMode,
             MetricKey = x.MetricKey,
+            MetricLabelCode = x.MetricLabelCode,
             RowKey = x.RowKey,
             ColumnKey = x.ColumnKey,
+            DataType = NormalizeDataType(x.DataType),
+            BucketKey = x.BucketKey,
+            BucketLabel = x.BucketLabel,
             PeriodKey = x.PeriodKey,
             PeriodInstanceKey = x.PeriodInstanceKey,
             PeriodKind = x.PeriodKind,
             ReportStatus = x.ReportStatus,
             ValueCount = x.ValueCount,
-            Sum = x.ValueCount > 0 ? x.Sum : null,
+            NumericValueCount = x.NumericValueCount,
+            Sum = x.NumericValueCount > 0 ? x.Sum : null,
             Min = x.Min,
             Max = x.Max,
-            Average = x.ValueCount > 0 ? x.Sum / x.ValueCount : null,
+            Average = x.NumericValueCount > 0 ? x.Sum / x.NumericValueCount : null,
+            TrueCount = x.TrueCount,
+            FalseCount = x.FalseCount,
+            EarliestDateUtc = x.EarliestDateUtc,
+            LatestDateUtc = x.LatestDateUtc,
             ReportCount = x.ReportCount,
             UpdatedAtUtc = x.UpdatedAtUtc
         }).ToList();
@@ -418,6 +470,15 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
         if (!string.IsNullOrWhiteSpace(req.MetricKey))
             filter &= fb.Eq(x => x.MetricKey, req.MetricKey!.Trim());
 
+        if (!string.IsNullOrWhiteSpace(req.MetricLabelCode))
+            filter &= fb.Eq(x => x.MetricLabelCode, NormalizeLabelCode(req.MetricLabelCode));
+
+        if (!string.IsNullOrWhiteSpace(req.DataType))
+            filter &= fb.Eq(x => x.DataType, NormalizeDataType(req.DataType));
+
+        if (!string.IsNullOrWhiteSpace(req.BucketKey))
+            filter &= fb.Eq(x => x.BucketKey, req.BucketKey!.Trim());
+
         if (!string.IsNullOrWhiteSpace(req.PeriodKey))
             filter &= fb.Eq(x => x.PeriodKey, req.PeriodKey!.Trim());
 
@@ -428,6 +489,150 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
             filter &= fb.Eq(x => x.ReportStatus, req.ReportStatus.Value);
 
         return filter;
+    }
+
+    private async Task<MetricTargetMap> LoadMetricTargetMapAsync(
+        string? dynamicFormTemplateId,
+        CancellationToken ct)
+    {
+        var map = new MetricTargetMap();
+        if (string.IsNullOrWhiteSpace(dynamicFormTemplateId))
+            return map;
+
+        var form = await _ctx.DynamicFormTemplates
+            .Find(x => x.Id == dynamicFormTemplateId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct);
+        if (form is null)
+            return map;
+
+        AddMetricTargetsFromBlockJson(form.BlocksJson, map);
+        AddMetricTargetsFromBlockJson(form.ExcelBlockJson, map);
+        return map;
+    }
+
+    private static void AddMetricTargetsFromBlockJson(
+        string? blockJson,
+        MetricTargetMap map)
+    {
+        if (string.IsNullOrWhiteSpace(blockJson))
+            return;
+
+        try
+        {
+            using var document = JsonDocument.Parse(blockJson);
+            var root = document.RootElement;
+            if (root.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var block in root.EnumerateArray())
+                    AddMetricTargetsFromBlock(block, map);
+                return;
+            }
+
+            AddMetricTargetsFromBlock(root, map);
+        }
+        catch (JsonException)
+        {
+            return;
+        }
+    }
+
+    private static void AddMetricTargetsFromBlock(
+        JsonElement block,
+        MetricTargetMap map)
+    {
+        if (block.ValueKind != JsonValueKind.Object)
+            return;
+
+        var blockId = NormalizeBlockId(
+            ReadOptionalString(block, "blockId")
+            ?? ReadOptionalString(block, "id"));
+        var tableMode = NormalizeTableMode(ReadOptionalString(block, "tableMode"));
+        var hasDataRect = TryReadBlockDataRect(block, out var dataRect);
+
+        if (block.TryGetProperty("metricRules", out var rules)
+            && rules.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var rule in rules.EnumerateArray())
+            {
+                if (rule.ValueKind != JsonValueKind.Object)
+                    continue;
+
+                var metricKey = ReadOptionalString(rule, "metricKey");
+                if (!string.IsNullOrWhiteSpace(metricKey))
+                    map.AllowedMetrics.Add(BuildMetricLabelMapKey(blockId, metricKey));
+            }
+        }
+
+        if (!block.TryGetProperty("metricLabelTargets", out var targets)
+            || targets.ValueKind != JsonValueKind.Array)
+            return;
+
+        foreach (var target in targets.EnumerateArray())
+        {
+            if (target.ValueKind != JsonValueKind.Object)
+                continue;
+
+            var labelCode = NormalizeLabelCode(ReadOptionalString(target, "statisticLabelCode"));
+
+            var metricKey = ReadOptionalString(target, "metricKey");
+            if (!string.IsNullOrWhiteSpace(metricKey))
+            {
+                var key = BuildMetricLabelMapKey(blockId, metricKey);
+                map.AllowedMetrics.Add(key);
+                if (!string.IsNullOrWhiteSpace(labelCode))
+                    map.LabelByMetric.TryAdd(key, labelCode);
+                continue;
+            }
+
+            if (!TryReadMetricLabelRange(target, out var range) || !hasDataRect)
+                continue;
+
+            foreach (var mappedMetricKey in ExpandRangeMetricKeys(blockId, tableMode, dataRect, range))
+            {
+                var key = BuildMetricLabelMapKey(blockId, mappedMetricKey);
+                map.AllowedMetrics.Add(key);
+                if (!string.IsNullOrWhiteSpace(labelCode))
+                    map.LabelByMetric.TryAdd(key, labelCode);
+            }
+        }
+    }
+
+    private static IEnumerable<string> ExpandRangeMetricKeys(
+        string blockId,
+        string tableMode,
+        MetricLabelRange dataRect,
+        MetricLabelRange range)
+    {
+        var r0 = Math.Max(dataRect.R0, range.R0);
+        var c0 = Math.Max(dataRect.C0, range.C0);
+        var r1 = Math.Min(dataRect.R1, range.R1);
+        var c1 = Math.Min(dataRect.C1, range.C1);
+        if (r1 < r0 || c1 < c0)
+            yield break;
+
+        if (tableMode == "APPEND_ROWS")
+        {
+            for (var c = c0; c <= c1; c++)
+                yield return $"table:{blockId}.column:col_{c - dataRect.C0 + 1}";
+            yield break;
+        }
+
+        if (tableMode == "APPEND_COLUMNS")
+        {
+            for (var r = r0; r <= r1; r++)
+                yield return $"table:{blockId}.row:row_{r - dataRect.R0 + 1}";
+            yield break;
+        }
+
+        for (var r = r0; r <= r1; r++)
+        {
+            for (var c = c0; c <= c1; c++)
+            {
+                var rowKey = $"row_{r - dataRect.R0 + 1}";
+                var columnKey = $"col_{c - dataRect.C0 + 1}";
+                yield return BuildMetricKey(blockId, rowKey, columnKey);
+            }
+        }
     }
 
     private async Task EnsureCanReadScopeAsync(
@@ -518,6 +723,9 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
             BlockId = string.IsNullOrWhiteSpace(req.BlockId) ? null : NormalizeBlockId(req.BlockId),
             TableMode = string.IsNullOrWhiteSpace(req.TableMode) ? null : NormalizeTableMode(req.TableMode),
             MetricKey = string.IsNullOrWhiteSpace(req.MetricKey) ? null : req.MetricKey.Trim(),
+            MetricLabelCode = string.IsNullOrWhiteSpace(req.MetricLabelCode) ? null : NormalizeLabelCode(req.MetricLabelCode),
+            DataType = string.IsNullOrWhiteSpace(req.DataType) ? null : NormalizeDataType(req.DataType),
+            BucketKey = string.IsNullOrWhiteSpace(req.BucketKey) ? null : req.BucketKey.Trim(),
             PeriodKey = string.IsNullOrWhiteSpace(req.PeriodKey) ? null : req.PeriodKey.Trim(),
             PeriodInstanceKey = string.IsNullOrWhiteSpace(req.PeriodInstanceKey) ? null : req.PeriodInstanceKey.Trim(),
             ReportStatus = req.ReportStatus,
@@ -541,9 +749,11 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
         };
     }
 
-    private static List<ParsedMetricValue> ExtractMetricValues(string? tableValuesJson)
+    private static List<ParsedMetricValue> ExtractMetricValues(
+        string? tableValuesJson,
+        MetricTargetMap metricTargets)
     {
-        if (string.IsNullOrWhiteSpace(tableValuesJson))
+        if (string.IsNullOrWhiteSpace(tableValuesJson) || metricTargets.AllowedMetrics.Count == 0)
             return new List<ParsedMetricValue>();
 
         try
@@ -561,24 +771,24 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
 
                 if (tableMode == "APPEND_ROWS")
                 {
-                    rows.AddRange(ExtractAppendRows(block, blockId, dynamicExcelTemplateId));
+                    rows.AddRange(ExtractAppendRows(block, blockId, dynamicExcelTemplateId, metricTargets));
                     continue;
                 }
 
                 if (tableMode == "APPEND_COLUMNS")
                 {
-                    rows.AddRange(ExtractAppendColumns(block, blockId, dynamicExcelTemplateId));
+                    rows.AddRange(ExtractAppendColumns(block, blockId, dynamicExcelTemplateId, metricTargets));
                     continue;
                 }
 
                 if (tableMode == "MATRIX")
                 {
-                    rows.AddRange(ExtractMatrixCells(block, blockId, dynamicExcelTemplateId));
+                    rows.AddRange(ExtractMatrixCells(block, blockId, dynamicExcelTemplateId, metricTargets));
                     continue;
                 }
 
                 if (tableMode == "FIXED_GRID")
-                    rows.AddRange(ExtractFixedGrid(block, blockId, dynamicExcelTemplateId));
+                    rows.AddRange(ExtractFixedGrid(block, blockId, dynamicExcelTemplateId, metricTargets));
             }
 
             return rows;
@@ -592,40 +802,44 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
     private static IEnumerable<ParsedMetricValue> ExtractFixedGrid(
         TableValuesBlock block,
         string blockId,
-        string? dynamicExcelTemplateId)
+        string? dynamicExcelTemplateId,
+        MetricTargetMap metricTargets)
     {
         if (block.Values1D is not { Count: > 0 })
             yield break;
 
-        var metrics = NormalizeIndexMap(block.IndexMap, blockId);
+        var metrics = NormalizeMetricDefinitions(block.MetricDefinitions, blockId, "FIXED_GRID");
         if (metrics.Count == 0)
-            metrics = BuildFallbackMetricMap(blockId, block.W, block.H, block.Values1D.Count);
+            metrics = NormalizeIndexMap(block.IndexMap, blockId);
+        if (metrics.Count == 0)
+            metrics = BuildFallbackMetricMap(blockId, block.W, block.H, block.Values1D.Count, metricTargets);
 
         foreach (var metric in metrics)
         {
+            if (!metricTargets.Contains(blockId, metric.MetricKey))
+                continue;
+
             if (metric.Index < 0 || metric.Index >= block.Values1D.Count)
                 continue;
 
-            var value = ToNullableDecimal(block.Values1D[metric.Index]);
-            if (!value.HasValue)
-                continue;
-
-            yield return new ParsedMetricValue(
-                blockId,
-                "FIXED_GRID",
-                dynamicExcelTemplateId,
-                metric.MetricKey,
-                metric.RowKey,
-                metric.ColumnKey,
-                $"index:{metric.Index}",
-                value.Value);
+            foreach (var value in ParseTypedMetricValue(
+                         block.Values1D[metric.Index],
+                         metric,
+                         blockId,
+                         "FIXED_GRID",
+                         dynamicExcelTemplateId,
+                         $"index:{metric.Index}"))
+            {
+                yield return value;
+            }
         }
     }
 
     private static IEnumerable<ParsedMetricValue> ExtractAppendRows(
         TableValuesBlock block,
         string blockId,
-        string? dynamicExcelTemplateId)
+        string? dynamicExcelTemplateId,
+        MetricTargetMap metricTargets)
     {
         foreach (var row in block.Rows ?? new List<TableAppendRow>())
         {
@@ -635,20 +849,21 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
             var rowSource = NormalizeMetricPart(row.RowInstanceId, $"row:{row.RowOrder.GetValueOrDefault()}");
             foreach (var cell in row.Cells)
             {
-                var value = ToNullableDecimal(cell.Value);
-                if (!value.HasValue)
+                var columnKey = NormalizeMetricPart(cell.Key, "value");
+                var metric = ResolveAppendRowsMetric(block, blockId, columnKey);
+                if (!metricTargets.Contains(blockId, metric.MetricKey))
                     continue;
 
-                var columnKey = NormalizeMetricPart(cell.Key, "value");
-                yield return new ParsedMetricValue(
-                    blockId,
-                    "APPEND_ROWS",
-                    dynamicExcelTemplateId,
-                    $"table:{blockId}.column:{columnKey}",
-                    "APPEND_ROWS",
-                    columnKey,
-                    $"{rowSource}:{columnKey}",
-                    value.Value);
+                foreach (var value in ParseTypedMetricValue(
+                             cell.Value,
+                             metric,
+                             blockId,
+                             "APPEND_ROWS",
+                             dynamicExcelTemplateId,
+                             $"{rowSource}:{columnKey}"))
+                {
+                    yield return value;
+                }
             }
         }
     }
@@ -656,7 +871,8 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
     private static IEnumerable<ParsedMetricValue> ExtractAppendColumns(
         TableValuesBlock block,
         string blockId,
-        string? dynamicExcelTemplateId)
+        string? dynamicExcelTemplateId,
+        MetricTargetMap metricTargets)
     {
         foreach (var column in block.Columns ?? new List<TableAppendColumn>())
         {
@@ -666,20 +882,21 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
             var columnSource = NormalizeMetricPart(column.ColumnInstanceId, $"column:{column.ColumnOrder.GetValueOrDefault()}");
             foreach (var cell in column.Cells)
             {
-                var value = ToNullableDecimal(cell.Value);
-                if (!value.HasValue)
+                var rowKey = NormalizeMetricPart(cell.Key, "row");
+                var metric = ResolveAppendColumnsMetric(block, blockId, rowKey);
+                if (!metricTargets.Contains(blockId, metric.MetricKey))
                     continue;
 
-                var rowKey = NormalizeMetricPart(cell.Key, "row");
-                yield return new ParsedMetricValue(
-                    blockId,
-                    "APPEND_COLUMNS",
-                    dynamicExcelTemplateId,
-                    $"table:{blockId}.row:{rowKey}",
-                    rowKey,
-                    "APPEND_COLUMNS",
-                    $"{columnSource}:{rowKey}",
-                    value.Value);
+                foreach (var value in ParseTypedMetricValue(
+                             cell.Value,
+                             metric,
+                             blockId,
+                             "APPEND_COLUMNS",
+                             dynamicExcelTemplateId,
+                             $"{columnSource}:{rowKey}"))
+                {
+                    yield return value;
+                }
             }
         }
     }
@@ -687,30 +904,256 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
     private static IEnumerable<ParsedMetricValue> ExtractMatrixCells(
         TableValuesBlock block,
         string blockId,
-        string? dynamicExcelTemplateId)
+        string? dynamicExcelTemplateId,
+        MetricTargetMap metricTargets)
     {
         foreach (var cell in block.Cells ?? new List<TableMatrixCell>())
         {
-            var value = ToNullableDecimal(cell.Value);
-            if (!value.HasValue)
-                continue;
-
             var rowKey = NormalizeMetricPart(cell.RowKey, "row");
             var columnKey = NormalizeMetricPart(cell.ColumnKey, "column");
             var metricKey = string.IsNullOrWhiteSpace(cell.MetricKey)
                 ? BuildMetricKey(blockId, rowKey, columnKey)
                 : cell.MetricKey.Trim();
+            if (!metricTargets.Contains(blockId, metricKey))
+                continue;
 
-            yield return new ParsedMetricValue(
-                blockId,
-                "MATRIX",
-                dynamicExcelTemplateId,
-                metricKey,
-                rowKey,
-                columnKey,
-                metricKey,
-                value.Value);
+            var metric = ResolveMatrixMetric(block, blockId, rowKey, columnKey, metricKey);
+
+            foreach (var value in ParseTypedMetricValue(
+                         cell.Value,
+                         metric,
+                         blockId,
+                         "MATRIX",
+                         dynamicExcelTemplateId,
+                         metricKey))
+            {
+                yield return value;
+            }
         }
+    }
+
+    private static MetricContract ResolveAppendRowsMetric(
+        TableValuesBlock block,
+        string blockId,
+        string columnKey)
+    {
+        var definitions = NormalizeMetricDefinitions(block.MetricDefinitions, blockId, "APPEND_ROWS");
+        return definitions.FirstOrDefault(x => string.Equals(x.ColumnKey, columnKey, StringComparison.Ordinal))
+               ?? new MetricContract(
+                   0,
+                   "APPEND_ROWS",
+                   columnKey,
+                   $"table:{blockId}.column:{columnKey}",
+                   "NUMBER",
+                   Array.Empty<MetricOption>());
+    }
+
+    private static MetricContract ResolveAppendColumnsMetric(
+        TableValuesBlock block,
+        string blockId,
+        string rowKey)
+    {
+        var definitions = NormalizeMetricDefinitions(block.MetricDefinitions, blockId, "APPEND_COLUMNS");
+        return definitions.FirstOrDefault(x => string.Equals(x.RowKey, rowKey, StringComparison.Ordinal))
+               ?? new MetricContract(
+                   0,
+                   rowKey,
+                   "APPEND_COLUMNS",
+                   $"table:{blockId}.row:{rowKey}",
+                   "NUMBER",
+                   Array.Empty<MetricOption>());
+    }
+
+    private static MetricContract ResolveMatrixMetric(
+        TableValuesBlock block,
+        string blockId,
+        string rowKey,
+        string columnKey,
+        string metricKey)
+    {
+        var definitions = NormalizeMetricDefinitions(block.MetricDefinitions, blockId, "MATRIX");
+        return definitions.FirstOrDefault(x => string.Equals(x.MetricKey, metricKey, StringComparison.Ordinal))
+               ?? new MetricContract(
+                   0,
+                   rowKey,
+                   columnKey,
+                   metricKey,
+                   "NUMBER",
+                   Array.Empty<MetricOption>());
+    }
+
+    private static IEnumerable<ParsedMetricValue> ParseTypedMetricValue(
+        JsonElement rawValue,
+        MetricContract metric,
+        string blockId,
+        string tableMode,
+        string? dynamicExcelTemplateId,
+        string sourceKey)
+    {
+        var dataType = NormalizeDataType(metric.DataType);
+        if (IsBlankJsonElement(rawValue))
+            yield break;
+
+        if (dataType == "NUMBER")
+        {
+            var number = ToNullableDecimal(rawValue);
+            if (!number.HasValue)
+                yield break;
+
+            yield return BuildParsedMetricValue(
+                blockId,
+                tableMode,
+                dynamicExcelTemplateId,
+                metric,
+                sourceKey,
+                numberValue: number.Value);
+            yield break;
+        }
+
+        if (dataType == "BOOLEAN")
+        {
+            if (!TryReadBoolean(rawValue, out var booleanValue))
+                yield break;
+
+            yield return BuildParsedMetricValue(
+                blockId,
+                tableMode,
+                dynamicExcelTemplateId,
+                metric,
+                sourceKey,
+                booleanValue: booleanValue);
+            yield break;
+        }
+
+        if (dataType is "DATE" or "FULL_DATE")
+        {
+            var date = ReadDateValue(rawValue, dataType == "FULL_DATE");
+            if (!date.HasValue)
+                yield break;
+
+            yield return BuildParsedMetricValue(
+                blockId,
+                tableMode,
+                dynamicExcelTemplateId,
+                metric,
+                sourceKey,
+                dateValue: date.Value);
+            yield break;
+        }
+
+        if (dataType == "SHORT_TEXT")
+        {
+            var text = ReadShortTextBucket(rawValue);
+            if (string.IsNullOrWhiteSpace(text))
+                yield break;
+
+            var option = ResolveMetricOption(metric.Options, text);
+            if (metric.Options.Length > 0 && option is null)
+                yield break;
+            var bucketKey = option?.Code ?? text;
+            var bucketLabel = option?.Label ?? text;
+
+            yield return BuildParsedMetricValue(
+                blockId,
+                tableMode,
+                dynamicExcelTemplateId,
+                metric,
+                sourceKey,
+                textValue: bucketKey,
+                bucketKey: bucketKey,
+                bucketLabel: bucketLabel);
+        }
+
+        if (dataType == "MULTI_SELECT")
+        {
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var item in ReadStringListValues(rawValue))
+            {
+                var option = ResolveMetricOption(metric.Options, item);
+                if (metric.Options.Length > 0 && option is null)
+                    continue;
+
+                var bucketKey = option?.Code ?? item;
+                var bucketLabel = option?.Label ?? item;
+                if (string.IsNullOrWhiteSpace(bucketKey) || !seen.Add(bucketKey))
+                    continue;
+
+                yield return BuildParsedMetricValue(
+                    blockId,
+                    tableMode,
+                    dynamicExcelTemplateId,
+                    metric,
+                    sourceKey,
+                    textValue: bucketKey,
+                    bucketKey: bucketKey,
+                    bucketLabel: bucketLabel);
+            }
+        }
+    }
+
+    private static ParsedMetricValue BuildParsedMetricValue(
+        string blockId,
+        string tableMode,
+        string? dynamicExcelTemplateId,
+        MetricContract metric,
+        string sourceKey,
+        decimal? numberValue = null,
+        string? textValue = null,
+        bool? booleanValue = null,
+        DateTime? dateValue = null,
+        string? bucketKey = null,
+        string? bucketLabel = null)
+        => new(
+            blockId,
+            tableMode,
+            dynamicExcelTemplateId,
+            metric.MetricKey,
+            metric.RowKey,
+            metric.ColumnKey,
+            sourceKey,
+            NormalizeDataType(metric.DataType),
+            numberValue,
+            textValue,
+            booleanValue,
+            dateValue,
+            bucketKey,
+            bucketLabel);
+
+    private static List<MetricContract> NormalizeMetricDefinitions(
+        List<TableMetricDefinition>? items,
+        string blockId,
+        string tableMode)
+    {
+        if (items is null || items.Count == 0)
+            return new List<MetricContract>();
+
+        return items
+            .Select((item, fallbackIndex) =>
+            {
+                var index = item.Index >= 0 ? item.Index : fallbackIndex;
+                var rowKey = NormalizeMetricPart(item.RowKey, $"row_{fallbackIndex + 1}");
+                var columnKey = NormalizeMetricPart(item.ColumnKey, "value");
+                var metricKey = string.IsNullOrWhiteSpace(item.MetricKey)
+                    ? BuildMetricKey(blockId, rowKey, columnKey)
+                    : item.MetricKey.Trim();
+
+                return new MetricContract(
+                    index,
+                    rowKey,
+                    columnKey,
+                    metricKey,
+                    NormalizeDataType(item.DataType),
+                    NormalizeMetricOptions(item.Options));
+            })
+            .GroupBy(x => tableMode == "APPEND_ROWS"
+                    ? x.ColumnKey
+                    : tableMode == "APPEND_COLUMNS"
+                        ? x.RowKey
+                        : x.MetricKey,
+                StringComparer.Ordinal)
+            .Select(x => x.First())
+            .OrderBy(x => x.Index)
+            .ToList();
     }
 
     private static List<MetricContract> NormalizeIndexMap(
@@ -730,7 +1173,13 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
                     ? BuildMetricKey(blockId, rowKey, columnKey)
                     : item.MetricKey.Trim();
 
-                return new MetricContract(index, rowKey, columnKey, metricKey);
+                return new MetricContract(
+                    index,
+                    rowKey,
+                    columnKey,
+                    metricKey,
+                    "NUMBER",
+                    Array.Empty<MetricOption>());
             })
             .GroupBy(x => x.MetricKey, StringComparer.Ordinal)
             .Select(x => x.First())
@@ -742,23 +1191,81 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
         string blockId,
         int? width,
         int? height,
-        int valueCount)
+        int valueCount,
+        MetricTargetMap metricTargets)
     {
         var w = width.GetValueOrDefault();
         var h = height.GetValueOrDefault();
-        if (w <= 0 || h <= 0 || valueCount <= 0)
+        if (w <= 0 || h <= 0 || valueCount <= 0 || metricTargets.AllowedMetrics.Count == 0)
             return new List<MetricContract>();
 
-        var count = Math.Min(w * h, valueCount);
         var metrics = new List<MetricContract>();
-        for (var index = 0; index < count; index++)
+        var normalizedBlockId = NormalizeBlockId(blockId);
+        var prefix = $"{normalizedBlockId}:table:{normalizedBlockId}.row:";
+        foreach (var key in metricTargets.AllowedMetrics)
         {
-            var rowKey = $"row_{index / w + 1}";
-            var columnKey = $"col_{index % w + 1}";
-            metrics.Add(new MetricContract(index, rowKey, columnKey, BuildMetricKey(blockId, rowKey, columnKey)));
+            if (!key.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            var metricKey = key[(normalizedBlockId.Length + 1)..];
+            if (!TryReadRowColumnFromMetricKey(metricKey, out var rowKey, out var columnKey))
+                continue;
+
+            var rowIndex = IndexFromOrdinalPart(rowKey, "row_");
+            var columnIndex = IndexFromOrdinalPart(columnKey, "col_");
+            if (!rowIndex.HasValue || !columnIndex.HasValue)
+                continue;
+
+            var index = rowIndex.Value * w + columnIndex.Value;
+            if (index < 0 || index >= valueCount || index >= w * h)
+                continue;
+
+            metrics.Add(new MetricContract(
+                index,
+                rowKey,
+                columnKey,
+                BuildMetricKey(blockId, rowKey, columnKey),
+                "NUMBER",
+                Array.Empty<MetricOption>()));
         }
 
-        return metrics;
+        return metrics
+            .GroupBy(x => x.MetricKey, StringComparer.Ordinal)
+            .Select(x => x.First())
+            .OrderBy(x => x.Index)
+            .ToList();
+    }
+
+    private static bool TryReadRowColumnFromMetricKey(
+        string metricKey,
+        out string rowKey,
+        out string columnKey)
+    {
+        rowKey = string.Empty;
+        columnKey = string.Empty;
+
+        var rowMarker = ".row:";
+        var columnMarker = ".column:";
+        var rowStart = metricKey.IndexOf(rowMarker, StringComparison.Ordinal);
+        var columnStart = metricKey.IndexOf(columnMarker, StringComparison.Ordinal);
+        if (rowStart < 0 || columnStart < 0 || rowStart >= columnStart)
+            return false;
+
+        rowStart += rowMarker.Length;
+        rowKey = metricKey[rowStart..columnStart].Trim();
+        columnStart += columnMarker.Length;
+        columnKey = metricKey[columnStart..].Trim();
+        return !string.IsNullOrWhiteSpace(rowKey) && !string.IsNullOrWhiteSpace(columnKey);
+    }
+
+    private static int? IndexFromOrdinalPart(string value, string prefix)
+    {
+        if (!value.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            return null;
+
+        return int.TryParse(value[prefix.Length..], out var n) && n > 0
+            ? n - 1
+            : null;
     }
 
     private static IEnumerable<AggregateScope> ResolveScopes(WorkReportTableStatValue value)
@@ -805,13 +1312,248 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
         return value.ValueKind switch
         {
             JsonValueKind.Number when value.TryGetDecimal(out var number) => number,
-            JsonValueKind.String when decimal.TryParse(value.GetString(), out var parsed) => parsed,
+            JsonValueKind.String when decimal.TryParse(value.GetString(), NumberStyles.Number, CultureInfo.InvariantCulture, out var parsed) => parsed,
             _ => null
         };
     }
 
+    private static bool IsBlankJsonElement(JsonElement value)
+        => value.ValueKind switch
+        {
+            JsonValueKind.Undefined or JsonValueKind.Null => true,
+            JsonValueKind.String => string.IsNullOrWhiteSpace(value.GetString()),
+            JsonValueKind.Array => !value.EnumerateArray().Any(),
+            _ => false
+        };
+
+    private static string NormalizeDataType(string? value)
+    {
+        var normalized = value?.Trim().ToUpperInvariant();
+        return normalized switch
+        {
+            "NUMBER" or "DECIMAL" or "NUMERIC" => "NUMBER",
+            "SHORT_TEXT" or "SHORTTEXT" or "TEXT" or "STRING" or "STRING_LIST" or "STRINGLIST" => "SHORT_TEXT",
+            "MULTI_SELECT" or "MULTISELECT" => "MULTI_SELECT",
+            "BOOLEAN" or "BOOL" => "BOOLEAN",
+            "DATE" => "DATE",
+            "FULL_DATE" or "FULLDATE" or "STRICT_DATE" => "FULL_DATE",
+            _ => "NUMBER"
+        };
+    }
+
+    private static string? ReadShortTextBucket(JsonElement value)
+    {
+        if (value.ValueKind != JsonValueKind.String)
+            return null;
+
+        var text = value.GetString()?.Trim();
+        if (string.IsNullOrWhiteSpace(text))
+            return null;
+
+        return text.Length <= ShortTextBucketMaxLength
+            ? text
+            : text[..ShortTextBucketMaxLength];
+    }
+
+    private static MetricOption[] NormalizeMetricOptions(List<TableMetricOption>? options)
+    {
+        if (options is null || options.Count == 0)
+            return Array.Empty<MetricOption>();
+
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var rows = new List<MetricOption>();
+        foreach (var option in options)
+        {
+            var code = option.Code?.Trim();
+            if (string.IsNullOrWhiteSpace(code) || !seen.Add(code))
+                continue;
+
+            var label = string.IsNullOrWhiteSpace(option.Label) ? code : option.Label.Trim();
+            rows.Add(new MetricOption(code, label));
+        }
+
+        return rows.ToArray();
+    }
+
+    private static IEnumerable<string> ReadStringListValues(JsonElement value)
+    {
+        if (value.ValueKind == JsonValueKind.String)
+        {
+            var text = value.GetString()?.Trim();
+            if (!string.IsNullOrWhiteSpace(text))
+                yield return text;
+            yield break;
+        }
+
+        if (value.ValueKind != JsonValueKind.Array)
+            yield break;
+
+        foreach (var item in value.EnumerateArray())
+        {
+            if (item.ValueKind != JsonValueKind.String)
+                continue;
+
+            var text = item.GetString()?.Trim();
+            if (!string.IsNullOrWhiteSpace(text))
+                yield return text;
+        }
+    }
+
+    private static MetricOption? ResolveMetricOption(
+        IReadOnlyCollection<MetricOption> options,
+        string value)
+    {
+        if (options.Count == 0)
+            return null;
+
+        return options.FirstOrDefault(option =>
+            string.Equals(option.Code, value, StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(option.Label, value, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static bool TryReadBoolean(JsonElement value, out bool result)
+    {
+        if (value.ValueKind is JsonValueKind.True or JsonValueKind.False)
+        {
+            result = value.GetBoolean();
+            return true;
+        }
+
+        if (value.ValueKind == JsonValueKind.Number && value.TryGetDecimal(out var number))
+        {
+            if (number == 1m)
+            {
+                result = true;
+                return true;
+            }
+
+            if (number == 0m)
+            {
+                result = false;
+                return true;
+            }
+        }
+
+        var text = value.ValueKind == JsonValueKind.String
+            ? value.GetString()?.Trim().ToLowerInvariant()
+            : null;
+        if (text is "true" or "1" or "yes" or "y" or "co" or "có")
+        {
+            result = true;
+            return true;
+        }
+
+        if (text is "false" or "0" or "no" or "n" or "khong" or "không")
+        {
+            result = false;
+            return true;
+        }
+
+        result = false;
+        return false;
+    }
+
+    private static DateTime? ReadDateValue(JsonElement value, bool requireFullDate)
+    {
+        if (value.ValueKind != JsonValueKind.String)
+            return null;
+
+        var text = value.GetString()?.Trim();
+        if (string.IsNullOrWhiteSpace(text))
+            return null;
+
+        if (DateTime.TryParseExact(
+                text,
+                "dd/MM/yyyy",
+                CultureInfo.InvariantCulture,
+                DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal,
+                out var fullDate))
+        {
+            return DateTime.SpecifyKind(fullDate.Date, DateTimeKind.Utc);
+        }
+
+        if (requireFullDate)
+            return null;
+
+        if (DateTime.TryParseExact(
+                text,
+                "MM/yyyy",
+                CultureInfo.InvariantCulture,
+                DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal,
+                out var monthDate))
+        {
+            return DateTime.SpecifyKind(new DateTime(monthDate.Year, monthDate.Month, 1), DateTimeKind.Utc);
+        }
+
+        return int.TryParse(text, NumberStyles.None, CultureInfo.InvariantCulture, out var year)
+               && year is >= 1 and <= 9999
+            ? DateTime.SpecifyKind(new DateTime(year, 1, 1), DateTimeKind.Utc)
+            : null;
+    }
+
     private static string NormalizeBlockId(string? value)
         => string.IsNullOrWhiteSpace(value) ? "excel_block" : value.Trim();
+
+    private static string NormalizeLabelCode(string? value)
+    {
+        var code = value?.Trim().ToLowerInvariant() ?? string.Empty;
+        return LabelCodeRegex.IsMatch(code) ? code : string.Empty;
+    }
+
+    private static string? ReadOptionalString(JsonElement element, string name)
+        => element.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String
+            ? value.GetString()?.Trim()
+            : null;
+
+    private static int? ReadOptionalNonNegativeInt(JsonElement element, string name)
+    {
+        if (!element.TryGetProperty(name, out var value))
+            return null;
+
+        return value.ValueKind == JsonValueKind.Number
+               && value.TryGetInt32(out var number)
+               && number >= 0
+            ? number
+            : null;
+    }
+
+    private static bool TryReadBlockDataRect(JsonElement block, out MetricLabelRange range)
+    {
+        range = default;
+        return block.TryGetProperty("dataRect", out var dataRect)
+               && dataRect.ValueKind == JsonValueKind.Object
+               && TryReadRangeCoordinates(dataRect, out range);
+    }
+
+    private static bool TryReadMetricLabelRange(JsonElement target, out MetricLabelRange range)
+    {
+        if (target.TryGetProperty("range", out var nested)
+            && nested.ValueKind == JsonValueKind.Object)
+        {
+            return TryReadRangeCoordinates(nested, out range);
+        }
+
+        return TryReadRangeCoordinates(target, out range);
+    }
+
+    private static bool TryReadRangeCoordinates(JsonElement element, out MetricLabelRange range)
+    {
+        range = default;
+        var r0 = ReadOptionalNonNegativeInt(element, "r0");
+        var c0 = ReadOptionalNonNegativeInt(element, "c0");
+        var r1 = ReadOptionalNonNegativeInt(element, "r1");
+        var c1 = ReadOptionalNonNegativeInt(element, "c1");
+        if (!r0.HasValue || !c0.HasValue || !r1.HasValue || !c1.HasValue)
+            return false;
+        if (r1.Value < r0.Value || c1.Value < c0.Value)
+            return false;
+
+        range = new MetricLabelRange(r0.Value, c0.Value, r1.Value, c1.Value);
+        return true;
+    }
+
+    private static string BuildMetricLabelMapKey(string blockId, string metricKey)
+        => $"{NormalizeBlockId(blockId)}:{metricKey.Trim()}";
 
     private static string NormalizeTableMode(string? value)
     {
@@ -847,6 +1589,7 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
         public int? H { get; set; }
         public List<JsonElement>? Values1D { get; set; }
         public List<TableIndexMapItem>? IndexMap { get; set; }
+        public List<TableMetricDefinition>? MetricDefinitions { get; set; }
         public List<TableAppendRow>? Rows { get; set; }
         public List<TableAppendColumn>? Columns { get; set; }
         public List<TableMatrixCell>? Cells { get; set; }
@@ -858,6 +1601,22 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
         public string? RowKey { get; set; }
         public string? ColumnKey { get; set; }
         public string? MetricKey { get; set; }
+    }
+
+    private sealed class TableMetricDefinition
+    {
+        public int Index { get; set; } = -1;
+        public string? MetricKey { get; set; }
+        public string? RowKey { get; set; }
+        public string? ColumnKey { get; set; }
+        public string? DataType { get; set; }
+        public List<TableMetricOption>? Options { get; set; }
+    }
+
+    private sealed class TableMetricOption
+    {
+        public string? Code { get; set; }
+        public string? Label { get; set; }
     }
 
     private sealed class TableAppendRow
@@ -882,6 +1641,15 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
         public JsonElement Value { get; set; }
     }
 
+    private sealed class MetricTargetMap
+    {
+        public HashSet<string> AllowedMetrics { get; } = new(StringComparer.OrdinalIgnoreCase);
+        public Dictionary<string, string> LabelByMetric { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+        public bool Contains(string blockId, string metricKey)
+            => AllowedMetrics.Contains(BuildMetricLabelMapKey(blockId, metricKey));
+    }
+
     private sealed record ParsedMetricValue(
         string BlockId,
         string TableMode,
@@ -890,13 +1658,31 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
         string RowKey,
         string ColumnKey,
         string SourceKey,
-        decimal Value);
+        string DataType,
+        decimal? NumberValue,
+        string? TextValue,
+        bool? BooleanValue,
+        DateTime? DateValue,
+        string? BucketKey,
+        string? BucketLabel);
 
     private sealed record MetricContract(
         int Index,
         string RowKey,
         string ColumnKey,
-        string MetricKey);
+        string MetricKey,
+        string DataType,
+        MetricOption[] Options);
+
+    private sealed record MetricOption(
+        string Code,
+        string Label);
+
+    private readonly record struct MetricLabelRange(
+        int R0,
+        int C0,
+        int R1,
+        int C1);
 
     private sealed record AggregateScope(string ScopeType, string ScopeId);
 
@@ -909,6 +1695,9 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
         string BlockId,
         string TableMode,
         string MetricKey,
+        string? MetricLabelCode,
+        string DataType,
+        string? BucketKey,
         string PeriodInstanceKey,
         int ReportStatus);
 
@@ -920,9 +1709,33 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
         public void Add(WorkReportTableStatValue value)
         {
             Row.ValueCount += 1;
-            Row.Sum += value.Value;
-            Row.Min = Row.Min.HasValue ? Math.Min(Row.Min.Value, value.Value) : value.Value;
-            Row.Max = Row.Max.HasValue ? Math.Max(Row.Max.Value, value.Value) : value.Value;
+
+            var dataType = NormalizeDataType(value.DataType);
+            if (dataType == "NUMBER")
+            {
+                Row.NumericValueCount += 1;
+                Row.Sum += value.Value;
+                Row.Min = Row.Min.HasValue ? Math.Min(Row.Min.Value, value.Value) : value.Value;
+                Row.Max = Row.Max.HasValue ? Math.Max(Row.Max.Value, value.Value) : value.Value;
+            }
+            else if (dataType == "BOOLEAN" && value.BooleanValue.HasValue)
+            {
+                if (value.BooleanValue.Value)
+                    Row.TrueCount += 1;
+                else
+                    Row.FalseCount += 1;
+            }
+            else if ((dataType == "DATE" || dataType == "FULL_DATE") && value.DateValue.HasValue)
+            {
+                var date = value.DateValue.Value;
+                Row.EarliestDateUtc = Row.EarliestDateUtc.HasValue
+                    ? (date < Row.EarliestDateUtc.Value ? date : Row.EarliestDateUtc.Value)
+                    : date;
+                Row.LatestDateUtc = Row.LatestDateUtc.HasValue
+                    ? (date > Row.LatestDateUtc.Value ? date : Row.LatestDateUtc.Value)
+                    : date;
+            }
+
             ReportIds.Add(value.WorkAssignmentReportId);
         }
     }

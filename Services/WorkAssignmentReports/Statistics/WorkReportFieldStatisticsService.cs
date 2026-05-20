@@ -11,23 +11,34 @@ using tdtd_be.Models;
 using tdtd_be.Models.Enums;
 using tdtd_be.Models.Statistics;
 using tdtd_be.Services.WorkAssignmentReports;
+using tdtd_be.Services.WorkAssignmentReports.Payloads;
 
 namespace tdtd_be.Services.WorkAssignmentReports.Statistics;
 
 public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatisticsService
 {
+    private const int ShortTextBucketMaxLength = 200;
+
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
         PropertyNameCaseInsensitive = true
     };
+    private static readonly Regex FullDateRegex = new(@"^(\d{2})/(\d{2})/(\d{4})$", RegexOptions.Compiled);
+    private static readonly Regex MonthDateRegex = new(@"^(\d{2})/(\d{4})$", RegexOptions.Compiled);
+    private static readonly Regex YearDateRegex = new(@"^(\d{4})$", RegexOptions.Compiled);
 
     private readonly MongoDbContext _ctx;
     private readonly MeAccessor _me;
+    private readonly IWorkReportPayloadReader _payloadReader;
 
-    public WorkReportFieldStatisticsService(MongoDbContext ctx, MeAccessor me)
+    public WorkReportFieldStatisticsService(
+        MongoDbContext ctx,
+        MeAccessor me,
+        IWorkReportPayloadReader payloadReader)
     {
         _ctx = ctx;
         _me = me;
+        _payloadReader = payloadReader;
     }
 
     public async Task RebuildForReportAsync(
@@ -69,6 +80,9 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
         var assignment = await _ctx.WorkAssignments
             .Find(x => x.Id == report.WorkAssignmentId && !x.IsDeleted)
             .FirstOrDefaultAsync(ct);
+        var period = await _ctx.WorkReportPeriods
+            .Find(x => x.Id == report.WorkReportPeriodId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct);
         var dynamicFormTemplateId = NormalizeObjectIdOrNull(report.DynamicFormTemplateId ?? assignment?.DynamicFormTemplateId);
 
         await _ctx.WorkReportFieldStatValues.DeleteManyAsync(
@@ -94,7 +108,10 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
 
         var template = await LoadTemplateAsync(report, assignment, ct);
         var fields = ExtractStatisticFields(template?.FieldsJson);
-        var values = ExtractFieldValues(report.FieldValuesJson, fields)
+        WorkReportPayloadConsistency.EnsureReadyForStatisticProjection(report);
+        var payload = await _payloadReader.LoadReportPayloadAsync(report, ct);
+        WorkReportPayloadConsistency.EnsureSnapshotFreshForStatisticProjection(report, payload);
+        var values = ExtractFieldValues(payload.FieldValuesJson, fields)
             .Where(value => contributionPolicy.ShouldIncludeField(value.Field.FieldKey))
             .ToList();
         dynamicFormTemplateId = NormalizeObjectIdOrNull(
@@ -106,12 +123,17 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
             var actorId = NormalizeObjectIdOrNull(actorUserId);
             var ancestorAssignmentIds = ExtractAncestorAssignmentIds(assignment, report.WorkAssignmentId);
             var sourceWindow = WorkAssignmentReportTemporalPolicy.ResolveSourceWindow(report);
+            var projectionContext = WorkReportStatisticProjectionContextBuilder.From(report, assignment, period, payload);
 
             var rows = values.Select(value => new WorkReportFieldStatValue
             {
                 Id = ObjectId.GenerateNewId().ToString(),
                 WorkId = report.WorkId,
                 WorkAssignmentId = report.WorkAssignmentId,
+                AssigneeUserId = projectionContext.AssigneeUserId,
+                AssigneeUnitId = projectionContext.AssigneeUnitId,
+                AssignmentIsActive = projectionContext.AssignmentIsActive,
+                ReportIsActive = projectionContext.ReportIsActive,
                 RootAssignmentId = assignment?.RootAssignmentId,
                 AncestorAssignmentIds = ancestorAssignmentIds,
                 WorkReportPeriodId = report.WorkReportPeriodId,
@@ -141,6 +163,8 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
                 CompletedDate = sourceWindow.CompletedDate,
                 IsHistoricalData = sourceWindow.IsHistoricalData,
                 ReportStatus = (int)report.Status,
+                SourcePayloadRevision = projectionContext.SourcePayloadRevision,
+                SourcePayloadHash = projectionContext.SourcePayloadHash,
                 CreatedAtUtc = now,
                 UpdatedAtUtc = now,
                 CreatedByUserId = actorId,
@@ -359,6 +383,7 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
             Average = x.NumericValueCount > 0 ? x.Sum / x.NumericValueCount : null,
             TrueCount = x.TrueCount,
             FalseCount = x.FalseCount,
+            EarliestDateUtc = x.EarliestDateUtc,
             LatestDateUtc = x.LatestDateUtc,
             ReportCount = x.ReportCount,
             UpdatedAtUtc = x.UpdatedAtUtc
@@ -490,25 +515,27 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
                 .ToDictionary(x => x.Id, x => x, StringComparer.Ordinal);
 
         var assignmentsById = assignments.ToDictionary(x => x.Id, x => x, StringComparer.Ordinal);
-        var parsedRows = reports
-            .Select(report =>
+        var parsedRows = new List<FieldTextConcatRow>();
+        foreach (var report in reports)
+        {
+            periodsById.TryGetValue(report.WorkReportPeriodId, out var period);
+            assignmentsById.TryGetValue(report.WorkAssignmentId, out var assignment);
+            var payload = await _payloadReader.LoadReportPayloadAsync(report, ct);
+            var value = ExtractConcatFieldValue(payload.FieldValuesJson, field, normalized.BucketKey);
+            if (value is null || string.IsNullOrWhiteSpace(value.Text))
+                continue;
+
+            if (!string.IsNullOrWhiteSpace(normalized.Q) &&
+                !value.Text.Contains(normalized.Q, StringComparison.OrdinalIgnoreCase) &&
+                !value.Items.Any(item =>
+                    item.Value.Contains(normalized.Q, StringComparison.OrdinalIgnoreCase) ||
+                    item.Label.Contains(normalized.Q, StringComparison.OrdinalIgnoreCase)))
             {
-                periodsById.TryGetValue(report.WorkReportPeriodId, out var period);
-                assignmentsById.TryGetValue(report.WorkAssignmentId, out var assignment);
-                var text = ExtractTextFieldValue(report.FieldValuesJson, field);
-                if (string.IsNullOrWhiteSpace(text))
-                    return null;
+                continue;
+            }
 
-                if (!string.IsNullOrWhiteSpace(normalized.Q) &&
-                    !text.Contains(normalized.Q, StringComparison.OrdinalIgnoreCase))
-                {
-                    return null;
-                }
-
-                return MapTextConcatRow(report, period, assignment, text, normalized.MaxRowChars);
-            })
-            .OfType<FieldTextConcatRow>()
-            .ToList();
+            parsedRows.Add(MapTextConcatRow(report, period, assignment, value, normalized.MaxRowChars));
+        }
 
         return new TextConcatQueryResult
         {
@@ -641,8 +668,7 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
             & fb.Eq(x => x.IsCurrent, true)
             & fb.Ne(x => x.IsActive, false)
             & fb.In(x => x.WorkAssignmentId, assignmentIds)
-            & fb.Eq(x => x.DynamicFormTemplateId, req.DynamicFormTemplateId.Trim())
-            & fb.Ne(x => x.FieldValuesJson, null);
+            & fb.Eq(x => x.DynamicFormTemplateId, req.DynamicFormTemplateId.Trim());
 
         if (!string.IsNullOrWhiteSpace(req.PeriodKey))
             filter &= fb.Eq(x => x.PeriodKey, req.PeriodKey.Trim());
@@ -746,6 +772,7 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
             DynamicFormTemplateId = dynamicFormTemplateId,
             FieldId = string.IsNullOrWhiteSpace(req.FieldId) ? null : req.FieldId.Trim(),
             FieldKey = string.IsNullOrWhiteSpace(req.FieldKey) ? null : req.FieldKey.Trim(),
+            BucketKey = string.IsNullOrWhiteSpace(req.BucketKey) ? null : req.BucketKey.Trim(),
             Q = string.IsNullOrWhiteSpace(req.Q) ? null : req.Q.Trim(),
             PeriodKey = string.IsNullOrWhiteSpace(req.PeriodKey) ? null : req.PeriodKey.Trim(),
             PeriodKeyFrom = string.IsNullOrWhiteSpace(req.PeriodKeyFrom) ? null : req.PeriodKeyFrom.Trim(),
@@ -804,7 +831,7 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
             return rawFields
                 .Select(ToStatisticFieldDefinition)
                 .OfType<StatisticFieldDefinition>()
-                .Where(x => x.FieldType is "shortText" or "longText")
+                .Where(x => x.FieldType is "shortText" or "stringList" or "longText" or "singleSelect" or "multiSelect")
                 .GroupBy(x => x.FieldId, StringComparer.Ordinal)
                 .Select(x => x.First())
                 .ToList();
@@ -815,9 +842,10 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
         }
     }
 
-    private static string? ExtractTextFieldValue(
+    private static FieldConcatValue? ExtractConcatFieldValue(
         string? fieldValuesJson,
-        StatisticFieldDefinition field)
+        StatisticFieldDefinition field,
+        string? bucketKey)
     {
         if (string.IsNullOrWhiteSpace(fieldValuesJson))
             return null;
@@ -831,8 +859,103 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
             if (!TryGetFieldValue(valuesObject, field, out var value))
                 return null;
 
+            if (field.FieldType == "shortText")
+            {
+                var code = NormalizeShortTextBucket(ToNullableString(value));
+                if (string.IsNullOrWhiteSpace(code))
+                    return null;
+
+                if (!string.IsNullOrWhiteSpace(bucketKey) &&
+                    !string.Equals(code, bucketKey, StringComparison.Ordinal))
+                {
+                    return null;
+                }
+
+                var label = ResolveOptionLabel(field, code);
+                return new FieldConcatValue(
+                    label,
+                    new List<FieldTextConcatItem>
+                    {
+                        new() { Value = code, Label = label }
+                    });
+            }
+
+            if (field.FieldType == "singleSelect")
+            {
+                var code = ToNullableString(value)?.Trim();
+                if (string.IsNullOrWhiteSpace(code))
+                    return null;
+
+                var label = ResolveOptionLabel(field, code);
+                if (!string.IsNullOrWhiteSpace(bucketKey) &&
+                    !string.Equals(code, bucketKey, StringComparison.Ordinal))
+                {
+                    return null;
+                }
+
+                return new FieldConcatValue(
+                    label,
+                    new List<FieldTextConcatItem>
+                    {
+                        new() { Value = code, Label = label }
+                    });
+            }
+
+            if (field.FieldType == "multiSelect")
+            {
+                var items = ToStringArray(value)
+                    .Distinct(StringComparer.Ordinal)
+                    .Select(code => new FieldTextConcatItem
+                    {
+                        Value = code,
+                        Label = ResolveOptionLabel(field, code)
+                    })
+                    .ToList();
+
+                if (!string.IsNullOrWhiteSpace(bucketKey))
+                {
+                    items = items
+                        .Where(item => string.Equals(item.Value, bucketKey, StringComparison.Ordinal))
+                        .ToList();
+                }
+
+                if (items.Count == 0)
+                    return null;
+
+                return new FieldConcatValue(
+                    string.Join(Environment.NewLine, items.Select(x => x.Label)),
+                    items);
+            }
+
+            if (field.FieldType is "stringList" or "longText")
+            {
+                var items = ToStringArray(value)
+                    .Select((text, index) => new FieldTextConcatItem
+                    {
+                        Value = text,
+                        Label = $"Ý {index + 1}: {text}"
+                    })
+                    .ToList();
+
+                if (!string.IsNullOrWhiteSpace(bucketKey))
+                {
+                    items = items
+                        .Where(item => string.Equals(item.Value, bucketKey, StringComparison.Ordinal))
+                        .ToList();
+                }
+
+                if (items.Count == 0)
+                    return null;
+
+                return new FieldConcatValue(
+                    string.Join(Environment.NewLine, items.Select(x => x.Value)),
+                    items);
+            }
+
             var text = ToNullableString(value);
-            return string.IsNullOrWhiteSpace(text) ? null : text.Trim();
+            return string.IsNullOrWhiteSpace(text)
+                ? null
+                : new FieldConcatValue(text.Trim(), new List<FieldTextConcatItem>());
         }
         catch (JsonException)
         {
@@ -844,12 +967,13 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
         WorkAssignmentReport report,
         WorkReportPeriod? period,
         WorkAssignment? assignment,
-        string text,
+        FieldConcatValue value,
         int maxRowChars)
     {
         var assigneeUserId = period?.AssigneeUserId ?? report.AssigneeUserId;
         var assignee = assignment?.Assignees?.FirstOrDefault(a =>
             string.Equals(a.UserId, assigneeUserId, StringComparison.Ordinal));
+        var text = value.Text;
         var rowText = text.Length > maxRowChars ? text[..maxRowChars] : text;
 
         return new FieldTextConcatRow
@@ -875,6 +999,7 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
             Text = rowText,
             CharCount = text.Length,
             RowTruncated = text.Length > maxRowChars,
+            Items = value.Items,
             SubmittedAtUtc = report.SubmittedAtUtc ?? period?.LastSubmittedAtUtc,
             ApprovedAtUtc = report.ApprovedAtUtc ?? period?.LastReviewedAtUtc
         };
@@ -942,6 +1067,7 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
             "rowTruncated",
             "submittedAtUtc",
             "approvedAtUtc",
+            "items",
             "text"
         };
         builder.AppendLine(string.Join(",", headers.Select(EscapeCsv)));
@@ -970,6 +1096,7 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
                 row.RowTruncated ? "true" : "false",
                 row.SubmittedAtUtc?.ToString("O", CultureInfo.InvariantCulture) ?? string.Empty,
                 row.ApprovedAtUtc?.ToString("O", CultureInfo.InvariantCulture) ?? string.Empty,
+                string.Join(" | ", row.Items.Select(x => $"{x.Label} ({x.Value})")),
                 row.Text
             };
             builder.AppendLine(string.Join(",", values.Select(EscapeCsv)));
@@ -1332,6 +1459,42 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
             yield break;
         }
 
+        if (field.FieldType == "shortText")
+        {
+            var code = NormalizeShortTextBucket(ToNullableString(value));
+            if (string.IsNullOrWhiteSpace(code))
+                yield break;
+
+            var label = ResolveOptionLabel(field, code);
+            yield return new ParsedFieldValue(
+                field,
+                code,
+                label,
+                field.FieldId,
+                "TEXT_BUCKET",
+                null,
+                null,
+                null);
+            yield break;
+        }
+
+        if (field.FieldType is "stringList" or "longText")
+        {
+            if (ToStringArray(value).Count == 0)
+                yield break;
+
+            yield return new ParsedFieldValue(
+                field,
+                null,
+                null,
+                field.FieldId,
+                "PRESENT",
+                null,
+                null,
+                null);
+            yield break;
+        }
+
         var text = ToNullableString(value);
         if (string.IsNullOrWhiteSpace(text))
             yield break;
@@ -1410,6 +1573,17 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
         };
     }
 
+    private static string? NormalizeShortTextBucket(string? value)
+    {
+        var text = value?.Trim();
+        if (string.IsNullOrWhiteSpace(text))
+            return null;
+
+        return text.Length <= ShortTextBucketMaxLength
+            ? text
+            : text[..ShortTextBucketMaxLength];
+    }
+
     private static decimal? ToNullableDecimal(JsonElement value)
     {
         if (value.ValueKind == JsonValueKind.Number && value.TryGetDecimal(out var number))
@@ -1451,8 +1625,39 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
         if (string.IsNullOrWhiteSpace(raw))
             return null;
 
+        var normalized = raw.Trim();
+        var full = FullDateRegex.Match(normalized);
+        if (full.Success)
+        {
+            var day = int.Parse(full.Groups[1].Value, CultureInfo.InvariantCulture);
+            var month = int.Parse(full.Groups[2].Value, CultureInfo.InvariantCulture);
+            var year = int.Parse(full.Groups[3].Value, CultureInfo.InvariantCulture);
+            return IsValidDatePart(year, month, day)
+                ? DateTime.SpecifyKind(new DateTime(year, month, day), DateTimeKind.Utc)
+                : null;
+        }
+
+        var monthOnly = MonthDateRegex.Match(normalized);
+        if (monthOnly.Success)
+        {
+            var month = int.Parse(monthOnly.Groups[1].Value, CultureInfo.InvariantCulture);
+            var year = int.Parse(monthOnly.Groups[2].Value, CultureInfo.InvariantCulture);
+            return IsValidYear(year) && month is >= 1 and <= 12
+                ? DateTime.SpecifyKind(new DateTime(year, month, 1), DateTimeKind.Utc)
+                : null;
+        }
+
+        var yearOnly = YearDateRegex.Match(normalized);
+        if (yearOnly.Success)
+        {
+            var year = int.Parse(yearOnly.Groups[1].Value, CultureInfo.InvariantCulture);
+            return IsValidYear(year)
+                ? DateTime.SpecifyKind(new DateTime(year, 1, 1), DateTimeKind.Utc)
+                : null;
+        }
+
         if (!DateTime.TryParse(
-                raw,
+                normalized,
                 CultureInfo.InvariantCulture,
                 DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal,
                 out var parsed))
@@ -1464,6 +1669,15 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
             ? parsed
             : DateTime.SpecifyKind(parsed, DateTimeKind.Utc);
     }
+
+    private static bool IsValidDatePart(int year, int month, int day)
+        => IsValidYear(year) &&
+           month is >= 1 and <= 12 &&
+           day >= 1 &&
+           day <= DateTime.DaysInMonth(year, month);
+
+    private static bool IsValidYear(int year)
+        => year is >= 1 and <= 9999;
 
     private static string ResolveOptionLabel(StatisticFieldDefinition field, string code)
         => field.Options.FirstOrDefault(x => string.Equals(x.Code, code, StringComparison.Ordinal))?.Label ?? code;
@@ -1514,10 +1728,12 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
         {
             "number" => "number",
             "date" => "date",
+            "fullDate" => "date",
             "singleSelect" => "singleSelect",
             "multiSelect" => "multiSelect",
             "boolean" => "boolean",
-            "longText" => "longText",
+            "stringList" => "stringList",
+            "longText" => "stringList",
             _ => "shortText"
         };
     }
@@ -1574,6 +1790,10 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
         bool? BooleanValue,
         DateTime? DateValueUtc);
 
+    private sealed record FieldConcatValue(
+        string Text,
+        List<FieldTextConcatItem> Items);
+
     private sealed record AggregateScope(string ScopeType, string ScopeId);
 
     private sealed record AggregateKey(
@@ -1621,6 +1841,10 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
 
             if (value.DateValueUtc.HasValue)
             {
+                Row.EarliestDateUtc = Row.EarliestDateUtc.HasValue
+                    ? (Row.EarliestDateUtc.Value <= value.DateValueUtc.Value ? Row.EarliestDateUtc.Value : value.DateValueUtc.Value)
+                    : value.DateValueUtc.Value;
+
                 Row.LatestDateUtc = Row.LatestDateUtc.HasValue
                     ? (Row.LatestDateUtc.Value >= value.DateValueUtc.Value ? Row.LatestDateUtc.Value : value.DateValueUtc.Value)
                     : value.DateValueUtc.Value;

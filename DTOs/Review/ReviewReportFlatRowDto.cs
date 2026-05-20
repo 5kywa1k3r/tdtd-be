@@ -37,6 +37,12 @@ public sealed class ReviewReportFlatRowDto
     public string? ReportDeactivationReason { get; set; }
     public DateTime? SubmittedAtUtc { get; set; }
     public DateTime? ApprovedAtUtc { get; set; }
+    public bool AutoApproved { get; set; }
+    public DateTime? AutoApprovedAtUtc { get; set; }
+    public string? AutoApprovedByUserId { get; set; }
+    public bool AutoApprovalLocked { get; set; }
+    public DateTime? AutoApprovalConfirmedAtUtc { get; set; }
+    public string? AutoApprovalConfirmedByUserId { get; set; }
     public DateTime? ReturnedAtUtc { get; set; }
     public string? ReturnReason { get; set; }
     public string? ReviewerComment { get; set; }
