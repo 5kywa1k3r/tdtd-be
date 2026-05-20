@@ -1,7 +1,9 @@
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Options;
+using MongoDB.Bson;
 using MongoDB.Driver;
+using System.Text.RegularExpressions;
 using tdtd_be.Common.Auth;
 using tdtd_be.Common.Errors;
 using tdtd_be.Data;
@@ -46,6 +48,9 @@ public sealed class WorkDocumentsController : ControllerBase
         CancellationToken ct)
     {
         var me = _me.RequireMe();
+        var normalizedScope = NormalizeScope(scope);
+        var normalizedAssignmentId = NullIfWhiteSpace(assignmentId);
+        var normalizedKeyword = NullIfWhiteSpace(keyword);
 
         var fb = Builders<FileDoc>.Filter;
         var newMetadataFilter = fb.Eq(x => x.WorkId, workId);
@@ -55,42 +60,24 @@ public sealed class WorkDocumentsController : ControllerBase
 
         var filter = (newMetadataFilter | legacyWorkBasisFilter) & fb.Eq(x => x.IsDeleted, false);
 
+        if (!string.IsNullOrWhiteSpace(normalizedKeyword))
+            filter &= fb.Regex(x => x.OriginalName, new BsonRegularExpression(Regex.Escape(normalizedKeyword), "i"));
+
+        if (!string.IsNullOrWhiteSpace(normalizedScope) && normalizedScope != "ALL")
+            filter &= BuildScopeFilter(fb, normalizedScope);
+
+        if (!string.IsNullOrWhiteSpace(normalizedAssignmentId))
+            filter &= BuildAssignmentFilter(fb, normalizedAssignmentId);
+
         var rows = await _ctx.Files
             .Find(filter)
             .SortByDescending(x => x.CreatedAtUtc)
             .ToListAsync(ct);
 
-        var normalizedScope = NormalizeScope(scope);
-        var normalizedAssignmentId = NullIfWhiteSpace(assignmentId);
-        var normalizedKeyword = NullIfWhiteSpace(keyword);
-
-        if (!string.IsNullOrWhiteSpace(normalizedKeyword))
-        {
-            rows = rows
-                .Where(x => x.OriginalName.Contains(normalizedKeyword, StringComparison.OrdinalIgnoreCase))
-                .ToList();
-        }
-
-        if (!string.IsNullOrWhiteSpace(normalizedScope) && normalizedScope != "ALL")
-        {
-            rows = rows
-                .Where(x => ScopeMatches(WorkDocumentScopeResolver.Resolve(x), normalizedScope))
-                .ToList();
-        }
-
-        if (!string.IsNullOrWhiteSpace(normalizedAssignmentId))
-        {
-            rows = rows
-                .Where(x => string.Equals(WorkDocumentScopeResolver.Resolve(x).AssignmentId, normalizedAssignmentId, StringComparison.Ordinal))
-                .ToList();
-        }
-
-        var visible = new List<FileDoc>();
-        foreach (var file in rows)
-        {
-            if (await _permission.CanReadFileAsync(file, me.Id, ct))
-                visible.Add(file);
-        }
+        var access = await LoadListAccessAsync(workId, me.Id, rows, ct);
+        var visible = rows
+            .Where(file => access.CanRead(file, WorkDocumentScopeResolver.Resolve(file)))
+            .ToList();
 
         var users = await LoadUsersAsync(visible.Select(x => x.CreatedByUserId), ct);
         var result = new List<WorkDocumentRow>();
@@ -113,8 +100,8 @@ public sealed class WorkDocumentsController : ControllerBase
                 AssignmentPath = scopeInfo.AssignmentPath,
                 CreatedByUserId = file.CreatedByUserId,
                 CreatedByName = ResolveUserName(users, file.CreatedByUserId),
-                CanUpdate = await _permission.CanUpdateFileAsync(file, me.Id, ct),
-                CanDelete = await _permission.CanDeleteFileAsync(file, me.Id, ct)
+                CanUpdate = access.CanDelete(file, scopeInfo),
+                CanDelete = access.CanDelete(file, scopeInfo)
             });
         }
 
@@ -458,11 +445,219 @@ public sealed class WorkDocumentsController : ControllerBase
         return trimmed;
     }
 
-    private static bool ScopeMatches(WorkDocumentScopeInfo scope, string targetScope)
+    private static FilterDefinition<FileDoc> BuildScopeFilter(
+        FilterDefinitionBuilder<FileDoc> fb,
+        string normalizedScope)
+        => string.Equals(normalizedScope, WorkDocumentConstants.ScopeWork, StringComparison.OrdinalIgnoreCase)
+            ? fb.Or(
+                fb.Eq(x => x.DocumentScope, WorkDocumentConstants.ScopeWork),
+                fb.Eq(x => x.SourceType, WorkDocumentConstants.SourceTypeWorkDocument),
+                fb.Eq(x => x.SourceType, WorkDocumentConstants.SourceTypeWorkBasis))
+            : string.Equals(normalizedScope, WorkDocumentConstants.ScopeAssignmentBranch, StringComparison.OrdinalIgnoreCase)
+                ? fb.Or(
+                    fb.Eq(x => x.DocumentScope, WorkDocumentConstants.ScopeAssignmentBranch),
+                    fb.Eq(x => x.SourceType, WorkDocumentConstants.SourceTypeAssignmentDocument))
+                : fb.Eq(x => x.Id, "__no_matching_work_document_scope__");
+
+    private static FilterDefinition<FileDoc> BuildAssignmentFilter(
+        FilterDefinitionBuilder<FileDoc> fb,
+        string assignmentId)
+        => BuildScopeFilter(fb, WorkDocumentConstants.ScopeAssignmentBranch) &
+           fb.Or(
+               fb.Eq(x => x.AssignmentId, assignmentId),
+               fb.Eq(x => x.SourceId, assignmentId));
+
+    private async Task<WorkDocumentListAccess> LoadListAccessAsync(
+        string workId,
+        string userId,
+        IReadOnlyCollection<FileDoc> files,
+        CancellationToken ct)
     {
-        return string.Equals(scope.Scope, targetScope, StringComparison.OrdinalIgnoreCase);
+        var workReadTask = _ctx.DocRoles
+            .Find(x => x.DocType == DocType.WORK && x.DocId == workId && x.UserId == userId && !x.IsDeleted)
+            .Limit(1)
+            .AnyAsync(ct);
+
+        var workOwnerTask = _ctx.Works
+            .Find(x => x.Id == workId && x.CreatedByUserId == userId && !x.IsDeleted)
+            .Limit(1)
+            .AnyAsync(ct);
+
+        var branchScopes = files
+            .Select(WorkDocumentScopeResolver.Resolve)
+            .Where(x => string.Equals(x.Scope, WorkDocumentConstants.ScopeAssignmentBranch, StringComparison.Ordinal))
+            .ToList();
+
+        var branchAssignmentIds = branchScopes
+            .Select(x => NullIfWhiteSpace(x.AssignmentId))
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Select(x => x!)
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+        var activeBranchAssignmentPathIds = new Dictionary<string, IReadOnlyList<string>>(StringComparer.Ordinal);
+        var ownedBranchAssignments = new HashSet<string>(StringComparer.Ordinal);
+        var branchPathIds = new List<string>();
+        if (branchAssignmentIds.Count > 0)
+        {
+            var directAssignments = await _ctx.WorkAssignments
+                .Find(x =>
+                    branchAssignmentIds.Contains(x.Id) &&
+                    x.WorkId == workId &&
+                    x.IsActive &&
+                    !x.IsDeleted)
+                .Project(x => new WorkDocumentAssignmentPathProjection
+                {
+                    Id = x.Id,
+                    Path = x.Path,
+                    CreatedByUserId = x.CreatedByUserId
+                })
+                .ToListAsync(ct);
+
+            foreach (var assignment in directAssignments)
+            {
+                var pathIds = ResolveAssignmentPathIds(assignment.Path, assignment.Id);
+                activeBranchAssignmentPathIds[assignment.Id] = pathIds;
+
+                if (string.Equals(assignment.CreatedByUserId, userId, StringComparison.Ordinal))
+                    ownedBranchAssignments.Add(assignment.Id);
+            }
+
+            branchPathIds = activeBranchAssignmentPathIds.Values
+                .SelectMany(x => x)
+                .Distinct(StringComparer.Ordinal)
+                .ToList();
+        }
+
+        var projectedReadable = new HashSet<string>(StringComparer.Ordinal);
+        if (branchPathIds.Count > 0)
+        {
+            var roleFb = Builders<AssignmentListDocRole>.Filter;
+            var roleRows = await _ctx.AssignmentListDocRoles
+                .Find(
+                    roleFb.Eq(x => x.WorkId, workId) &
+                    roleFb.Eq(x => x.UserId, userId) &
+                    roleFb.In(x => x.AssignmentId, branchPathIds) &
+                    roleFb.Eq(x => x.IsDeleted, false) &
+                    roleFb.SizeGt(x => x.Roles, 0))
+                .Project(x => x.AssignmentId)
+                .ToListAsync(ct);
+
+            projectedReadable = roleRows.ToHashSet(StringComparer.Ordinal);
+        }
+
+        var sourceReadable = new HashSet<string>(StringComparer.Ordinal);
+        if (branchPathIds.Count > 0)
+        {
+            var assignmentFb = Builders<WorkAssignment>.Filter;
+            var assignments = await _ctx.WorkAssignments
+                .Find(
+                    assignmentFb.Eq(x => x.WorkId, workId) &
+                    assignmentFb.In(x => x.Id, branchPathIds) &
+                    assignmentFb.Eq(x => x.IsActive, true) &
+                    assignmentFb.Eq(x => x.IsDeleted, false))
+                .ToListAsync(ct);
+
+            sourceReadable = assignments
+                .Where(x => IsBranchMember(x, userId))
+                .Select(x => x.Id)
+                .ToHashSet(StringComparer.Ordinal);
+        }
+
+        var canReadWork = await workReadTask;
+        var isWorkOwner = await workOwnerTask;
+
+        return new WorkDocumentListAccess(
+            userId,
+            canReadWork,
+            isWorkOwner,
+            activeBranchAssignmentPathIds,
+            projectedReadable,
+            sourceReadable,
+            ownedBranchAssignments);
+    }
+
+    private static IReadOnlyList<string> ResolveAssignmentPathIds(string? assignmentPath, string? assignmentId)
+    {
+        var ids = (assignmentPath ?? string.Empty)
+            .Split('/', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+
+        var normalizedAssignmentId = NullIfWhiteSpace(assignmentId);
+        if (!string.IsNullOrWhiteSpace(normalizedAssignmentId) && !ids.Contains(normalizedAssignmentId, StringComparer.Ordinal))
+            ids.Add(normalizedAssignmentId);
+
+        return ids;
+    }
+
+    private static bool IsBranchMember(WorkAssignment assignment, string userId)
+    {
+        if (string.Equals(assignment.CreatedByUserId, userId, StringComparison.Ordinal))
+            return true;
+
+        if ((assignment.Assignees ?? new List<UserRef>())
+            .Any(x => string.Equals(x.UserId, userId, StringComparison.Ordinal)))
+            return true;
+
+        return (assignment.LeaderWatcherUserIds ?? new List<string>())
+            .Any(x => string.Equals(x, userId, StringComparison.Ordinal)) ||
+            (assignment.LeaderWatchers ?? new List<UserRef>())
+            .Any(x => string.Equals(x.UserId, userId, StringComparison.Ordinal));
     }
 
     private static string? NullIfWhiteSpace(string? value)
         => string.IsNullOrWhiteSpace(value) ? null : value.Trim();
+
+    private sealed record WorkDocumentListAccess(
+        string UserId,
+        bool CanReadWorkDocuments,
+        bool IsWorkOwner,
+        Dictionary<string, IReadOnlyList<string>> ActiveBranchAssignmentPathIds,
+        HashSet<string> ProjectedReadableAssignmentIds,
+        HashSet<string> SourceReadableAssignmentIds,
+        HashSet<string> OwnedBranchAssignmentIds)
+    {
+        public bool CanRead(FileDoc file, WorkDocumentScopeInfo scope)
+        {
+            if (string.Equals(scope.Scope, WorkDocumentConstants.ScopeWork, StringComparison.Ordinal))
+                return CanReadWorkDocuments;
+
+            if (string.Equals(scope.Scope, WorkDocumentConstants.ScopeAssignmentBranch, StringComparison.Ordinal))
+            {
+                var assignmentId = NullIfWhiteSpace(scope.AssignmentId);
+                if (assignmentId is null || !ActiveBranchAssignmentPathIds.TryGetValue(assignmentId, out var pathIds))
+                    return false;
+
+                return pathIds
+                    .Any(id => ProjectedReadableAssignmentIds.Contains(id) || SourceReadableAssignmentIds.Contains(id));
+            }
+
+            return string.Equals(file.CreatedByUserId, UserId, StringComparison.Ordinal);
+        }
+
+        public bool CanDelete(FileDoc file, WorkDocumentScopeInfo scope)
+        {
+            if (string.Equals(scope.Scope, WorkDocumentConstants.ScopeWork, StringComparison.Ordinal))
+                return IsWorkOwner;
+
+            if (string.Equals(scope.Scope, WorkDocumentConstants.ScopeAssignmentBranch, StringComparison.Ordinal))
+            {
+                var assignmentId = NullIfWhiteSpace(scope.AssignmentId);
+                if (assignmentId is null || !ActiveBranchAssignmentPathIds.ContainsKey(assignmentId))
+                    return false;
+
+                return IsWorkOwner || OwnedBranchAssignmentIds.Contains(assignmentId);
+            }
+
+            return string.Equals(file.CreatedByUserId, UserId, StringComparison.Ordinal);
+        }
+    }
+
+    private sealed class WorkDocumentAssignmentPathProjection
+    {
+        public string Id { get; set; } = default!;
+        public string? Path { get; set; }
+        public string? CreatedByUserId { get; set; }
+    }
 }
