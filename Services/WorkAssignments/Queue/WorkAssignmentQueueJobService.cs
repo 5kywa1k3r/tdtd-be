@@ -1,6 +1,7 @@
 using MongoDB.Driver;
 using Microsoft.Extensions.Logging;
 using tdtd_be.Data;
+using tdtd_be.Enum;
 using tdtd_be.Models;
 using tdtd_be.Models.Enums;
 using tdtd_be.Services.Common;
@@ -40,6 +41,57 @@ public sealed class WorkAssignmentQueueJobService : IWorkAssignmentQueueJobServi
             .Limit(2000)
             .ToListAsync(ct);
 
+        var assignmentIds = queueItems
+            .Select(x => x.WorkAssignmentId)
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+
+        var assignments = assignmentIds.Count == 0
+            ? new List<WorkAssignment>()
+            : await _ctx.WorkAssignments
+                .Find(x => assignmentIds.Contains(x.Id) && !x.IsDeleted)
+                .ToListAsync(ct);
+
+        var assignmentById = assignments
+            .Where(x => !string.IsNullOrWhiteSpace(x.Id))
+            .ToDictionary(x => x.Id!, StringComparer.Ordinal);
+
+        var ancestorIds = assignments
+            .SelectMany(ResolveAncestorIds)
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+
+        var completedAssignmentIds = ancestorIds.Count == 0
+            ? new HashSet<string>(StringComparer.Ordinal)
+            : (await _ctx.WorkAssignments
+                .Find(x =>
+                    ancestorIds.Contains(x.Id) &&
+                    !x.IsDeleted &&
+                    (x.CompletedAtUtc != null ||
+                     (x.ProgressStatus == (int)WorkAssignmentProgressStatus.Completed && x.CompletedDate != null)))
+                .Project(x => x.Id)
+                .ToListAsync(ct))
+                .Where(x => !string.IsNullOrWhiteSpace(x))
+                .ToHashSet(StringComparer.Ordinal);
+
+        var workIds = queueItems
+            .Select(x => x.WorkId)
+            .Concat(assignments.Select(x => x.WorkId))
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+
+        var works = workIds.Count == 0
+            ? new List<Work>()
+            : await _ctx.Works
+                .Find(x => workIds.Contains(x.Id) && !x.IsDeleted)
+                .ToListAsync(ct);
+
+        var workById = works
+            .Where(x => !string.IsNullOrWhiteSpace(x.Id))
+            .ToDictionary(x => x.Id!, StringComparer.Ordinal);
+
         var changed = 0;
         var disabled = 0;
         var missingPeriod = 0;
@@ -51,6 +103,19 @@ public sealed class WorkAssignmentQueueJobService : IWorkAssignmentQueueJobServi
             scanned++;
             try
             {
+                assignmentById.TryGetValue(item.WorkAssignmentId, out var assignment);
+                var workId = assignment?.WorkId ?? item.WorkId;
+                workById.TryGetValue(workId, out var work);
+
+                if (assignment is null ||
+                    !assignment.IsActive ||
+                    IsCompletionLocked(assignment, work, completedAssignmentIds))
+                {
+                    await DisableQueueItemAsync(item.Id!, now, ct);
+                    disabled++;
+                    continue;
+                }
+
                 var period = await _ctx.WorkReportPeriods
                     .Find(x => x.WorkAssignmentId == item.WorkAssignmentId &&
                                x.AssigneeUserId == item.AssigneeUserId &&
@@ -61,14 +126,7 @@ public sealed class WorkAssignmentQueueJobService : IWorkAssignmentQueueJobServi
 
                 if (period is null || !period.IsActive)
                 {
-                    await _ctx.WorkAssignmentQueueItems.UpdateOneAsync(
-                        x => x.Id == item.Id,
-                        Builders<WorkAssignmentQueueItem>.Update
-                            .Set(x => x.IsActive, false)
-                            .Set(x => x.LastScannedAtUtc, now)
-                            .Set(x => x.UpdatedAtUtc, now)
-                            .Set(x => x.UpdatedByUserId, null),
-                        cancellationToken: ct);
+                    await DisableQueueItemAsync(item.Id!, now, ct);
                     missingPeriod++;
                     disabled++;
                     continue;
@@ -169,6 +227,45 @@ public sealed class WorkAssignmentQueueJobService : IWorkAssignmentQueueJobServi
                 StartedAtUtc = startedAtUtc
             }, startedAtUtc, ct);
         }
+    }
+
+    private async Task DisableQueueItemAsync(string queueItemId, DateTime now, CancellationToken ct)
+    {
+        await _ctx.WorkAssignmentQueueItems.UpdateOneAsync(
+            x => x.Id == queueItemId,
+            Builders<WorkAssignmentQueueItem>.Update
+                .Set(x => x.IsActive, false)
+                .Set(x => x.LastScannedAtUtc, now)
+                .Set(x => x.UpdatedAtUtc, now)
+                .Set(x => x.UpdatedByUserId, null),
+            cancellationToken: ct);
+    }
+
+    private static bool IsCompletionLocked(
+        WorkAssignment assignment,
+        Work? work,
+        HashSet<string> completedAssignmentIds)
+    {
+        if (work is null || work.CompletedAtUtc.HasValue || work.Status == WorkStatus.S3)
+            return true;
+
+        if (assignment.CompletedAtUtc.HasValue ||
+            (assignment.ProgressStatus == (int)WorkAssignmentProgressStatus.Completed && assignment.CompletedDate.HasValue))
+            return true;
+
+        return ResolveAncestorIds(assignment).Any(completedAssignmentIds.Contains);
+    }
+
+    private static List<string> ResolveAncestorIds(WorkAssignment assignment)
+    {
+        if (string.IsNullOrWhiteSpace(assignment.Path))
+            return new List<string>();
+
+        return assignment.Path
+            .Split('/', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Where(x => !string.Equals(x, assignment.Id, StringComparison.Ordinal))
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
     }
 
     private async Task WriteStatusOperationLogAsync(

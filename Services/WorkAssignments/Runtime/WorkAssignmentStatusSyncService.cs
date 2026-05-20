@@ -216,7 +216,14 @@ public sealed class WorkAssignmentStatusSyncService : IWorkAssignmentStatusSyncS
             snapshot.Add((WorkAssignmentProgressStatus)root.ProgressStatus);
         }
 
-        var mappedWorkStatus = MapToWorkStatus(snapshot);
+        var work = await _ctx.Works
+            .Find(x => x.Id == workId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct);
+
+        var mappedWorkStatus = work is not null &&
+                               (work.CompletedAtUtc.HasValue || work.Status == WorkStatus.S3)
+            ? WorkStatus.S3
+            : MapToWorkStatus(snapshot);
 
         await _ctx.Works.UpdateOneAsync(
             x => x.Id == workId && !x.IsDeleted,
@@ -248,8 +255,8 @@ public sealed class WorkAssignmentStatusSyncService : IWorkAssignmentStatusSyncS
         if (snapshot.Overdue > 0) return WorkStatus.S5;
         if (snapshot.AtRiskOverdue > 0) return WorkStatus.S4;
         if (snapshot.InProgress > 0) return WorkStatus.S2;
+        if (snapshot.Completed > 0) return WorkStatus.S2;
         if (snapshot.NotStarted > 0) return WorkStatus.S1;
-        if (snapshot.Completed > 0) return WorkStatus.S3;
         return WorkStatus.S1;
     }
 

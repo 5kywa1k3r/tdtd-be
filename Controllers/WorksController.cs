@@ -60,6 +60,10 @@ public sealed class WorksController : ControllerBase
     public async Task<ActionResult<WorkResponse>> Update([FromRoute] string id, [FromBody] WorkUpdateRequest req, CancellationToken ct)
         => Ok(await _svc.UpdateAsync(id, req, ct));
 
+    [HttpPost("{id}/complete")]
+    public async Task<ActionResult<WorkResponse>> Complete([FromRoute] string id, [FromBody] CompleteWorkRequest req, CancellationToken ct)
+        => Ok(await _svc.CompleteAsync(id, req, ct));
+
     [HttpDelete("{id}")]
     public async Task<IActionResult> Delete([FromRoute] string id, CancellationToken ct)
     {

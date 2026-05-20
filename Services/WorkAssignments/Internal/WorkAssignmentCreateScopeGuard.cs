@@ -13,17 +13,15 @@ internal static class WorkAssignmentCreateScopeGuard
     {
         EnsureActor(actorUserId);
 
-        // Assignee ids are intentionally not authorization input. A user may assign
-        // a scoped assignment to themself; parent/work scope decides whether create is allowed.
-        _ = assigneeUserIds;
-
         if (parent is null)
         {
             EnsureCanCreateRoot(work, actorUserId);
+            EnsureNoSelfAssignment(actorUserId, assigneeUserIds);
             return;
         }
 
         EnsureCanCreateBranch(parent, actorUserId);
+        EnsureNoSelfAssignment(actorUserId, assigneeUserIds);
     }
 
     public static void EnsureActor(string actorUserId)
@@ -54,5 +52,20 @@ internal static class WorkAssignmentCreateScopeGuard
             throw AppExceptionFactory.Forbidden(
                 AppErrorCode.WORK_ASSIGNMENT_BRANCH_CREATE_FORBIDDEN,
                 new { workId = parent.WorkId, parentAssignmentId = parent.Id, actorUserId });
+    }
+
+    public static void EnsureNoSelfAssignment(string actorUserId, IEnumerable<string>? assigneeUserIds)
+    {
+        EnsureActor(actorUserId);
+
+        var hasSelf = (assigneeUserIds ?? Array.Empty<string>())
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Distinct(StringComparer.Ordinal)
+            .Any(x => string.Equals(x, actorUserId, StringComparison.Ordinal));
+
+        if (hasSelf)
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_SELF_ASSIGNMENT_NOT_ALLOWED,
+                new { actorUserId });
     }
 }

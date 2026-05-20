@@ -32,6 +32,11 @@ public sealed record WorkUpdateRequest(
     WorkPriority? Priority
 );
 
+public sealed record CompleteWorkRequest(
+    DateTime? CompletedDate,
+    string? Note
+);
+
 public sealed record WorkResponse(
     string Id,
     string AutoCode,
@@ -53,6 +58,9 @@ public sealed record WorkResponse(
     DateTime? StartDate,
     DateTime? EndDate,
     DateTime? DueDate,
+    DateTime? CompletedDate,
+    DateTime? CompletedAtUtc,
+    string? CompletedByUserId,
     WorkPriority Priority,
     WorkType Type,
     bool IsDeleted,
@@ -83,6 +91,9 @@ public sealed record WorkListRow(
     string? WorstEvaluationCode,
     string? WorstEvaluationLabel,
     DateTime? DueDate,
+    DateTime? CompletedDate,
+    DateTime? CompletedAtUtc,
+    string? CompletedByUserId,
     DateTime CreatedAtUtc
 );
 

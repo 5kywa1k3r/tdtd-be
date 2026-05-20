@@ -13,6 +13,7 @@ public class WorkAssignmentResponse
     public string? DynamicFormTemplateCode { get; set; }
     public string? DynamicFormTemplateName { get; set; }
     public string? DynamicFormDataSourceRulesJson { get; set; }
+    public string? AutoApproveConditionJson { get; set; }
 
     public string WorkType { get; set; } = string.Empty;
     public string AssignmentType { get; set; } = string.Empty;
@@ -20,7 +21,10 @@ public class WorkAssignmentResponse
 
     public AssignmentScheduleDto? Schedule { get; set; }
     public DateTime? StartDate { get; set; }
+    public DateTime? DueDate { get; set; }
     public DateTime? CompletedDate { get; set; }
+    public DateTime? CompletedAtUtc { get; set; }
+    public string? CompletedByUserId { get; set; }
 
     public List<UserRefDTO> Assignees { get; set; } = new();
     public List<string> LeaderWatcherUserIds { get; set; } = new();

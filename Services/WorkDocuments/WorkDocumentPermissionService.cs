@@ -106,6 +106,15 @@ public sealed class WorkDocumentPermissionService : IWorkDocumentPermissionServi
             throw AppExceptionFactory.Forbidden(AppErrorCode.AUTH_FORBIDDEN, new { fileId = file.Id });
     }
 
+    public Task<bool> CanUpdateFileAsync(FileDoc file, string userId, CancellationToken ct)
+        => CanDeleteFileAsync(file, userId, ct);
+
+    public async Task EnsureCanUpdateFileAsync(FileDoc file, string userId, CancellationToken ct)
+    {
+        if (!await CanUpdateFileAsync(file, userId, ct))
+            throw AppExceptionFactory.Forbidden(AppErrorCode.AUTH_FORBIDDEN, new { fileId = file.Id });
+    }
+
     public async Task<bool> CanDeleteFileAsync(FileDoc file, string userId, CancellationToken ct)
     {
         var scope = WorkDocumentScopeResolver.Resolve(file);

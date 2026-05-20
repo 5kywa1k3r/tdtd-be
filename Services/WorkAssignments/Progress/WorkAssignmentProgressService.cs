@@ -59,6 +59,18 @@ public sealed class WorkAssignmentProgressService : IWorkAssignmentProgressServi
         Work work,
         CancellationToken ct)
     {
+        if (IsManuallyCompleted(assignment))
+        {
+            return new ProgressComputeResult
+            {
+                ProgressStatus = (int)WorkAssignmentProgressStatus.Completed,
+                HasAnyDuePeriod = assignment.HasAnyDuePeriod,
+                HasOverduePeriod = assignment.HasOverduePeriod,
+                LatestPeriodKey = assignment.LatestPeriodKey,
+                LatestDueAtUtc = assignment.LatestDueAtUtc
+            };
+        }
+
         var now = DateTime.UtcNow;
 
         var isOnceAssignment = IsOnceAssignment(assignment);
@@ -83,10 +95,6 @@ public sealed class WorkAssignmentProgressService : IWorkAssignmentProgressServi
         if (!facts.HasAnyDuePeriod && !facts.HasAnyOpenPeriod)
         {
             status = (int)WorkAssignmentProgressStatus.NotStarted;
-        }
-        else if (facts.HasMaterializedPeriods && facts.AreAllPeriodsApprovedWithinScope)
-        {
-            status = (int)WorkAssignmentProgressStatus.Completed;
         }
         else if (facts.IsEnded && facts.HasDueButNotApproved)
         {
@@ -116,6 +124,18 @@ public sealed class WorkAssignmentProgressService : IWorkAssignmentProgressServi
         List<WorkAssignment> directChildren,
         CancellationToken ct)
     {
+        if (IsManuallyCompleted(parent))
+        {
+            return Task.FromResult(new ProgressComputeResult
+            {
+                ProgressStatus = (int)WorkAssignmentProgressStatus.Completed,
+                HasAnyDuePeriod = parent.HasAnyDuePeriod,
+                HasOverduePeriod = parent.HasOverduePeriod,
+                LatestPeriodKey = parent.LatestPeriodKey,
+                LatestDueAtUtc = parent.LatestDueAtUtc
+            });
+        }
+
         var activeChildren = directChildren
             .Where(x => x.IsActive && !x.IsDeleted)
             .ToList();
@@ -135,9 +155,7 @@ public sealed class WorkAssignmentProgressService : IWorkAssignmentProgressServi
         var statuses = activeChildren.Select(x => x.ProgressStatus).ToList();
 
         int status;
-        if (statuses.All(x => x == (int)WorkAssignmentProgressStatus.Completed))
-            status = (int)WorkAssignmentProgressStatus.Completed;
-        else if (statuses.Any(x => x == (int)WorkAssignmentProgressStatus.Overdue))
+        if (statuses.Any(x => x == (int)WorkAssignmentProgressStatus.Overdue))
             status = (int)WorkAssignmentProgressStatus.Overdue;
         else if (statuses.Any(x => x == (int)WorkAssignmentProgressStatus.AtRiskOverdue))
             status = (int)WorkAssignmentProgressStatus.AtRiskOverdue;
@@ -533,6 +551,11 @@ public sealed class WorkAssignmentProgressService : IWorkAssignmentProgressServi
 
     private static bool IsOnceAssignment(WorkAssignment assignment)
         => string.Equals(assignment.AssignmentType, WorkAssignmentTypes.Once, StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsManuallyCompleted(WorkAssignment assignment)
+        => assignment.CompletedAtUtc.HasValue ||
+           (assignment.ProgressStatus == (int)WorkAssignmentProgressStatus.Completed &&
+            assignment.CompletedDate.HasValue);
 
     private static bool IsApprovedPeriodStatus(WorkReportPeriodStatus status)
         => WorkReportPeriodStatusHelper.IsTerminal(status);

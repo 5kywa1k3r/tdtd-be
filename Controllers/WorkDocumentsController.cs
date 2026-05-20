@@ -113,6 +113,7 @@ public sealed class WorkDocumentsController : ControllerBase
                 AssignmentPath = scopeInfo.AssignmentPath,
                 CreatedByUserId = file.CreatedByUserId,
                 CreatedByName = ResolveUserName(users, file.CreatedByUserId),
+                CanUpdate = await _permission.CanUpdateFileAsync(file, me.Id, ct),
                 CanDelete = await _permission.CanDeleteFileAsync(file, me.Id, ct)
             });
         }
@@ -184,6 +185,143 @@ public sealed class WorkDocumentsController : ControllerBase
             sourceType: WorkDocumentConstants.SourceTypeAssignmentDocument,
             sourceId: assignmentId,
             userId: me.Id));
+    }
+
+    [HttpPatch("{fileId}")]
+    public async Task<ActionResult<WorkDocumentRow>> Update(
+        [FromRoute] string workId,
+        [FromRoute] string fileId,
+        [FromBody] UpdateWorkDocumentReq req,
+        CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(fileId))
+            throw AppExceptionFactory.BadRequest(AppErrorCode.UPLOAD_FILE_ID_REQUIRED);
+
+        req ??= new UpdateWorkDocumentReq();
+
+        var me = _me.RequireMe();
+        var file = await _ctx.Files
+            .Find(x => x.Id == fileId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct);
+
+        if (file is null)
+            throw AppExceptionFactory.NotFound(AppErrorCode.UPLOAD_FILE_NOT_FOUND, new { workId, fileId });
+
+        var currentScope = WorkDocumentScopeResolver.Resolve(file);
+        if (!string.Equals(currentScope.WorkId, workId, StringComparison.Ordinal))
+            throw AppExceptionFactory.NotFound(AppErrorCode.UPLOAD_FILE_NOT_FOUND, new { workId, fileId });
+
+        await _permission.EnsureCanUpdateFileAsync(file, me.Id, ct);
+
+        var update = Builders<FileDoc>.Update
+            .Set(x => x.UpdatedAtUtc, DateTime.UtcNow)
+            .Set(x => x.UpdatedByUserId, me.Id);
+
+        var nextName = NullIfWhiteSpace(req.OriginalName);
+        if (nextName is not null)
+        {
+            update = update.Set(x => x.OriginalName, nextName);
+            file.OriginalName = nextName;
+        }
+
+        var targetProvided =
+            !string.IsNullOrWhiteSpace(req.Scope) ||
+            !string.IsNullOrWhiteSpace(req.AssignmentId);
+
+        if (targetProvided)
+        {
+            var targetScope = NormalizeScope(req.Scope) ?? currentScope.Scope;
+            var targetAssignmentId = NullIfWhiteSpace(req.AssignmentId);
+            var sameScope = string.Equals(targetScope, currentScope.Scope, StringComparison.OrdinalIgnoreCase);
+            var sameTarget =
+                sameScope &&
+                (targetScope != WorkDocumentConstants.ScopeAssignmentBranch ||
+                 string.Equals(targetAssignmentId ?? currentScope.AssignmentId, currentScope.AssignmentId, StringComparison.Ordinal));
+
+            if (!sameTarget)
+            {
+                if (string.Equals(targetScope, WorkDocumentConstants.ScopeWork, StringComparison.OrdinalIgnoreCase))
+                {
+                    await _permission.EnsureCanCreateWorkDocumentAsync(workId, me.Id, ct);
+
+                    update = update
+                        .Set(x => x.SourceType, WorkDocumentConstants.SourceTypeWorkDocument)
+                        .Set(x => x.SourceId, workId)
+                        .Set(x => x.WorkId, workId)
+                        .Set(x => x.AssignmentId, (string?)null)
+                        .Set(x => x.DocumentScope, WorkDocumentConstants.ScopeWork)
+                        .Set(x => x.AssignmentCode, (string?)null)
+                        .Set(x => x.AssignmentPath, (string?)null);
+
+                    file.SourceType = WorkDocumentConstants.SourceTypeWorkDocument;
+                    file.SourceId = workId;
+                    file.WorkId = workId;
+                    file.AssignmentId = null;
+                    file.DocumentScope = WorkDocumentConstants.ScopeWork;
+                    file.AssignmentCode = null;
+                    file.AssignmentPath = null;
+                }
+                else if (string.Equals(targetScope, WorkDocumentConstants.ScopeAssignmentBranch, StringComparison.OrdinalIgnoreCase))
+                {
+                    if (string.IsNullOrWhiteSpace(targetAssignmentId))
+                        throw AppExceptionFactory.BadRequest(
+                            AppErrorCode.WORK_ASSIGNMENT_ID_REQUIRED,
+                            new { workId, fileId, assignmentId = targetAssignmentId });
+
+                    var assignment = await _permission.EnsureCanCreateAssignmentDocumentAsync(workId, targetAssignmentId, me.Id, ct);
+
+                    update = update
+                        .Set(x => x.SourceType, WorkDocumentConstants.SourceTypeAssignmentDocument)
+                        .Set(x => x.SourceId, assignment.Id)
+                        .Set(x => x.WorkId, workId)
+                        .Set(x => x.AssignmentId, assignment.Id)
+                        .Set(x => x.DocumentScope, WorkDocumentConstants.ScopeAssignmentBranch)
+                        .Set(x => x.AssignmentCode, assignment.Code)
+                        .Set(x => x.AssignmentPath, assignment.Path);
+
+                    file.SourceType = WorkDocumentConstants.SourceTypeAssignmentDocument;
+                    file.SourceId = assignment.Id;
+                    file.WorkId = workId;
+                    file.AssignmentId = assignment.Id;
+                    file.DocumentScope = WorkDocumentConstants.ScopeAssignmentBranch;
+                    file.AssignmentCode = assignment.Code;
+                    file.AssignmentPath = assignment.Path;
+                }
+                else
+                {
+                    throw AppExceptionFactory.BadRequest(
+                        AppErrorCode.COMMON_VALIDATION_FAILED,
+                        new { scope = req.Scope });
+                }
+            }
+        }
+
+        await _ctx.Files.UpdateOneAsync(
+            x => x.Id == fileId && !x.IsDeleted,
+            update,
+            cancellationToken: ct);
+
+        var users = await LoadUsersAsync(new[] { file.CreatedByUserId }, ct);
+        var nextScope = WorkDocumentScopeResolver.Resolve(file);
+
+        return Ok(new WorkDocumentRow
+        {
+            Id = file.Id,
+            OriginalName = file.OriginalName,
+            MimeType = file.MimeType,
+            Size = file.Size,
+            CreatedAtUtc = file.CreatedAtUtc,
+            Scope = nextScope.Scope,
+            SourceType = file.SourceType,
+            WorkId = nextScope.WorkId,
+            AssignmentId = nextScope.AssignmentId,
+            AssignmentCode = nextScope.AssignmentCode,
+            AssignmentPath = nextScope.AssignmentPath,
+            CreatedByUserId = file.CreatedByUserId,
+            CreatedByName = ResolveUserName(users, file.CreatedByUserId),
+            CanUpdate = await _permission.CanUpdateFileAsync(file, me.Id, ct),
+            CanDelete = await _permission.CanDeleteFileAsync(file, me.Id, ct)
+        });
     }
 
     [HttpDelete("{fileId}")]

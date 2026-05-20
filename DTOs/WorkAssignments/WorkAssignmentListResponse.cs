@@ -14,11 +14,15 @@ public sealed class WorkAssignmentListResponse
     public string? DynamicFormTemplateCode { get; set; }
     public string? DynamicFormTemplateName { get; set; }
     public string? DynamicFormDataSourceRulesJson { get; set; }
+    public string? AutoApproveConditionJson { get; set; }
 
     public string AssignmentType { get; set; } = string.Empty;
     public string AggregationType { get; set; } = string.Empty;
     public DateTime? StartDate { get; set; }
+    public DateTime? DueDate { get; set; }
     public DateTime? CompletedDate { get; set; }
+    public DateTime? CompletedAtUtc { get; set; }
+    public string? CompletedByUserId { get; set; }
 
     public List<UserRefDTO> Assignees { get; set; } = new();
     public List<UserRefDTO> LeaderWatchers { get; set; } = new();

@@ -113,6 +113,34 @@ public sealed class WorkAssignmentsController : ControllerBase
         return Ok(rs);
     }
 
+    [HttpPatch("work-assignments/{id}/auto-approve-condition")]
+    public async Task<ActionResult<WorkAssignmentResponse>> UpdateAutoApproveCondition(
+        [FromRoute] string id,
+        [FromBody] UpdateWorkAssignmentAutoApproveConditionRequest req,
+        CancellationToken ct)
+    {
+        var actorUserId = GetActorUserId();
+        var rs = await _service.UpdateAutoApproveConditionAsync(id, req, actorUserId, ct);
+        if (rs is null)
+            throw AppExceptionFactory.NotFound(AppErrorCode.WORK_ASSIGNMENT_NOT_FOUND, new { assignmentId = id });
+
+        return Ok(rs);
+    }
+
+    [HttpPost("work-assignments/{id}/complete")]
+    public async Task<ActionResult<WorkAssignmentResponse>> Complete(
+        [FromRoute] string id,
+        [FromBody] CompleteWorkAssignmentRequest req,
+        CancellationToken ct)
+    {
+        var actorUserId = GetActorUserId();
+        var rs = await _service.CompleteAsync(id, req, actorUserId, ct);
+        if (rs is null)
+            throw AppExceptionFactory.NotFound(AppErrorCode.WORK_ASSIGNMENT_NOT_FOUND, new { assignmentId = id });
+
+        return Ok(rs);
+    }
+
     [HttpPost("work-assignments/{id}/deactivate")]
     public async Task<ActionResult> Deactivate(
         [FromRoute] string id,

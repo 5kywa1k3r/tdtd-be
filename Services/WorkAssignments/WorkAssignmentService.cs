@@ -1,7 +1,9 @@
 
+using MongoDB.Bson;
 using MongoDB.Driver;
 using Microsoft.Extensions.Logging;
 using System.Linq;
+using System.Text.RegularExpressions;
 using tdtd_be.Common.Auth;
 using tdtd_be.Common.Errors;
 using tdtd_be.Common.Time;
@@ -11,6 +13,7 @@ using tdtd_be.DTOs.Operations;
 using tdtd_be.DTOs.Users;
 using tdtd_be.DTOs.WorkAssignments;
 using tdtd_be.DTOs.WorkAssignments.Review;
+using tdtd_be.Enum;
 using tdtd_be.Models;
 using tdtd_be.Models.Enums;
 using tdtd_be.Services.Common;
@@ -314,7 +317,7 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
         if (unitManagerUserIds.Count > 0)
         {
             normalizedReq.AssigneeUserIds = normalizedReq.AssigneeUserIds
-                .Concat(unitManagerUserIds)
+                .Concat(unitManagerUserIds.Where(id => !string.Equals(id, actorUserId, StringComparison.Ordinal)))
                 .Distinct(StringComparer.Ordinal)
                 .ToList();
         }
@@ -335,6 +338,8 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
                     new { workId, parentAssignmentId = normalizedReq.ParentAssignmentId });
 
         }
+
+        await EnsureCreateScopeOpenAsync(work, parent, actorUserId, ct);
 
         var now = DateTime.UtcNow;
         normalizedReq = WorkAssignmentScheduleHelper.ApplyEffectiveDateDefaults(
@@ -365,10 +370,15 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
         var dynamicFormDataSourceRulesJson = DynamicFormDataSourceRuleNormalizer.NormalizeOrDefault(
             normalizedReq.DynamicFormDataSourceRulesJson,
             dynamicFormTemplate.SectionsJson);
+        var autoApproveConditionJson = WorkAssignmentAutoApproveConditionNormalizer.NormalizeOrNull(
+            normalizedReq.AutoApproveConditionJson,
+            dynamicFormTemplate.FieldsJson);
 
         EnsureNoCreateTimeSourceAssignments(dynamicFormDataSourceRulesJson);
 
         var assignees = await WorkAssignmentUserHelper.BuildAssigneesAsync(_ctx, normalizedReq.AssigneeUserIds, ct);
+        await EnsureAssignmentTargetsAllowedAsync(actorUserId, assignees, ct);
+
         var leaderWatchers = await WorkAssignmentUserHelper.BuildLeaderWatchersAsync(
             _ctx,
             normalizedReq.LeaderWatcherUserIds ?? new List<string>(),
@@ -377,7 +387,15 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
 
         var willBeActive = normalizedReq.IsActive ?? true;
 
-        await EnsureNoActiveTemplateReuseConflictAsync(
+        await EnsureNoActiveSiblingDynamicFormConflictAsync(
+            workId,
+            parent?.Id,
+            template.DynamicFormTemplateId,
+            exceptAssignmentId: null,
+            onlyWhenActive: willBeActive,
+            ct: ct);
+
+        await EnsureNoActiveAssigneeDynamicFormBindingConflictAsync(
             workId,
             template.DynamicFormTemplateId,
             assignees.Select(x => x.UserId).ToList(),
@@ -402,6 +420,7 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
             DynamicFormTemplateCode = template.DynamicFormTemplateCode,
             DynamicFormTemplateName = template.DynamicFormTemplateName,
             DynamicFormDataSourceRulesJson = dynamicFormDataSourceRulesJson,
+            AutoApproveConditionJson = autoApproveConditionJson,
 
             EvaluationTemplateId = string.IsNullOrWhiteSpace(work.EvaluationTemplateId) ? null : work.EvaluationTemplateId,
             EvaluationTemplateCode = string.IsNullOrWhiteSpace(work.EvaluationTemplateCode) ? null : work.EvaluationTemplateCode,
@@ -412,7 +431,8 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
             AggregationType = normalizedReq.AggregationType,
             Schedule = WorkAssignmentScheduleHelper.MapSchedule(normalizedReq.Schedule, normalizedReq.AssignmentType),
             StartDate = NormalizeDate(normalizedReq.StartDate),
-            CompletedDate = NormalizeDate(normalizedReq.CompletedDate),
+            DueDate = NormalizeDate(normalizedReq.DueDate),
+            CompletedDate = null,
 
             Assignees = assignees,
             LeaderWatcherUserIds = leaderWatchers
@@ -539,6 +559,8 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
                 AppErrorCode.WORK_ASSIGNMENT_DATA_SOURCE_RULES_FORBIDDEN,
                 new { assignmentId = id });
 
+        await EnsureAssignmentMutationScopeOpenAsync(entity, actorUserId, ct);
+
         var hasData = await _dataGuard.HasAssignmentDataAsync(entity.Id!, ct);
         if (hasData)
             throw AppExceptionFactory.Create(
@@ -584,6 +606,175 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
         return ToDetailResponse(entity, hasData: false);
     }
 
+    public async Task<WorkAssignmentResponse?> UpdateAutoApproveConditionAsync(
+        string id,
+        UpdateWorkAssignmentAutoApproveConditionRequest req,
+        string actorUserId,
+        CancellationToken ct = default)
+    {
+        EnsureActor(actorUserId);
+
+        var entity = await _ctx.WorkAssignments
+            .Find(x => x.Id == id && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct);
+
+        if (entity is null)
+            return null;
+
+        if (!CanConfigureDataSourceRules(entity, actorUserId))
+            throw AppExceptionFactory.Forbidden(
+                AppErrorCode.WORK_ASSIGNMENT_DATA_SOURCE_RULES_FORBIDDEN,
+                new { assignmentId = id });
+
+        await EnsureAssignmentMutationScopeOpenAsync(entity, actorUserId, ct);
+
+        var dynamicFormTemplate = await _ctx.DynamicFormTemplates
+            .Find(x => x.Id == entity.DynamicFormTemplateId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct)
+            ?? throw AppExceptionFactory.NotFound(
+                AppErrorCode.DYNAMIC_FORM_TEMPLATE_NOT_FOUND_OR_UNPUBLISHED,
+                new { dynamicFormTemplateId = entity.DynamicFormTemplateId });
+
+        var normalizedJson = WorkAssignmentAutoApproveConditionNormalizer.NormalizeOrNull(
+            req?.AutoApproveConditionJson,
+            dynamicFormTemplate.FieldsJson);
+
+        var now = DateTime.UtcNow;
+        var rs = await _ctx.WorkAssignments.UpdateOneAsync(
+            x => x.Id == entity.Id && !x.IsDeleted,
+            Builders<WorkAssignment>.Update
+                .Set(x => x.AutoApproveConditionJson, normalizedJson)
+                .Set(x => x.UpdatedAtUtc, now)
+                .Set(x => x.UpdatedByUserId, actorUserId),
+            cancellationToken: ct);
+
+        if (rs.ModifiedCount > 0)
+        {
+            entity.AutoApproveConditionJson = normalizedJson;
+            entity.UpdatedAtUtc = now;
+            entity.UpdatedByUserId = actorUserId;
+
+            await _docRoleReadModelProjection.RebuildAssignmentAsync(entity.Id!, actorUserId, ct);
+            await _binding.RebuildForAssignmentAsync(entity, actorUserId, ct);
+        }
+
+        var hasData = await _dataGuard.HasAssignmentDataAsync(entity.Id!, ct);
+        return ToDetailResponse(entity, hasData);
+    }
+
+    public async Task<WorkAssignmentResponse?> CompleteAsync(
+        string id,
+        CompleteWorkAssignmentRequest req,
+        string actorUserId,
+        CancellationToken ct = default)
+    {
+        EnsureActor(actorUserId);
+
+        var entity = await _ctx.WorkAssignments
+            .Find(x => x.Id == id && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct);
+
+        if (entity is null)
+            return null;
+
+        if (!CanConfigureDataSourceRules(entity, actorUserId))
+            throw AppExceptionFactory.Forbidden(
+                AppErrorCode.WORK_ASSIGNMENT_COMPLETION_FORBIDDEN,
+                new { assignmentId = id, actorUserId });
+
+        var work = await _ctx.Works
+            .Find(x => x.Id == entity.WorkId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct)
+            ?? throw AppExceptionFactory.NotFound(
+                AppErrorCode.WORK_ASSIGNMENT_WORK_NOT_FOUND,
+                new { assignmentId = id, entity.WorkId });
+
+        if (work.CompletedAtUtc.HasValue || work.Status == WorkStatus.S3)
+            throw AppExceptionFactory.Create(
+                AppErrorCode.WORK_COMPLETED_LOCKED,
+                new { workId = work.Id, assignmentId = id });
+
+        await EnsureNoCompletedAncestorAsync(entity, actorUserId, ct);
+
+        var now = DateTime.UtcNow;
+        var completedDate = (req?.CompletedDate ?? now).Date;
+
+        var rs = await _ctx.WorkAssignments.UpdateOneAsync(
+            x => x.Id == id && !x.IsDeleted,
+            Builders<WorkAssignment>.Update
+                .Set(x => x.CompletedDate, completedDate)
+                .Set(x => x.CompletedAtUtc, now)
+                .Set(x => x.CompletedByUserId, actorUserId)
+                .Set(x => x.ProgressStatus, (int)WorkAssignmentProgressStatus.Completed)
+                .Set(x => x.ProgressStatusUpdatedAtUtc, now)
+                .Set(x => x.UpdatedAtUtc, now)
+                .Set(x => x.UpdatedByUserId, actorUserId),
+            cancellationToken: ct);
+
+        if (rs.ModifiedCount > 0)
+        {
+            entity.CompletedDate = completedDate;
+            entity.CompletedAtUtc = now;
+            entity.CompletedByUserId = actorUserId;
+            entity.ProgressStatus = (int)WorkAssignmentProgressStatus.Completed;
+            entity.ProgressStatusUpdatedAtUtc = now;
+            entity.UpdatedAtUtc = now;
+            entity.UpdatedByUserId = actorUserId;
+
+            await DisableRuntimeForCompletedAssignmentScopeAsync(entity, actorUserId, now, ct);
+            await _docRoleReadModelProjection.RebuildAssignmentAsync(id, actorUserId, ct);
+            await _statusRepair.RebuildWorkTreeAsync(entity.WorkId, ct);
+        }
+
+        var hasData = await _dataGuard.HasAssignmentDataAsync(entity.Id!, ct);
+        return ToDetailResponse(entity, hasData);
+    }
+
+    private async Task DisableRuntimeForCompletedAssignmentScopeAsync(
+        WorkAssignment assignment,
+        string actorUserId,
+        DateTime now,
+        CancellationToken ct)
+    {
+        var assignmentIds = await _ctx.WorkAssignments
+            .Find(x =>
+                x.WorkId == assignment.WorkId &&
+                !x.IsDeleted &&
+                (x.Id == assignment.Id || x.Path.StartsWith($"{assignment.Path}/")))
+            .Project(x => x.Id)
+            .ToListAsync(ct);
+
+        assignmentIds = assignmentIds
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+
+        if (assignmentIds.Count == 0)
+            return;
+
+        await _ctx.WorkAssignmentQueueItems.UpdateManyAsync(
+            x => assignmentIds.Contains(x.WorkAssignmentId) && !x.IsDeleted && x.IsActive,
+            Builders<WorkAssignmentQueueItem>.Update
+                .Set(x => x.IsActive, false)
+                .Set(x => x.UpdatedAtUtc, now)
+                .Set(x => x.UpdatedByUserId, actorUserId),
+            cancellationToken: ct);
+
+        await _ctx.WorkAssignmentMaterializeJobs.UpdateManyAsync(
+            x => assignmentIds.Contains(x.WorkAssignmentId) &&
+                 !x.IsDeleted &&
+                 x.IsActive &&
+                 x.Status != MaterializeJobStatuses.Completed &&
+                 x.Status != MaterializeJobStatuses.DeadLetter,
+            Builders<WorkAssignmentMaterializeJobs>.Update
+                .Set(x => x.IsActive, false)
+                .Set(x => x.Status, MaterializeJobStatuses.Completed)
+                .Set(x => x.CompletedAtUtc, now)
+                .Set(x => x.UpdatedAtUtc, now)
+                .Set(x => x.UpdatedByUserId, actorUserId),
+            cancellationToken: ct);
+    }
+
     public async Task<bool> DeactivateAsync(
         string id,
         string actorUserId,
@@ -603,6 +794,8 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
 
         if (!entity.IsActive)
             return true;
+
+        await EnsureAssignmentMutationScopeOpenAsync(entity, actorUserId, ct);
 
         var now = DateTime.UtcNow;
 
@@ -667,13 +860,23 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
         if (entity.IsActive)
             return true;
 
+        await EnsureAssignmentMutationScopeOpenAsync(entity, actorUserId, ct);
+
         var assigneeUserIds = (entity.Assignees ?? Enumerable.Empty<UserRef>())
             .Select(x => x.UserId)
             .Where(x => !string.IsNullOrWhiteSpace(x))
             .Distinct(StringComparer.Ordinal)
             .ToList();
 
-        await EnsureNoActiveTemplateReuseConflictAsync(
+        await EnsureNoActiveSiblingDynamicFormConflictAsync(
+            entity.WorkId,
+            entity.ParentAssignmentId,
+            entity.DynamicFormTemplateId,
+            exceptAssignmentId: entity.Id,
+            onlyWhenActive: true,
+            ct: ct);
+
+        await EnsureNoActiveAssigneeDynamicFormBindingConflictAsync(
             entity.WorkId,
             entity.DynamicFormTemplateId,
             assigneeUserIds,
@@ -712,7 +915,181 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
         return true;
     }
 
-    private async Task EnsureNoActiveTemplateReuseConflictAsync(
+    private async Task EnsureAssignmentTargetsAllowedAsync(
+        string actorUserId,
+        List<UserRef> assignees,
+        CancellationToken ct)
+    {
+        var assigneeUserIds = (assignees ?? new List<UserRef>())
+            .Select(x => x.UserId)
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+
+        if (assigneeUserIds.Count == 0)
+            return;
+
+        WorkAssignmentCreateScopeGuard.EnsureNoSelfAssignment(actorUserId, assigneeUserIds);
+
+        var userIds = assigneeUserIds
+            .Append(actorUserId)
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+
+        var users = await _ctx.Users
+            .Find(x => userIds.Contains(x.Id!) && !x.IsDeleted)
+            .ToListAsync(ct);
+
+        var userById = users
+            .Where(x => !string.IsNullOrWhiteSpace(x.Id))
+            .ToDictionary(x => x.Id!, x => x, StringComparer.Ordinal);
+
+        if (!userById.TryGetValue(actorUserId, out var actorUser))
+            throw AppExceptionFactory.Unauthorized(
+                AppErrorCode.WORK_ASSIGNMENT_ACTOR_REQUIRED,
+                new { actorUserId });
+
+        var missingAssigneeUserIds = assigneeUserIds
+            .Where(id => !userById.ContainsKey(id))
+            .ToList();
+
+        if (missingAssigneeUserIds.Count > 0)
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_ASSIGNEE_USER_NOT_FOUND,
+                new { userIds = missingAssigneeUserIds });
+
+        if (!WorkAssignmentTargetScopeValidator.IsUnitManager(actorUser))
+            return;
+
+        var unitIds = users
+            .Select(x => x.UnitId)
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+
+        var units = unitIds.Count == 0
+            ? new List<Unit>()
+            : await _ctx.Units
+                .Find(x => unitIds.Contains(x.Id!) && !x.IsDeleted)
+                .ToListAsync(ct);
+
+        var unitById = units
+            .Where(x => !string.IsNullOrWhiteSpace(x.Id))
+            .ToDictionary(x => x.Id!, x => x, StringComparer.Ordinal);
+
+        if (unitById.Count != unitIds.Count)
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_USER_UNIT_INACTIVE,
+                new { userIds, unitIds });
+
+        var actorUnit = !string.IsNullOrWhiteSpace(actorUser.UnitId) &&
+                        unitById.TryGetValue(actorUser.UnitId!, out var resolvedActorUnit)
+            ? resolvedActorUnit
+            : null;
+
+        var actorUnitHasAssignableDescendants = actorUnit is not null &&
+                                                await HasAssignableDescendantUnitAsync(actorUnit, ct);
+
+        var targetUsers = assigneeUserIds
+            .Select(id => userById[id])
+            .ToList();
+
+        WorkAssignmentTargetScopeValidator.EnsureCanAssignTargets(
+            actorUser,
+            actorUnit,
+            targetUsers,
+            unitById,
+            actorUnitHasAssignableDescendants);
+    }
+
+    private async Task<bool> HasAssignableDescendantUnitAsync(Unit actorUnit, CancellationToken ct)
+    {
+        var f = Builders<Unit>.Filter;
+        var filter = f.Eq(x => x.IsDeleted, false)
+                     & f.Eq(x => x.IsVirtual, false)
+                     & f.Ne(x => x.Id, actorUnit.Id);
+
+        var code = actorUnit.Code?.Trim();
+        if (!string.IsNullOrWhiteSpace(code))
+        {
+            filter &= f.Regex(x => x.Code, new BsonRegularExpression("^" + Regex.Escape(code)));
+        }
+        else
+        {
+            filter &= f.Eq(x => x.ParentUnitId, actorUnit.Id);
+        }
+
+        return await _ctx.Units
+            .Find(filter)
+            .Limit(1)
+            .AnyAsync(ct);
+    }
+
+    private async Task EnsureNoActiveSiblingDynamicFormConflictAsync(
+        string workId,
+        string? parentAssignmentId,
+        string? dynamicFormTemplateId,
+        string? exceptAssignmentId,
+        bool onlyWhenActive,
+        CancellationToken ct)
+    {
+        if (!onlyWhenActive)
+            return;
+
+        if (string.IsNullOrWhiteSpace(dynamicFormTemplateId))
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.DYNAMIC_FORM_TEMPLATE_REQUIRED,
+                new { workId, parentAssignmentId });
+
+        var normalizedParentId = string.IsNullOrWhiteSpace(parentAssignmentId)
+            ? null
+            : parentAssignmentId.Trim();
+
+        var f = Builders<WorkAssignment>.Filter;
+        var parentFilter = normalizedParentId is null
+            ? f.Or(
+                f.Eq(x => x.ParentAssignmentId, null),
+                f.Eq(x => x.ParentAssignmentId, string.Empty))
+            : f.Eq(x => x.ParentAssignmentId, normalizedParentId);
+
+        var filter = f.Eq(x => x.WorkId, workId)
+                     & f.Eq(x => x.IsActive, true)
+                     & f.Eq(x => x.IsDeleted, false)
+                     & parentFilter
+                     & f.Eq(x => x.DynamicFormTemplateId, dynamicFormTemplateId);
+
+        if (!string.IsNullOrWhiteSpace(exceptAssignmentId))
+            filter &= f.Ne(x => x.Id, exceptAssignmentId);
+
+        var conflicts = await _ctx.WorkAssignments
+            .Find(filter)
+            .Project(x => new
+            {
+                x.Id,
+                x.Code,
+                x.DynamicFormTemplateCode,
+                x.DynamicFormTemplateName
+            })
+            .ToListAsync(ct);
+
+        if (conflicts.Count == 0)
+            return;
+
+        var conflictedAssignments = conflicts
+            .Select(x => string.IsNullOrWhiteSpace(x.Code)
+                ? x.Id
+                : $"{x.Code} ({x.Id})")
+            .Distinct(StringComparer.Ordinal)
+            .OrderBy(x => x, StringComparer.Ordinal)
+            .ToList();
+
+        throw AppExceptionFactory.BadRequest(
+            AppErrorCode.WORK_ASSIGNMENT_TEMPLATE_REUSE_CONFLICT,
+            new { workId, parentAssignmentId = normalizedParentId, dynamicFormTemplateId, conflictedAssignments });
+    }
+
+    private async Task EnsureNoActiveAssigneeDynamicFormBindingConflictAsync(
         string workId,
         string? dynamicFormTemplateId,
         List<string> assigneeUserIds,
@@ -834,6 +1211,93 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
 
         return (assignment.Assignees ?? new List<UserRef>())
             .Any(x => string.Equals(x.UserId, actorUserId, StringComparison.Ordinal));
+    }
+
+    private async Task EnsureCreateScopeOpenAsync(
+        Work work,
+        WorkAssignment? parent,
+        string actorUserId,
+        CancellationToken ct)
+    {
+        if (work.CompletedAtUtc.HasValue || work.Status == WorkStatus.S3)
+            throw AppExceptionFactory.Create(
+                AppErrorCode.WORK_COMPLETED_LOCKED,
+                new { workId = work.Id, actorUserId });
+
+        if (parent is null)
+            return;
+
+        EnsureAssignmentSelfOpen(parent, actorUserId);
+        await EnsureNoCompletedAncestorAsync(parent, actorUserId, ct);
+    }
+
+    private async Task EnsureAssignmentMutationScopeOpenAsync(
+        WorkAssignment assignment,
+        string actorUserId,
+        CancellationToken ct)
+    {
+        var work = await _ctx.Works
+            .Find(x => x.Id == assignment.WorkId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct)
+            ?? throw AppExceptionFactory.NotFound(
+                AppErrorCode.WORK_ASSIGNMENT_WORK_NOT_FOUND,
+                new { assignmentId = assignment.Id, assignment.WorkId });
+
+        if (work.CompletedAtUtc.HasValue || work.Status == WorkStatus.S3)
+            throw AppExceptionFactory.Create(
+                AppErrorCode.WORK_COMPLETED_LOCKED,
+                new { workId = work.Id, assignmentId = assignment.Id, actorUserId });
+
+        EnsureAssignmentSelfOpen(assignment, actorUserId);
+        await EnsureNoCompletedAncestorAsync(assignment, actorUserId, ct);
+    }
+
+    private async Task EnsureNoCompletedAncestorAsync(
+        WorkAssignment assignment,
+        string actorUserId,
+        CancellationToken ct)
+    {
+        var ancestorIds = ResolveAncestorIds(assignment);
+        if (ancestorIds.Count == 0)
+            return;
+
+        var hasCompletedAncestor = await _ctx.WorkAssignments
+            .Find(x =>
+                ancestorIds.Contains(x.Id) &&
+                x.WorkId == assignment.WorkId &&
+                !x.IsDeleted &&
+                (x.CompletedAtUtc != null ||
+                 (x.ProgressStatus == (int)WorkAssignmentProgressStatus.Completed && x.CompletedDate != null)))
+            .Limit(1)
+            .AnyAsync(ct);
+
+        if (hasCompletedAncestor)
+            throw AppExceptionFactory.Create(
+                AppErrorCode.WORK_ASSIGNMENT_COMPLETED_LOCKED,
+                new { assignmentId = assignment.Id, actorUserId });
+    }
+
+    private static void EnsureAssignmentSelfOpen(WorkAssignment assignment, string actorUserId)
+    {
+        if (assignment.CompletedAtUtc.HasValue ||
+            (assignment.ProgressStatus == (int)WorkAssignmentProgressStatus.Completed && assignment.CompletedDate.HasValue))
+        {
+            throw AppExceptionFactory.Create(
+                AppErrorCode.WORK_ASSIGNMENT_COMPLETED_LOCKED,
+                new { assignmentId = assignment.Id, actorUserId });
+        }
+    }
+
+    private static List<string> ResolveAncestorIds(WorkAssignment assignment)
+    {
+        if (string.IsNullOrWhiteSpace(assignment.Path))
+            return new List<string>();
+
+        return assignment.Path
+            .Split('/', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Where(x => !string.Equals(x, assignment.Id, StringComparison.Ordinal))
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
     }
 
     private static void EnsureActor(string actorUserId)
@@ -1082,11 +1546,15 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
             DynamicFormTemplateCode = detail.DynamicFormTemplateCode,
             DynamicFormTemplateName = detail.DynamicFormTemplateName,
             DynamicFormDataSourceRulesJson = detail.DynamicFormDataSourceRulesJson,
+            AutoApproveConditionJson = detail.AutoApproveConditionJson,
 
             AssignmentType = detail.AssignmentType,
             AggregationType = detail.AggregationType,
             StartDate = detail.StartDate,
+            DueDate = detail.DueDate,
             CompletedDate = detail.CompletedDate,
+            CompletedAtUtc = detail.CompletedAtUtc,
+            CompletedByUserId = detail.CompletedByUserId,
 
             Assignees = detail.Assignees ?? new(),
             LeaderWatchers = detail.LeaderWatchers ?? new(),
@@ -1142,11 +1610,15 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
             DynamicFormTemplateCode = entity.DynamicFormTemplateCode,
             DynamicFormTemplateName = entity.DynamicFormTemplateName,
             DynamicFormDataSourceRulesJson = entity.DynamicFormDataSourceRulesJson,
+            AutoApproveConditionJson = entity.AutoApproveConditionJson,
 
             AssignmentType = entity.AssignmentType,
             AggregationType = entity.AggregationType,
             StartDate = entity.StartDate,
+            DueDate = entity.DueDate,
             CompletedDate = entity.CompletedDate,
+            CompletedAtUtc = entity.CompletedAtUtc,
+            CompletedByUserId = entity.CompletedByUserId,
 
             Assignees = (entity.Assignees ?? new List<UserRef>()).Select(ToUserRefDto).ToList(),
             LeaderWatchers = (entity.LeaderWatchers ?? new List<UserRef>()).Select(ToUserRefDto).ToList(),
@@ -1209,7 +1681,10 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
         detail.LatestPeriodKey = entity.LatestPeriodKey;
         detail.LatestDueAtUtc = entity.LatestDueAtUtc;
         detail.StartDate = entity.StartDate;
+        detail.DueDate = entity.DueDate;
         detail.CompletedDate = entity.CompletedDate;
+        detail.CompletedAtUtc = entity.CompletedAtUtc;
+        detail.CompletedByUserId = entity.CompletedByUserId;
         detail.HasAnyDuePeriod = entity.HasAnyDuePeriod;
         detail.HasOverduePeriod = entity.HasOverduePeriod;
         detail.EvaluationTemplateId = entity.EvaluationTemplateId;

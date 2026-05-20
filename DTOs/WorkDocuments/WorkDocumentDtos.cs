@@ -15,6 +15,7 @@ public sealed class WorkDocumentRow
     public string? AssignmentPath { get; set; }
     public string? CreatedByUserId { get; set; }
     public string? CreatedByName { get; set; }
+    public bool CanUpdate { get; set; }
     public bool CanDelete { get; set; }
 }
 
@@ -37,6 +38,13 @@ public sealed class CreateWorkDocumentUploadSessionReq
     public string FileName { get; set; } = default!;
     public long Size { get; set; }
     public string? Mime { get; set; }
+}
+
+public sealed class UpdateWorkDocumentReq
+{
+    public string? OriginalName { get; set; }
+    public string? Scope { get; set; }
+    public string? AssignmentId { get; set; }
 }
 
 public sealed class CreateWorkDocumentUploadSessionResp

@@ -26,13 +26,17 @@ internal static class WorkAssignmentResponseMapper
             DynamicFormTemplateCode = entity.DynamicFormTemplateCode,
             DynamicFormTemplateName = entity.DynamicFormTemplateName,
             DynamicFormDataSourceRulesJson = entity.DynamicFormDataSourceRulesJson,
+            AutoApproveConditionJson = entity.AutoApproveConditionJson,
 
             WorkType = entity.WorkType,
             AssignmentType = entity.AssignmentType,
             AggregationType = entity.AggregationType,
             Schedule = WorkAssignmentScheduleHelper.ToScheduleDto(entity.Schedule),
             StartDate = entity.StartDate,
+            DueDate = entity.DueDate,
             CompletedDate = entity.CompletedDate,
+            CompletedAtUtc = entity.CompletedAtUtc,
+            CompletedByUserId = entity.CompletedByUserId,
 
             Assignees = (entity.Assignees ?? new List<UserRef>())
                 .Select(ToUserRefDto)

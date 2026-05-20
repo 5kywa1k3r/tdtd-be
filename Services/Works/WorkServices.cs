@@ -23,6 +23,7 @@ namespace tdtd_be.Services.Works
             Task<WorkResponse> GetByIdAsync(string id, CancellationToken ct);
             Task<PagedResult<WorkListRow>> SearchAsync(WorkSearchRequest req, CancellationToken ct);
             Task<WorkResponse> UpdateAsync(string id, WorkUpdateRequest req, CancellationToken ct);
+            Task<WorkResponse> CompleteAsync(string id, CompleteWorkRequest req, CancellationToken ct);
             Task DeleteAsync(string id, CancellationToken ct);
         }
 
@@ -329,6 +330,9 @@ namespace tdtd_be.Services.Works
                         x.WorstEvaluationCode,
                         x.WorstEvaluationLabel,
                         x.DueDate,
+                        x.CompletedDate,
+                        x.CompletedAtUtc,
+                        x.CompletedByUserId,
                         x.WorkCreatedAtUtc
                     ))
                     .ToListAsync(ct);
@@ -439,6 +443,89 @@ namespace tdtd_be.Services.Works
                     ct: ct);
 
                 return ToResponse(doc);
+            }
+
+            public async Task<WorkResponse> CompleteAsync(string id, CompleteWorkRequest req, CancellationToken ct)
+            {
+                var me = _me.RequireMe();
+
+                var doc = await _ctx.Works
+                    .Find(x => x.Id == id && !x.IsDeleted)
+                    .FirstOrDefaultAsync(ct);
+
+                if (doc is null)
+                    throw AppExceptionFactory.NotFound(AppErrorCode.WORK_NOT_FOUND, new { workId = id });
+
+                await _permission.EnsureCanUpdateRootAsync(id, me.Id, ct);
+
+                var now = DateTime.UtcNow;
+                var completedDate = (req?.CompletedDate ?? now).Date;
+
+                var update = Builders<Work>.Update
+                    .Set(x => x.Status, WorkStatus.S3)
+                    .Set(x => x.CompletedDate, completedDate)
+                    .Set(x => x.CompletedAtUtc, now)
+                    .Set(x => x.CompletedByUserId, me.Id)
+                    .Set(x => x.UpdatedAtUtc, now)
+                    .Set(x => x.UpdatedByUserId, me.Id);
+
+                await _ctx.Works.UpdateOneAsync(
+                    x => x.Id == id && !x.IsDeleted,
+                    update,
+                    cancellationToken: ct);
+
+                doc.Status = WorkStatus.S3;
+                doc.CompletedDate = completedDate;
+                doc.CompletedAtUtc = now;
+                doc.CompletedByUserId = me.Id;
+                doc.UpdatedAtUtc = now;
+                doc.UpdatedByUserId = me.Id;
+
+                await DisableRuntimeForCompletedWorkAsync(id, me.Id, now, ct);
+                await _docRoleReadModelProjection.RebuildWorkAsync(id, me.Id, ct);
+
+                await _history.AppendAsync(
+                    workId: id,
+                    byUserId: me.Id,
+                    type: WorkHistoryType.UPDATED,
+                    data: new Dictionary<string, object?>
+                    {
+                        { "action", "WORK_COMPLETED" },
+                        { "completedDate", completedDate },
+                        { "note", req?.Note }
+                    },
+                    ct: ct);
+
+                return ToResponse(doc);
+            }
+
+            private async Task DisableRuntimeForCompletedWorkAsync(
+                string workId,
+                string actorUserId,
+                DateTime now,
+                CancellationToken ct)
+            {
+                await _ctx.WorkAssignmentQueueItems.UpdateManyAsync(
+                    x => x.WorkId == workId && !x.IsDeleted && x.IsActive,
+                    Builders<WorkAssignmentQueueItem>.Update
+                        .Set(x => x.IsActive, false)
+                        .Set(x => x.UpdatedAtUtc, now)
+                        .Set(x => x.UpdatedByUserId, actorUserId),
+                    cancellationToken: ct);
+
+                await _ctx.WorkAssignmentMaterializeJobs.UpdateManyAsync(
+                    x => x.WorkId == workId &&
+                         !x.IsDeleted &&
+                         x.IsActive &&
+                         x.Status != MaterializeJobStatuses.Completed &&
+                         x.Status != MaterializeJobStatuses.DeadLetter,
+                    Builders<WorkAssignmentMaterializeJobs>.Update
+                        .Set(x => x.IsActive, false)
+                        .Set(x => x.Status, MaterializeJobStatuses.Completed)
+                        .Set(x => x.CompletedAtUtc, now)
+                        .Set(x => x.UpdatedAtUtc, now)
+                        .Set(x => x.UpdatedByUserId, actorUserId),
+                    cancellationToken: ct);
             }
 
             public async Task DeleteAsync(string id, CancellationToken ct)
@@ -559,6 +646,9 @@ namespace tdtd_be.Services.Works
                 x.StartDate,
                 x.EndDate,
                 x.DueDate,
+                x.CompletedDate,
+                x.CompletedAtUtc,
+                x.CompletedByUserId,
                 x.Priority,
                 x.Type,
                 x.IsDeleted,

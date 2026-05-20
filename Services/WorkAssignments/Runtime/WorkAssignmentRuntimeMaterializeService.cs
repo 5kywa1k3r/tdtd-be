@@ -4,6 +4,7 @@ using System.Globalization;
 using tdtd_be.Common.Errors;
 using tdtd_be.Common.Time;
 using tdtd_be.Data;
+using tdtd_be.Enum;
 using tdtd_be.Models;
 using tdtd_be.Models.Enums;
 using tdtd_be.Services.Common;
@@ -55,6 +56,9 @@ public sealed class WorkAssignmentRuntimeMaterializeService : IWorkAssignmentRun
             .Find(x => x.Id == assignment.WorkId && !x.IsDeleted)
             .FirstOrDefaultAsync(ct)
             ?? throw AssignmentWorkNotFound(assignment);
+
+        if (await IsCompletionLockedAsync(assignment, work, ct))
+            return;
 
         var parent = await LoadParentAssignmentAsync(assignment, ct);
 
@@ -202,6 +206,21 @@ public sealed class WorkAssignmentRuntimeMaterializeService : IWorkAssignmentRun
 
     public async Task RematerializeForAssignmentAsync(string workAssignmentId, string actorUserId, CancellationToken ct = default)
     {
+        var assignment = await _ctx.WorkAssignments
+            .Find(x => x.Id == workAssignmentId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct);
+
+        if (assignment is not null)
+        {
+            var work = await _ctx.Works
+                .Find(x => x.Id == assignment.WorkId && !x.IsDeleted)
+                .FirstOrDefaultAsync(ct)
+                ?? throw AssignmentWorkNotFound(assignment);
+
+            if (await IsCompletionLockedAsync(assignment, work, ct))
+                return;
+        }
+
         await _queue.DisableByAssignmentAsync(workAssignmentId, actorUserId, ct);
 
         var disableResult = await _ctx.WorkReportPeriods.UpdateManyAsync(
@@ -251,5 +270,45 @@ public sealed class WorkAssignmentRuntimeMaterializeService : IWorkAssignmentRun
                 x.WorkId == assignment.WorkId &&
                 !x.IsDeleted)
             .FirstOrDefaultAsync(ct);
+    }
+
+    private async Task<bool> IsCompletionLockedAsync(WorkAssignment assignment, Work work, CancellationToken ct)
+    {
+        if (work.CompletedAtUtc.HasValue || work.Status == WorkStatus.S3)
+            return true;
+
+        if (IsManuallyCompleted(assignment))
+            return true;
+
+        var ancestorIds = ResolveAncestorIds(assignment);
+        if (ancestorIds.Count == 0)
+            return false;
+
+        return await _ctx.WorkAssignments
+            .Find(x =>
+                ancestorIds.Contains(x.Id) &&
+                x.WorkId == assignment.WorkId &&
+                !x.IsDeleted &&
+                (x.CompletedAtUtc != null ||
+                 (x.ProgressStatus == (int)WorkAssignmentProgressStatus.Completed && x.CompletedDate != null)))
+            .Limit(1)
+            .AnyAsync(ct);
+    }
+
+    private static bool IsManuallyCompleted(WorkAssignment assignment)
+        => assignment.CompletedAtUtc.HasValue ||
+           (assignment.ProgressStatus == (int)WorkAssignmentProgressStatus.Completed &&
+            assignment.CompletedDate.HasValue);
+
+    private static List<string> ResolveAncestorIds(WorkAssignment assignment)
+    {
+        if (string.IsNullOrWhiteSpace(assignment.Path))
+            return new List<string>();
+
+        return assignment.Path
+            .Split('/', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Where(x => !string.Equals(x, assignment.Id, StringComparison.Ordinal))
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
     }
 }

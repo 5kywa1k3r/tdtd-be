@@ -14,22 +14,37 @@ internal static class WorkAssignmentDatePolicy
         DateTime? requestedCompletedDate,
         Work work,
         WorkAssignment? parent)
-    {
-        if (requestedCompletedDate.HasValue)
-            return requestedCompletedDate.Value.Date;
+        => ResolveEffectiveDueDate(requestedCompletedDate, work, parent);
 
-        return ResolveInheritedCompletedDate(work, parent);
+    public static DateTime? ResolveEffectiveDueDate(
+        DateTime? requestedDueDate,
+        Work work,
+        WorkAssignment? parent)
+    {
+        if (requestedDueDate.HasValue)
+            return requestedDueDate.Value.Date;
+
+        return ResolveInheritedDueDate(work, parent);
     }
 
     public static DateTime? ResolveEffectiveCompletedDate(
         WorkAssignment assignment,
         Work work,
         WorkAssignment? parent)
+        => ResolveEffectiveDueDate(assignment, work, parent);
+
+    public static DateTime? ResolveEffectiveDueDate(
+        WorkAssignment assignment,
+        Work work,
+        WorkAssignment? parent)
     {
-        if (assignment.CompletedDate.HasValue)
+        if (assignment.DueDate.HasValue)
+            return assignment.DueDate.Value.Date;
+
+        if (!assignment.CompletedAtUtc.HasValue && assignment.CompletedDate.HasValue)
             return assignment.CompletedDate.Value.Date;
 
-        return ResolveInheritedCompletedDate(work, parent);
+        return ResolveInheritedDueDate(work, parent);
     }
 
     public static DateTime? ResolveWorkRootDueDate(Work work)
@@ -50,11 +65,12 @@ internal static class WorkAssignmentDatePolicy
             : endDate.Value;
     }
 
-    private static DateTime? ResolveInheritedCompletedDate(Work work, WorkAssignment? parent)
+    private static DateTime? ResolveInheritedDueDate(Work work, WorkAssignment? parent)
     {
         if (parent is not null)
         {
-            return parent.CompletedDate?.Date
+            return parent.DueDate?.Date
+                   ?? (!parent.CompletedAtUtc.HasValue ? parent.CompletedDate?.Date : null)
                    ?? parent.DueAtUtc?.Date
                    ?? parent.LatestDueAtUtc?.Date
                    ?? ResolveWorkRootDueDate(work);

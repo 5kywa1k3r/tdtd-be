@@ -2,13 +2,16 @@
 using Microsoft.AspNetCore.Mvc;
 using MongoDB.Bson;
 using MongoDB.Driver;
+using System.Text.RegularExpressions;
 using tdtd_be.Common.Auth;
 using tdtd_be.Common.Pickers;
 using tdtd_be.Data;
+using tdtd_be.DTOs.Auth;
 using tdtd_be.DTOs.Common;
 using tdtd_be.DTOs.Pickers;
 using tdtd_be.Enum;
 using tdtd_be.Models;
+using tdtd_be.Services;
 
 namespace tdtd_be.Controllers;
 
@@ -302,7 +305,11 @@ public sealed class PickersController : ControllerBase
     }
 
     // =========================
-    // ASSIGNEES: by unit (rule: unit.level >= meLevel)
+    // ASSIGNEES: by unit.
+    // Assignment target picker mirrors assignment-create target rules for mu_* accounts:
+    // - normal flow assigns to units, which later resolve to mu_* accounts;
+    // - direct user picking is only for final units with no assignable child units;
+    // - peer/subordinate unit coordination exposes the target unit's mu_* account only.
     // =========================
     // ✅ search username only
     [HttpGet("assignees/by-unit")]
@@ -323,26 +330,38 @@ public sealed class PickersController : ControllerBase
         pageSize = PickQueryHelper.ClampPageSize(pageSize, 20, 50);
 
         var selectedUnitId = unitId.Trim();
-        var allowedUnit = await _ctx.Units
+        var selectedUnit = await _ctx.Units
             .Find(x => x.Id == selectedUnitId && !x.IsDeleted && x.Level >= meLevel)
-            .Project(x => x.Id)
             .FirstOrDefaultAsync(ct);
 
-        if (string.IsNullOrWhiteSpace(allowedUnit))
-        {
-            return Ok(new PagedResult<UserPickRow>(
-                rows: new(),
-                total: 0,
-                page: page,
-                pageSize: pageSize
-            ));
-        }
+        if (selectedUnit is null)
+            return EmptyUserPickPage(page, pageSize);
 
         var fb = Builders<AppUser>.Filter;
         var filter = fb.And(
             fb.Eq(x => x.IsDeleted, false),
             fb.Eq(x => x.UnitId, selectedUnitId)
         );
+
+        if (IsUnitManager(me))
+        {
+            var actorUnit = await LoadActorUnitAsync(me, ct);
+            if (actorUnit is null)
+                return EmptyUserPickPage(page, pageSize);
+
+            var actorUnitHasAssignableDescendants = await HasAssignableDescendantUnitAsync(actorUnit, ct);
+            var assignmentTargetFilter = BuildUnitManagerAssignmentAssigneeFilter(
+                fb,
+                me,
+                actorUnit,
+                selectedUnit,
+                actorUnitHasAssignableDescendants);
+
+            if (assignmentTargetFilter is null)
+                return EmptyUserPickPage(page, pageSize);
+
+            filter = fb.And(filter, assignmentTargetFilter);
+        }
 
         if (!string.IsNullOrWhiteSpace(username))
         {
@@ -362,6 +381,9 @@ public sealed class PickersController : ControllerBase
                 Username = x.Username,
                 FullName = x.FullName,
                 UnitId = x.UnitId,
+                UnitCode = selectedUnit.Code,
+                UnitShortName = selectedUnit.ShortName,
+                UnitSymbol = selectedUnit.Symbol,
                 PositionCode = x.PositionCode
             })
             .ToListAsync(ct);
@@ -400,12 +422,27 @@ public sealed class PickersController : ControllerBase
         var u = await _ctx.Users.Find(filter).FirstOrDefaultAsync(ct);
         if (u is null || string.IsNullOrWhiteSpace(u.UnitId)) return Ok(null);
 
-        // enforce unit.level >= meLevel
         var unit = await _ctx.Units.Find(x => x.Id == u.UnitId && !x.IsDeleted)
-            .Project(x => new { x.Level })
             .FirstOrDefaultAsync(ct);
 
         if (unit is null || unit.Level < meLevel) return Ok(null);
+
+        if (IsUnitManager(me))
+        {
+            var actorUnit = await LoadActorUnitAsync(me, ct);
+            if (actorUnit is null) return Ok(null);
+
+            var actorUnitHasAssignableDescendants = await HasAssignableDescendantUnitAsync(actorUnit, ct);
+            if (!IsAllowedUnitManagerAssignmentTarget(
+                    me,
+                    actorUnit,
+                    u,
+                    unit,
+                    actorUnitHasAssignableDescendants))
+            {
+                return Ok(null);
+            }
+        }
 
         return Ok(new UserPickRow
         {
@@ -413,7 +450,157 @@ public sealed class PickersController : ControllerBase
             Username = u.Username,
             FullName = u.FullName,
             UnitId = u.UnitId,
+            UnitCode = unit.Code,
+            UnitShortName = unit.ShortName,
+            UnitSymbol = unit.Symbol,
             PositionCode = u.PositionCode
         });
+    }
+
+    private ActionResult<PagedResult<UserPickRow>> EmptyUserPickPage(int page, int pageSize)
+        => Ok(new PagedResult<UserPickRow>(
+            rows: new(),
+            total: 0,
+            page: page,
+            pageSize: pageSize));
+
+    private async Task<Unit?> LoadActorUnitAsync(MeResponse me, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(me.UnitId))
+            return null;
+
+        return await _ctx.Units
+            .Find(x => x.Id == me.UnitId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct);
+    }
+
+    private async Task<bool> HasAssignableDescendantUnitAsync(Unit actorUnit, CancellationToken ct)
+    {
+        var fb = Builders<Unit>.Filter;
+        var filter = fb.Eq(x => x.IsDeleted, false)
+                     & fb.Eq(x => x.IsVirtual, false)
+                     & fb.Ne(x => x.Id, actorUnit.Id);
+
+        var code = actorUnit.Code?.Trim();
+        if (!string.IsNullOrWhiteSpace(code))
+        {
+            filter &= fb.Regex(x => x.Code, new BsonRegularExpression("^" + Regex.Escape(code)));
+        }
+        else
+        {
+            filter &= fb.Eq(x => x.ParentUnitId, actorUnit.Id);
+        }
+
+        return await _ctx.Units
+            .Find(filter)
+            .Limit(1)
+            .AnyAsync(ct);
+    }
+
+    private static FilterDefinition<AppUser>? BuildUnitManagerAssignmentAssigneeFilter(
+        FilterDefinitionBuilder<AppUser> fb,
+        MeResponse me,
+        Unit actorUnit,
+        Unit selectedUnit,
+        bool actorUnitHasAssignableDescendants)
+    {
+        if (string.Equals(actorUnit.Id, selectedUnit.Id, StringComparison.Ordinal))
+        {
+            if (actorUnitHasAssignableDescendants)
+                return null;
+
+            return fb.And(
+                NormalUserAccountFilter(fb),
+                fb.Ne(x => x.Id, me.Id));
+        }
+
+        if (IsPeerUnit(actorUnit, selectedUnit) || IsDescendantUnit(actorUnit, selectedUnit))
+        {
+            return fb.And(
+                UnitManagerAccountFilter(fb),
+                fb.Ne(x => x.Id, me.Id));
+        }
+
+        return null;
+    }
+
+    private static bool IsAllowedUnitManagerAssignmentTarget(
+        MeResponse me,
+        Unit actorUnit,
+        AppUser targetUser,
+        Unit targetUnit,
+        bool actorUnitHasAssignableDescendants)
+    {
+        if (string.Equals(me.Id, targetUser.Id, StringComparison.Ordinal))
+            return false;
+
+        if (IsUnitManager(targetUser))
+            return IsPeerUnit(actorUnit, targetUnit) || IsDescendantUnit(actorUnit, targetUnit);
+
+        if (IsNormalUser(targetUser))
+        {
+            return !actorUnitHasAssignableDescendants &&
+                   string.Equals(actorUnit.Id, targetUnit.Id, StringComparison.Ordinal);
+        }
+
+        return false;
+    }
+
+    private static FilterDefinition<AppUser> UnitManagerAccountFilter(FilterDefinitionBuilder<AppUser> fb)
+        => fb.Or(
+            fb.Eq(x => x.AccountKind, ManagementAccountKind.UnitManager),
+            fb.Regex(x => x.Username, new BsonRegularExpression("^" + Regex.Escape(ManagementAccountConvention.UnitManagerPrefix), "i")));
+
+    private static FilterDefinition<AppUser> NormalUserAccountFilter(FilterDefinitionBuilder<AppUser> fb)
+        => fb.And(
+            fb.Or(
+                fb.Eq(x => x.AccountKind, null),
+                fb.Eq(x => x.AccountKind, string.Empty),
+                fb.Eq(x => x.AccountKind, ManagementAccountKind.NormalUser)),
+            fb.Not(fb.Regex(x => x.Username, new BsonRegularExpression("^(mu_|ml_)", "i"))));
+
+    private static bool IsUnitManager(MeResponse me)
+        => string.Equals(me.AccountKind, ManagementAccountKind.UnitManager, StringComparison.OrdinalIgnoreCase) ||
+           (me.Username ?? string.Empty).StartsWith(ManagementAccountConvention.UnitManagerPrefix, StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsUnitManager(AppUser user)
+        => string.Equals(user.AccountKind, ManagementAccountKind.UnitManager, StringComparison.OrdinalIgnoreCase) ||
+           (user.Username ?? string.Empty).StartsWith(ManagementAccountConvention.UnitManagerPrefix, StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsLevelManager(AppUser user)
+        => string.Equals(user.AccountKind, ManagementAccountKind.LevelManager, StringComparison.OrdinalIgnoreCase) ||
+           (user.Username ?? string.Empty).StartsWith(ManagementAccountConvention.LevelManagerPrefix, StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsNormalUser(AppUser user)
+        => !IsUnitManager(user) &&
+           !IsLevelManager(user) &&
+           (string.IsNullOrWhiteSpace(user.AccountKind) ||
+            string.Equals(user.AccountKind, ManagementAccountKind.NormalUser, StringComparison.OrdinalIgnoreCase));
+
+    private static bool IsPeerUnit(Unit actorUnit, Unit targetUnit)
+    {
+        if (string.Equals(actorUnit.Id, targetUnit.Id, StringComparison.Ordinal))
+            return false;
+
+        return actorUnit.Level == targetUnit.Level &&
+               string.Equals(actorUnit.ParentUnitId ?? string.Empty, targetUnit.ParentUnitId ?? string.Empty, StringComparison.Ordinal);
+    }
+
+    private static bool IsDescendantUnit(Unit actorUnit, Unit targetUnit)
+    {
+        if (string.Equals(actorUnit.Id, targetUnit.Id, StringComparison.Ordinal))
+            return false;
+
+        var actorCode = actorUnit.Code?.Trim();
+        var targetCode = targetUnit.Code?.Trim();
+        if (!string.IsNullOrWhiteSpace(actorCode) &&
+            !string.IsNullOrWhiteSpace(targetCode) &&
+            targetUnit.Level > actorUnit.Level &&
+            targetCode.StartsWith(actorCode, StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        return string.Equals(targetUnit.ParentUnitId, actorUnit.Id, StringComparison.Ordinal);
     }
 }

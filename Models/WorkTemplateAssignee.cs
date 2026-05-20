@@ -42,6 +42,9 @@ public sealed class WorkTemplateAssignee : BaseEntity
     [BsonElement("dynamicFormDataSourceRulesJson")]
     public string? DynamicFormDataSourceRulesJson { get; set; }
 
+    [BsonElement("autoApproveConditionJson")]
+    public string? AutoApproveConditionJson { get; set; }
+
     [BsonElement("assigneeUserId")]
     public string AssigneeUserId { get; set; } = default!;
 
@@ -74,6 +77,9 @@ public sealed class WorkTemplateAssignee : BaseEntity
 
     [BsonElement("startDate")]
     public DateTime? StartDate { get; set; }
+
+    [BsonElement("dueDate")]
+    public DateTime? DueDate { get; set; }
 
     [BsonElement("completedDate")]
     public DateTime? CompletedDate { get; set; }

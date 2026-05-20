@@ -67,6 +67,16 @@ public sealed class Work : BaseEntity
     [BsonElement("dueDate")]
     public DateTime? DueDate { get; set; }
 
+    [BsonElement("completedDate")]
+    public DateTime? CompletedDate { get; set; }
+
+    [BsonElement("completedAtUtc")]
+    public DateTime? CompletedAtUtc { get; set; }
+
+    [BsonElement("completedByUserId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? CompletedByUserId { get; set; }
+
     [BsonElement("attachmentCount")]
     public int AttachmentCount { get; set; } = 0;
 

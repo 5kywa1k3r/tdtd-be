@@ -38,6 +38,9 @@ public sealed class WorkAssignment : BaseEntity
     [BsonElement("dynamicFormDataSourceRulesJson")]
     public string? DynamicFormDataSourceRulesJson { get; set; }
 
+    [BsonElement("autoApproveConditionJson")]
+    public string? AutoApproveConditionJson { get; set; }
+
     [BsonElement("workType")]
     public string WorkType { get; set; } = string.Empty;
 
@@ -53,8 +56,18 @@ public sealed class WorkAssignment : BaseEntity
     [BsonElement("startDate")]
     public DateTime? StartDate { get; set; }
 
+    [BsonElement("dueDate")]
+    public DateTime? DueDate { get; set; }
+
     [BsonElement("completedDate")]
     public DateTime? CompletedDate { get; set; }
+
+    [BsonElement("completedAtUtc")]
+    public DateTime? CompletedAtUtc { get; set; }
+
+    [BsonElement("completedByUserId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? CompletedByUserId { get; set; }
 
     [BsonElement("allowUserCreatedReports")]
     public bool AllowUserCreatedReports { get; set; } = true;
