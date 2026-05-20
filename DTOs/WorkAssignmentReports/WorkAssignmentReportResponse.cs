@@ -45,6 +45,11 @@ public sealed class WorkAssignmentReportResponse
     public string? LinkedScheduledPeriodId { get; set; }
     public DateTime? StartedDate { get; set; }
     public DateTime? CompletedDate { get; set; }
+    public bool CanEditCompletedDate { get; set; }
+    public bool RequiresCompletedDate { get; set; }
+    public DateTime? CompletedDateMin { get; set; }
+    public DateTime? CompletedDateMax { get; set; }
+    public string? CompletedDatePolicyReason { get; set; }
     public bool IsHistoricalData { get; set; }
     public bool HistoricalDataApproved { get; set; }
     public DateTime? HistoricalDataApprovedAtUtc { get; set; }
@@ -70,8 +75,6 @@ public sealed class WorkAssignmentReportResponse
     public string DynamicExcelTemplateId { get; set; } = string.Empty;
     public string DynamicExcelTemplateCode { get; set; } = string.Empty;
     public string DynamicExcelTemplateName { get; set; } = string.Empty;
-    public string TableKind { get; set; } = "NUMERIC_GRID";
-    public string? RecordTableSpecJson { get; set; }
     public string? DynamicFormTemplateId { get; set; }
     public string? DynamicFormTemplateCode { get; set; }
     public string? DynamicFormTemplateName { get; set; }
@@ -131,6 +134,13 @@ public sealed class WorkAssignmentReportResponse
 
     public DateTime? ApprovedAtUtc { get; set; }
     public string? ApprovedByUserId { get; set; }
+    public bool AutoApproved { get; set; }
+    public DateTime? AutoApprovedAtUtc { get; set; }
+    public string? AutoApprovedByUserId { get; set; }
+    public string? AutoApproveConditionSnapshotJson { get; set; }
+    public bool AutoApprovalLocked { get; set; }
+    public DateTime? AutoApprovalConfirmedAtUtc { get; set; }
+    public string? AutoApprovalConfirmedByUserId { get; set; }
 
     public string? Note { get; set; }
 

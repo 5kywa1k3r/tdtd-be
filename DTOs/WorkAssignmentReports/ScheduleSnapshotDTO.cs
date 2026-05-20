@@ -28,6 +28,11 @@ public sealed class ScheduleSnapshotDTO
     public DateTime? AssignmentCompletedDate { get; set; }
 
     /// <summary>
+    /// Hạn nộp / ngày kết thúc kế hoạch của assignment tại thời điểm report được tạo.
+    /// </summary>
+    public DateTime? AssignmentDueDate { get; set; }
+
+    /// <summary>
     /// Danh sách thứ trong tuần nếu dùng chu kỳ tuần.
     /// </summary>
     public int[] WeekDays { get; set; } = Array.Empty<int>();

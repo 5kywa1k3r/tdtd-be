@@ -1,3 +1,4 @@
+using System.Text.Json;
 using tdtd_be.DTOs.DynamicExcel;
 
 namespace tdtd_be.DTOs.DynamicForms;
@@ -136,8 +137,9 @@ public sealed record DynamicFormExcelBlockSnapshot(
     string TableMode = "FIXED_GRID",
     DynamicFormTableIndexMapItem[]? IndexMap = null,
     string? ExcelSpecKind = null,
-    string TableKind = "NUMERIC_GRID",
-    string? RecordTableSpecJson = null
+    string? DefaultDataType = null,
+    JsonElement[]? DefaultOptions = null,
+    JsonElement[]? DataTypeOverrides = null
 );
 
 public sealed record DynamicFormTableIndexMapItem(

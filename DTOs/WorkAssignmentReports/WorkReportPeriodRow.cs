@@ -26,6 +26,11 @@ public sealed class WorkReportPeriodRow
     public string? LinkedScheduledPeriodId { get; set; }
     public DateTime? StartedDate { get; set; }
     public DateTime? CompletedDate { get; set; }
+    public bool CanEditCompletedDate { get; set; }
+    public bool RequiresCompletedDate { get; set; }
+    public DateTime? CompletedDateMin { get; set; }
+    public DateTime? CompletedDateMax { get; set; }
+    public string? CompletedDatePolicyReason { get; set; }
     public bool IsHistoricalData { get; set; }
     public bool HistoricalDataApproved { get; set; }
     public DateTime? HistoricalDataApprovedAtUtc { get; set; }

@@ -10,6 +10,9 @@ public sealed class TableStatisticSummaryRequest
     public string? BlockId { get; set; }
     public string? TableMode { get; set; }
     public string? MetricKey { get; set; }
+    public string? MetricLabelCode { get; set; }
+    public string? DataType { get; set; }
+    public string? BucketKey { get; set; }
     public string? PeriodKey { get; set; }
     public string? PeriodInstanceKey { get; set; }
     public int? ReportStatus { get; set; }
@@ -30,17 +33,26 @@ public sealed class TableStatisticSummaryRow
     public string BlockId { get; set; } = default!;
     public string TableMode { get; set; } = default!;
     public string MetricKey { get; set; } = default!;
+    public string? MetricLabelCode { get; set; }
     public string RowKey { get; set; } = default!;
     public string ColumnKey { get; set; } = default!;
+    public string DataType { get; set; } = "NUMBER";
+    public string? BucketKey { get; set; }
+    public string? BucketLabel { get; set; }
     public string PeriodKey { get; set; } = default!;
     public string PeriodInstanceKey { get; set; } = default!;
     public string PeriodKind { get; set; } = default!;
     public int ReportStatus { get; set; }
     public long ValueCount { get; set; }
+    public long NumericValueCount { get; set; }
     public decimal? Sum { get; set; }
     public decimal? Min { get; set; }
     public decimal? Max { get; set; }
     public decimal? Average { get; set; }
+    public long TrueCount { get; set; }
+    public long FalseCount { get; set; }
+    public DateTime? EarliestDateUtc { get; set; }
+    public DateTime? LatestDateUtc { get; set; }
     public long ReportCount { get; set; }
     public DateTime UpdatedAtUtc { get; set; }
 }

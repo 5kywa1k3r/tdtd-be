@@ -30,6 +30,9 @@ public sealed class LabelCatalogItem : BaseEntity
     [BsonElement("groupCode")]
     public string? GroupCode { get; set; }
 
+    [BsonElement("usage")]
+    public string Usage { get; set; } = LabelUsages.Classification;
+
     [BsonElement("dataType")]
     public string DataType { get; set; } = LabelDataTypes.Number;
 
@@ -62,6 +65,7 @@ public static class LabelDataTypes
 {
     public const string Number = "NUMBER";
     public const string ShortText = "SHORT_TEXT";
+    public const string StringList = "STRING_LIST";
     public const string LongText = "LONG_TEXT";
     public const string Date = "DATE";
     public const string Boolean = "BOOLEAN";
@@ -73,15 +77,58 @@ public static class LabelDataTypes
         {
             Number => Number,
             ShortText => ShortText,
-            LongText => LongText,
+            StringList => StringList,
+            LongText => StringList,
             Date => Date,
+            "FULL_DATE" => Date,
+            "FULLDATE" => Date,
+            "STRICT_DATE" => Date,
             Boolean => Boolean,
             "TEXT" => ShortText,
             "STRING" => ShortText,
             "SHORTTEXT" => ShortText,
-            "LONGDATE" => LongText,
-            "LONGTEXT" => LongText,
+            "STRINGLIST" => StringList,
+            "MULTI_SELECT" => ShortText,
+            "MULTISELECT" => ShortText,
+            "LONGDATE" => StringList,
+            "LONGTEXT" => StringList,
             _ => Number
         };
+    }
+}
+
+public static class LabelUsages
+{
+    public const string Classification = "CLASSIFICATION";
+    public const string Statistic = "STATISTIC";
+    public const string TableTarget = "TABLE_TARGET";
+
+    public static string Normalize(string? value, string fallback = Classification)
+    {
+        var normalized = value?.Trim().ToUpperInvariant();
+        return normalized switch
+        {
+            Classification => Classification,
+            Statistic => Statistic,
+            TableTarget => TableTarget,
+            "TAG" => Classification,
+            "FORM" => Classification,
+            "SECTION" => Classification,
+            "BLOCK" => Classification,
+            "LABEL" => Classification,
+            "STATS" => Statistic,
+            "FIELD_STATISTIC" => Statistic,
+            _ => fallback
+        };
+    }
+
+    public static bool CanUseAsStatistic(string? value)
+    {
+        return Normalize(value, string.Empty) == Statistic;
+    }
+
+    public static bool CanUseAsTableTarget(string? value)
+    {
+        return Normalize(value, string.Empty) == TableTarget;
     }
 }

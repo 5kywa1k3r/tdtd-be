@@ -9,9 +9,9 @@ public sealed class SaveWorkAssignmentReportDraftRequest
 {
     /// <summary>
     /// Dữ liệu 1D đã trải phẳng từ vùng dataRect.
-    /// FE dùng extractNumericValues1D(...) để tính trước.
+    /// Giá trị giữ theo kiểu cấu hình của Dynamic Excel: number/text/date/boolean/null.
     /// </summary>
-    public List<decimal?> Values1D { get; set; } = new();
+    public List<object?> Values1D { get; set; } = new();
 
     /// <summary>
     /// Dynamic Form field values JSON. Kept raw as source of truth for non-Excel fields.
@@ -64,6 +64,10 @@ public sealed class SaveWorkAssignmentReportDraftRequest
     /// Phương án giải quyết / đề xuất.
     /// </summary>
     public string? ProposedSolution { get; set; }
+
+    public DateTime? StartedDate { get; set; }
+
+    public DateTime? CompletedDate { get; set; }
 
     /// <summary>
     /// Lý do trễ hạn nếu có.

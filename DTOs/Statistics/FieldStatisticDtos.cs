@@ -50,6 +50,7 @@ public sealed class FieldStatisticSummaryRow
     public decimal? Average { get; set; }
     public long TrueCount { get; set; }
     public long FalseCount { get; set; }
+    public DateTime? EarliestDateUtc { get; set; }
     public DateTime? LatestDateUtc { get; set; }
     public long ReportCount { get; set; }
     public DateTime UpdatedAtUtc { get; set; }
@@ -87,6 +88,7 @@ public sealed class FieldTextConcatRequest
     public string DynamicFormTemplateId { get; set; } = default!;
     public string? FieldId { get; set; }
     public string? FieldKey { get; set; }
+    public string? BucketKey { get; set; }
     public string? Q { get; set; }
     public string? PeriodKey { get; set; }
     public string? PeriodKeyFrom { get; set; }
@@ -119,8 +121,15 @@ public sealed class FieldTextConcatRow
     public string Text { get; set; } = string.Empty;
     public int CharCount { get; set; }
     public bool RowTruncated { get; set; }
+    public List<FieldTextConcatItem> Items { get; set; } = new();
     public DateTime? SubmittedAtUtc { get; set; }
     public DateTime? ApprovedAtUtc { get; set; }
+}
+
+public sealed class FieldTextConcatItem
+{
+    public string Value { get; set; } = default!;
+    public string Label { get; set; } = default!;
 }
 
 public sealed class FieldTextConcatResponse

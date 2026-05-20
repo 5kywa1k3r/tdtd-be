@@ -41,7 +41,7 @@ public sealed class DynamicFormService : IDynamicFormService
     private static readonly Regex LabelCodeRegex = new("^[a-z0-9][a-z0-9_.-]{0,63}$", RegexOptions.Compiled);
     private static readonly Regex MetricKeyRegex = new("^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$", RegexOptions.Compiled);
     private static readonly Regex GenericFieldDisplayNameRegex = new(
-        "^(field|truong|number|date|short\\s*text|shorttext|long\\s*text|longtext|boolean|single\\s*select|singleselect|multi\\s*select|multiselect|so|ngay|van\\s*ban\\s*ngan|van\\s*ban\\s*dai|chon\\s*mot|chon\\s*nhieu|co\\s*khong)[\\s_-]*\\d*$",
+        "^(field|truong|number|date|full\\s*date|fulldate|short\\s*text|shorttext|long\\s*text|longtext|boolean|single\\s*select|singleselect|multi\\s*select|multiselect|so|ngay|ngay\\s*day\\s*du|van\\s*ban\\s*ngan|van\\s*ban\\s*dai|chon\\s*mot|chon\\s*nhieu|co\\s*khong)[\\s_-]*\\d*$",
         RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly HashSet<string> GenericFieldDisplayNames = new(StringComparer.Ordinal)
     {
@@ -49,6 +49,7 @@ public sealed class DynamicFormService : IDynamicFormService
         "longtext",
         "number",
         "date",
+        "fulldate",
         "singleselect",
         "multiselect",
         "boolean",
@@ -60,6 +61,7 @@ public sealed class DynamicFormService : IDynamicFormService
         "van ban dai",
         "so",
         "ngay",
+        "ngay day du",
         "chon mot",
         "chon nhieu",
         "co/khong",
@@ -205,6 +207,7 @@ public sealed class DynamicFormService : IDynamicFormService
         var fieldsJson = NormalizeJsonArray(req.FieldsJson, "FieldsJson");
         EnsureFieldsLimit(fieldsJson);
         EnsureFieldDisplayNames(fieldsJson);
+        fieldsJson = NormalizeFieldPayload(fieldsJson, existingFieldsJson: null);
         var excelBlockJson = NormalizeOptionalJsonObject(req.ExcelBlockJson, "ExcelBlockJson");
         var blocksJson = NormalizeBlocksJson(req.BlocksJson, excelBlockJson);
         blocksJson = NormalizeBlocksForSections(blocksJson, sectionsJson);
@@ -258,6 +261,7 @@ public sealed class DynamicFormService : IDynamicFormService
         var fieldsJson = NormalizeJsonArray(req.FieldsJson, "FieldsJson");
         EnsureFieldsLimit(fieldsJson);
         EnsureFieldDisplayNames(fieldsJson);
+        fieldsJson = NormalizeFieldPayload(fieldsJson, doc.FieldsJson);
         var excelBlockJson = NormalizeOptionalJsonObject(req.ExcelBlockJson, "ExcelBlockJson");
         var blocksJson = NormalizeBlocksJson(req.BlocksJson, excelBlockJson);
         blocksJson = NormalizeBlocksForSections(blocksJson, sectionsJson);
@@ -314,6 +318,7 @@ public sealed class DynamicFormService : IDynamicFormService
         var fieldsJson = NormalizeJsonArray(req.FieldsJson, "FieldsJson");
         EnsureFieldsLimit(fieldsJson);
         EnsureFieldDisplayNames(fieldsJson);
+        fieldsJson = NormalizeFieldPayload(fieldsJson, doc.FieldsJson);
         var excelBlockJson = NormalizeOptionalJsonObject(req.ExcelBlockJson, "ExcelBlockJson");
         var blocksJson = NormalizeBlocksJson(req.BlocksJson, excelBlockJson);
         blocksJson = NormalizeBlocksForSections(blocksJson, doc.SectionsJson);
@@ -523,7 +528,7 @@ public sealed class DynamicFormService : IDynamicFormService
             new
             {
                 id = sectionId,
-                title = "Excel block",
+                title = "Bảng Excel động",
                 description = excel.Name,
                 order = 0,
             }
@@ -1002,8 +1007,13 @@ public sealed class DynamicFormService : IDynamicFormService
         CancellationToken ct)
     {
         var collection = _ctx.Db.GetCollection<BsonDocument>(collectionName);
-        var filter = Builders<BsonDocument>.Filter.Eq("dynamicFormTemplateId", templateId)
-            & Builders<BsonDocument>.Filter.Ne("isDeleted", true);
+        var f = Builders<BsonDocument>.Filter;
+        var idFilter = ObjectId.TryParse(templateId, out var objectId)
+            ? f.Or(
+                f.Eq("dynamicFormTemplateId", objectId),
+                f.Eq("dynamicFormTemplateId", templateId))
+            : f.Eq("dynamicFormTemplateId", templateId);
+        var filter = idFilter & f.Ne("isDeleted", true);
 
         return await collection.Find(filter).Limit(1).AnyAsync(ct);
     }
@@ -1119,6 +1129,8 @@ public sealed class DynamicFormService : IDynamicFormService
         if (root.TryGetProperty("metricRules", out var metricRules))
             ValidateMetricRules(metricRules);
 
+        ValidateMetricLabelTargets(root, fieldName);
+
         if (string.Equals(tableMode, "SUMMARY_TEMPLATE", StringComparison.OrdinalIgnoreCase))
             ValidateSummaryTemplateLayout(root);
 
@@ -1181,6 +1193,249 @@ public sealed class DynamicFormService : IDynamicFormService
                 ValidateMetricKey(metricKey);
             }
         }
+    }
+
+    private static void ValidateMetricLabelTargets(JsonElement block, string fieldName)
+    {
+        if (!block.TryGetProperty("metricLabelTargets", out var targets)
+            || targets.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined)
+        {
+            return;
+        }
+
+        if (targets.ValueKind != JsonValueKind.Array)
+            throw DynamicFormValidation(
+                AppErrorCode.DYNAMIC_FORM_LABEL_STATISTIC_TARGET_INVALID,
+                "metricLabelTargets phai la JSON array.",
+                new { propertyName = $"{fieldName}.metricLabelTargets", actualKind = targets.ValueKind.ToString() });
+
+        var index = 0;
+        foreach (var target in targets.EnumerateArray())
+        {
+            if (target.ValueKind != JsonValueKind.Object)
+                throw DynamicFormValidation(
+                    AppErrorCode.DYNAMIC_FORM_LABEL_STATISTIC_TARGET_INVALID,
+                    "metricLabelTargets item phai la JSON object.",
+                    new { propertyName = $"{fieldName}.metricLabelTargets[{index}]", actualKind = target.ValueKind.ToString() });
+
+            var labelCode = ReadOptionalString(target, "statisticLabelCode");
+            if (string.IsNullOrWhiteSpace(labelCode))
+                throw DynamicFormValidation(
+                    AppErrorCode.DYNAMIC_FORM_LABEL_CODE_INVALID,
+                    "metricLabelTargets.statisticLabelCode khong duoc trong.",
+                    new { propertyName = $"{fieldName}.metricLabelTargets[{index}].statisticLabelCode" });
+
+            NormalizeLabelCode(labelCode);
+
+            var metricKey = ReadOptionalString(target, "metricKey");
+            var hasMetric = !string.IsNullOrWhiteSpace(metricKey);
+            var hasRange = TryReadMetricLabelRange(target, out _);
+
+            if (hasMetric == hasRange)
+                throw DynamicFormValidation(
+                    AppErrorCode.DYNAMIC_FORM_LABEL_STATISTIC_TARGET_INVALID,
+                    "metricLabelTargets can dung dung mot trong hai kieu: metricKey hoac range.",
+                    new { propertyName = $"{fieldName}.metricLabelTargets[{index}]", hasMetric, hasRange });
+
+            if (hasMetric)
+                ValidateMetricKey(metricKey!);
+            else
+                ResolveMetricLabelTargetDataType(block, target, fieldName, index);
+
+            index++;
+        }
+    }
+
+    private static string ResolveMetricLabelTargetDataType(
+        JsonElement block,
+        JsonElement target,
+        string fieldName,
+        int targetIndex)
+    {
+        if (!TryReadMetricLabelRange(target, out var range))
+        {
+            var explicitType = ReadOptionalString(target, "dataType")
+                               ?? ReadOptionalString(target, "targetDataType")
+                               ?? ReadOptionalString(block, "defaultDataType")
+                               ?? ReadOptionalString(block, "dataType");
+            return LabelDataTypes.Normalize(explicitType);
+        }
+
+        var dataRect = ReadBlockDataRect(block, fieldName);
+        if (!ContainsRange(dataRect, range))
+            throw DynamicFormValidation(
+                AppErrorCode.DYNAMIC_FORM_LABEL_STATISTIC_TARGET_INVALID,
+                "Vùng gắn nhãn thống kê phải nằm trong vùng dữ liệu của bảng Excel động.",
+                new
+                {
+                    propertyName = $"{fieldName}.metricLabelTargets[{targetIndex}]",
+                    range,
+                    dataRect
+                });
+
+        string? resolved = null;
+        for (var r = range.R0; r <= range.R1; r++)
+        {
+            for (var c = range.C0; c <= range.C1; c++)
+            {
+                var cellType = ResolveBlockCellDataType(block, r, c);
+                if (resolved is null)
+                {
+                    resolved = cellType;
+                    continue;
+                }
+
+                if (!string.Equals(resolved, cellType, StringComparison.OrdinalIgnoreCase))
+                    throw DynamicFormValidation(
+                        AppErrorCode.DYNAMIC_FORM_LABEL_STATISTIC_TARGET_INVALID,
+                        "Range gan nhan thong ke phai co cung mot kieu du lieu.",
+                        new
+                        {
+                            propertyName = $"{fieldName}.metricLabelTargets[{targetIndex}]",
+                            range,
+                            firstDataType = resolved,
+                            conflictDataType = cellType,
+                            conflictCell = new { r, c }
+                        });
+            }
+        }
+
+        resolved ??= LabelDataTypes.Normalize(ReadOptionalString(block, "defaultDataType"));
+        var explicitDataType = ReadOptionalString(target, "dataType")
+                               ?? ReadOptionalString(target, "targetDataType");
+        if (!string.IsNullOrWhiteSpace(explicitDataType))
+        {
+            var normalizedExplicit = LabelDataTypes.Normalize(explicitDataType);
+            if (!string.Equals(resolved, normalizedExplicit, StringComparison.OrdinalIgnoreCase))
+                throw DynamicFormValidation(
+                    AppErrorCode.DYNAMIC_FORM_LABEL_STATISTIC_TARGET_INVALID,
+                    "Kiểu dữ liệu khai báo cho vùng không khớp kiểu dữ liệu thực của vùng dữ liệu.",
+                    new
+                    {
+                        propertyName = $"{fieldName}.metricLabelTargets[{targetIndex}].dataType",
+                        expectedDataType = resolved,
+                        actualDataType = normalizedExplicit
+                    });
+        }
+
+        return resolved;
+    }
+
+    private static MetricLabelRange ReadBlockDataRect(JsonElement block, string fieldName)
+    {
+        if (!block.TryGetProperty("dataRect", out var dataRect)
+            || dataRect.ValueKind != JsonValueKind.Object)
+        {
+            throw DynamicFormValidation(
+                AppErrorCode.DYNAMIC_FORM_LABEL_STATISTIC_TARGET_INVALID,
+                "Cấu hình vùng gắn nhãn thống kê cần vùng dữ liệu trong bảng Excel động.",
+                new { propertyName = $"{fieldName}.dataRect" });
+        }
+
+        if (!TryReadRangeCoordinates(dataRect, out var range))
+            throw DynamicFormValidation(
+                AppErrorCode.DYNAMIC_FORM_LABEL_STATISTIC_TARGET_INVALID,
+                "Vùng dữ liệu của bảng Excel động không hợp lệ.",
+                new { propertyName = $"{fieldName}.dataRect" });
+
+        return range;
+    }
+
+    private static bool TryReadMetricLabelRange(JsonElement target, out MetricLabelRange range)
+    {
+        if (target.TryGetProperty("range", out var nested)
+            && nested.ValueKind == JsonValueKind.Object)
+        {
+            return TryReadRangeCoordinates(nested, out range);
+        }
+
+        return TryReadRangeCoordinates(target, out range);
+    }
+
+    private static bool TryReadRangeCoordinates(JsonElement element, out MetricLabelRange range)
+    {
+        range = default;
+        var r0 = ReadOptionalNonNegativeInt(element, "r0");
+        var c0 = ReadOptionalNonNegativeInt(element, "c0");
+        var r1 = ReadOptionalNonNegativeInt(element, "r1");
+        var c1 = ReadOptionalNonNegativeInt(element, "c1");
+        if (!r0.HasValue || !c0.HasValue || !r1.HasValue || !c1.HasValue)
+            return false;
+        if (r1.Value < r0.Value || c1.Value < c0.Value)
+            return false;
+
+        range = new MetricLabelRange(r0.Value, c0.Value, r1.Value, c1.Value);
+        return true;
+    }
+
+    private static int? ReadOptionalNonNegativeInt(JsonElement element, string name)
+    {
+        if (!element.TryGetProperty(name, out var value))
+            return null;
+
+        return value.ValueKind == JsonValueKind.Number
+               && value.TryGetInt32(out var number)
+               && number >= 0
+            ? number
+            : null;
+    }
+
+    private static bool ContainsRange(MetricLabelRange outer, MetricLabelRange inner)
+        => inner.R0 >= outer.R0
+           && inner.C0 >= outer.C0
+           && inner.R1 <= outer.R1
+           && inner.C1 <= outer.C1;
+
+    private static string ResolveBlockCellDataType(JsonElement block, int row, int column)
+    {
+        var defaultType = LabelDataTypes.Normalize(
+            ReadOptionalString(block, "defaultDataType")
+            ?? ReadOptionalString(block, "dataType"));
+        var specKind = ReadOptionalString(block, "excelSpecKind")
+                       ?? ReadOptionalString(block, "kind");
+
+        if (!block.TryGetProperty("dataTypeOverrides", out var overrides)
+            || overrides.ValueKind != JsonValueKind.Array)
+        {
+            return defaultType;
+        }
+
+        var resolved = defaultType;
+        foreach (var item in overrides.EnumerateArray())
+        {
+            if (item.ValueKind != JsonValueKind.Object)
+                continue;
+
+            var scope = ReadOptionalString(item, "scope")?.ToUpperInvariant();
+            var dataType = LabelDataTypes.Normalize(ReadOptionalString(item, "dataType"));
+            if (string.Equals(scope, "COLUMN", StringComparison.Ordinal)
+                && string.Equals(specKind, "TOP", StringComparison.OrdinalIgnoreCase)
+                && ReadOptionalNonNegativeInt(item, "index") == column)
+            {
+                resolved = dataType;
+                continue;
+            }
+
+            if (string.Equals(scope, "ROW", StringComparison.Ordinal)
+                && string.Equals(specKind, "LEFT", StringComparison.OrdinalIgnoreCase)
+                && ReadOptionalNonNegativeInt(item, "index") == row)
+            {
+                resolved = dataType;
+                continue;
+            }
+
+            if (string.Equals(scope, "RANGE", StringComparison.Ordinal)
+                && TryReadRangeCoordinates(item, out var range)
+                && row >= range.R0
+                && row <= range.R1
+                && column >= range.C0
+                && column <= range.C1)
+            {
+                resolved = dataType;
+            }
+        }
+
+        return resolved;
     }
 
     private static void EnsureBlocksTableStatisticContract(string? blocksJson, string fieldName)
@@ -1381,6 +1636,14 @@ public sealed class DynamicFormService : IDynamicFormService
         return value.GetString()?.Trim();
     }
 
+    private static string? ReadOptionalString(JsonObject obj, string name)
+    {
+        if (!obj.TryGetPropertyValue(name, out var node) || node is not JsonValue value)
+            return null;
+
+        return value.TryGetValue<string>(out var text) ? text?.Trim() : null;
+    }
+
     private static bool IsTableModeAllowedForExcelSpecKind(string tableMode, string? excelSpecKind)
     {
         if (string.Equals(tableMode, "SUMMARY_TEMPLATE", StringComparison.OrdinalIgnoreCase))
@@ -1398,8 +1661,7 @@ public sealed class DynamicFormService : IDynamicFormService
                    || string.Equals(tableMode, "APPEND_COLUMNS", StringComparison.OrdinalIgnoreCase);
 
         if (string.Equals(excelSpecKind, "MATRIX", StringComparison.OrdinalIgnoreCase))
-            return string.Equals(tableMode, "FIXED_GRID", StringComparison.OrdinalIgnoreCase)
-                   || string.Equals(tableMode, "MATRIX", StringComparison.OrdinalIgnoreCase);
+            return string.Equals(tableMode, "FIXED_GRID", StringComparison.OrdinalIgnoreCase);
 
         return true;
     }
@@ -1426,7 +1688,7 @@ public sealed class DynamicFormService : IDynamicFormService
             return new[] { "FIXED_GRID", "APPEND_COLUMNS" };
 
         if (string.Equals(excelSpecKind, "MATRIX", StringComparison.OrdinalIgnoreCase))
-            return new[] { "FIXED_GRID", "MATRIX" };
+            return new[] { "FIXED_GRID" };
 
         return new[] { "FIXED_GRID", "APPEND_ROWS", "APPEND_COLUMNS", "MATRIX", "SUMMARY_TEMPLATE" };
     }
@@ -1489,6 +1751,9 @@ public sealed class DynamicFormService : IDynamicFormService
         string sectionId)
     {
         var blockId = $"excel_{excel.Id}";
+        var typeMetadata = ReadDynamicExcelTypeMetadata(excel.SpecJson);
+        var specKind = ReadDynamicExcelSpecKind(excel.SpecJson);
+        var tableMode = NormalizeDynamicExcelTemplateTableMode(excel.TableMode, specKind);
         return new DynamicFormExcelBlockSnapshot(
             excel.Id,
             excel.Code,
@@ -1502,45 +1767,91 @@ public sealed class DynamicFormService : IDynamicFormService
             excel.H,
             blockId,
             sectionId,
-            "FIXED_GRID",
-            NormalizeDynamicExcelTableKind(excel.TableKind) == DynamicExcelTableKind.RecordTable
-                ? Array.Empty<DynamicFormTableIndexMapItem>()
-                : BuildFixedGridIndexMap(blockId, excel.W, excel.H),
-            ReadDynamicExcelSpecKind(excel.SpecJson),
-            NormalizeDynamicExcelTableKind(excel.TableKind),
-            excel.RecordTableSpecJson);
+            tableMode,
+            Array.Empty<DynamicFormTableIndexMapItem>(),
+            specKind,
+            typeMetadata.DefaultDataType,
+            typeMetadata.DefaultOptions,
+            typeMetadata.DataTypeOverrides);
     }
 
-    private static string NormalizeDynamicExcelTableKind(string? value)
-        => string.Equals(value?.Trim(), DynamicExcelTableKind.RecordTable, StringComparison.OrdinalIgnoreCase)
-            ? DynamicExcelTableKind.RecordTable
-            : DynamicExcelTableKind.NumericGrid;
-
-    private static DynamicFormTableIndexMapItem[] BuildFixedGridIndexMap(
-        string blockId,
-        int width,
-        int height)
+    private static string NormalizeDynamicExcelTemplateTableMode(string? tableMode, string? specKind)
     {
-        if (width <= 0 || height <= 0)
-            return Array.Empty<DynamicFormTableIndexMapItem>();
+        var normalized = string.IsNullOrWhiteSpace(tableMode)
+            ? "FIXED_GRID"
+            : tableMode.Trim().ToUpperInvariant();
 
-        var rows = new List<DynamicFormTableIndexMapItem>(width * height);
-        for (var r = 0; r < height; r++)
+        var ok = specKind?.Trim().ToUpperInvariant() switch
         {
-            for (var c = 0; c < width; c++)
-            {
-                var index = r * width + c;
-                var rowKey = $"row_{r + 1}";
-                var columnKey = $"col_{c + 1}";
-                rows.Add(new DynamicFormTableIndexMapItem(
-                    index,
-                    rowKey,
-                    columnKey,
-                    $"table:{blockId}.row:{rowKey}.column:{columnKey}"));
-            }
-        }
+            "TOP" => normalized is "FIXED_GRID" or "APPEND_ROWS",
+            "LEFT" => normalized is "FIXED_GRID" or "APPEND_COLUMNS",
+            "MATRIX" => normalized is "FIXED_GRID",
+            _ => false
+        };
 
-        return rows.ToArray();
+        return ok ? normalized : "FIXED_GRID";
+    }
+
+    private static DynamicExcelTypeMetadata ReadDynamicExcelTypeMetadata(string? specJson)
+    {
+        const string fallbackType = LabelDataTypes.Number;
+        if (string.IsNullOrWhiteSpace(specJson))
+            return new DynamicExcelTypeMetadata(fallbackType, Array.Empty<JsonElement>(), Array.Empty<JsonElement>());
+
+        try
+        {
+            using var document = JsonDocument.Parse(specJson);
+            if (document.RootElement.ValueKind != JsonValueKind.Object)
+                return new DynamicExcelTypeMetadata(fallbackType, Array.Empty<JsonElement>(), Array.Empty<JsonElement>());
+
+            var defaultType = NormalizeDynamicExcelMetadataDataType(
+                ReadOptionalString(document.RootElement, "defaultDataType"));
+
+            var defaultOptions = Array.Empty<JsonElement>();
+            if (document.RootElement.TryGetProperty("defaultOptions", out var defaultOptionsElement)
+                && defaultOptionsElement.ValueKind == JsonValueKind.Array)
+            {
+                defaultOptions = defaultOptionsElement
+                    .EnumerateArray()
+                    .Where(item => item.ValueKind is JsonValueKind.Object or JsonValueKind.String)
+                    .Select(item => item.Clone())
+                    .ToArray();
+            }
+
+            var overrides = Array.Empty<JsonElement>();
+            if (document.RootElement.TryGetProperty("dataTypeOverrides", out var overrideElement)
+                && overrideElement.ValueKind == JsonValueKind.Array)
+            {
+                overrides = overrideElement
+                    .EnumerateArray()
+                    .Where(item => item.ValueKind == JsonValueKind.Object)
+                    .Select(item => item.Clone())
+                    .ToArray();
+            }
+
+            return new DynamicExcelTypeMetadata(defaultType, defaultOptions, overrides);
+        }
+        catch (JsonException)
+        {
+            return new DynamicExcelTypeMetadata(fallbackType, Array.Empty<JsonElement>(), Array.Empty<JsonElement>());
+        }
+    }
+
+    private sealed record DynamicExcelTypeMetadata(
+        string DefaultDataType,
+        JsonElement[] DefaultOptions,
+        JsonElement[] DataTypeOverrides);
+
+    private static string NormalizeDynamicExcelMetadataDataType(string? value)
+    {
+        var raw = value?.Trim().ToUpperInvariant();
+        if (raw is "FULL_DATE" or "FULLDATE" or "STRICT_DATE")
+            return "FULL_DATE";
+        if (raw is "MULTI_SELECT" or "MULTISELECT")
+            return "MULTI_SELECT";
+
+        var normalized = LabelDataTypes.Normalize(value);
+        return normalized == LabelDataTypes.LongText ? LabelDataTypes.StringList : normalized;
     }
 
     private async Task EnsureLabelReferencesAsync(
@@ -1569,7 +1880,7 @@ public sealed class DynamicFormService : IDynamicFormService
 
         var found = await _ctx.Labels
             .Find(filter)
-            .Project(x => new { x.Code, x.DataType })
+            .Project(x => new { x.Code, x.DataType, x.Usage })
             .ToListAsync(ct);
 
         var foundTypes = found
@@ -1577,6 +1888,12 @@ public sealed class DynamicFormService : IDynamicFormService
             .ToDictionary(
                 x => x.Key,
                 x => LabelDataTypes.Normalize(x.First().DataType),
+                StringComparer.OrdinalIgnoreCase);
+        var foundUsages = found
+            .GroupBy(x => x.Code, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(
+                x => x.Key,
+                x => LabelUsages.Normalize(x.First().Usage, LabelUsages.Classification),
                 StringComparer.OrdinalIgnoreCase);
         var foundSet = new HashSet<string>(foundTypes.Keys, StringComparer.OrdinalIgnoreCase);
         var missing = codes
@@ -1590,7 +1907,14 @@ public sealed class DynamicFormService : IDynamicFormService
                 "Nhan khong ton tai, inactive hoac ngoai pham vi.",
                 new { missing });
 
-        EnsureStatisticLabelTypeCompatibility(fieldsJson, blocksJson, foundTypes);
+        EnsureLabelUsageCompatibility(
+            formTagCodes,
+            sectionsJson,
+            fieldsJson,
+            excelBlockJson,
+            blocksJson,
+            foundTypes,
+            foundUsages);
     }
 
     private static FilterDefinition<LabelCatalogItem> BuildLabelVisibilityFilter(MeResponse me)
@@ -1693,8 +2017,9 @@ public sealed class DynamicFormService : IDynamicFormService
             AddUniqueLabelTarget(targetsByLabel, field.LabelCode, field.Target);
         }
 
-        targetCount += CountExcelStatisticColumns(blocksJson);
-        foreach (var column in ReadExcelColumnStatisticTargets(blocksJson))
+        var metricTargets = ReadMetricLabelTargets(blocksJson).ToList();
+        targetCount += metricTargets.Count;
+        foreach (var column in metricTargets)
         {
             AddUniqueLabelTarget(targetsByLabel, column.LabelCode, column.Target);
         }
@@ -1709,15 +2034,52 @@ public sealed class DynamicFormService : IDynamicFormService
         }
     }
 
+    private static void EnsureLabelUsageCompatibility(
+        string[]? formTagCodes,
+        string? sectionsJson,
+        string? fieldsJson,
+        string? excelBlockJson,
+        string? blocksJson,
+        IReadOnlyDictionary<string, string> labelDataTypes,
+        IReadOnlyDictionary<string, string> labelUsages)
+    {
+        foreach (var code in NormalizeLabelCodes(formTagCodes))
+            EnsureLabelHasUsage(
+                code,
+                "form.tagCodes",
+                LabelUsages.Classification,
+                labelUsages,
+                "Nhan gan tag bieu mau phai co usage=CLASSIFICATION.");
+
+        foreach (var target in ReadLabelPropertyTargets("SectionsJson", sectionsJson, "tagCodes")
+                     .Concat(ReadLabelPropertyTargets("FieldsJson", fieldsJson, "tagCodes"))
+                     .Concat(ReadLabelPropertyTargets("ExcelBlockJson", excelBlockJson, "tagCodes"))
+                     .Concat(ReadLabelPropertyTargets("BlocksJson", blocksJson, "tagCodes")))
+        {
+            EnsureLabelHasUsage(
+                target.LabelCode,
+                target.Target,
+                LabelUsages.Classification,
+                labelUsages,
+                "Nhan gan tag phai co usage=CLASSIFICATION.");
+        }
+
+        EnsureStatisticLabelTypeCompatibility(fieldsJson, blocksJson, labelDataTypes, labelUsages);
+        EnsureTableTargetLabelTypeCompatibility(excelBlockJson, blocksJson, labelDataTypes, labelUsages);
+    }
+
     private static void EnsureStatisticLabelTypeCompatibility(
         string? fieldsJson,
         string? blocksJson,
-        IReadOnlyDictionary<string, string> labelDataTypes)
+        IReadOnlyDictionary<string, string> labelDataTypes,
+        IReadOnlyDictionary<string, string> labelUsages)
     {
         foreach (var target in ReadFieldStatisticTargets(fieldsJson))
         {
             if (string.IsNullOrWhiteSpace(target.ExpectedDataType))
                 continue;
+
+            EnsureLabelCanBeStatistic(target, labelUsages);
 
             if (!labelDataTypes.TryGetValue(target.LabelCode, out var actualDataType))
                 continue;
@@ -1736,16 +2098,18 @@ public sealed class DynamicFormService : IDynamicFormService
                     });
         }
 
-        foreach (var target in ReadExcelColumnStatisticTargets(blocksJson))
+        foreach (var target in ReadMetricLabelTargets(blocksJson))
         {
+            EnsureLabelCanBeStatistic(target, labelUsages);
+
             if (!labelDataTypes.TryGetValue(target.LabelCode, out var actualDataType))
                 continue;
 
-            var expectedDataType = LabelDataTypes.Number;
+            var expectedDataType = LabelDataTypes.Normalize(target.ExpectedDataType);
             if (!string.Equals(actualDataType, expectedDataType, StringComparison.OrdinalIgnoreCase))
                 throw DynamicFormValidation(
                     AppErrorCode.DYNAMIC_FORM_LABEL_STATISTIC_TARGET_INVALID,
-                    "Kieu du lieu cua nhan thong ke cot Excel dong phai la NUMBER.",
+                    "Kieu du lieu cua nhan thong ke bang khong khop voi vung/metric duoc gan.",
                     new
                     {
                         target = target.Target,
@@ -1754,6 +2118,89 @@ public sealed class DynamicFormService : IDynamicFormService
                         actualDataType
                     });
         }
+    }
+
+    private static void EnsureLabelCanBeStatistic(
+        LabelStatisticTarget target,
+        IReadOnlyDictionary<string, string> labelUsages)
+    {
+        EnsureLabelHasUsage(
+            target.LabelCode,
+            target.Target,
+            LabelUsages.Statistic,
+            labelUsages,
+            "Nhan gan vao muc tieu thong ke phai co usage=STATISTIC.");
+    }
+
+    private static void EnsureTableTargetLabelTypeCompatibility(
+        string? excelBlockJson,
+        string? blocksJson,
+        IReadOnlyDictionary<string, string> labelDataTypes,
+        IReadOnlyDictionary<string, string> labelUsages)
+    {
+        foreach (var target in ReadTableTargetLabelTargets("ExcelBlockJson", excelBlockJson)
+                     .Concat(ReadTableTargetLabelTargets("BlocksJson", blocksJson)))
+        {
+            EnsureLabelHasUsage(
+                target.LabelCode,
+                target.Target,
+                LabelUsages.TableTarget,
+                labelUsages,
+                "Nhan gan vao vi tri bang phai co usage=TABLE_TARGET.");
+
+            if (string.IsNullOrWhiteSpace(target.ExpectedDataType))
+                throw DynamicFormValidation(
+                    AppErrorCode.DYNAMIC_FORM_LABEL_STATISTIC_TARGET_INVALID,
+                    "Nhan vi tri bang phai khai bao kieu du lieu target.",
+                    new
+                    {
+                        target = target.Target,
+                        labelCode = target.LabelCode,
+                        expectedFields = new[] { "rowLabelDataType", "columnLabelDataType", "cellLabelDataType", "rangeLabelDataType", "targetDataType", "defaultDataType" }
+                    });
+
+            if (!labelDataTypes.TryGetValue(target.LabelCode, out var actualDataType))
+                continue;
+
+            var expectedDataType = LabelDataTypes.Normalize(target.ExpectedDataType);
+            if (!string.Equals(actualDataType, expectedDataType, StringComparison.OrdinalIgnoreCase))
+                throw DynamicFormValidation(
+                    AppErrorCode.DYNAMIC_FORM_LABEL_STATISTIC_TARGET_INVALID,
+                    "Kieu du lieu cua nhan vi tri bang khong khop voi Dynamic Excel target.",
+                    new
+                    {
+                        target = target.Target,
+                        labelCode = target.LabelCode,
+                        expectedDataType,
+                        actualDataType
+                    });
+        }
+    }
+
+    private static void EnsureLabelHasUsage(
+        string labelCode,
+        string target,
+        string expectedUsage,
+        IReadOnlyDictionary<string, string> labelUsages,
+        string message)
+    {
+        if (!labelUsages.TryGetValue(labelCode, out var usage))
+            return;
+
+        var normalizedUsage = LabelUsages.Normalize(usage, string.Empty);
+        if (string.Equals(normalizedUsage, expectedUsage, StringComparison.Ordinal))
+            return;
+
+        throw DynamicFormValidation(
+            AppErrorCode.DYNAMIC_FORM_LABEL_STATISTIC_TARGET_INVALID,
+            message,
+            new
+            {
+                target,
+                labelCode,
+                expectedUsage,
+                actualUsage = usage
+            });
     }
 
     private static void EnsureFieldsLimit(string? fieldsJson)
@@ -1822,6 +2269,130 @@ public sealed class DynamicFormService : IDynamicFormService
 
             index++;
         }
+    }
+
+    private static string? NormalizeFieldDisplayAliases(string? fieldsJson)
+        => NormalizeFieldPayload(fieldsJson, existingFieldsJson: null);
+
+    private static string? NormalizeFieldPayload(string? fieldsJson, string? existingFieldsJson)
+    {
+        if (string.IsNullOrWhiteSpace(fieldsJson))
+            return fieldsJson;
+
+        JsonNode? node;
+        try
+        {
+            node = JsonNode.Parse(fieldsJson);
+        }
+        catch (JsonException ex)
+        {
+            throw DynamicFormJsonInvalid("FieldsJson", "FieldsJson khong phai JSON hop le.", ex);
+        }
+
+        if (node is not JsonArray fields)
+            return fieldsJson;
+
+        var existingKeysById = ReadExistingFieldKeysById(existingFieldsJson);
+        var usedKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var index = 0;
+        foreach (var item in fields)
+        {
+            if (item is not JsonObject field)
+                continue;
+
+            var id = ReadOptionalString(field, "id");
+            var name = ReadOptionalString(field, "name")
+                       ?? ReadOptionalString(field, "displayName")
+                       ?? ReadOptionalString(field, "label");
+
+            if (!string.IsNullOrWhiteSpace(name))
+                field["name"] = name.Trim();
+
+            field.Remove("displayName");
+            field.Remove("label");
+
+            var requestedKey = ReadOptionalString(field, "key");
+            var existingKey = !string.IsNullOrWhiteSpace(id) && existingKeysById.TryGetValue(id, out var retainedKey)
+                ? retainedKey
+                : null;
+            var type = ReadOptionalString(field, "type");
+            var baseKey = NormalizeFieldTechnicalKey(requestedKey ?? existingKey ?? id ?? type)
+                          ?? $"field_{index + 1}";
+            field["key"] = MakeUniqueFieldTechnicalKey(baseKey, usedKeys);
+            index++;
+        }
+
+        return fields.ToJsonString(JsonOptions);
+    }
+
+    private static Dictionary<string, string> ReadExistingFieldKeysById(string? fieldsJson)
+    {
+        var result = new Dictionary<string, string>(StringComparer.Ordinal);
+        if (string.IsNullOrWhiteSpace(fieldsJson))
+            return result;
+
+        try
+        {
+            using var document = JsonDocument.Parse(fieldsJson);
+            if (document.RootElement.ValueKind != JsonValueKind.Array)
+                return result;
+
+            foreach (var item in document.RootElement.EnumerateArray())
+            {
+                if (item.ValueKind != JsonValueKind.Object)
+                    continue;
+
+                var id = ReadOptionalString(item, "id");
+                var key = ReadOptionalString(item, "key");
+                if (!string.IsNullOrWhiteSpace(id) && !string.IsNullOrWhiteSpace(key))
+                    result[id] = key;
+            }
+        }
+        catch (JsonException)
+        {
+            return result;
+        }
+
+        return result;
+    }
+
+    private static string? NormalizeFieldTechnicalKey(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return null;
+
+        var formD = value.Trim().Normalize(System.Text.NormalizationForm.FormD);
+        var chars = formD
+            .Where(ch => CharUnicodeInfo.GetUnicodeCategory(ch) != UnicodeCategory.NonSpacingMark)
+            .ToArray();
+        var withoutMarks = new string(chars).Normalize(System.Text.NormalizationForm.FormC).ToLowerInvariant();
+        var normalized = Regex.Replace(withoutMarks, "[^a-z0-9_.-]+", "_").Trim('_', '.', '-');
+        if (string.IsNullOrWhiteSpace(normalized))
+            return null;
+
+        if (!char.IsLetter(normalized[0]))
+            normalized = $"field_{normalized}";
+
+        return normalized.Length <= 96 ? normalized : normalized[..96].TrimEnd('_', '.', '-');
+    }
+
+    private static string MakeUniqueFieldTechnicalKey(string baseKey, HashSet<string> usedKeys)
+    {
+        var normalizedBase = string.IsNullOrWhiteSpace(baseKey) ? "field" : baseKey;
+        var candidate = normalizedBase;
+        var suffix = 2;
+        while (!usedKeys.Add(candidate))
+        {
+            var suffixText = $"_{suffix}";
+            var maxBaseLength = Math.Max(1, 96 - suffixText.Length);
+            var prefix = normalizedBase.Length <= maxBaseLength
+                ? normalizedBase
+                : normalizedBase[..maxBaseLength].TrimEnd('_', '.', '-');
+            candidate = $"{prefix}{suffixText}";
+            suffix++;
+        }
+
+        return candidate;
     }
 
     private static bool IsGenericFieldDisplayName(string? fieldType, string displayName)
@@ -1903,6 +2474,7 @@ public sealed class DynamicFormService : IDynamicFormService
             }
             obj.Remove("statisticColumns");
             obj.Remove("statisticColumnLabels");
+            obj.Remove("metricLabelTargets");
 
             foreach (var child in obj.ToList())
                 StripStatisticConfig(child.Value, removeFieldStatisticLabels);
@@ -1920,6 +2492,233 @@ public sealed class DynamicFormService : IDynamicFormService
         => obj.ContainsKey("id")
            && obj.ContainsKey("type")
            && (obj.ContainsKey("key") || obj.ContainsKey("sectionId"));
+
+    private static IEnumerable<LabelStatisticTarget> ReadLabelPropertyTargets(
+        string fieldName,
+        string? json,
+        params string[] propertyNames)
+    {
+        if (string.IsNullOrWhiteSpace(json))
+            yield break;
+
+        JsonDocument document;
+        try
+        {
+            document = JsonDocument.Parse(json);
+        }
+        catch (JsonException)
+        {
+            yield break;
+        }
+
+        using (document)
+        {
+            var names = new HashSet<string>(propertyNames, StringComparer.OrdinalIgnoreCase);
+            foreach (var target in ReadLabelPropertyTargets(document.RootElement, fieldName, names))
+                yield return target;
+        }
+    }
+
+    private static IEnumerable<LabelStatisticTarget> ReadLabelPropertyTargets(
+        JsonElement element,
+        string path,
+        HashSet<string> propertyNames)
+    {
+        if (element.ValueKind == JsonValueKind.Object)
+        {
+            foreach (var property in element.EnumerateObject())
+            {
+                var nextPath = $"{path}.{property.Name}";
+                if (propertyNames.Contains(property.Name))
+                {
+                    foreach (var code in ReadLabelCodesFromElement(property.Value))
+                        yield return new LabelStatisticTarget(code, nextPath);
+                    continue;
+                }
+
+                foreach (var target in ReadLabelPropertyTargets(property.Value, nextPath, propertyNames))
+                    yield return target;
+            }
+
+            yield break;
+        }
+
+        if (element.ValueKind == JsonValueKind.Array)
+        {
+            var index = 0;
+            foreach (var item in element.EnumerateArray())
+            {
+                foreach (var target in ReadLabelPropertyTargets(item, $"{path}[{index}]", propertyNames))
+                    yield return target;
+                index++;
+            }
+        }
+    }
+
+    private static IEnumerable<LabelStatisticTarget> ReadTableTargetLabelTargets(
+        string fieldName,
+        string? json)
+    {
+        if (string.IsNullOrWhiteSpace(json))
+            yield break;
+
+        JsonDocument document;
+        try
+        {
+            document = JsonDocument.Parse(json);
+        }
+        catch (JsonException)
+        {
+            yield break;
+        }
+
+        using (document)
+        {
+            foreach (var target in ReadTableTargetLabelTargets(
+                         document.RootElement,
+                         fieldName,
+                         currentRowLabelDataType: null,
+                         currentColumnLabelDataType: null,
+                         currentCellLabelDataType: null,
+                         currentRangeLabelDataType: null))
+                yield return target;
+        }
+    }
+
+    private static IEnumerable<LabelStatisticTarget> ReadTableTargetLabelTargets(
+        JsonElement element,
+        string path,
+        string? currentRowLabelDataType,
+        string? currentColumnLabelDataType,
+        string? currentCellLabelDataType,
+        string? currentRangeLabelDataType)
+    {
+        if (element.ValueKind == JsonValueKind.Object)
+        {
+            var rowLabelDataType = ReadOptionalString(element, "rowLabelDataType")
+                                   ?? ReadOptionalString(element, "rowLabelTargetDataType")
+                                   ?? currentRowLabelDataType;
+            var columnLabelDataType = ReadOptionalString(element, "columnLabelDataType")
+                                      ?? ReadOptionalString(element, "columnLabelTargetDataType")
+                                      ?? currentColumnLabelDataType;
+            var cellLabelDataType = ReadOptionalString(element, "cellLabelDataType")
+                                    ?? ReadOptionalString(element, "cellLabelTargetDataType")
+                                    ?? currentCellLabelDataType;
+            var rangeLabelDataType = ReadOptionalString(element, "rangeLabelDataType")
+                                     ?? ReadOptionalString(element, "rangeLabelTargetDataType")
+                                     ?? currentRangeLabelDataType;
+
+            foreach (var property in element.EnumerateObject())
+            {
+                var nextPath = $"{path}.{property.Name}";
+                if (IsTableTargetLabelProperty(property.Name))
+                {
+                    var expectedDataType = ResolveTableTargetDataType(
+                        element,
+                        property.Name,
+                        rowLabelDataType,
+                        columnLabelDataType,
+                        cellLabelDataType,
+                        rangeLabelDataType);
+                    foreach (var code in ReadLabelCodesFromElement(property.Value))
+                        yield return new LabelStatisticTarget(code, nextPath, expectedDataType);
+                    continue;
+                }
+
+                foreach (var target in ReadTableTargetLabelTargets(
+                             property.Value,
+                             nextPath,
+                             rowLabelDataType,
+                             columnLabelDataType,
+                             cellLabelDataType,
+                             rangeLabelDataType))
+                    yield return target;
+            }
+
+            yield break;
+        }
+
+        if (element.ValueKind == JsonValueKind.Array)
+        {
+            var index = 0;
+            foreach (var item in element.EnumerateArray())
+            {
+                foreach (var target in ReadTableTargetLabelTargets(
+                             item,
+                             $"{path}[{index}]",
+                             currentRowLabelDataType,
+                             currentColumnLabelDataType,
+                             currentCellLabelDataType,
+                             currentRangeLabelDataType))
+                    yield return target;
+                index++;
+            }
+        }
+    }
+
+    private static bool IsTableTargetLabelProperty(string name)
+        => string.Equals(name, "allowedRowLabelCodes", StringComparison.OrdinalIgnoreCase)
+           || string.Equals(name, "rowLabelCodes", StringComparison.OrdinalIgnoreCase)
+           || string.Equals(name, "allowedColumnLabelCodes", StringComparison.OrdinalIgnoreCase)
+           || string.Equals(name, "columnLabelCodes", StringComparison.OrdinalIgnoreCase)
+           || string.Equals(name, "allowedCellLabelCodes", StringComparison.OrdinalIgnoreCase)
+           || string.Equals(name, "cellLabelCodes", StringComparison.OrdinalIgnoreCase)
+           || string.Equals(name, "allowedRangeLabelCodes", StringComparison.OrdinalIgnoreCase)
+           || string.Equals(name, "rangeLabelCodes", StringComparison.OrdinalIgnoreCase)
+           || string.Equals(name, "targetLabelCodes", StringComparison.OrdinalIgnoreCase);
+
+    private static string? ResolveTableTargetDataType(
+        JsonElement owner,
+        string propertyName,
+        string? rowLabelDataType,
+        string? columnLabelDataType,
+        string? cellLabelDataType,
+        string? rangeLabelDataType)
+    {
+        var scopedType = IsRowTargetLabelProperty(propertyName)
+            ? ReadOptionalString(owner, "rowLabelDataType") ?? ReadOptionalString(owner, "rowLabelTargetDataType") ?? rowLabelDataType
+            : IsColumnTargetLabelProperty(propertyName)
+                ? ReadOptionalString(owner, "columnLabelDataType") ?? ReadOptionalString(owner, "columnLabelTargetDataType") ?? columnLabelDataType
+                : IsCellTargetLabelProperty(propertyName)
+                    ? ReadOptionalString(owner, "cellLabelDataType") ?? ReadOptionalString(owner, "cellLabelTargetDataType") ?? cellLabelDataType
+                    : IsRangeTargetLabelProperty(propertyName)
+                        ? ReadOptionalString(owner, "rangeLabelDataType") ?? ReadOptionalString(owner, "rangeLabelTargetDataType") ?? rangeLabelDataType
+                        : null;
+        var explicitType = scopedType
+                           ?? ReadOptionalString(owner, "targetDataType")
+                           ?? ReadOptionalString(owner, "labelDataType")
+                           ?? ReadOptionalString(owner, "defaultDataType")
+                           ?? ReadOptionalString(owner, "dataType");
+
+        if (!string.IsNullOrWhiteSpace(explicitType))
+            return LabelDataTypes.Normalize(explicitType);
+
+        return LabelDataTypes.Number;
+    }
+
+    private static bool IsRowTargetLabelProperty(string name)
+        => string.Equals(name, "allowedRowLabelCodes", StringComparison.OrdinalIgnoreCase)
+           || string.Equals(name, "rowLabelCodes", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsColumnTargetLabelProperty(string name)
+        => string.Equals(name, "allowedColumnLabelCodes", StringComparison.OrdinalIgnoreCase)
+           || string.Equals(name, "columnLabelCodes", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsCellTargetLabelProperty(string name)
+        => string.Equals(name, "allowedCellLabelCodes", StringComparison.OrdinalIgnoreCase)
+           || string.Equals(name, "cellLabelCodes", StringComparison.OrdinalIgnoreCase)
+           || string.Equals(name, "targetLabelCodes", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsRangeTargetLabelProperty(string name)
+        => string.Equals(name, "allowedRangeLabelCodes", StringComparison.OrdinalIgnoreCase)
+           || string.Equals(name, "rangeLabelCodes", StringComparison.OrdinalIgnoreCase);
+
+    private static List<string> ReadLabelCodesFromElement(JsonElement element)
+    {
+        var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        AddLabelCodes(element, set);
+        return set.OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToList();
+    }
 
     private static IEnumerable<LabelStatisticTarget> ReadFieldStatisticTargets(string? fieldsJson)
     {
@@ -1968,8 +2767,12 @@ public sealed class DynamicFormService : IDynamicFormService
         {
             "number" => LabelDataTypes.Number,
             "date" => LabelDataTypes.Date,
+            "fullDate" => LabelDataTypes.Date,
             "boolean" => LabelDataTypes.Boolean,
-            "longText" => LabelDataTypes.LongText,
+            "longText" => LabelDataTypes.StringList,
+            "stringList" => LabelDataTypes.StringList,
+            "singleSelect" => LabelDataTypes.ShortText,
+            "multiSelect" => LabelDataTypes.ShortText,
             _ => LabelDataTypes.ShortText
         };
 
@@ -2001,6 +2804,95 @@ public sealed class DynamicFormService : IDynamicFormService
         }
 
         return count;
+    }
+
+    private static IEnumerable<LabelStatisticTarget> ReadMetricLabelTargets(string? blocksJson)
+    {
+        if (string.IsNullOrWhiteSpace(blocksJson))
+            yield break;
+
+        using var document = ParseJson(blocksJson, "BlocksJson");
+        if (document.RootElement.ValueKind != JsonValueKind.Array)
+            throw DynamicFormJsonKindInvalid(
+                "BlocksJson",
+                "array",
+                document.RootElement.ValueKind,
+                "BlocksJson phai la JSON array.");
+
+        var blockIndex = 0;
+        foreach (var block in document.RootElement.EnumerateArray())
+        {
+            if (block.ValueKind != JsonValueKind.Object)
+                throw DynamicFormJsonKindInvalid(
+                    "BlocksJson[]",
+                    "object",
+                    block.ValueKind,
+                    "BlocksJson item phai la JSON object.");
+
+            if (!block.TryGetProperty("metricLabelTargets", out var targets)
+                || targets.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined)
+            {
+                blockIndex++;
+                continue;
+            }
+
+            if (targets.ValueKind != JsonValueKind.Array)
+                throw DynamicFormValidation(
+                    AppErrorCode.DYNAMIC_FORM_LABEL_STATISTIC_TARGET_INVALID,
+                    "metricLabelTargets phai la JSON array.",
+                    new { propertyName = "metricLabelTargets", actualKind = targets.ValueKind.ToString() });
+
+            var blockId = ReadOptionalString(block, "blockId")
+                          ?? ReadOptionalString(block, "id")
+                          ?? $"block_{blockIndex + 1}";
+
+            var targetIndex = 0;
+            foreach (var target in targets.EnumerateArray())
+            {
+                if (target.ValueKind != JsonValueKind.Object)
+                    throw DynamicFormValidation(
+                        AppErrorCode.DYNAMIC_FORM_LABEL_STATISTIC_TARGET_INVALID,
+                        "metricLabelTargets item phai la JSON object.",
+                        new { propertyName = "metricLabelTargets", actualKind = target.ValueKind.ToString() });
+
+                var labelCode = NormalizeLabelCode(ReadOptionalString(target, "statisticLabelCode"));
+                var metricKey = ReadOptionalString(target, "metricKey");
+                var hasMetric = !string.IsNullOrWhiteSpace(metricKey);
+                var hasRange = TryReadMetricLabelRange(target, out var range);
+
+                if (hasMetric == hasRange)
+                    throw DynamicFormValidation(
+                        AppErrorCode.DYNAMIC_FORM_LABEL_STATISTIC_TARGET_INVALID,
+                        "metricLabelTargets can dung dung mot trong hai kieu: metricKey hoac range.",
+                        new { blockId, targetIndex, hasMetric, hasRange });
+
+                if (hasMetric)
+                {
+                    ValidateMetricKey(metricKey!);
+                    var expectedDataType = LabelDataTypes.Normalize(
+                        ReadOptionalString(target, "dataType")
+                        ?? ReadOptionalString(target, "targetDataType")
+                        ?? ReadOptionalString(block, "defaultDataType")
+                        ?? ReadOptionalString(block, "dataType"));
+                    yield return new LabelStatisticTarget(
+                        labelCode,
+                        $"table:{blockId}.metric:{metricKey}",
+                        expectedDataType);
+                }
+                else
+                {
+                    var expectedDataType = ResolveMetricLabelTargetDataType(block, target, $"BlocksJson[{blockIndex}]", targetIndex);
+                    yield return new LabelStatisticTarget(
+                        labelCode,
+                        $"table:{blockId}.range:{range.R0},{range.C0}:{range.R1},{range.C1}",
+                        expectedDataType);
+                }
+
+                targetIndex++;
+            }
+
+            blockIndex++;
+        }
     }
 
     private static IEnumerable<LabelStatisticTarget> ReadExcelColumnStatisticTargets(string? blocksJson)
@@ -2205,6 +3097,12 @@ public sealed class DynamicFormService : IDynamicFormService
         string Target,
         string? ExpectedDataType = null);
 
+    private readonly record struct MetricLabelRange(
+        int R0,
+        int C0,
+        int R1,
+        int C1);
+
     private static string[] NormalizeLabelCodes(string[]? labelCodes)
         => labelCodes?
             .Where(x => !string.IsNullOrWhiteSpace(x))
@@ -2336,6 +3234,7 @@ public sealed class DynamicFormService : IDynamicFormService
                     new { fieldName = "BlocksJson" });
 
             RemoveRawTemplatePayload(block);
+            RemoveLegacyStatisticColumnPayload(block);
 
             var sectionId = ReadJsonObjectString(block, "sectionId")
                             ?? ReadJsonObjectString(block, "SectionId")
@@ -2372,6 +3271,8 @@ public sealed class DynamicFormService : IDynamicFormService
 
         if (node is not JsonArray blocks)
             throw DynamicFormJsonInvalid("BlocksJson", "BlocksJson phai la JSON array.");
+
+        EnsureUniqueDynamicExcelTemplateBlocks(blocks);
 
         var ids = blocks
             .OfType<JsonObject>()
@@ -2421,9 +3322,61 @@ public sealed class DynamicFormService : IDynamicFormService
 
             block.Remove("ExcelSpecKind");
             block["excelSpecKind"] = specKind;
+            block.Remove("TableMode");
+            block["tableMode"] = NormalizeDynamicExcelTemplateTableMode(template.TableMode, specKind);
+            ApplyDynamicExcelTypeMetadata(block, template);
         }
 
         return blocks.ToJsonString(JsonOptions);
+    }
+
+    private static void EnsureUniqueDynamicExcelTemplateBlocks(JsonArray blocks)
+    {
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var block in blocks.OfType<JsonObject>())
+        {
+            var id = ReadJsonObjectString(block, "dynamicExcelTemplateId")
+                     ?? ReadJsonObjectString(block, "DynamicExcelTemplateId")
+                     ?? ReadJsonObjectString(block, "excelBlockDynamicExcelTemplateId")
+                     ?? ReadJsonObjectString(block, "ExcelBlockDynamicExcelTemplateId");
+            if (string.IsNullOrWhiteSpace(id))
+                continue;
+
+            if (!seen.Add(id))
+                throw DynamicFormValidation(
+                    AppErrorCode.DYNAMIC_FORM_BLOCK_DUPLICATE,
+                    "Bảng Excel động đã tồn tại trong biểu mẫu động.",
+                    new { dynamicExcelTemplateId = id });
+        }
+    }
+
+    private static void ApplyDynamicExcelTypeMetadata(JsonObject block, DynamicExcelTemplate template)
+    {
+        block.Remove("DefaultDataType");
+        block.Remove("defaultDataType");
+        block.Remove("DataTypeOverrides");
+        block.Remove("dataTypeOverrides");
+        block.Remove("DefaultOptions");
+        block.Remove("defaultOptions");
+
+        var metadata = ReadDynamicExcelTypeMetadata(template.SpecJson);
+        block["defaultDataType"] = metadata.DefaultDataType;
+
+        if (metadata.DefaultOptions.Length > 0)
+        {
+            var defaultOptions = new JsonArray();
+            foreach (var item in metadata.DefaultOptions)
+                defaultOptions.Add(JsonNode.Parse(item.GetRawText()));
+            block["defaultOptions"] = defaultOptions;
+        }
+
+        if (metadata.DataTypeOverrides.Length == 0)
+            return;
+
+        var overrides = new JsonArray();
+        foreach (var item in metadata.DataTypeOverrides)
+            overrides.Add(JsonNode.Parse(item.GetRawText()));
+        block["dataTypeOverrides"] = overrides;
     }
 
     private static string NormalizeImportSectionId(string? sectionId, string sectionsJson)
@@ -2474,6 +3427,13 @@ public sealed class DynamicFormService : IDynamicFormService
                     "SectionsJson.id khong duoc trong.",
                     new { propertyName = "SectionsJson.id" });
 
+            var title = ReadOptionalString(item, "title");
+            if (string.IsNullOrWhiteSpace(title))
+                throw DynamicFormValidation(
+                    AppErrorCode.DYNAMIC_FORM_SECTION_CONFIG_INVALID,
+                    "Tiêu đề phần không được để trống.",
+                    new { sectionId = id, propertyName = "SectionsJson.title" });
+
             if (ids.Contains(id, StringComparer.Ordinal))
                 throw DynamicFormValidation(
                     AppErrorCode.DYNAMIC_FORM_SECTION_CONFIG_INVALID,
@@ -2502,6 +3462,12 @@ public sealed class DynamicFormService : IDynamicFormService
         {
             block.Remove(name);
         }
+    }
+
+    private static void RemoveLegacyStatisticColumnPayload(JsonObject block)
+    {
+        block.Remove("statisticColumns");
+        block.Remove("statisticColumnLabels");
     }
 
     private static string? ReadJsonObjectString(JsonObject obj, string name)

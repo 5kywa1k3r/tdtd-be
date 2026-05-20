@@ -56,15 +56,7 @@ public sealed class AggregateTableService : IAggregateTableService
         var sources = BuildAggregateSources(assignments, effectiveReports);
 
         if (effectiveReports.Count == 0)
-        {
-            if (IsRecordTableTemplate(dynamicExcelTemplate, null))
-                return BuildEmptyRecordTableResponse(normalized, assignments[0], sources, dynamicExcelTemplate);
-
             return BuildEmptyAggregateResponse(normalized, assignments[0], sources);
-        }
-
-        if (IsRecordTableTemplate(dynamicExcelTemplate, effectiveReports[0]))
-            return BuildRecordTableResult(normalized, assignments, effectiveReports, sources, dynamicExcelTemplate);
 
         return normalized.AggregateMode switch
         {
@@ -108,7 +100,7 @@ public sealed class AggregateTableService : IAggregateTableService
                 .Where(x => requestedMetricKeys.Contains(x.MetricKey))
                 .ToList();
 
-        if (metrics.Count == 0)
+        if (metrics.Count == 0 && requestedMetricKeys.Count > 0)
             throw AppExceptionFactory.BadRequest(
                 AppErrorCode.WORK_ASSIGNMENT_AGGREGATE_METRIC_KEY_NOT_FOUND,
                 new
@@ -119,6 +111,13 @@ public sealed class AggregateTableService : IAggregateTableService
                     requestedMetricKeys
                 });
 
+        var warnings = new List<string>();
+        if (metrics.Count == 0)
+        {
+            warnings.Add("Bảng Excel động chưa cấu hình chỉ tiêu thống kê nên không có dữ liệu tổng hợp bảng.");
+            return BuildEmptyDynamicFormResponse(normalized, template, contract, metrics, warnings);
+        }
+
         normalized.SelectedUnitIds = await ResolveSelectedUnitIdsAsync(normalized.SelectedUnitIds, ct);
 
         var assignments = await LoadDynamicFormAggregateAssignmentsAsync(
@@ -128,7 +127,6 @@ public sealed class AggregateTableService : IAggregateTableService
             normalized.SelectedUnitIds,
             ct);
 
-        var warnings = new List<string>();
         if (assignments.Count == 0)
         {
             return BuildEmptyDynamicFormResponse(normalized, template, contract, metrics, warnings);
@@ -876,6 +874,7 @@ public sealed class AggregateTableService : IAggregateTableService
                      & fb.Eq(x => x.BlockId, contract.BlockId)
                      & fb.Eq(x => x.TableMode, contract.TableMode)
                      & fb.In(x => x.MetricKey, metricKeys)
+                     & fb.Eq(x => x.DataType, "NUMBER")
                      & fb.Eq(x => x.IsDeleted, false);
 
         var values = await _ctx.WorkReportTableStatValues
@@ -951,6 +950,7 @@ public sealed class AggregateTableService : IAggregateTableService
                      & fb.Eq(x => x.DynamicFormTemplateId, req.DynamicFormTemplateId)
                      & fb.Eq(x => x.BlockId, layout.SourceBlockId)
                      & fb.In(x => x.MetricKey, metricKeys)
+                     & fb.Eq(x => x.DataType, "NUMBER")
                      & fb.Eq(x => x.IsDeleted, false);
 
         if (!string.IsNullOrWhiteSpace(layout.SourceTableMode))
@@ -989,7 +989,7 @@ public sealed class AggregateTableService : IAggregateTableService
 
         if (layout.GroupBy.Any(x => x != "UNIT" && x != "ASSIGNMENT"))
         {
-            warnings.Add("Preview hiện hiển thị theo đơn vị hoặc công việc; các nhóm khác vẫn được giữ trong cấu hình tổng hợp.");
+            warnings.Add("Preview hiển thị theo đơn vị hoặc công việc; các nhóm khác vẫn được giữ trong cấu hình tổng hợp.");
         }
 
         var metricByKey = metrics.ToDictionary(x => x.MetricKey, x => x, StringComparer.Ordinal);
@@ -1394,31 +1394,19 @@ public sealed class AggregateTableService : IAggregateTableService
 
         if (tableMode == "APPEND_ROWS")
         {
-            var appendRowMetrics = BuildAppendRowsMetricMap(blockId, block.W);
-            if (appendRowMetrics.Count == 0)
-                throw DynamicFormTableContractInvalid(template.Id, blockId, tableMode, "APPEND_ROWS_WIDTH_REQUIRED");
-
+            var appendRowMetrics = BuildConfiguredMetricMap(block, blockId, tableMode);
             return new DynamicFormTableContract(blockId, tableMode, appendRowMetrics);
         }
 
         if (tableMode == "APPEND_COLUMNS")
         {
-            var appendColumnMetrics = BuildAppendColumnsMetricMap(blockId, block.H);
-            if (appendColumnMetrics.Count == 0)
-                throw DynamicFormTableContractInvalid(template.Id, blockId, tableMode, "APPEND_COLUMNS_HEIGHT_REQUIRED");
-
+            var appendColumnMetrics = BuildConfiguredMetricMap(block, blockId, tableMode);
             return new DynamicFormTableContract(blockId, tableMode, appendColumnMetrics);
         }
 
         if (tableMode == "MATRIX")
         {
-            var matrixMap = NormalizeMetricMap(block.IndexMap, blockId);
-            if (matrixMap.Count == 0)
-                matrixMap = BuildFallbackMetricMap(blockId, block.W, block.H);
-
-            if (matrixMap.Count == 0)
-                throw DynamicFormTableContractInvalid(template.Id, blockId, tableMode, "MATRIX_METRIC_MAP_REQUIRED");
-
+            var matrixMap = BuildConfiguredMetricMap(block, blockId, tableMode);
             return new DynamicFormTableContract(blockId, tableMode, matrixMap);
         }
 
@@ -1439,13 +1427,7 @@ public sealed class AggregateTableService : IAggregateTableService
             throw DynamicFormTableContractInvalid(template.Id, blockId, tableMode, "TABLE_MODE_UNSUPPORTED");
         }
 
-        var indexMap = NormalizeMetricMap(block.IndexMap, blockId);
-        if (indexMap.Count == 0)
-            indexMap = BuildFallbackMetricMap(blockId, block.W, block.H);
-
-        if (indexMap.Count == 0)
-            throw DynamicFormTableContractInvalid(template.Id, blockId, tableMode, "FIXED_GRID_METRIC_MAP_REQUIRED");
-
+        var indexMap = BuildConfiguredMetricMap(block, blockId, tableMode);
         return new DynamicFormTableContract(blockId, tableMode, indexMap);
     }
 
@@ -1577,48 +1559,64 @@ public sealed class AggregateTableService : IAggregateTableService
         return metrics;
     }
 
-    private static List<MetricContract> BuildAppendRowsMetricMap(
+    private static List<MetricContract> BuildConfiguredMetricMap(
+        DynamicFormExcelBlockJson block,
         string blockId,
-        int? width)
+        string tableMode)
     {
-        var w = width.GetValueOrDefault();
-        if (w <= 0)
-            return new List<MetricContract>();
+        var knownByMetricKey = NormalizeMetricMap(block.IndexMap, blockId)
+            .GroupBy(x => x.MetricKey, StringComparer.Ordinal)
+            .ToDictionary(x => x.Key, x => x.First(), StringComparer.Ordinal);
+        var metrics = new Dictionary<string, MetricContract>(StringComparer.Ordinal);
 
-        var metrics = new List<MetricContract>();
-        for (var c = 0; c < w; c++)
+        void AddMetric(MetricContract? metric)
         {
-            var columnKey = $"col_{c + 1}";
-            metrics.Add(new MetricContract(
-                c,
-                "APPEND_ROWS",
-                columnKey,
-                $"table:{blockId}.column:{columnKey}"));
+            if (metric is null || metrics.ContainsKey(metric.MetricKey))
+                return;
+
+            metrics[metric.MetricKey] = metric;
         }
 
-        return metrics;
-    }
-
-    private static List<MetricContract> BuildAppendColumnsMetricMap(
-        string blockId,
-        int? height)
-    {
-        var h = height.GetValueOrDefault();
-        if (h <= 0)
-            return new List<MetricContract>();
-
-        var metrics = new List<MetricContract>();
-        for (var r = 0; r < h; r++)
+        void AddMetricKey(string? metricKey, int fallbackIndex)
         {
-            var rowKey = $"row_{r + 1}";
-            metrics.Add(new MetricContract(
-                r,
-                rowKey,
-                "APPEND_COLUMNS",
-                $"table:{blockId}.row:{rowKey}"));
+            if (string.IsNullOrWhiteSpace(metricKey))
+                return;
+
+            var normalizedMetricKey = metricKey.Trim();
+            AddMetric(knownByMetricKey.TryGetValue(normalizedMetricKey, out var known)
+                ? known
+                : ParseConfiguredMetricKey(normalizedMetricKey, tableMode, block.W, fallbackIndex));
         }
 
-        return metrics;
+        if (block.MetricRules is { Count: > 0 })
+        {
+            for (var i = 0; i < block.MetricRules.Count; i++)
+                AddMetricKey(block.MetricRules[i].MetricKey, i);
+        }
+
+        if (block.MetricLabelTargets is { Count: > 0 })
+        {
+            for (var i = 0; i < block.MetricLabelTargets.Count; i++)
+            {
+                var target = block.MetricLabelTargets[i];
+                if (!string.IsNullOrWhiteSpace(target.MetricKey))
+                {
+                    AddMetricKey(target.MetricKey, i);
+                    continue;
+                }
+
+                if (target.Range is null || block.DataRect is null)
+                    continue;
+
+                foreach (var metric in ExpandConfiguredMetricRange(blockId, tableMode, block.DataRect, target.Range, block.W, block.H))
+                    AddMetric(metric);
+            }
+        }
+
+        return metrics.Values
+            .OrderBy(x => x.Index)
+            .ThenBy(x => x.MetricKey, StringComparer.Ordinal)
+            .ToList();
     }
 
     private static List<MetricContract> NormalizeMetricMap(
@@ -1646,33 +1644,160 @@ public sealed class AggregateTableService : IAggregateTableService
             .ToList();
     }
 
-    private static List<MetricContract> BuildFallbackMetricMap(
+    private static MetricContract ParseConfiguredMetricKey(
+        string metricKey,
+        string tableMode,
+        int? width,
+        int fallbackIndex)
+    {
+        var rowKey = TryReadMetricSegment(metricKey, ".row:");
+        var columnKey = TryReadMetricSegment(metricKey, ".column:");
+        if (!string.IsNullOrWhiteSpace(rowKey) && !string.IsNullOrWhiteSpace(columnKey))
+        {
+            rowKey = NormalizeMetricPart(rowKey, $"row_{fallbackIndex + 1}");
+            columnKey = NormalizeMetricPart(columnKey, "value");
+            return new MetricContract(
+                IndexFromRowColumn(rowKey, columnKey, width) ?? fallbackIndex,
+                rowKey,
+                columnKey,
+                metricKey);
+        }
+
+        if (tableMode == "APPEND_ROWS")
+        {
+            columnKey = TryReadMetricSegment(metricKey, ".column:");
+            columnKey = NormalizeMetricPart(columnKey, $"col_{fallbackIndex + 1}");
+            return new MetricContract(
+                IndexFromOrdinalPart(columnKey, "col_") ?? fallbackIndex,
+                "APPEND_ROWS",
+                columnKey,
+                metricKey);
+        }
+
+        if (tableMode == "APPEND_COLUMNS")
+        {
+            rowKey = TryReadMetricSegment(metricKey, ".row:");
+            rowKey = NormalizeMetricPart(rowKey, $"row_{fallbackIndex + 1}");
+            return new MetricContract(
+                IndexFromOrdinalPart(rowKey, "row_") ?? fallbackIndex,
+                rowKey,
+                "APPEND_COLUMNS",
+                metricKey);
+        }
+
+        return new MetricContract(
+            fallbackIndex,
+            tableMode == "APPEND_ROWS" ? "APPEND_ROWS" : $"row_{fallbackIndex + 1}",
+            tableMode == "APPEND_COLUMNS" ? "APPEND_COLUMNS" : "value",
+            metricKey);
+    }
+
+    private static IEnumerable<MetricContract> ExpandConfiguredMetricRange(
         string blockId,
+        string tableMode,
+        MetricRangeJson dataRect,
+        MetricRangeJson range,
         int? width,
         int? height)
     {
-        var w = width.GetValueOrDefault();
-        var h = height.GetValueOrDefault();
-        if (w <= 0 || h <= 0)
-            return new List<MetricContract>();
+        var r0 = Math.Max(dataRect.R0, range.R0);
+        var c0 = Math.Max(dataRect.C0, range.C0);
+        var r1 = Math.Min(dataRect.R1, range.R1);
+        var c1 = Math.Min(dataRect.C1, range.C1);
+        if (r1 < r0 || c1 < c0)
+            yield break;
 
-        var metrics = new List<MetricContract>();
-        for (var r = 0; r < h; r++)
+        var w = width.GetValueOrDefault(dataRect.C1 - dataRect.C0 + 1);
+        var h = height.GetValueOrDefault(dataRect.R1 - dataRect.R0 + 1);
+
+        if (tableMode == "APPEND_ROWS")
         {
-            for (var c = 0; c < w; c++)
+            for (var c = c0; c <= c1; c++)
             {
-                var index = r * w + c;
-                var rowKey = $"row_{r + 1}";
-                var columnKey = $"col_{c + 1}";
-                metrics.Add(new MetricContract(
-                    index,
-                    rowKey,
+                var columnOffset = c - dataRect.C0;
+                if (columnOffset < 0 || columnOffset >= w)
+                    continue;
+
+                var columnKey = $"col_{columnOffset + 1}";
+                yield return new MetricContract(
+                    columnOffset,
+                    "APPEND_ROWS",
                     columnKey,
-                    BuildMetricKey(blockId, rowKey, columnKey)));
+                    $"table:{blockId}.column:{columnKey}");
             }
+
+            yield break;
         }
 
-        return metrics;
+        if (tableMode == "APPEND_COLUMNS")
+        {
+            for (var r = r0; r <= r1; r++)
+            {
+                var rowOffset = r - dataRect.R0;
+                if (rowOffset < 0 || rowOffset >= h)
+                    continue;
+
+                var rowKey = $"row_{rowOffset + 1}";
+                yield return new MetricContract(
+                    rowOffset,
+                    rowKey,
+                    "APPEND_COLUMNS",
+                    $"table:{blockId}.row:{rowKey}");
+            }
+
+            yield break;
+        }
+
+        for (var r = r0; r <= r1; r++)
+        {
+            for (var c = c0; c <= c1; c++)
+            {
+                var rowOffset = r - dataRect.R0;
+                var columnOffset = c - dataRect.C0;
+                if (rowOffset < 0 || rowOffset >= h || columnOffset < 0 || columnOffset >= w)
+                    continue;
+
+                var rowKey = $"row_{rowOffset + 1}";
+                var columnKey = $"col_{columnOffset + 1}";
+                yield return new MetricContract(
+                    rowOffset * w + columnOffset,
+                    rowKey,
+                    columnKey,
+                    BuildMetricKey(blockId, rowKey, columnKey));
+            }
+        }
+    }
+
+    private static string? TryReadMetricSegment(string metricKey, string marker)
+    {
+        var start = metricKey.IndexOf(marker, StringComparison.Ordinal);
+        if (start < 0)
+            return null;
+
+        start += marker.Length;
+        var end = metricKey.IndexOf('.', start);
+        return (end < 0 ? metricKey[start..] : metricKey[start..end]).Trim();
+    }
+
+    private static int? IndexFromRowColumn(string rowKey, string columnKey, int? width)
+    {
+        var rowIndex = IndexFromOrdinalPart(rowKey, "row_");
+        var columnIndex = IndexFromOrdinalPart(columnKey, "col_");
+        var w = width.GetValueOrDefault();
+        if (!rowIndex.HasValue || !columnIndex.HasValue || w <= 0)
+            return null;
+
+        return rowIndex.Value * w + columnIndex.Value;
+    }
+
+    private static int? IndexFromOrdinalPart(string value, string prefix)
+    {
+        if (!value.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            return null;
+
+        return int.TryParse(value[prefix.Length..], out var n) && n > 0
+            ? n - 1
+            : null;
     }
 
     private static string NormalizeBlockId(string? value)
@@ -1967,163 +2092,6 @@ public sealed class AggregateTableService : IAggregateTableService
         return rows;
     }
 
-    private static bool IsRecordTableTemplate(
-        DynamicExcelTemplate? template,
-        WorkAssignmentReport? report)
-    {
-        var kind = report?.DynamicExcelTableKind ?? template?.TableKind;
-        return string.Equals(kind?.Trim(), DynamicExcelTableKind.RecordTable, StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static AggregateTableResponse BuildRecordTableResult(
-        AggregateTableRequest req,
-        List<WorkAssignment> assignments,
-        List<WorkAssignmentReport> reports,
-        List<AggregateSourceRowDto> sources,
-        DynamicExcelTemplate? template)
-    {
-        var first = reports[0];
-        var specJson = string.IsNullOrWhiteSpace(first.RecordTableSpecJson)
-            ? template?.RecordTableSpecJson
-            : first.RecordTableSpecJson;
-        var spec = DynamicExcelRecordTableRuntime.ParseSpec(specJson);
-        var assignmentMap = assignments.ToDictionary(x => x.Id, x => x, StringComparer.Ordinal);
-        var rows = new List<AggregateRecordTableRowDto>();
-
-        foreach (var report in reports)
-        {
-            assignmentMap.TryGetValue(report.WorkAssignmentId, out var assignment);
-            var assignee = assignment?.Assignees?.FirstOrDefault(x => x.UserId == report.AssigneeUserId)
-                           ?? assignment?.Assignees?.FirstOrDefault();
-
-            var recordRows = DynamicExcelRecordTableRuntime.ExtractRows(
-                report.TableValuesJson,
-                spec,
-                report.DynamicExcelTemplateId);
-
-            foreach (var record in recordRows)
-            {
-                var calculated = DynamicExcelRecordTableRuntime.BuildCalculatedValues(spec, record.Values);
-                var values = new Dictionary<string, object?>(StringComparer.Ordinal);
-                foreach (var column in spec.Columns)
-                {
-                    record.Values.TryGetValue(column.Key, out var value);
-                    values[column.Key] = DynamicExcelRecordTableRuntime.ToJsonFriendly(value);
-                }
-
-                foreach (var output in spec.CalculatedOutputs)
-                {
-                    calculated.TryGetValue(output.Key, out var value);
-                    values[output.Key] = DynamicExcelRecordTableRuntime.ToJsonFriendly(value);
-                }
-
-                rows.Add(new AggregateRecordTableRowDto
-                {
-                    ReportId = report.Id,
-                    WorkAssignmentId = assignment?.Id ?? report.WorkAssignmentId,
-                    UserId = report.AssigneeUserId ?? assignee?.UserId,
-                    UserName = assignee?.Username,
-                    FullName = assignee?.FullName,
-                    UnitSymbol = assignee?.UnitSymbol,
-                    UnitShortName = assignee?.UnitShortName,
-                    PeriodKey = report.PeriodKey,
-                    SourceRowIndex = record.RowIndex,
-                    SourceRowKey = record.RowKey,
-                    Values = values,
-                });
-            }
-        }
-
-        var includedPeriodKeys = reports
-            .Select(x => x.PeriodKey)
-            .Where(x => !string.IsNullOrWhiteSpace(x))
-            .Distinct(StringComparer.Ordinal)
-            .OrderBy(x => x, StringComparer.Ordinal)
-            .ToList();
-
-        return new AggregateTableResponse
-        {
-            DynamicExcelId = template?.Id ?? first.DynamicExcelTemplateId,
-            DynamicExcelCode = template?.Code ?? first.DynamicExcelTemplateCode,
-            DynamicExcelName = template?.Name ?? first.DynamicExcelTemplateName,
-            PeriodScopeMode = req.PeriodScopeMode,
-            PeriodKey = req.PeriodKey,
-            PeriodKeyFrom = req.PeriodKeyFrom,
-            PeriodKeyTo = req.PeriodKeyTo,
-            SelectedUnitIds = req.SelectedUnitIds ?? new List<string>(),
-            AggregateMode = "RECORD_TABLE_CONCAT",
-            PeriodCount = includedPeriodKeys.Count,
-            IncludedPeriodKeys = includedPeriodKeys,
-            DataRectR0 = 0,
-            DataRectC0 = 0,
-            DataRectR1 = 0,
-            DataRectC1 = 0,
-            W = 0,
-            H = 0,
-            MetaColumns = new List<string> { "periodKey", "user", "unit" },
-            Rows = new List<AggregateTableRowDto>(),
-            TableKind = DynamicExcelTableKind.RecordTable,
-            RecordOrientation = spec.Orientation,
-            RecordColumns = BuildRecordColumns(spec),
-            RecordRows = rows,
-            Warnings = rows.Count == 0
-                ? new List<string> { "Không có dòng dữ liệu phát sinh trong các báo cáo đã chọn." }
-                : new List<string>(),
-            Sources = sources,
-        };
-    }
-
-    private static AggregateTableResponse BuildEmptyRecordTableResponse(
-        AggregateTableRequest req,
-        WorkAssignment assignment,
-        List<AggregateSourceRowDto> sources,
-        DynamicExcelTemplate? template)
-    {
-        var columns = new List<AggregateRecordTableColumnDto>();
-        var orientation = "ROWS";
-        if (!string.IsNullOrWhiteSpace(template?.RecordTableSpecJson))
-        {
-            var spec = DynamicExcelRecordTableRuntime.ParseSpec(template.RecordTableSpecJson);
-            columns = BuildRecordColumns(spec);
-            orientation = spec.Orientation;
-        }
-
-        return new AggregateTableResponse
-        {
-            DynamicExcelId = template?.Id ?? assignment.DynamicExcelId,
-            DynamicExcelCode = template?.Code ?? assignment.DynamicExcelCode,
-            DynamicExcelName = template?.Name ?? assignment.DynamicExcelName,
-            PeriodScopeMode = req.PeriodScopeMode,
-            PeriodKey = req.PeriodKey,
-            PeriodKeyFrom = req.PeriodKeyFrom,
-            PeriodKeyTo = req.PeriodKeyTo,
-            SelectedUnitIds = req.SelectedUnitIds ?? new List<string>(),
-            AggregateMode = "RECORD_TABLE_CONCAT",
-            PeriodCount = 0,
-            IncludedPeriodKeys = new List<string>(),
-            MetaColumns = new List<string> { "periodKey", "user", "unit" },
-            Rows = new List<AggregateTableRowDto>(),
-            TableKind = DynamicExcelTableKind.RecordTable,
-            RecordOrientation = orientation,
-            RecordColumns = columns,
-            RecordRows = new List<AggregateRecordTableRowDto>(),
-            Warnings = new List<string> { "Không có báo cáo đã duyệt phù hợp với bộ lọc hiện tại." },
-            Sources = sources,
-        };
-    }
-
-    private static List<AggregateRecordTableColumnDto> BuildRecordColumns(DynamicExcelRecordTableRuntime.TableSpec spec)
-        => spec.Columns
-            .Concat(spec.CalculatedOutputs)
-            .Select(column => new AggregateRecordTableColumnDto
-            {
-                Key = column.Key,
-                Label = column.Label,
-                DataType = column.DataType,
-                IsCalculated = column.IsCalculated,
-            })
-            .ToList();
-
     private static AggregateTableResponse BuildResponse(
         AggregateTableRequest req,
         WorkAssignment assignment,
@@ -2252,7 +2220,10 @@ public sealed class AggregateTableService : IAggregateTableService
         public string? TableMode { get; set; }
         public int? W { get; set; }
         public int? H { get; set; }
+        public MetricRangeJson? DataRect { get; set; }
         public List<DynamicFormIndexMapItem>? IndexMap { get; set; }
+        public List<DynamicFormMetricRuleJson>? MetricRules { get; set; }
+        public List<DynamicFormMetricLabelTargetJson>? MetricLabelTargets { get; set; }
         public string? SourceBlockId { get; set; }
         public string? SourceTableMode { get; set; }
         public List<string>? GroupBy { get; set; }
@@ -2266,6 +2237,25 @@ public sealed class AggregateTableService : IAggregateTableService
         public string? RowKey { get; set; }
         public string? ColumnKey { get; set; }
         public string? MetricKey { get; set; }
+    }
+
+    private sealed class DynamicFormMetricRuleJson
+    {
+        public string? MetricKey { get; set; }
+    }
+
+    private sealed class DynamicFormMetricLabelTargetJson
+    {
+        public string? MetricKey { get; set; }
+        public MetricRangeJson? Range { get; set; }
+    }
+
+    private sealed class MetricRangeJson
+    {
+        public int R0 { get; set; }
+        public int C0 { get; set; }
+        public int R1 { get; set; }
+        public int C1 { get; set; }
     }
 
     private sealed class SummaryTemplateOutputLayoutJson

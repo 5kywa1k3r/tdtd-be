@@ -7,6 +7,7 @@ public sealed record LabelRow(
     string? Description,
     string? Color,
     string? GroupCode,
+    string Usage,
     string DataType,
     string ScopeType,
     string? ScopeId,
@@ -22,6 +23,7 @@ public sealed record LabelSearchReq(
     string? Code,
     string? Name,
     string? GroupCode,
+    string? Usage,
     string? ScopeType,
     string? ScopeId,
     bool? IsActive,
@@ -37,6 +39,7 @@ public sealed record CreateLabelReq(
     string? Description,
     string? Color,
     string? GroupCode,
+    string? Usage,
     string? DataType,
     string? ScopeType,
     string? ScopeId,
@@ -48,6 +51,7 @@ public sealed record UpdateLabelReq(
     string? Description,
     string? Color,
     string? GroupCode,
+    string? Usage,
     string? DataType,
     bool IsActive = true
 );

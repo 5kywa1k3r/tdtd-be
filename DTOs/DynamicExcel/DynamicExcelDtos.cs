@@ -6,21 +6,22 @@ public sealed record DynamicExcelRow(
     string Id,
     string Code,
     string Name,
-    string[] Labels,
+    string? HeaderKind,
+    string TableMode,
+    int ContractVersion,
     string CreatedByUsername,
-    DateTime CreatedAtUtc,
-    string TableKind
+    DateTime CreatedAtUtc
 );
 
 public sealed record DynamicExcelDetail(
     string Id,
     string Code,
     string Name,
-    string[] Labels,
+    string? HeaderKind,
+    string TableMode,
+    int ContractVersion,
     string CreatedByUsername,
     DateTime CreatedAtUtc,
-    string TableKind,
-    string? RecordTableSpecJson,
     string RawWorkbookDataJson,
     string SpecJson,
     DynamicExcelDataRectDto DataRect,
@@ -31,26 +32,17 @@ public sealed record DynamicExcelDetail(
 public sealed record CreateDynamicExcelReq(
     string? Code,               // optional: if null => BE auto-generate
     string Name,
-    string[]? Labels,
+    string TableMode,
+    int? ContractVersion,
     string RawWorkbookDataJson,
     string SpecJson,
     DynamicExcelDataRectDto? DataRect,
     int W,
-    int H,
-    string? TableKind = null,
-    string? RecordTableSpecJson = null
+    int H
 );
 
 public sealed record UpdateDynamicExcelReq(
-    string Name,
-    string[]? Labels,
-    string RawWorkbookDataJson,
-    string SpecJson,
-    DynamicExcelDataRectDto? DataRect,
-    int W,
-    int H,
-    string? TableKind = null,
-    string? RecordTableSpecJson = null
+    string Name
 );
 
 public sealed record DynamicExcelSearchReq(
@@ -60,7 +52,6 @@ public sealed record DynamicExcelSearchReq(
     string? CreatedBy,           // search substring in createdByUsername
     DateTime? CreatedFromUtc,
     DateTime? CreatedToUtc,
-    string[]? Labels,            // any match
     int Page = 0,
     int PageSize = 10,
     string? SortField = "createdAtUtc",

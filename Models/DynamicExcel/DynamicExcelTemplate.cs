@@ -19,21 +19,15 @@ public sealed class DynamicExcelTemplate : BaseEntity
     [BsonElement("name")]
     public string Name { get; set; } = default!;
 
-    // ✅ labels nhẹ: list string (sau này muốn object {id,name} cũng được)
-    [BsonElement("labels")]
-    public string[] Labels { get; set; } = Array.Empty<string>();
+    [BsonElement("tableMode")]
+    public string TableMode { get; set; } = "FIXED_GRID";
+
+    [BsonElement("contractVersion")]
+    public int ContractVersion { get; set; } = 1;
 
     // ✅ để search/filter theo người tạo mà không join
     [BsonElement("createdByUsername")]
     public string CreatedByUsername { get; set; } = default!;
-
-    // NUMERIC_GRID: legacy dataRect/values1D decimal grid.
-    // RECORD_TABLE: typed record schema for raw-data consolidation.
-    [BsonElement("tableKind")]
-    public string TableKind { get; set; } = DynamicExcelTableKind.NumericGrid;
-
-    [BsonElement("recordTableSpecJson")]
-    public string? RecordTableSpecJson { get; set; }
 
     // FortuneSheet full JSON
     [BsonElement("rawWorkbookDataJson")]
@@ -61,10 +55,4 @@ public sealed class DynamicExcelTemplate : BaseEntity
 
     [BsonElement("h")]
     public int H { get; set; }
-}
-
-public static class DynamicExcelTableKind
-{
-    public const string NumericGrid = "NUMERIC_GRID";
-    public const string RecordTable = "RECORD_TABLE";
 }

@@ -6,7 +6,7 @@
 /// </summary>
 public sealed class SubmitWorkAssignmentReportRequest
 {
-    public List<decimal?>? Values1D { get; set; } = default!;
+    public List<object?>? Values1D { get; set; } = default!;
     public string? FieldValuesJson { get; set; }
     public string? TableValuesJson { get; set; }
     /// <summary>

@@ -29,10 +29,6 @@ public sealed class AggregateTableResponse
 
     public List<string> MetaColumns { get; set; } = new();
     public List<AggregateTableRowDto> Rows { get; set; } = new();
-    public string TableKind { get; set; } = "NUMERIC_GRID";
-    public string? RecordOrientation { get; set; }
-    public List<AggregateRecordTableColumnDto> RecordColumns { get; set; } = new();
-    public List<AggregateRecordTableRowDto> RecordRows { get; set; } = new();
     public List<string> Warnings { get; set; } = new();
     public List<AggregateSourceRowDto> Sources { get; set; } = new();
 }
