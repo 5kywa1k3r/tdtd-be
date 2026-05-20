@@ -67,9 +67,18 @@ public sealed class MarkNotificationsReadRequest
     public List<string> Ids { get; set; } = new();
 }
 
+public static class NotificationRealtimeChangeKinds
+{
+    public const string Created = "CREATED";
+    public const string Read = "READ";
+    public const string ReadMany = "READ_MANY";
+    public const string ReadAll = "READ_ALL";
+}
+
 public sealed class NotificationRealtimeMessage
 {
     public string NotificationId { get; set; } = default!;
     public string Type { get; set; } = string.Empty;
     public DateTime OccurredAtUtc { get; set; }
+    public string ChangeKind { get; set; } = NotificationRealtimeChangeKinds.Created;
 }

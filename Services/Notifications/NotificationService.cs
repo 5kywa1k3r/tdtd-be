@@ -217,10 +217,24 @@ public sealed class NotificationService : INotificationService
         if (clicked)
             update = update.Set(x => x.ClickedAtUtc, now);
 
-        await _ctx.Notifications.UpdateOneAsync(
+        var result = await _ctx.Notifications.UpdateOneAsync(
             x => x.Id == notificationId && x.RecipientUserId == actorUserId && !x.IsDeleted && x.ReadAtUtc == null,
             update,
             cancellationToken: ct);
+
+        if (result.ModifiedCount > 0)
+        {
+            await PushRealtimeAsync(
+                actorUserId,
+                new NotificationRealtimeMessage
+                {
+                    NotificationId = notificationId.Trim(),
+                    Type = "NOTIFICATION_READ",
+                    ChangeKind = NotificationRealtimeChangeKinds.Read,
+                    OccurredAtUtc = now
+                },
+                ct);
+        }
     }
 
     public async Task MarkManyReadAsync(IEnumerable<string> notificationIds, string actorUserId, CancellationToken ct = default)
@@ -237,13 +251,27 @@ public sealed class NotificationService : INotificationService
             return;
 
         var now = DateTime.UtcNow;
-        await _ctx.Notifications.UpdateManyAsync(
+        var result = await _ctx.Notifications.UpdateManyAsync(
             x => ids.Contains(x.Id) && x.RecipientUserId == actorUserId && !x.IsDeleted && x.ReadAtUtc == null,
             Builders<UserNotification>.Update
                 .Set(x => x.ReadAtUtc, now)
                 .Set(x => x.UpdatedAtUtc, now)
                 .Set(x => x.UpdatedByUserId, actorUserId),
             cancellationToken: ct);
+
+        if (result.ModifiedCount > 0)
+        {
+            await PushRealtimeAsync(
+                actorUserId,
+                new NotificationRealtimeMessage
+                {
+                    NotificationId = ids[0],
+                    Type = "NOTIFICATIONS_READ",
+                    ChangeKind = NotificationRealtimeChangeKinds.ReadMany,
+                    OccurredAtUtc = now
+                },
+                ct);
+        }
     }
 
     public async Task MarkAllReadAsync(string actorUserId, CancellationToken ct = default)
@@ -251,13 +279,27 @@ public sealed class NotificationService : INotificationService
         EnsureActor(actorUserId);
 
         var now = DateTime.UtcNow;
-        await _ctx.Notifications.UpdateManyAsync(
+        var result = await _ctx.Notifications.UpdateManyAsync(
             x => x.RecipientUserId == actorUserId && !x.IsDeleted && x.ReadAtUtc == null,
             Builders<UserNotification>.Update
                 .Set(x => x.ReadAtUtc, now)
                 .Set(x => x.UpdatedAtUtc, now)
                 .Set(x => x.UpdatedByUserId, actorUserId),
             cancellationToken: ct);
+
+        if (result.ModifiedCount > 0)
+        {
+            await PushRealtimeAsync(
+                actorUserId,
+                new NotificationRealtimeMessage
+                {
+                    NotificationId = string.Empty,
+                    Type = "NOTIFICATIONS_READ_ALL",
+                    ChangeKind = NotificationRealtimeChangeKinds.ReadAll,
+                    OccurredAtUtc = now
+                },
+                ct);
+        }
     }
 
     public Task NotifyAssignmentAssignedAsync(
@@ -372,28 +414,41 @@ public sealed class NotificationService : INotificationService
     {
         foreach (var notification in notifications)
         {
-            try
-            {
-                await _hub.Clients
-                    .Group(NotificationsHub.UserGroup(notification.RecipientUserId))
-                    .SendAsync(
-                        "notificationChanged",
-                        new NotificationRealtimeMessage
-                        {
-                            NotificationId = notification.Id,
-                            Type = notification.Type,
-                            OccurredAtUtc = notification.OccurredAtUtc
-                        },
-                        ct);
-            }
-            catch (Exception ex) when (ex is not OperationCanceledException)
-            {
-                _log.LogDebug(
-                    ex,
-                    "Failed to push notification realtime signal. notificationId={notificationId} recipientUserId={recipientUserId}",
-                    notification.Id,
-                    notification.RecipientUserId);
-            }
+            await PushRealtimeAsync(
+                notification.RecipientUserId,
+                new NotificationRealtimeMessage
+                {
+                    NotificationId = notification.Id,
+                    Type = notification.Type,
+                    ChangeKind = NotificationRealtimeChangeKinds.Created,
+                    OccurredAtUtc = notification.OccurredAtUtc
+                },
+                ct);
+        }
+    }
+
+    private async Task PushRealtimeAsync(
+        string recipientUserId,
+        NotificationRealtimeMessage message,
+        CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(recipientUserId))
+            return;
+
+        try
+        {
+            await _hub.Clients
+                .Group(NotificationsHub.UserGroup(recipientUserId))
+                .SendAsync("notificationChanged", message, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log.LogDebug(
+                ex,
+                "Failed to push notification realtime signal. notificationId={notificationId} recipientUserId={recipientUserId} changeKind={changeKind}",
+                message.NotificationId,
+                recipientUserId,
+                message.ChangeKind);
         }
     }
 
