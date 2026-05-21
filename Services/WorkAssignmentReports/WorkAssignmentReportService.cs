@@ -62,6 +62,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
     {
         WriteIndented = false
     };
+    private const string EmptyValues1DJson = "[]";
 
     public WorkAssignmentReportService(
         MongoDbContext ctx,
@@ -114,61 +115,51 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
 
         await EnsureMyReportListDocRolesForUserWorkAsync(workId, actorUserId, ct);
 
-        var filter = Builders<MyReportTemplateListDocRole>.Filter.Eq(x => x.UserId, actorUserId)
+        var projectionFilter = Builders<MyReportTemplateListDocRole>.Filter.Eq(x => x.UserId, actorUserId)
             & Builders<MyReportTemplateListDocRole>.Filter.Eq(x => x.WorkId, workId)
             & Builders<MyReportTemplateListDocRole>.Filter.Eq(x => x.IsDeleted, false);
 
-        if (!string.IsNullOrWhiteSpace(req.Q))
-        {
-            var q = req.Q.Trim();
-            var regex = new MongoDB.Bson.BsonRegularExpression(Regex.Escape(q), "i");
-
-            filter &= Builders<MyReportTemplateListDocRole>.Filter.Or(
-                Builders<MyReportTemplateListDocRole>.Filter.Regex(x => x.DynamicFormTemplateCode, regex),
-                Builders<MyReportTemplateListDocRole>.Filter.Regex(x => x.DynamicFormTemplateName, regex),
-                Builders<MyReportTemplateListDocRole>.Filter.Regex(x => x.DynamicExcelCode, regex),
-                Builders<MyReportTemplateListDocRole>.Filter.Regex(x => x.DynamicExcelName, regex)
-            );
-        }
-
-        if (req.HasOverduePeriod.HasValue)
-            filter &= Builders<MyReportTemplateListDocRole>.Filter.Eq(x => x.HasOverduePeriod, req.HasOverduePeriod.Value);
-
-        if (req.HasReport.HasValue)
-        {
-            filter &= req.HasReport.Value
-                ? Builders<MyReportTemplateListDocRole>.Filter.Gt(x => x.ReportCount, 0)
-                : Builders<MyReportTemplateListDocRole>.Filter.Eq(x => x.ReportCount, 0);
-        }
-
-        var total = await _ctx.MyReportTemplateListDocRoles.CountDocumentsAsync(filter, cancellationToken: ct);
-
-        var rows = await _ctx.MyReportTemplateListDocRoles
-            .Find(filter)
-            .Sort(BuildTemplateListDocRoleSort(req.SortField, req.SortDirection))
-            .Skip(page * pageSize)
-            .Limit(pageSize)
+        var projectionRows = await _ctx.MyReportTemplateListDocRoles
+            .Find(projectionFilter)
             .ToListAsync(ct);
 
-        var items = rows.Select(x => new MyReportTemplateRow
+        var rowsByTemplate = new Dictionary<string, MyReportTemplateRow>(StringComparer.Ordinal);
+        foreach (var row in projectionRows.Select(MapTemplateDocRoleToRow))
         {
-            DynamicFormTemplateId = x.DynamicFormTemplateId ?? string.Empty,
-            DynamicFormTemplateCode = x.DynamicFormTemplateCode ?? string.Empty,
-            DynamicFormTemplateName = x.DynamicFormTemplateName ?? string.Empty,
-            DynamicExcelId = x.DynamicExcelId,
-            DynamicExcelCode = x.DynamicExcelCode ?? string.Empty,
-            DynamicExcelName = x.DynamicExcelName ?? string.Empty,
-            BindingCount = x.BindingCount,
-            PeriodCount = x.PeriodCount,
-            ReportCount = x.ReportCount,
-            LatestPeriodId = x.LatestPeriodId,
-            LatestPeriodKey = x.LatestPeriodKey,
-            LatestPeriodStatus = x.LatestPeriodStatus.HasValue ? (int?)x.LatestPeriodStatus.Value : null,
-            LatestDueAtUtc = x.LatestDueAtUtc,
-            LatestReportId = x.LatestReportId,
-            LatestUpdatedAtUtc = x.LatestUpdatedAtUtc,
-            HasOverduePeriod = x.HasOverduePeriod
-        }).ToList();
+            var key = BuildTemplateGroupKey(row.DynamicFormTemplateId, row.DynamicExcelId);
+            if (string.IsNullOrWhiteSpace(key))
+                continue;
+
+            rowsByTemplate[key] = row;
+        }
+
+        var bindings = await LoadVisibleReportBindingsAsync(workId, actorUserId, ct);
+        foreach (var group in bindings
+            .Where(x => x.IsActive)
+            .GroupBy(x => BuildTemplateGroupKey(x.DynamicFormTemplateId, x.DynamicExcelId), StringComparer.Ordinal))
+        {
+            if (string.IsNullOrWhiteSpace(group.Key))
+                continue;
+
+            var bindingGroup = group.ToList();
+            if (!rowsByTemplate.TryGetValue(group.Key, out var row))
+            {
+                rowsByTemplate[group.Key] = BuildTemplateRowFromBindings(bindingGroup);
+                continue;
+            }
+
+            MergeBindingMetadata(row, bindingGroup);
+        }
+
+        var filteredRows = rowsByTemplate.Values
+            .Where(row => MatchesTemplateSearch(row, req))
+            .ToList();
+
+        var total = filteredRows.Count;
+        var items = ApplyTemplateSort(filteredRows, req.SortField, req.SortDirection)
+            .Skip(page * pageSize)
+            .Take(pageSize)
+            .ToList();
 
         return new PagedResult<MyReportTemplateRow>(items, total, page, pageSize);
     }
@@ -385,9 +376,16 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                 .Find(x => x.Id == dynamicExcelId && !x.IsDeleted)
                 .FirstOrDefaultAsync(ct);
 
+        var bindingAssignmentIds = bindings
+            .Select(x => x.WorkAssignmentId)
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+
         var assignmentIds = periods
             .Select(x => x.WorkAssignmentId)
             .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Concat(bindingAssignmentIds)
             .Distinct(StringComparer.Ordinal)
             .ToList();
 
@@ -413,6 +411,13 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             WorkTemplateAssigneeId = primaryBinding.Id,
             WorkAssignmentId = primaryBinding.WorkAssignmentId,
             TemplateSnapshotJson = template is null ? string.Empty : JsonSerializer.Serialize(BuildTemplateSnapshot(template), _jsonOptions),
+            AssignmentOptions = bindings
+                .OrderByDescending(x => x.IsActive)
+                .ThenBy(x => x.WorkAssignmentId)
+                .Select(x => MapToTemplateAssignmentOption(
+                    x,
+                    assignmentById.TryGetValue(x.WorkAssignmentId, out var assignment) ? assignment : null))
+                .ToList(),
             Periods = periods
                 .Select(x => MapToPeriodRow(
                     x,
@@ -585,6 +590,13 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                         actorUserId,
                         linkedScheduledPeriodId = req.LinkedScheduledPeriodId
                     });
+
+            ValidateLinkedScheduledPeriodForUserCreatedReport(
+                linkedScheduledPeriod,
+                assignment,
+                binding,
+                actorUserId,
+                req.LinkedScheduledPeriodId);
         }
 
         var now = DateTime.UtcNow;
@@ -610,9 +622,43 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             completedDatePolicy,
             NormalizeDate(req.CompletedDate),
             new { workAssignmentId, actorUserId, reportDate, periodStart, periodEnd },
-            requireWhenMissing: false);
+            requireWhenMissing: completedDatePolicy.RequiresCompletedDate);
         EnsureReportDateRange(startedDate, completedDate, "StartedDate", "CompletedDate");
-        var periodInstanceKey = $"USER_CREATED:{ObjectId.GenerateNewId()}";
+        var requestedDueAtUtc = req.DueAtUtc ?? linkedScheduledPeriod?.DueAtUtc;
+        EnsureUserCreatedReportHasDueAtUtc(WorkReportPeriodKind.UserCreated, requestedDueAtUtc, new
+        {
+            workAssignmentId,
+            actorUserId,
+            periodKey,
+            reportDate,
+            linkedScheduledPeriodId = linkedScheduledPeriod?.Id
+        });
+        EnsureUserCreatedReportDueAtOrBeforeAssignmentDueAtUtc(
+            WorkReportPeriodKind.UserCreated,
+            requestedDueAtUtc,
+            assignment,
+            new
+            {
+                workAssignmentId,
+                actorUserId,
+                periodKey,
+                reportDate,
+                linkedScheduledPeriodId = linkedScheduledPeriod?.Id
+            });
+        var dueAtUtc = ResolveEffectiveReportDueAtUtc(requestedDueAtUtc, assignment);
+        var initialStatus = ResolveDraftPeriodStatus(isHistoricalData, completedDate, dueAtUtc, now);
+        var periodInstanceKey = $"{periodKey}:{ObjectId.GenerateNewId()}";
+
+        await EnsureNoDuplicateUserCreatedPeriodAsync(
+            assignment,
+            binding,
+            actorUserId,
+            periodKey,
+            reportDate,
+            periodStart,
+            periodEnd,
+            linkedScheduledPeriod?.Id,
+            ct);
 
         var period = new WorkReportPeriod
         {
@@ -638,9 +684,9 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             IsHistoricalData = isHistoricalData,
             PeriodStart = periodStart,
             PeriodEnd = periodEnd,
-            DueAtUtc = req.DueAtUtc,
-            Status = ResolveDraftPeriodStatus(req.DueAtUtc, now),
-            IsOverdue = WorkReportPeriodStatusHelper.IsOverdue(ResolveDraftPeriodStatus(req.DueAtUtc, now)),
+            DueAtUtc = dueAtUtc,
+            Status = initialStatus,
+            IsOverdue = WorkReportPeriodStatusHelper.IsOverdue(initialStatus),
             IsActive = true,
             IsDeleted = false,
             CreatedAtUtc = now,
@@ -938,6 +984,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         var period = await _ctx.WorkReportPeriods
             .Find(x => x.Id == entity.WorkReportPeriodId && !x.IsDeleted)
             .FirstOrDefaultAsync(ct);
+        var isHistoricalData = IsHistoricalReportData(entity, period, now);
         var completedDatePolicy = ResolveReportCompletedDatePolicy(reportAccess.assignment, entity, period, now);
         var startedDate = NormalizeDate(req.StartedDate) ?? entity.StartedDate ?? entity.PeriodStart ?? entity.ReportDate;
         var requestedCompletedDate = NormalizeDate(req.CompletedDate);
@@ -945,8 +992,18 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             completedDatePolicy,
             completedDatePolicy.CanEditCompletedDate ? requestedCompletedDate ?? entity.CompletedDate : requestedCompletedDate,
             ReportDetails(entity, actorUserId),
-            requireWhenMissing: false);
+            requireWhenMissing: completedDatePolicy.RequiresCompletedDate);
         EnsureReportDateRange(startedDate, completedDate, "StartedDate", "CompletedDate");
+        var effectiveDueAtUtc = ResolveEffectiveReportDueAtUtc(entity.DueAtUtc ?? period?.DueAtUtc, reportAccess.assignment);
+        EnsureUserCreatedReportHasDueAtUtc(
+            entity.PeriodKind,
+            effectiveDueAtUtc,
+            ReportDetails(entity, actorUserId));
+        EnsureUserCreatedReportDueAtOrBeforeAssignmentDueAtUtc(
+            entity.PeriodKind,
+            effectiveDueAtUtc,
+            reportAccess.assignment,
+            ReportDetails(entity, actorUserId));
         var nextDataOrigin = ResolveReportDataOrigin(req.DataOrigin, entity.DataOrigin);
         var nextContributionMode = ResolveCumulativeContributionMode(
             req.CumulativeContributionMode,
@@ -1008,19 +1065,13 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
 
         await _ctx.WorkAssignmentReports.UpdateOneAsync(
             x => x.Id == id && !x.IsDeleted,
-            Builders<WorkAssignmentReport>.Update
-                .Set(x => x.Values1DJson, values1DJson)
-                .Set(x => x.FieldValuesJson, fieldValuesJson)
-                .Set(x => x.TableValuesJson, tableValuesJson)
-                .Set(x => x.PayloadRevision, payloadResult.PayloadRevision)
-                .Set(x => x.PayloadHash, payloadResult.PayloadHash)
-                .Set(x => x.PayloadSizeBytes, payloadResult.PayloadSizeBytes)
-                .Set(x => x.PayloadStatus, payloadResult.PayloadStatus)
-                .Set(x => x.PayloadUpdatedAtUtc, now)
+            ApplyPayloadHeaderUpdate(
+                Builders<WorkAssignmentReport>.Update,
+                payloadResult,
+                now)
                 .Set(x => x.DataOrigin, nextDataOrigin)
                 .Set(x => x.CumulativeContributionMode, nextContributionMode)
                 .Set(x => x.CumulativeContributionPolicyJson, nextContributionPolicyJson)
-                .Set(x => x.SummarySourceJson, nextSummarySourceJson)
                 .Set(x => x.AggregateSourceReportIds, nextAggregateSources.ReportIds)
                 .Set(x => x.AggregateSourceAssignmentIds, nextAggregateSources.AssignmentIds)
                 .Set(x => x.AggregateSourceUpdatedAtUtc, nextAggregateSourceUpdatedAtUtc)
@@ -1034,6 +1085,8 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                 .Set(x => x.ProposedSolution, req.ProposedSolution)
                 .Set(x => x.StartedDate, startedDate)
                 .Set(x => x.CompletedDate, completedDate)
+                .Set(x => x.IsHistoricalData, isHistoricalData)
+                .Set(x => x.DueAtUtc, effectiveDueAtUtc)
                 .Set(x => x.LateReason, req.LateReason)
                 .Set(x => x.Status, nextStatus)
                 .Set(x => x.CreatedByUserId, string.IsNullOrWhiteSpace(entity.CreatedByUserId) ? actorUserId : entity.CreatedByUserId)
@@ -1062,6 +1115,8 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         entity.ProposedSolution = req.ProposedSolution;
         entity.StartedDate = startedDate;
         entity.CompletedDate = completedDate;
+        entity.IsHistoricalData = isHistoricalData;
+        entity.DueAtUtc = effectiveDueAtUtc;
         entity.LateReason = req.LateReason;
         entity.Status = nextStatus;
         entity.CreatedByUserId = string.IsNullOrWhiteSpace(entity.CreatedByUserId) ? actorUserId : entity.CreatedByUserId;
@@ -1070,7 +1125,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
 
         if (period is not null)
         {
-            var periodStatus = ResolveDraftPeriodStatus(period.DueAtUtc, now);
+            var periodStatus = ResolveDraftPeriodStatus(isHistoricalData, completedDate, effectiveDueAtUtc, now);
 
             await _ctx.WorkReportPeriods.UpdateOneAsync(
                 x => x.Id == period.Id && !x.IsDeleted,
@@ -1084,6 +1139,8 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                     .Set(x => x.ProposedSolution, req.ProposedSolution)
                     .Set(x => x.StartedDate, startedDate)
                     .Set(x => x.CompletedDate, completedDate)
+                    .Set(x => x.IsHistoricalData, isHistoricalData)
+                    .Set(x => x.DueAtUtc, effectiveDueAtUtc)
                     .Set(x => x.LateReason, req.LateReason)
                     .Set(x => x.UpdatedAtUtc, now)
                     .Set(x => x.UpdatedByUserId, actorUserId),
@@ -1098,6 +1155,8 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             period.ProposedSolution = req.ProposedSolution;
             period.StartedDate = startedDate;
             period.CompletedDate = completedDate;
+            period.IsHistoricalData = isHistoricalData;
+            period.DueAtUtc = effectiveDueAtUtc;
             period.LateReason = req.LateReason;
             period.UpdatedAtUtc = now;
             period.UpdatedByUserId = actorUserId;
@@ -1505,7 +1564,6 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             .Find(x => x.Id == entity.WorkReportPeriodId && !x.IsDeleted)
             .FirstOrDefaultAsync(ct);
 
-        var isLate = entity.DueAtUtc.HasValue && now > entity.DueAtUtc.Value;
         var isHistoricalData = IsHistoricalReportData(entity, period, now);
         var completedDatePolicy = ResolveReportCompletedDatePolicy(reportAccess.assignment, entity, period, now);
         var startedDate = NormalizeDate(req.StartedDate) ?? entity.StartedDate ?? entity.PeriodStart ?? entity.ReportDate;
@@ -1516,6 +1574,21 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             ReportDetails(entity, actorUserId),
             requireWhenMissing: true);
         EnsureReportDateRange(startedDate, completedDate, "StartedDate", "CompletedDate");
+        var effectiveDueAtUtc = ResolveEffectiveReportDueAtUtc(entity.DueAtUtc ?? period?.DueAtUtc, reportAccess.assignment);
+        EnsureUserCreatedReportHasDueAtUtc(
+            entity.PeriodKind,
+            effectiveDueAtUtc,
+            ReportDetails(entity, actorUserId));
+        EnsureUserCreatedReportDueAtOrBeforeAssignmentDueAtUtc(
+            entity.PeriodKind,
+            effectiveDueAtUtc,
+            reportAccess.assignment,
+            ReportDetails(entity, actorUserId));
+        var isLate = ResolveReportLateSubmission(
+            isHistoricalData,
+            completedDate,
+            effectiveDueAtUtc,
+            now);
         var lateReason = string.IsNullOrWhiteSpace(req.LateReason) ? entity.LateReason : req.LateReason?.Trim();
 
         if (isLate && string.IsNullOrWhiteSpace(lateReason))
@@ -1550,6 +1623,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         entity.StartedDate = startedDate;
         entity.CompletedDate = completedDate;
         entity.IsHistoricalData = isHistoricalData;
+        entity.DueAtUtc = effectiveDueAtUtc;
         entity.IsLateSubmission = isLate;
         entity.LateReason = lateReason;
         entity.SubmittedAtUtc = now;
@@ -1580,19 +1654,13 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
 
         await _ctx.WorkAssignmentReports.UpdateOneAsync(
             x => x.Id == id && !x.IsDeleted,
-            Builders<WorkAssignmentReport>.Update
-                .Set(x => x.Values1DJson, entity.Values1DJson)
-                .Set(x => x.FieldValuesJson, entity.FieldValuesJson)
-                .Set(x => x.TableValuesJson, entity.TableValuesJson)
-                .Set(x => x.PayloadRevision, entity.PayloadRevision)
-                .Set(x => x.PayloadHash, entity.PayloadHash)
-                .Set(x => x.PayloadSizeBytes, entity.PayloadSizeBytes)
-                .Set(x => x.PayloadStatus, entity.PayloadStatus)
-                .Set(x => x.PayloadUpdatedAtUtc, entity.PayloadUpdatedAtUtc)
+            ApplyPayloadHeaderUpdate(
+                Builders<WorkAssignmentReport>.Update,
+                payloadResult,
+                now)
                 .Set(x => x.DataOrigin, entity.DataOrigin)
                 .Set(x => x.CumulativeContributionMode, entity.CumulativeContributionMode)
                 .Set(x => x.CumulativeContributionPolicyJson, entity.CumulativeContributionPolicyJson)
-                .Set(x => x.SummarySourceJson, entity.SummarySourceJson)
                 .Set(x => x.AggregateSourceReportIds, entity.AggregateSourceReportIds)
                 .Set(x => x.AggregateSourceAssignmentIds, entity.AggregateSourceAssignmentIds)
                 .Set(x => x.AggregateSourceUpdatedAtUtc, entity.AggregateSourceUpdatedAtUtc)
@@ -1608,6 +1676,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                 .Set(x => x.StartedDate, entity.StartedDate)
                 .Set(x => x.CompletedDate, entity.CompletedDate)
                 .Set(x => x.IsHistoricalData, entity.IsHistoricalData)
+                .Set(x => x.DueAtUtc, entity.DueAtUtc)
                 .Set(x => x.IsLateSubmission, entity.IsLateSubmission)
                 .Set(x => x.LateReason, entity.LateReason)
                 .Set(x => x.SubmittedAtUtc, entity.SubmittedAtUtc)
@@ -1631,7 +1700,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         {
             var periodStatus = autoApproveMatches
                 ? ResolveApprovedPeriodStatus(period, entity, now)
-                : WorkReportPeriodStatusHelper.ResolveSubmittedStatus(period.DueAtUtc, now);
+                : ResolveSubmittedPeriodStatus(period, entity, now);
 
             await _ctx.WorkReportPeriods.UpdateOneAsync(
                 x => x.Id == period.Id && !x.IsDeleted,
@@ -1647,6 +1716,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                     .Set(x => x.StartedDate, entity.StartedDate)
                     .Set(x => x.CompletedDate, entity.CompletedDate)
                     .Set(x => x.IsHistoricalData, entity.IsHistoricalData)
+                    .Set(x => x.DueAtUtc, entity.DueAtUtc)
                     .Set(x => x.LateReason, entity.LateReason)
                     .Set(x => x.RequiresLateReason, isLate)
                     .Set(x => x.LastReviewedAtUtc, autoApproveMatches ? now : period.LastReviewedAtUtc)
@@ -1667,6 +1737,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             period.StartedDate = entity.StartedDate;
             period.CompletedDate = entity.CompletedDate;
             period.IsHistoricalData = entity.IsHistoricalData;
+            period.DueAtUtc = entity.DueAtUtc;
             period.LateReason = entity.LateReason;
             period.RequiresLateReason = isLate;
             period.LastReviewedAtUtc = autoApproveMatches ? now : period.LastReviewedAtUtc;
@@ -2130,7 +2201,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
 
         if (period is not null)
         {
-            var nextPeriodStatus = WorkReportPeriodStatusHelper.ResolveDraftStatus(period.DueAtUtc, now);
+            var nextPeriodStatus = ResolveDraftPeriodStatus(period, entity, now);
 
             await _ctx.WorkReportPeriods.UpdateOneAsync(
                 x => x.Id == period.Id && !x.IsDeleted,
@@ -2290,7 +2361,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
 
         if (period is not null)
         {
-            var nextPeriodStatus = WorkReportPeriodStatusHelper.ResolveDraftStatus(period.DueAtUtc, now);
+            var nextPeriodStatus = ResolveDraftPeriodStatus(period, entity, now);
             var periodUpdate = Builders<WorkReportPeriod>.Update
                 .Set(x => x.Status, nextPeriodStatus)
                 .Set(x => x.IsOverdue, WorkReportPeriodStatusHelper.IsOverdue(nextPeriodStatus))
@@ -2379,14 +2450,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
 
         await EnsureReportMutationScopeOpenAsync(assignment, actorUserId, ct);
 
-        var template = await _ctx.DynamicExcelTemplates
-            .Find(x => x.Id == period.DynamicExcelId && !x.IsDeleted)
-            .FirstOrDefaultAsync(ct);
-
-        if (template is null)
-            throw AppExceptionFactory.NotFound(
-                AppErrorCode.DYNAMIC_EXCEL_TEMPLATE_NOT_FOUND,
-                new { dynamicExcelTemplateId = period.DynamicExcelId, periodId = period.Id });
+        var template = await ResolveDynamicExcelTemplateForPeriodAsync(period, ct);
 
         var existedCurrent = await _ctx.WorkAssignmentReports
             .Find(Builders<WorkAssignmentReport>.Filter.Eq(x => x.WorkReportPeriodId, period.Id)
@@ -2404,6 +2468,13 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         var now = DateTime.UtcNow;
         var periodInstanceKey = NormalizePeriodInstanceKey(period);
         var periodKind = NormalizePeriodKind(period.PeriodKind);
+        var effectiveDueAtUtc = ResolveEffectiveReportDueAtUtc(period.DueAtUtc, assignment);
+        EnsureUserCreatedReportHasDueAtUtc(periodKind, effectiveDueAtUtc, PeriodDetails(period, actorUserId));
+        EnsureUserCreatedReportDueAtOrBeforeAssignmentDueAtUtc(
+            periodKind,
+            effectiveDueAtUtc,
+            assignment,
+            PeriodDetails(period, actorUserId));
         var defaultDataOrigin = DynamicFormDataSourceRuleNormalizer.ResolveDefaultReportDataOrigin(
             assignment.DynamicFormDataSourceRulesJson);
 
@@ -2432,24 +2503,26 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             HistoricalDataApprovedByUserId = period.HistoricalDataApprovedByUserId,
             PeriodStart = period.PeriodStart,
             PeriodEnd = period.PeriodEnd,
-            DueAtUtc = period.DueAtUtc,
+            DueAtUtc = effectiveDueAtUtc,
 
             Status = WorkAssignmentReportStatus.Draft,
             ScheduleSnapshotJson = JsonSerializer.Serialize(BuildScheduleSnapshot(assignment), _jsonOptions),
 
-            DynamicExcelTemplateId = template.Id,
-            DynamicExcelTemplateCode = template.Code,
-            DynamicExcelTemplateName = template.Name,
-            SpecJson = template.SpecJson,
+            DynamicExcelTemplateId = template?.Id,
+            DynamicExcelTemplateCode = template?.Code ?? string.Empty,
+            DynamicExcelTemplateName = template?.Name ?? string.Empty,
+            SpecJson = template?.SpecJson ?? string.Empty,
 
-            DataRectR0 = template.DataRectR0,
-            DataRectC0 = template.DataRectC0,
-            DataRectR1 = template.DataRectR1,
-            DataRectC1 = template.DataRectC1,
-            W = template.W,
-            H = template.H,
+            DataRectR0 = template?.DataRectR0 ?? 0,
+            DataRectC0 = template?.DataRectC0 ?? 0,
+            DataRectR1 = template?.DataRectR1 ?? 0,
+            DataRectC1 = template?.DataRectC1 ?? 0,
+            W = template?.W ?? 0,
+            H = template?.H ?? 0,
 
-            Values1DJson = JsonSerializer.Serialize(CreateEmptyValues1D(template.W, template.H), _jsonOptions),
+            Values1DJson = JsonSerializer.Serialize(
+                template is null ? new List<decimal?>() : CreateEmptyValues1D(template.W, template.H),
+                _jsonOptions),
             DataOrigin = defaultDataOrigin,
             CumulativeContributionMode = WorkReportDataOrigin.DefaultContributionMode(defaultDataOrigin),
 
@@ -2475,9 +2548,15 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             ct);
         ApplyPayloadMetadata(entity, payloadResult, now);
 
+        var detailValues1DJson = entity.Values1DJson;
+        var detailFieldValuesJson = entity.FieldValuesJson;
+        var detailTableValuesJson = entity.TableValuesJson;
+        var detailSummarySourceJson = entity.SummarySourceJson;
+        CompactEmbeddedPayloadHeader(entity);
         await _ctx.WorkAssignmentReports.InsertOneAsync(entity, cancellationToken: ct);
+        RestoreRuntimePayload(entity, detailValues1DJson, detailFieldValuesJson, detailTableValuesJson, detailSummarySourceJson);
 
-        var nextPeriodStatus = ResolveDraftPeriodStatus(period.DueAtUtc, now);
+        var nextPeriodStatus = ResolveDraftPeriodStatus(period, entity, now);
 
         await _ctx.WorkReportPeriods.UpdateOneAsync(
             x => x.Id == period.Id && !x.IsDeleted,
@@ -2486,6 +2565,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                 .Set(x => x.PeriodInstanceKey, periodInstanceKey)
                 .Set(x => x.PeriodKind, periodKind)
                 .Set(x => x.ReportVersionCount, entity.VersionNo)
+                .Set(x => x.DueAtUtc, effectiveDueAtUtc)
                 .Set(x => x.Status, nextPeriodStatus)
                 .Set(x => x.IsOverdue, WorkReportPeriodStatusHelper.IsOverdue(nextPeriodStatus))
                 .Set(x => x.LastDraftSavedAtUtc, now)
@@ -2497,6 +2577,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         period.PeriodInstanceKey = periodInstanceKey;
         period.PeriodKind = periodKind;
         period.ReportVersionCount = entity.VersionNo;
+        period.DueAtUtc = effectiveDueAtUtc;
         period.Status = nextPeriodStatus;
         period.IsOverdue = WorkReportPeriodStatusHelper.IsOverdue(nextPeriodStatus);
         period.LastDraftSavedAtUtc = now;
@@ -2518,6 +2599,49 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             ct: ct);
 
         return entity;
+    }
+
+    private async Task<DynamicExcelTemplate?> ResolveDynamicExcelTemplateForPeriodAsync(
+        WorkReportPeriod period,
+        CancellationToken ct)
+    {
+        var dynamicExcelTemplateId = NormalizeOptionalTextOrNull(period.DynamicExcelId);
+
+        if (string.IsNullOrWhiteSpace(dynamicExcelTemplateId) &&
+            !string.IsNullOrWhiteSpace(period.DynamicFormTemplateId))
+        {
+            var form = await _ctx.DynamicFormTemplates
+                .Find(x => x.Id == period.DynamicFormTemplateId && !x.IsDeleted)
+                .FirstOrDefaultAsync(ct);
+
+            if (form is null)
+                throw AppExceptionFactory.NotFound(
+                    AppErrorCode.DYNAMIC_FORM_TEMPLATE_NOT_FOUND,
+                    new { dynamicFormTemplateId = period.DynamicFormTemplateId, periodId = period.Id });
+
+            dynamicExcelTemplateId =
+                NormalizeOptionalTextOrNull(form.ExcelBlockDynamicExcelTemplateId) ??
+                ExtractPrimaryDynamicExcelTemplateId(form.ExcelBlockJson, form.BlocksJson);
+
+            if (string.IsNullOrWhiteSpace(dynamicExcelTemplateId))
+                return null;
+        }
+
+        if (string.IsNullOrWhiteSpace(dynamicExcelTemplateId))
+            throw AppExceptionFactory.NotFound(
+                AppErrorCode.DYNAMIC_EXCEL_TEMPLATE_NOT_FOUND,
+                new { dynamicExcelTemplateId = period.DynamicExcelId, periodId = period.Id });
+
+        var template = await _ctx.DynamicExcelTemplates
+            .Find(x => x.Id == dynamicExcelTemplateId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct);
+
+        if (template is null)
+            throw AppExceptionFactory.NotFound(
+                AppErrorCode.DYNAMIC_EXCEL_TEMPLATE_NOT_FOUND,
+                new { dynamicExcelTemplateId, periodId = period.Id, period.DynamicFormTemplateId });
+
+        return template;
     }
 
     private async Task ValidateRuntimeRowLabelsAsync(
@@ -3742,6 +3866,62 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             .ToList();
     }
 
+    private static string? ExtractPrimaryDynamicExcelTemplateId(string? excelBlockJson, string? blocksJson)
+        => ExtractDynamicExcelTemplateId(excelBlockJson) ?? ExtractFirstDynamicExcelTemplateId(blocksJson);
+
+    private static string? ExtractDynamicExcelTemplateId(string? json)
+    {
+        if (string.IsNullOrWhiteSpace(json))
+            return null;
+
+        try
+        {
+            using var document = JsonDocument.Parse(json);
+            return ExtractDynamicExcelTemplateId(document.RootElement);
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
+    private static string? ExtractFirstDynamicExcelTemplateId(string? blocksJson)
+    {
+        if (string.IsNullOrWhiteSpace(blocksJson))
+            return null;
+
+        try
+        {
+            using var document = JsonDocument.Parse(blocksJson);
+            if (document.RootElement.ValueKind != JsonValueKind.Array)
+                return null;
+
+            foreach (var item in document.RootElement.EnumerateArray())
+            {
+                var id = ExtractDynamicExcelTemplateId(item);
+                if (!string.IsNullOrWhiteSpace(id))
+                    return id;
+            }
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+
+        return null;
+    }
+
+    private static string? ExtractDynamicExcelTemplateId(JsonElement element)
+    {
+        if (element.ValueKind != JsonValueKind.Object)
+            return null;
+
+        return NormalizeOptionalTextOrNull(ReadJsonString(element, "dynamicExcelTemplateId"))
+               ?? NormalizeOptionalTextOrNull(ReadJsonString(element, "DynamicExcelTemplateId"))
+               ?? NormalizeOptionalTextOrNull(ReadJsonString(element, "excelBlockDynamicExcelTemplateId"))
+               ?? NormalizeOptionalTextOrNull(ReadJsonString(element, "ExcelBlockDynamicExcelTemplateId"));
+    }
+
     private static string NormalizeBlockId(string? value)
         => string.IsNullOrWhiteSpace(value) ? "excel_block" : value.Trim();
 
@@ -3777,20 +3957,24 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         WorkReportPeriod? period,
         CancellationToken ct)
     {
-        var template = await _ctx.DynamicExcelTemplates
-            .Find(t => t.Id == x.DynamicExcelTemplateId && !t.IsDeleted)
-            .FirstOrDefaultAsync(ct);
+        DynamicExcelTemplate? template = null;
+        if (!string.IsNullOrWhiteSpace(x.DynamicExcelTemplateId))
+        {
+            template = await _ctx.DynamicExcelTemplates
+                .Find(t => t.Id == x.DynamicExcelTemplateId && !t.IsDeleted)
+                .FirstOrDefaultAsync(ct);
 
-        if (template is null)
-            throw AppExceptionFactory.NotFound(
-                AppErrorCode.WORK_ASSIGNMENT_REPORT_DYNAMIC_EXCEL_TEMPLATE_NOT_FOUND,
-                new
-                {
-                    reportId = x.Id,
-                    workAssignmentId = x.WorkAssignmentId,
-                    dynamicExcelTemplateId = x.DynamicExcelTemplateId,
-                    dynamicFormTemplateId = x.DynamicFormTemplateId
-                });
+            if (template is null)
+                throw AppExceptionFactory.NotFound(
+                    AppErrorCode.WORK_ASSIGNMENT_REPORT_DYNAMIC_EXCEL_TEMPLATE_NOT_FOUND,
+                    new
+                    {
+                        reportId = x.Id,
+                        workAssignmentId = x.WorkAssignmentId,
+                        dynamicExcelTemplateId = x.DynamicExcelTemplateId,
+                        dynamicFormTemplateId = x.DynamicFormTemplateId
+                    });
+        }
 
         var assignment = await _ctx.WorkAssignments
             .Find(a => a.Id == x.WorkAssignmentId && !a.IsDeleted)
@@ -3828,7 +4012,9 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             Status = x.Status,
             PeriodStatus = period?.Status,
 
-            TemplateSnapshotJson = JsonSerializer.Serialize(BuildTemplateSnapshot(template), _jsonOptions),
+            TemplateSnapshotJson = template is null
+                ? string.Empty
+                : JsonSerializer.Serialize(BuildTemplateSnapshot(template), _jsonOptions),
             ScheduleSnapshotJson = x.ScheduleSnapshotJson,
 
             DynamicExcelTemplateId = x.DynamicExcelTemplateId,
@@ -3837,7 +4023,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             DynamicFormTemplateId = x.DynamicFormTemplateId ?? period?.DynamicFormTemplateId,
             DynamicFormTemplateCode = x.DynamicFormTemplateCode ?? period?.DynamicFormTemplateCode,
             DynamicFormTemplateName = x.DynamicFormTemplateName ?? period?.DynamicFormTemplateName,
-            SpecJson = string.IsNullOrWhiteSpace(x.SpecJson) ? template.SpecJson : x.SpecJson,
+            SpecJson = string.IsNullOrWhiteSpace(x.SpecJson) ? template?.SpecJson ?? string.Empty : x.SpecJson,
 
             DataRectR0 = x.DataRectR0,
             DataRectC0 = x.DataRectC0,
@@ -3922,6 +4108,42 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         report.PayloadSizeBytes = result.PayloadSizeBytes;
         report.PayloadStatus = result.PayloadStatus;
         report.PayloadUpdatedAtUtc = updatedAtUtc;
+    }
+
+    private static UpdateDefinition<WorkAssignmentReport> ApplyPayloadHeaderUpdate(
+        UpdateDefinitionBuilder<WorkAssignmentReport> update,
+        WorkReportPayloadWriteResult result,
+        DateTime updatedAtUtc)
+        => update
+            .Set(x => x.Values1DJson, EmptyValues1DJson)
+            .Set(x => x.FieldValuesJson, (string?)null)
+            .Set(x => x.TableValuesJson, (string?)null)
+            .Set(x => x.SummarySourceJson, (string?)null)
+            .Set(x => x.PayloadRevision, result.PayloadRevision)
+            .Set(x => x.PayloadHash, result.PayloadHash)
+            .Set(x => x.PayloadSizeBytes, result.PayloadSizeBytes)
+            .Set(x => x.PayloadStatus, result.PayloadStatus)
+            .Set(x => x.PayloadUpdatedAtUtc, updatedAtUtc);
+
+    private static void CompactEmbeddedPayloadHeader(WorkAssignmentReport report)
+    {
+        report.Values1DJson = EmptyValues1DJson;
+        report.FieldValuesJson = null;
+        report.TableValuesJson = null;
+        report.SummarySourceJson = null;
+    }
+
+    private static void RestoreRuntimePayload(
+        WorkAssignmentReport report,
+        string values1DJson,
+        string? fieldValuesJson,
+        string? tableValuesJson,
+        string? summarySourceJson)
+    {
+        report.Values1DJson = values1DJson;
+        report.FieldValuesJson = fieldValuesJson;
+        report.TableValuesJson = tableValuesJson;
+        report.SummarySourceJson = summarySourceJson;
     }
 
     private sealed record RuntimeRowLabelPayload(string BlockId, List<string> LabelCodes);
@@ -4123,6 +4345,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             if (visitedReportIds.Contains(candidate.Id))
                 continue;
 
+            await HydrateReportPayloadAsync(candidate, ct);
             var summary = TryReadAggregateDraftSummary(candidate.SummarySourceJson);
             if (summary is null)
                 continue;
@@ -4191,6 +4414,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         var scopeAssignments = new Dictionary<string, WorkAssignment?>(StringComparer.Ordinal);
         foreach (var candidate in candidates)
         {
+            await HydrateReportPayloadAsync(candidate, ct);
             var summary = TryReadAggregateDraftSummary(candidate.SummarySourceJson);
             if (summary is null)
                 continue;
@@ -4251,6 +4475,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
     {
         try
         {
+            await HydrateReportPayloadAsync(candidate, ct);
             var summary = TryReadAggregateDraftSummary(candidate.SummarySourceJson);
             if (summary is null)
             {
@@ -4333,7 +4558,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
 
         if (period is not null)
         {
-            var nextPeriodStatus = WorkReportPeriodStatusHelper.ResolveSubmittedStatus(period.DueAtUtc, now);
+            var nextPeriodStatus = ResolveSubmittedPeriodStatus(period, report, now);
 
             await _ctx.WorkReportPeriods.UpdateOneAsync(
                 x => x.Id == period.Id && !x.IsDeleted,
@@ -4448,7 +4673,6 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                      & fb.Eq(x => x.DynamicFormTemplateId, source.DynamicFormTemplateId)
                      & fb.Ne(x => x.Id, source.Id)
                      & fb.In(x => x.DataOrigin, aggregateOrigins)
-                     & fb.Ne(x => x.SummarySourceJson, null)
                      & fb.Ne(x => x.IsActive, false)
                      & fb.Eq(x => x.IsDeleted, false);
 
@@ -4467,6 +4691,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         if (!report.AggregateSnapshotDirty)
             return report;
 
+        await HydrateReportPayloadAsync(report, ct);
         var summary = TryReadAggregateDraftSummary(report.SummarySourceJson);
         if (summary is null)
             return report;
@@ -4705,18 +4930,13 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
 
         await _ctx.WorkAssignmentReports.UpdateOneAsync(
             x => x.Id == report.Id && !x.IsDeleted,
-            Builders<WorkAssignmentReport>.Update
-                .Set(x => x.Values1DJson, values1DJson)
-                .Set(x => x.TableValuesJson, tableValuesJson)
-                .Set(x => x.PayloadRevision, payloadResult.PayloadRevision)
-                .Set(x => x.PayloadHash, payloadResult.PayloadHash)
-                .Set(x => x.PayloadSizeBytes, payloadResult.PayloadSizeBytes)
-                .Set(x => x.PayloadStatus, payloadResult.PayloadStatus)
-                .Set(x => x.PayloadUpdatedAtUtc, now)
+            ApplyPayloadHeaderUpdate(
+                Builders<WorkAssignmentReport>.Update,
+                payloadResult,
+                now)
                 .Set(x => x.DataOrigin, dataOrigin)
                 .Set(x => x.CumulativeContributionMode, WorkReportDataOrigin.DefaultContributionMode(dataOrigin))
                 .Set(x => x.CumulativeContributionPolicyJson, contributionPolicyJson)
-                .Set(x => x.SummarySourceJson, summarySourceJson)
                 .Set(x => x.AggregateSourceReportIds, sourceSnapshot.ReportIds)
                 .Set(x => x.AggregateSourceAssignmentIds, sourceSnapshot.AssignmentIds)
                 .Set(x => x.AggregateSourceUpdatedAtUtc, now)
@@ -4812,6 +5032,117 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         await _statusLog.WriteAsync(log, ct);
     }
 
+    private static MyReportTemplateRow MapTemplateDocRoleToRow(MyReportTemplateListDocRole x)
+        => new()
+        {
+            DynamicFormTemplateId = x.DynamicFormTemplateId ?? string.Empty,
+            DynamicFormTemplateCode = x.DynamicFormTemplateCode ?? string.Empty,
+            DynamicFormTemplateName = x.DynamicFormTemplateName ?? string.Empty,
+            DynamicExcelId = x.DynamicExcelId,
+            DynamicExcelCode = x.DynamicExcelCode ?? string.Empty,
+            DynamicExcelName = x.DynamicExcelName ?? string.Empty,
+            BindingCount = x.BindingCount,
+            PeriodCount = x.PeriodCount,
+            ReportCount = x.ReportCount,
+            LatestPeriodId = x.LatestPeriodId,
+            LatestPeriodKey = x.LatestPeriodKey,
+            LatestPeriodStatus = x.LatestPeriodStatus.HasValue ? (int?)x.LatestPeriodStatus.Value : null,
+            LatestDueAtUtc = x.LatestDueAtUtc,
+            LatestReportId = x.LatestReportId,
+            LatestUpdatedAtUtc = x.LatestUpdatedAtUtc,
+            HasOverduePeriod = x.HasOverduePeriod
+        };
+
+    private static MyReportTemplateRow BuildTemplateRowFromBindings(List<WorkTemplateAssignee> bindings)
+    {
+        var latest = bindings
+            .OrderByDescending(x => x.UpdatedAtUtc)
+            .ThenByDescending(x => x.CreatedAtUtc)
+            .First();
+
+        return new MyReportTemplateRow
+        {
+            DynamicFormTemplateId = latest.DynamicFormTemplateId ?? string.Empty,
+            DynamicFormTemplateCode = latest.DynamicFormTemplateCode ?? string.Empty,
+            DynamicFormTemplateName = latest.DynamicFormTemplateName ?? string.Empty,
+            DynamicExcelId = latest.DynamicExcelId,
+            DynamicExcelCode = latest.DynamicExcelCode ?? string.Empty,
+            DynamicExcelName = latest.DynamicExcelName ?? string.Empty,
+            BindingCount = bindings
+                .Select(x => x.Id)
+                .Where(x => !string.IsNullOrWhiteSpace(x))
+                .Distinct(StringComparer.Ordinal)
+                .Count(),
+            PeriodCount = 0,
+            ReportCount = 0,
+            LatestUpdatedAtUtc = latest.UpdatedAtUtc == default ? latest.CreatedAtUtc : latest.UpdatedAtUtc,
+            HasOverduePeriod = false
+        };
+    }
+
+    private static void MergeBindingMetadata(MyReportTemplateRow row, List<WorkTemplateAssignee> bindings)
+    {
+        var latest = bindings
+            .OrderByDescending(x => x.UpdatedAtUtc)
+            .ThenByDescending(x => x.CreatedAtUtc)
+            .FirstOrDefault();
+        if (latest is null)
+            return;
+
+        row.DynamicFormTemplateId = FirstNonEmpty(row.DynamicFormTemplateId, latest.DynamicFormTemplateId);
+        row.DynamicFormTemplateCode = FirstNonEmpty(row.DynamicFormTemplateCode, latest.DynamicFormTemplateCode);
+        row.DynamicFormTemplateName = FirstNonEmpty(row.DynamicFormTemplateName, latest.DynamicFormTemplateName);
+        row.DynamicExcelId = FirstNonEmpty(row.DynamicExcelId, latest.DynamicExcelId);
+        row.DynamicExcelCode = FirstNonEmpty(row.DynamicExcelCode, latest.DynamicExcelCode);
+        row.DynamicExcelName = FirstNonEmpty(row.DynamicExcelName, latest.DynamicExcelName);
+        row.BindingCount = Math.Max(
+            row.BindingCount,
+            bindings
+                .Select(x => x.Id)
+                .Where(x => !string.IsNullOrWhiteSpace(x))
+                .Distinct(StringComparer.Ordinal)
+                .Count());
+
+        var latestBindingUpdatedAt = latest.UpdatedAtUtc == default ? latest.CreatedAtUtc : latest.UpdatedAtUtc;
+        if (!row.LatestUpdatedAtUtc.HasValue || row.LatestUpdatedAtUtc.Value < latestBindingUpdatedAt)
+            row.LatestUpdatedAtUtc = latestBindingUpdatedAt;
+    }
+
+    private static string BuildTemplateGroupKey(string? dynamicFormTemplateId, string? dynamicExcelId)
+    {
+        var formId = NormalizeOptionalTextOrNull(dynamicFormTemplateId);
+        if (!string.IsNullOrWhiteSpace(formId))
+            return $"form:{formId}";
+
+        var excelId = NormalizeOptionalTextOrNull(dynamicExcelId);
+        return string.IsNullOrWhiteSpace(excelId) ? string.Empty : $"excel:{excelId}";
+    }
+
+    private static bool MatchesTemplateSearch(MyReportTemplateRow row, MyReportTemplateSearchRequest req)
+    {
+        if (req.HasOverduePeriod.HasValue && row.HasOverduePeriod != req.HasOverduePeriod.Value)
+            return false;
+
+        if (req.HasReport.HasValue && (row.ReportCount > 0) != req.HasReport.Value)
+            return false;
+
+        var q = NormalizeOptionalTextOrNull(req.Q);
+        if (string.IsNullOrWhiteSpace(q))
+            return true;
+
+        return ContainsIgnoreCase(row.DynamicFormTemplateCode, q)
+            || ContainsIgnoreCase(row.DynamicFormTemplateName, q)
+            || ContainsIgnoreCase(row.DynamicExcelCode, q)
+            || ContainsIgnoreCase(row.DynamicExcelName, q);
+    }
+
+    private static bool ContainsIgnoreCase(string? value, string q)
+        => !string.IsNullOrWhiteSpace(value)
+           && value.Contains(q, StringComparison.OrdinalIgnoreCase);
+
+    private static string FirstNonEmpty(string? current, string? fallback)
+        => string.IsNullOrWhiteSpace(current) ? fallback ?? string.Empty : current;
+
     private static List<MyReportTemplateRow> ApplyTemplateSort(
         List<MyReportTemplateRow> rows,
         string? sortField,
@@ -4825,6 +5156,9 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             "dynamicformtemplatename" => x => x.DynamicFormTemplateName,
             "dynamicexcelcode" => x => x.DynamicExcelCode,
             "dynamicexcelname" => x => x.DynamicExcelName,
+            "bindingcount" => x => x.BindingCount,
+            "reportcount" => x => x.ReportCount,
+            "latestperiodkey" => x => x.LatestPeriodKey,
             "latestdueatutc" => x => x.LatestDueAtUtc,
             "periodcount" => x => x.PeriodCount,
             _ => x => x.LatestUpdatedAtUtc
@@ -4900,8 +5234,43 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         };
     }
 
-    private static WorkReportPeriodStatus ResolveDraftPeriodStatus(DateTime? dueAtUtc, DateTime now)
-        => WorkReportPeriodStatusHelper.ResolveDraftStatus(dueAtUtc, now);
+    private static WorkReportPeriodStatus ResolveDraftPeriodStatus(
+        bool isHistoricalData,
+        DateTime? completedDate,
+        DateTime? dueAtUtc,
+        DateTime now)
+        => WorkAssignmentReportHistoricalDataHelper.ResolveDraftPeriodStatus(
+            isHistoricalData,
+            completedDate,
+            dueAtUtc,
+            now);
+
+    private static WorkReportPeriodStatus ResolveDraftPeriodStatus(
+        WorkReportPeriod period,
+        WorkAssignmentReport report,
+        DateTime now)
+        => WorkAssignmentReportHistoricalDataHelper.ResolveDraftPeriodStatus(
+            report.IsHistoricalData || period.IsHistoricalData,
+            report.CompletedDate ?? period.CompletedDate,
+            report.DueAtUtc ?? period.DueAtUtc,
+            now);
+
+    private static WorkReportPeriodStatus ResolveSubmittedPeriodStatus(
+        WorkReportPeriod period,
+        WorkAssignmentReport report,
+        DateTime now)
+        => WorkAssignmentReportHistoricalDataHelper.ResolveSubmittedPeriodStatus(period, report, now);
+
+    private static bool ResolveReportLateSubmission(
+        bool isHistoricalData,
+        DateTime? completedDate,
+        DateTime? dueAtUtc,
+        DateTime now)
+        => WorkAssignmentReportHistoricalDataHelper.ResolveIsLateSubmission(
+            isHistoricalData,
+            completedDate,
+            dueAtUtc,
+            now);
 
     private static DateTime? NormalizeDate(DateTime? value)
         => WorkAssignmentReportHistoricalDataHelper.NormalizeDate(value);
@@ -5199,6 +5568,156 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                ?? period.CreatedAtUtc;
     }
 
+    private async Task EnsureNoDuplicateUserCreatedPeriodAsync(
+        WorkAssignment assignment,
+        WorkTemplateAssignee binding,
+        string actorUserId,
+        string periodKey,
+        DateTime reportDate,
+        DateTime periodStart,
+        DateTime periodEnd,
+        string? linkedScheduledPeriodId,
+        CancellationToken ct)
+    {
+        var fb = Builders<WorkReportPeriod>.Filter;
+        var baseFilter =
+            fb.Eq(x => x.WorkAssignmentId, assignment.Id) &
+            fb.Eq(x => x.WorkTemplateAssigneeId, binding.Id) &
+            fb.Eq(x => x.AssigneeUserId, actorUserId) &
+            fb.Eq(x => x.PeriodKind, WorkReportPeriodKind.UserCreated) &
+            fb.Eq(x => x.IsActive, true) &
+            fb.Eq(x => x.IsDeleted, false);
+
+        var sameSourceWindow =
+            fb.Eq(x => x.PeriodKey, periodKey) &
+            fb.Eq(x => x.ReportDate, (DateTime?)reportDate) &
+            fb.Eq(x => x.PeriodStart, (DateTime?)periodStart) &
+            fb.Eq(x => x.PeriodEnd, (DateTime?)periodEnd);
+
+        var duplicateScope = string.IsNullOrWhiteSpace(linkedScheduledPeriodId)
+            ? sameSourceWindow
+            : fb.Or(
+                sameSourceWindow,
+                fb.Eq(x => x.LinkedScheduledPeriodId, linkedScheduledPeriodId));
+
+        var duplicate = await _ctx.WorkReportPeriods
+            .Find(baseFilter & duplicateScope)
+            .FirstOrDefaultAsync(ct);
+
+        if (duplicate is null)
+            return;
+
+        throw AppExceptionFactory.Create(
+            AppErrorCode.WORK_ASSIGNMENT_REPORT_USER_CREATED_DUPLICATE,
+            new
+            {
+                workAssignmentId = assignment.Id,
+                bindingId = binding.Id,
+                actorUserId,
+                periodKey,
+                reportDate,
+                periodStart,
+                periodEnd,
+                linkedScheduledPeriodId,
+                duplicatePeriodId = duplicate.Id
+            });
+    }
+
+    private static void ValidateLinkedScheduledPeriodForUserCreatedReport(
+        WorkReportPeriod linkedPeriod,
+        WorkAssignment assignment,
+        WorkTemplateAssignee binding,
+        string actorUserId,
+        string? requestedLinkedScheduledPeriodId)
+    {
+        var expectedFormTemplateId = NormalizeOptionalTextOrNull(binding.DynamicFormTemplateId)
+                                     ?? NormalizeOptionalTextOrNull(assignment.DynamicFormTemplateId);
+        var linkedFormTemplateId = NormalizeOptionalTextOrNull(linkedPeriod.DynamicFormTemplateId);
+
+        if (WorkReportPeriodKind.IsScheduled(linkedPeriod.PeriodKind) &&
+            linkedPeriod.IsActive &&
+            string.Equals(linkedPeriod.WorkAssignmentId, assignment.Id, StringComparison.Ordinal) &&
+            string.Equals(linkedPeriod.WorkTemplateAssigneeId, binding.Id, StringComparison.Ordinal) &&
+            string.Equals(linkedPeriod.AssigneeUserId, actorUserId, StringComparison.Ordinal) &&
+            string.Equals(linkedFormTemplateId, expectedFormTemplateId, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        throw AppExceptionFactory.BadRequest(
+            AppErrorCode.WORK_ASSIGNMENT_REPORT_LINKED_PERIOD_INVALID,
+            new
+            {
+                workAssignmentId = assignment.Id,
+                bindingId = binding.Id,
+                actorUserId,
+                linkedScheduledPeriodId = requestedLinkedScheduledPeriodId ?? linkedPeriod.Id,
+                linkedPeriodKind = linkedPeriod.PeriodKind,
+                linkedIsActive = linkedPeriod.IsActive,
+                linkedWorkAssignmentId = linkedPeriod.WorkAssignmentId,
+                linkedBindingId = linkedPeriod.WorkTemplateAssigneeId,
+                linkedAssigneeUserId = linkedPeriod.AssigneeUserId,
+                linkedFormTemplateId,
+                expectedFormTemplateId
+            });
+    }
+
+    private static void EnsureUserCreatedReportHasDueAtUtc(
+        string? periodKind,
+        DateTime? dueAtUtc,
+        object details)
+    {
+        if (WorkReportPeriodKind.IsUserCreated(periodKind) && !dueAtUtc.HasValue)
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_DUE_REQUIRED,
+                details);
+    }
+
+    private static void EnsureUserCreatedReportDueAtOrBeforeAssignmentDueAtUtc(
+        string? periodKind,
+        DateTime? dueAtUtc,
+        WorkAssignment? assignment,
+        object details)
+    {
+        if (!WorkReportPeriodKind.IsUserCreated(periodKind) || !dueAtUtc.HasValue)
+            return;
+
+        var assignmentDueAtUtc = ResolveAssignmentHardDueAtUtc(assignment);
+        if (!assignmentDueAtUtc.HasValue || dueAtUtc.Value <= assignmentDueAtUtc.Value)
+            return;
+
+        throw AppExceptionFactory.BadRequest(
+            AppErrorCode.WORK_ASSIGNMENT_REPORT_DUE_AFTER_ASSIGNMENT_DUE,
+            new
+            {
+                dueAtUtc = dueAtUtc.Value,
+                assignmentDueAtUtc = assignmentDueAtUtc.Value,
+                details
+            });
+    }
+
+    private static DateTime? ResolveEffectiveReportDueAtUtc(DateTime? reportDueAtUtc, WorkAssignment? assignment)
+    {
+        var assignmentDueAtUtc = ResolveAssignmentHardDueAtUtc(assignment);
+        if (!reportDueAtUtc.HasValue)
+            return assignmentDueAtUtc;
+
+        return reportDueAtUtc.Value;
+    }
+
+    private static DateTime? ResolveAssignmentHardDueAtUtc(WorkAssignment? assignment)
+    {
+        if (assignment is null)
+            return null;
+
+        if (assignment.DueAtUtc.HasValue)
+            return assignment.DueAtUtc.Value;
+
+        return assignment.DueDate.HasValue
+            ? NormalizeDueAtUtc(assignment.DueDate.Value)
+            : null;
+    }
+
     private static DateTime NormalizeDueAtUtc(DateTime date)
         => AppTimeRangeHelper.EndOfUtcDate(date);
 
@@ -5297,6 +5816,23 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             ReturnReason = x.ReturnReason
         };
     }
+
+    private static MyReportTemplateAssignmentOption MapToTemplateAssignmentOption(
+        WorkTemplateAssignee binding,
+        WorkAssignment? assignment)
+        => new()
+        {
+            WorkAssignmentId = binding.WorkAssignmentId ?? string.Empty,
+            WorkTemplateAssigneeId = binding.Id ?? string.Empty,
+            AssignmentCode = assignment?.Code,
+            AssignmentType = assignment?.AssignmentType ?? binding.AssignmentType,
+            StartDate = assignment?.StartDate ?? binding.StartDate,
+            DueDate = assignment?.DueDate ?? binding.DueDate,
+            CompletedDate = assignment?.CompletedDate ?? binding.CompletedDate,
+            DueAtUtc = assignment?.DueAtUtc,
+            IsActive = assignment?.IsActive ?? binding.IsActive,
+            AllowUserCreatedReports = assignment?.AllowUserCreatedReports ?? binding.AllowUserCreatedReports
+        };
 
     private static WorkAssignmentReportListRow MapToListRow(WorkAssignmentReport x)
     {
@@ -6467,10 +7003,12 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
     private static string NormalizeUserCreatedPeriodKey(string? value, DateTime reportDate)
     {
         var key = value?.Trim();
-        if (!string.IsNullOrWhiteSpace(key))
-            return key;
+        if (string.IsNullOrWhiteSpace(key))
+            key = reportDate.ToString("yyyyMMdd", CultureInfo.InvariantCulture);
 
-        return reportDate.ToString("yyyyMMdd", CultureInfo.InvariantCulture);
+        return key.StartsWith("ADHOC:", StringComparison.OrdinalIgnoreCase)
+            ? $"ADHOC:{key[6..].Trim()}"
+            : $"ADHOC:{key}";
     }
 
     private static string NormalizePeriodInstanceKey(WorkReportPeriod period)

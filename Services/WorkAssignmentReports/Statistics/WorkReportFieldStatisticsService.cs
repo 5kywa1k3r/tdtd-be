@@ -1395,7 +1395,7 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
             yield return new ParsedFieldValue(
                 field,
                 boolean.Value ? "true" : "false",
-                boolean.Value ? "True" : "False",
+                boolean.Value ? "Có" : "Không",
                 field.FieldId,
                 "BOOLEAN",
                 null,

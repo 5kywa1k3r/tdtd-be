@@ -698,6 +698,7 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
 
         var now = DateTime.UtcNow;
         var completedDate = (req?.CompletedDate ?? now).Date;
+        await EnsureAssignmentCompletionReadyAsync(entity, work, completedDate, actorUserId, ct);
 
         var rs = await _ctx.WorkAssignments.UpdateOneAsync(
             x => x.Id == id && !x.IsDeleted,
@@ -724,10 +725,118 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
             await DisableRuntimeForCompletedAssignmentScopeAsync(entity, actorUserId, now, ct);
             await _docRoleReadModelProjection.RebuildAssignmentAsync(id, actorUserId, ct);
             await _statusRepair.RebuildWorkTreeAsync(entity.WorkId, ct);
+            await RebuildReportPeriodProjectionsForAssignmentScopeAsync(entity, actorUserId, ct);
         }
 
         var hasData = await _dataGuard.HasAssignmentDataAsync(entity.Id!, ct);
         return ToDetailResponse(entity, hasData);
+    }
+
+    private async Task EnsureAssignmentCompletionReadyAsync(
+        WorkAssignment assignment,
+        Work work,
+        DateTime completedDate,
+        string actorUserId,
+        CancellationToken ct)
+    {
+        var allAssignments = await _ctx.WorkAssignments
+            .Find(x => x.WorkId == assignment.WorkId && !x.IsDeleted)
+            .ToListAsync(ct);
+
+        var scopeAssignmentIds = ResolveAssignmentScopeIds(allAssignments, assignment);
+        if (scopeAssignmentIds.Count == 0)
+            return;
+
+        var bindings = await _ctx.WorkTemplateAssignees
+            .Find(x => scopeAssignmentIds.Contains(x.WorkAssignmentId) && !x.IsDeleted)
+            .ToListAsync(ct);
+
+        var activeScheduledPeriods = await _ctx.WorkReportPeriods
+            .Find(x =>
+                scopeAssignmentIds.Contains(x.WorkAssignmentId) &&
+                !x.IsDeleted &&
+                x.IsActive &&
+                (x.PeriodKind == null || x.PeriodKind == WorkReportPeriodKind.Scheduled))
+            .ToListAsync(ct);
+
+        var readiness = WorkAssignmentCompletionReadiness.Evaluate(
+            work,
+            allAssignments,
+            scopeAssignmentIds,
+            bindings,
+            activeScheduledPeriods,
+            completedDate,
+            DateTime.UtcNow);
+
+        if (readiness.CanComplete)
+            return;
+
+        throw AppExceptionFactory.Create(
+            AppErrorCode.WORK_ASSIGNMENT_COMPLETION_PENDING_REPORTS,
+            new
+            {
+                assignmentId = assignment.Id,
+                assignment.WorkId,
+                actorUserId,
+                completedDate,
+                readiness.OpenPeriodCount,
+                readiness.FutureExpectedPendingCount,
+                readiness.Samples
+            });
+    }
+
+    private async Task RebuildReportPeriodProjectionsForAssignmentScopeAsync(
+        WorkAssignment assignment,
+        string actorUserId,
+        CancellationToken ct)
+    {
+        var assignmentIds = await _ctx.WorkAssignments
+            .Find(x =>
+                x.WorkId == assignment.WorkId &&
+                !x.IsDeleted &&
+                (x.Id == assignment.Id || x.Path.StartsWith($"{assignment.Path}/")))
+            .Project(x => x.Id)
+            .ToListAsync(ct);
+
+        assignmentIds = assignmentIds
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+
+        if (assignmentIds.Count == 0)
+            return;
+
+        var periodIds = await _ctx.WorkReportPeriods
+            .Find(x => assignmentIds.Contains(x.WorkAssignmentId) && !x.IsDeleted)
+            .Project(x => x.Id)
+            .ToListAsync(ct);
+
+        foreach (var periodId in periodIds.Where(x => !string.IsNullOrWhiteSpace(x)))
+            await _docRoleReadModelProjection.RebuildReportPeriodAsync(periodId, actorUserId, ct);
+    }
+
+    private static List<string> ResolveAssignmentScopeIds(
+        IReadOnlyCollection<WorkAssignment> assignments,
+        WorkAssignment root)
+    {
+        if (string.IsNullOrWhiteSpace(root.Id))
+            return new List<string>();
+
+        var rootPath = root.Path ?? string.Empty;
+        var childPathPrefix = string.IsNullOrWhiteSpace(rootPath)
+            ? null
+            : $"{rootPath}/";
+
+        return assignments
+            .Where(x =>
+                !string.IsNullOrWhiteSpace(x.Id) &&
+                (string.Equals(x.Id, root.Id, StringComparison.Ordinal) ||
+                 (!string.IsNullOrWhiteSpace(childPathPrefix) &&
+                  !string.IsNullOrWhiteSpace(x.Path) &&
+                  x.Path.StartsWith(childPathPrefix, StringComparison.Ordinal))))
+            .Select(x => x.Id!)
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
     }
 
     private async Task DisableRuntimeForCompletedAssignmentScopeAsync(

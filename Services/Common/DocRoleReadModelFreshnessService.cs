@@ -25,16 +25,16 @@ public sealed class DocRoleReadModelFreshnessService : IDocRoleReadModelFreshnes
     private static readonly TimeSpan _localGateTtl = TimeSpan.FromSeconds(30);
 
     private readonly MongoDbContext _ctx;
-    private readonly IDocRoleReadModelProjectionService _projection;
+    private readonly IDocRoleReadModelProjectionRetryJobService _retryJobs;
     private readonly ILogger<DocRoleReadModelFreshnessService> _log;
 
     public DocRoleReadModelFreshnessService(
         MongoDbContext ctx,
-        IDocRoleReadModelProjectionService projection,
+        IDocRoleReadModelProjectionRetryJobService retryJobs,
         ILogger<DocRoleReadModelFreshnessService> log)
     {
         _ctx = ctx;
-        _projection = projection;
+        _retryJobs = retryJobs;
         _log = log;
     }
 
@@ -64,10 +64,15 @@ public sealed class DocRoleReadModelFreshnessService : IDocRoleReadModelFreshnes
                 return;
             }
 
-            await _projection.RebuildWorkAsync(work.Id, actorUserId, ct);
+            await _retryJobs.EnqueueRebuildWorkAsync(
+                work.Id,
+                actorUserId,
+                $"read-model-{reason}",
+                CreateQueuedFreshnessException("work", work.Id, reason),
+                CancellationToken.None);
 
             _log.LogInformation(
-                "DocRole read-model micro-repair completed. scope=work reason={reason} workId={workId} actorUserId={actorUserId} sourceUpdatedAtUtc={sourceUpdatedAtUtc} projectionUpdatedAtUtc={projectionUpdatedAtUtc}",
+                "DocRole read-model freshness repair queued. scope=work reason={reason} workId={workId} actorUserId={actorUserId} sourceUpdatedAtUtc={sourceUpdatedAtUtc} projectionUpdatedAtUtc={projectionUpdatedAtUtc}",
                 reason,
                 work.Id,
                 actorUserId,
@@ -78,7 +83,7 @@ public sealed class DocRoleReadModelFreshnessService : IDocRoleReadModelFreshnes
         {
             _log.LogWarning(
                 ex,
-                "DocRole read-model micro-repair failed. scope=work workId={workId} actorUserId={actorUserId}",
+                "DocRole read-model freshness repair enqueue failed. scope=work workId={workId} actorUserId={actorUserId}",
                 work.Id,
                 actorUserId);
         }
@@ -110,10 +115,15 @@ public sealed class DocRoleReadModelFreshnessService : IDocRoleReadModelFreshnes
                 return;
             }
 
-            await _projection.RebuildAssignmentAsync(assignment.Id, actorUserId, ct);
+            await _retryJobs.EnqueueRebuildAssignmentAsync(
+                assignment.Id,
+                actorUserId,
+                $"read-model-{reason}",
+                CreateQueuedFreshnessException("assignment", assignment.Id, reason),
+                CancellationToken.None);
 
             _log.LogInformation(
-                "DocRole read-model micro-repair completed. scope=assignment reason={reason} assignmentId={assignmentId} actorUserId={actorUserId} sourceUpdatedAtUtc={sourceUpdatedAtUtc} projectionUpdatedAtUtc={projectionUpdatedAtUtc}",
+                "DocRole read-model freshness repair queued. scope=assignment reason={reason} assignmentId={assignmentId} actorUserId={actorUserId} sourceUpdatedAtUtc={sourceUpdatedAtUtc} projectionUpdatedAtUtc={projectionUpdatedAtUtc}",
                 reason,
                 assignment.Id,
                 actorUserId,
@@ -124,7 +134,7 @@ public sealed class DocRoleReadModelFreshnessService : IDocRoleReadModelFreshnes
         {
             _log.LogWarning(
                 ex,
-                "DocRole read-model micro-repair failed. scope=assignment assignmentId={assignmentId} actorUserId={actorUserId}",
+                "DocRole read-model freshness repair enqueue failed. scope=assignment assignmentId={assignmentId} actorUserId={actorUserId}",
                 assignment.Id,
                 actorUserId);
         }
@@ -167,10 +177,15 @@ public sealed class DocRoleReadModelFreshnessService : IDocRoleReadModelFreshnes
                 return;
             }
 
-            await _projection.RebuildReportPeriodAsync(period.Id, actorUserId, ct);
+            await _retryJobs.EnqueueRebuildReportPeriodAsync(
+                period.Id,
+                actorUserId,
+                $"read-model-{reason}",
+                CreateQueuedFreshnessException("period", period.Id, reason),
+                CancellationToken.None);
 
             _log.LogInformation(
-                "DocRole read-model micro-repair completed. scope=period reason={reason} periodId={periodId} reportId={reportId} actorUserId={actorUserId} sourceUpdatedAtUtc={sourceUpdatedAtUtc} projectionUpdatedAtUtc={projectionUpdatedAtUtc}",
+                "DocRole read-model freshness repair queued. scope=period reason={reason} periodId={periodId} reportId={reportId} actorUserId={actorUserId} sourceUpdatedAtUtc={sourceUpdatedAtUtc} projectionUpdatedAtUtc={projectionUpdatedAtUtc}",
                 reason,
                 period.Id,
                 report?.Id,
@@ -182,12 +197,16 @@ public sealed class DocRoleReadModelFreshnessService : IDocRoleReadModelFreshnes
         {
             _log.LogWarning(
                 ex,
-                "DocRole read-model micro-repair failed. scope=period periodId={periodId} reportId={reportId} actorUserId={actorUserId}",
+                "DocRole read-model freshness repair enqueue failed. scope=period periodId={periodId} reportId={reportId} actorUserId={actorUserId}",
                 period.Id,
                 report?.Id,
                 actorUserId);
         }
     }
+
+    private static Exception CreateQueuedFreshnessException(string scope, string targetId, string reason)
+        => new InvalidOperationException(
+            $"DocRole read-model freshness repair queued. scope={scope};targetId={targetId};reason={reason}");
 
     private static bool IsFresh(DateTime? projectionUpdatedAtUtc, DateTime sourceUpdatedAtUtc)
         => projectionUpdatedAtUtc.HasValue && projectionUpdatedAtUtc.Value >= sourceUpdatedAtUtc;

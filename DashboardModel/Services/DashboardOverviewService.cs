@@ -301,7 +301,7 @@ public sealed class DashboardOverviewService : IDashboardOverviewService
 
         cards.AddRange(BuildPeriodStatusCards(
             reportAgg.Counts,
-            "Nhóm thẻ dưới đang mô tả trạng thái kỳ / báo cáo. Pie chart bên cạnh đang mô tả cơ cấu assignment."));
+            "Nhóm thẻ dưới đang mô tả trạng thái kỳ / báo cáo. Biểu đồ tròn bên cạnh đang mô tả cơ cấu công việc đã giao."));
 
         var pie = visibleAssignments
             .GroupBy(x => x.ProgressStatus.ToString())
@@ -962,11 +962,11 @@ public sealed class DashboardOverviewService : IDashboardOverviewService
     {
         return new List<DashboardOverviewMetricDto>
         {
-            new() { Key = "notStarted", Label = "Chưa thực hiện", Value = progress.NotStarted, Category = "status", Description = "Nhóm thẻ dưới đang mô tả trạng thái assignment / công việc." },
-            new() { Key = "inProgress", Label = "Đang thực hiện", Value = progress.InProgress, Category = "status", Description = "Nhóm thẻ dưới đang mô tả trạng thái assignment / công việc." },
-            new() { Key = "completed", Label = "Đã hoàn thành", Value = progress.Completed, ValueColor = "success.main", Category = "status", Description = "Nhóm thẻ dưới đang mô tả trạng thái assignment / công việc." },
-            new() { Key = "atRiskOverdue", Label = "Có nguy cơ chậm", Value = progress.AtRiskOverdue, ValueColor = "warning.main", Category = "status", Description = "Nhóm thẻ dưới đang mô tả trạng thái assignment / công việc." },
-            new() { Key = "overdue", Label = "Chậm muộn", Value = progress.Overdue, ValueColor = "error.main", Category = "status", Description = "Nhóm thẻ dưới đang mô tả trạng thái assignment / công việc." },
+            new() { Key = "notStarted", Label = "Chưa thực hiện", Value = progress.NotStarted, Category = "status", Description = "Nhóm thẻ dưới đang mô tả trạng thái công việc được giao." },
+            new() { Key = "inProgress", Label = "Đang thực hiện", Value = progress.InProgress, Category = "status", Description = "Nhóm thẻ dưới đang mô tả trạng thái công việc được giao." },
+            new() { Key = "completed", Label = "Đã hoàn thành", Value = progress.Completed, ValueColor = "success.main", Category = "status", Description = "Nhóm thẻ dưới đang mô tả trạng thái công việc được giao." },
+            new() { Key = "atRiskOverdue", Label = "Có nguy cơ chậm", Value = progress.AtRiskOverdue, ValueColor = "warning.main", Category = "status", Description = "Nhóm thẻ dưới đang mô tả trạng thái công việc được giao." },
+            new() { Key = "overdue", Label = "Chậm muộn", Value = progress.Overdue, ValueColor = "error.main", Category = "status", Description = "Nhóm thẻ dưới đang mô tả trạng thái công việc được giao." },
         };
     }
 

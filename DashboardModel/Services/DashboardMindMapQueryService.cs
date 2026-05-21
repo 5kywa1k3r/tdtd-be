@@ -2442,18 +2442,18 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
         var parts = new List<string>();
 
         if (assignment.Assignees is { Count: > 0 })
-            parts.Add($"{assignment.Assignees.Count} assignee");
+            parts.Add($"{assignment.Assignees.Count} người phụ trách");
 
         if (assignment.ActiveChildCount > 0)
-            parts.Add($"{assignment.ActiveChildCount} child");
+            parts.Add($"{assignment.ActiveChildCount} nhánh con");
 
         if (assignment.HasOverduePeriod)
-            parts.Add("overdue");
+            parts.Add("có báo cáo chậm");
         else if (assignment.HasAnyDuePeriod)
-            parts.Add("has due period");
+            parts.Add("có kỳ báo cáo");
 
         if (!string.IsNullOrWhiteSpace(assignment.LatestPeriodKey))
-            parts.Add($"latest {assignment.LatestPeriodKey}");
+            parts.Add($"kỳ gần nhất {assignment.LatestPeriodKey}");
 
         if (!string.IsNullOrWhiteSpace(assignment.Description))
             parts.Add(assignment.Description.Trim());
@@ -2644,11 +2644,11 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
             Total = summary.Total,
             Segments = new List<DashboardStackedBarSegmentDto>
             {
-                BuildSegment(BucketPending, "Chua bat dau", summary.PendingCount),
-                BuildSegment(BucketDraft, "Draft", summary.DraftCount),
-                BuildSegment(BucketSubmitted, "Da gui", summary.SubmittedCount),
-                BuildSegment(BucketApproved, "Da duyet", summary.ApprovedCount),
-                BuildSegment(BucketOverdue, "Qua han", overdue),
+                BuildSegment(BucketPending, "Chưa bắt đầu", summary.PendingCount),
+                BuildSegment(BucketDraft, "Bản nháp", summary.DraftCount),
+                BuildSegment(BucketSubmitted, "Đã gửi", summary.SubmittedCount),
+                BuildSegment(BucketApproved, "Đã duyệt", summary.ApprovedCount),
+                BuildSegment(BucketOverdue, "Quá hạn", overdue),
             },
         };
     }
@@ -2657,9 +2657,9 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
     {
         return new List<DashboardStackedBarSegmentDto>
         {
-            BuildSegment(BucketTodo, "Chua lam", values.GetValueOrDefault(BucketTodo)),
-            BuildSegment(BucketDone, "Da lam", values.GetValueOrDefault(BucketDone)),
-            BuildSegment(BucketOverdue, "Cham muon", values.GetValueOrDefault(BucketOverdue)),
+            BuildSegment(BucketTodo, "Chưa làm", values.GetValueOrDefault(BucketTodo)),
+            BuildSegment(BucketDone, "Đã làm", values.GetValueOrDefault(BucketDone)),
+            BuildSegment(BucketOverdue, "Chậm muộn", values.GetValueOrDefault(BucketOverdue)),
         };
     }
 

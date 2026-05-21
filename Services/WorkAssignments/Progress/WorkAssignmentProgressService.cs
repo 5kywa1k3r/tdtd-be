@@ -590,6 +590,10 @@ public sealed class WorkAssignmentProgressService : IWorkAssignmentProgressServi
             .Find(x => x.WorkAssignmentId == assignment.Id && x.IsActive && !x.IsDeleted)
             .ToListAsync(ct);
 
+        periods = periods
+            .Where(WorkAssignmentReportTemporalPolicy.ContributesToProgress)
+            .ToList();
+
         if (periods.Count == 0)
         {
             return new WorstFacts();

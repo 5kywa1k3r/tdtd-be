@@ -537,7 +537,7 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
 
         if (period is not null)
         {
-            var periodStatus = WorkReportPeriodStatusHelper.ResolveDraftStatus(period.DueAtUtc, now);
+            var periodStatus = ResolveDraftPeriodStatus(period, report, now);
 
             await _ctx.WorkReportPeriods.UpdateOneAsync(
                 x => x.Id == period.Id && !x.IsDeleted,
@@ -639,8 +639,6 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
         await EnsureNoLaterApprovedReportsAsync(period, ct);
 
         var now = DateTime.UtcNow;
-        var nextPeriodStatus = WorkReportPeriodStatusHelper.ResolveSubmittedStatus(report.DueAtUtc, now);
-
         await _ctx.WorkAssignmentReports.UpdateOneAsync(
             x => x.Id == report.Id,
             Builders<WorkAssignmentReport>.Update
@@ -667,6 +665,8 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
 
         if (period is not null)
         {
+            var nextPeriodStatus = ResolveSubmittedPeriodStatus(period, report, now);
+
             await _ctx.WorkReportPeriods.UpdateOneAsync(
                 x => x.Id == period.Id && !x.IsDeleted,
                 Builders<WorkReportPeriod>.Update
@@ -833,6 +833,8 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
             await _statusSync.SyncFromAssignmentAsync(report.WorkAssignmentId, ct);
         }
 
+        await RefreshAggregateDependentsAfterReviewAsync(report.Id, me.Id, ct);
+
         await InsertReportLogAsync(
             report.WorkId,
             report.WorkAssignmentId,
@@ -983,6 +985,8 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
             disableQueue: !WorkReportPeriodStatusHelper.ShouldKeepQueueActive(period.Status),
             ct,
             forceRebuildStatistics: true);
+
+        await RefreshAggregateDependentsAfterReviewAsync(report.Id, me.Id, ct);
 
         await InsertReportLogAsync(
             report.WorkId,
@@ -1415,6 +1419,26 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
         return WorkAssignmentReportHistoricalDataHelper.ResolveApprovedPeriodStatus(period, report, now);
     }
 
+    private static WorkReportPeriodStatus ResolveDraftPeriodStatus(
+        WorkReportPeriod period,
+        WorkAssignmentReport report,
+        DateTime now)
+    {
+        return WorkAssignmentReportHistoricalDataHelper.ResolveDraftPeriodStatus(
+            report.IsHistoricalData || period.IsHistoricalData,
+            report.CompletedDate ?? period.CompletedDate,
+            report.DueAtUtc ?? period.DueAtUtc,
+            now);
+    }
+
+    private static WorkReportPeriodStatus ResolveSubmittedPeriodStatus(
+        WorkReportPeriod period,
+        WorkAssignmentReport report,
+        DateTime now)
+    {
+        return WorkAssignmentReportHistoricalDataHelper.ResolveSubmittedPeriodStatus(period, report, now);
+    }
+
     private static WorkReportPeriodStatus ResolvePeriodStatusFromReport(
         WorkReportPeriod period,
         WorkAssignmentReport report,
@@ -1423,8 +1447,8 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
         return report.Status switch
         {
             WorkAssignmentReportStatus.Approved => ResolveApprovedPeriodStatus(period, report, now),
-            WorkAssignmentReportStatus.Submitted => WorkReportPeriodStatusHelper.ResolveSubmittedStatus(period.DueAtUtc, now),
-            _ => WorkReportPeriodStatusHelper.ResolveDraftStatus(period.DueAtUtc, now)
+            WorkAssignmentReportStatus.Submitted => ResolveSubmittedPeriodStatus(period, report, now),
+            _ => ResolveDraftPeriodStatus(period, report, now)
         };
     }
 

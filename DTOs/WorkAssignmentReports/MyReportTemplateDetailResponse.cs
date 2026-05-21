@@ -42,4 +42,27 @@ public sealed class MyReportTemplateDetailResponse
     /// Danh sách kỳ phải báo cáo của template này.
     /// </summary>
     public List<WorkReportPeriodRow> Periods { get; set; } = new();
+
+    /// <summary>
+    /// Danh sách phân công/binding mà user hiện tại có thể tạo báo cáo chủ động.
+    /// Cần cho trường hợp cùng một biểu mẫu được giao nhiều lần nhưng chưa có kỳ/report nào.
+    /// </summary>
+    public List<MyReportTemplateAssignmentOption> AssignmentOptions { get; set; } = new();
+}
+
+public sealed class MyReportTemplateAssignmentOption
+{
+    public string WorkAssignmentId { get; set; } = string.Empty;
+    public string WorkTemplateAssigneeId { get; set; } = string.Empty;
+
+    public string? AssignmentCode { get; set; }
+    public string? AssignmentType { get; set; }
+
+    public DateTime? StartDate { get; set; }
+    public DateTime? DueDate { get; set; }
+    public DateTime? CompletedDate { get; set; }
+    public DateTime? DueAtUtc { get; set; }
+
+    public bool IsActive { get; set; } = true;
+    public bool AllowUserCreatedReports { get; set; } = true;
 }

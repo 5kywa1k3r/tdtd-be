@@ -34,7 +34,7 @@ public sealed class WorkAssignmentReportListRow
     public bool IsLateSubmission { get; set; }
     public string? LateReason { get; set; }
 
-    public string DynamicExcelTemplateId { get; set; } = string.Empty;
+    public string? DynamicExcelTemplateId { get; set; }
     public string DynamicExcelTemplateCode { get; set; } = string.Empty;
     public string DynamicExcelTemplateName { get; set; } = string.Empty;
     public string? DynamicFormTemplateId { get; set; }

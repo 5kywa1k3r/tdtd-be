@@ -20,6 +20,7 @@ using System.Reflection;
 using System.Text.Json;
 using Microsoft.AspNetCore.Http;
 using Hangfire;
+using MongoDB.Bson;
 using tdtd_be.Jobs;
 
 var tests = new (string Name, Action Run)[]
@@ -44,8 +45,15 @@ var tests = new (string Name, Action Run)[]
     ("root missing assignment due date defaults to work due date", DefaultsRootDueDateToWorkDueDate),
     ("child missing assignment due date defaults to parent assignment due date", DefaultsChildDueDateToParentDueDate),
     ("periodic assignment date range caps occurrence validation", ValidatesPeriodicAssignmentDateRange),
-    ("historical data approval resolves as normal approved", ResolvesHistoricalDataApprovalAsNormalApproved),
+    ("assignment completion blocks open materialized report periods", BlocksCompletionWithOpenMaterializedReportPeriod),
+    ("assignment completion blocks future expected report periods", BlocksCompletionWithFutureExpectedReportPeriods),
+    ("assignment completion allows approved periods with no future expected periods", AllowsCompletionWhenReportsAreTerminalAndNoFutureExpected),
+    ("historical data approval uses completed date for due status", ResolvesHistoricalDataApprovalFromCompletedDate),
+    ("historical data submission uses completed date for due status", ResolvesHistoricalSubmittedStatusFromCompletedDate),
     ("historical user-created period is data-only for progress", TreatsHistoricalUserCreatedPeriodAsDataOnly),
+    ("user-created report period key uses ad-hoc namespace", NormalizesUserCreatedPeriodKeyAsAdHoc),
+    ("user-created report requires effective due", RequiresUserCreatedReportDue),
+    ("user-created report due cannot exceed assignment hard due", RejectsUserCreatedReportDueAfterAssignmentHardDue),
     ("historical report source window matches aggregate period filters", MatchesHistoricalReportSourceWindowForAggregation),
     ("generated unit manager can create root work", AllowsGeneratedUnitManagerWorkCreate),
     ("generated level manager can create root work", AllowsGeneratedLevelManagerWorkCreate),
@@ -64,6 +72,9 @@ var tests = new (string Name, Action Run)[]
     ("stat projection accepts verified external payload snapshot", AcceptsVerifiedExternalPayloadForStatisticProjection),
     ("stat projection rejects embedded payload fallback", RejectsEmbeddedPayloadForStatisticProjection),
     ("stat projection rejects unverified external payload hash", RejectsUnverifiedExternalPayloadHashForStatisticProjection),
+    ("form-only report can omit dynamic excel template id", AllowsFormOnlyReportWithoutDynamicExcelTemplate),
+    ("report service resolves dynamic excel id from form blocks", ResolvesDynamicExcelIdFromFormBlocks),
+    ("report payload header compaction clears embedded detail fields", CompactsReportPayloadHeader),
     ("auto approve condition normalizes and matches report fields", MatchesAutoApproveCondition),
     ("dynamic form table target labels use dynamic excel default type", ValidatesDynamicFormTableTargetDefaultDataType),
     ("dynamic form metric label targets validate range type and uniqueness", ValidatesDynamicFormMetricLabelTargets),
@@ -541,24 +552,144 @@ static void ValidatesPeriodicAssignmentDateRange()
     AssertEqual(new DateTime(2026, 5, 1), normalized.Schedule?.StartDate, "schedule start should default from assignment start date");
 }
 
-static void ResolvesHistoricalDataApprovalAsNormalApproved()
+static void BlocksCompletionWithOpenMaterializedReportPeriod()
+{
+    var now = new DateTime(2026, 5, 20);
+    var workId = ObjectId(71);
+    var assignmentId = ObjectId(72);
+    var assigneeUserId = UserId(72);
+    var work = new Work { Id = workId, DueDate = now.AddDays(2) };
+    var assignment = PeriodicAssignment(workId, assignmentId, now.AddDays(-1), now.AddDays(2));
+    var binding = Binding(workId, assignmentId, assigneeUserId);
+    var period = ScheduledPeriod(workId, assignmentId, assigneeUserId, now, WorkReportPeriodStatus.Pending);
+
+    var readiness = WorkAssignmentCompletionReadiness.Evaluate(
+        work,
+        new[] { assignment },
+        new[] { assignmentId },
+        new[] { binding },
+        new[] { period },
+        completedDate: now,
+        nowUtc: now);
+
+    AssertFalse(readiness.CanComplete, "completion should be blocked while a materialized period is still open");
+    AssertEqual(1, readiness.OpenPeriodCount, "open materialized period should be counted");
+}
+
+static void BlocksCompletionWithFutureExpectedReportPeriods()
+{
+    var now = new DateTime(2026, 5, 20);
+    var workId = ObjectId(73);
+    var assignmentId = ObjectId(74);
+    var assigneeUserId = UserId(74);
+    var work = new Work { Id = workId, DueDate = now.AddDays(3) };
+    var assignment = PeriodicAssignment(workId, assignmentId, now, now.AddDays(3));
+    var binding = Binding(workId, assignmentId, assigneeUserId);
+
+    var readiness = WorkAssignmentCompletionReadiness.Evaluate(
+        work,
+        new[] { assignment },
+        new[] { assignmentId },
+        new[] { binding },
+        Array.Empty<WorkReportPeriod>(),
+        completedDate: now,
+        nowUtc: now);
+
+    AssertFalse(readiness.CanComplete, "completion should be blocked when current/future expected periods are not terminal");
+    AssertTrue(readiness.FutureExpectedPendingCount > 0, "future expected report periods should be counted");
+}
+
+static void AllowsCompletionWhenReportsAreTerminalAndNoFutureExpected()
+{
+    var now = new DateTime(2026, 5, 20);
+    var workId = ObjectId(75);
+    var assignmentId = ObjectId(76);
+    var assigneeUserId = UserId(76);
+    var work = new Work { Id = workId, DueDate = now.AddDays(-1) };
+    var assignment = PeriodicAssignment(workId, assignmentId, now.AddDays(-3), now.AddDays(-1));
+    var binding = Binding(workId, assignmentId, assigneeUserId);
+    var period = ScheduledPeriod(workId, assignmentId, assigneeUserId, now.AddDays(-1), WorkReportPeriodStatus.Approved);
+
+    var readiness = WorkAssignmentCompletionReadiness.Evaluate(
+        work,
+        new[] { assignment },
+        new[] { assignmentId },
+        new[] { binding },
+        new[] { period },
+        completedDate: now,
+        nowUtc: now);
+
+    AssertTrue(readiness.CanComplete, "completion should be allowed once report periods are terminal and no current/future periods are expected");
+    AssertEqual(0, readiness.OpenPeriodCount, "terminal periods should not be counted as open");
+    AssertEqual(0, readiness.FutureExpectedPendingCount, "past-only completed scope should not create future expected periods");
+}
+
+static void ResolvesHistoricalDataApprovalFromCompletedDate()
+{
+    var now = new DateTime(2026, 5, 13);
+    var onTimePeriod = new WorkReportPeriod
+    {
+        Status = WorkReportPeriodStatus.OverdueSubmitted,
+        DueAtUtc = new DateTime(2026, 5, 10, 23, 59, 59)
+    };
+    var onTimeReport = new WorkAssignmentReport
+    {
+        IsHistoricalData = true,
+        HistoricalDataApproved = true,
+        CompletedDate = new DateTime(2026, 5, 10),
+        IsLateSubmission = true
+    };
+
+    var onTimeStatus = WorkAssignmentReportHistoricalDataHelper.ResolveApprovedPeriodStatus(onTimePeriod, onTimeReport, now);
+
+    AssertEqual(WorkReportPeriodStatus.Approved, onTimeStatus, "historical report completed by due date should approve on time");
+
+    var lateReport = new WorkAssignmentReport
+    {
+        IsHistoricalData = true,
+        HistoricalDataApproved = true,
+        CompletedDate = new DateTime(2026, 5, 11)
+    };
+
+    var lateStatus = WorkAssignmentReportHistoricalDataHelper.ResolveApprovedPeriodStatus(onTimePeriod, lateReport, now);
+
+    AssertEqual(WorkReportPeriodStatus.OverdueApproved, lateStatus, "historical report completed after due date should approve as overdue");
+}
+
+static void ResolvesHistoricalSubmittedStatusFromCompletedDate()
 {
     var now = new DateTime(2026, 5, 13);
     var period = new WorkReportPeriod
     {
-        Status = WorkReportPeriodStatus.OverdueSubmitted,
-        DueAtUtc = new DateTime(2026, 5, 1)
+        IsHistoricalData = true,
+        DueAtUtc = new DateTime(2026, 5, 10, 23, 59, 59)
     };
     var report = new WorkAssignmentReport
     {
         IsHistoricalData = true,
-        HistoricalDataApproved = true,
-        IsLateSubmission = true
+        CompletedDate = new DateTime(2026, 5, 10)
     };
 
-    var status = WorkAssignmentReportHistoricalDataHelper.ResolveApprovedPeriodStatus(period, report, now);
+    var status = WorkAssignmentReportHistoricalDataHelper.ResolveSubmittedPeriodStatus(period, report, now);
+    var isLate = WorkAssignmentReportHistoricalDataHelper.ResolveIsLateSubmission(
+        isHistoricalData: true,
+        completedDate: report.CompletedDate,
+        dueAtUtc: period.DueAtUtc,
+        now: now);
 
-    AssertEqual(WorkReportPeriodStatus.Approved, status, "historical approved report should not remain overdue");
+    AssertEqual(WorkReportPeriodStatus.Submitted, status, "historical report completed by due date should not become overdue because it is submitted later");
+    AssertFalse(isLate, "historical late flag should use completed date instead of submit time");
+
+    report.CompletedDate = new DateTime(2026, 5, 11);
+    var lateStatus = WorkAssignmentReportHistoricalDataHelper.ResolveSubmittedPeriodStatus(period, report, now);
+    var lateFlag = WorkAssignmentReportHistoricalDataHelper.ResolveIsLateSubmission(
+        isHistoricalData: true,
+        completedDate: report.CompletedDate,
+        dueAtUtc: period.DueAtUtc,
+        now: now);
+
+    AssertEqual(WorkReportPeriodStatus.OverdueSubmitted, lateStatus, "historical report completed after due date should submit as overdue");
+    AssertTrue(lateFlag, "historical late flag should turn on when completed date is after due date");
 }
 
 static void TreatsHistoricalUserCreatedPeriodAsDataOnly()
@@ -583,6 +714,90 @@ static void TreatsHistoricalUserCreatedPeriodAsDataOnly()
     AssertTrue(
         WorkAssignmentReportTemporalPolicy.ContributesToProgress(linked),
         "linked historical user-created period can still be treated as progress-contributing");
+}
+
+static void NormalizesUserCreatedPeriodKeyAsAdHoc()
+{
+    var reportDate = new DateTime(2026, 5, 21);
+    var generated = InvokePrivateStatic<string>(
+        typeof(WorkAssignmentReportService),
+        "NormalizeUserCreatedPeriodKey",
+        null,
+        reportDate);
+    var custom = InvokePrivateStatic<string>(
+        typeof(WorkAssignmentReportService),
+        "NormalizeUserCreatedPeriodKey",
+        "manual-1",
+        reportDate);
+    var alreadyAdHoc = InvokePrivateStatic<string>(
+        typeof(WorkAssignmentReportService),
+        "NormalizeUserCreatedPeriodKey",
+        "ADHOC:manual-2",
+        reportDate);
+
+    AssertEqual("ADHOC:20260521", generated, "generated user-created period key should be namespaced");
+    AssertEqual("ADHOC:manual-1", custom, "custom user-created period key should be namespaced");
+    AssertEqual("ADHOC:manual-2", alreadyAdHoc, "existing ad-hoc namespace should be preserved");
+}
+
+static void RequiresUserCreatedReportDue()
+{
+    AssertThrowsFromReflection(
+        AppErrorCode.WORK_ASSIGNMENT_REPORT_DUE_REQUIRED,
+        () => InvokePrivateStatic<object?>(
+            typeof(WorkAssignmentReportService),
+            "EnsureUserCreatedReportHasDueAtUtc",
+            WorkReportPeriodKind.UserCreated,
+            null,
+            new { reportId = ObjectId(201) }));
+
+    InvokePrivateStatic<object?>(
+        typeof(WorkAssignmentReportService),
+        "EnsureUserCreatedReportHasDueAtUtc",
+        WorkReportPeriodKind.UserCreated,
+        new DateTime(2026, 5, 21),
+        new { reportId = ObjectId(202) });
+}
+
+static void RejectsUserCreatedReportDueAfterAssignmentHardDue()
+{
+    var assignmentDueAtUtc = new DateTime(2026, 5, 21, 12, 0, 0, DateTimeKind.Utc);
+    var assignment = new WorkAssignment
+    {
+        DueAtUtc = assignmentDueAtUtc
+    };
+
+    var laterThanAssignmentDue = new DateTime(2026, 5, 30, 23, 59, 0, DateTimeKind.Utc);
+
+    AssertThrowsFromReflection(
+        AppErrorCode.WORK_ASSIGNMENT_REPORT_DUE_AFTER_ASSIGNMENT_DUE,
+        () => InvokePrivateStatic<object?>(
+            typeof(WorkAssignmentReportService),
+            "EnsureUserCreatedReportDueAtOrBeforeAssignmentDueAtUtc",
+            WorkReportPeriodKind.UserCreated,
+            laterThanAssignmentDue,
+            assignment,
+            new { reportId = ObjectId(203) }));
+
+    var preserved = InvokePrivateStatic<DateTime?>(
+        typeof(WorkAssignmentReportService),
+        "ResolveEffectiveReportDueAtUtc",
+        laterThanAssignmentDue,
+        assignment);
+    var stricterReportDue = InvokePrivateStatic<DateTime?>(
+        typeof(WorkAssignmentReportService),
+        "ResolveEffectiveReportDueAtUtc",
+        new DateTime(2026, 5, 20, 23, 59, 0, DateTimeKind.Utc),
+        assignment);
+    var assignmentFallback = InvokePrivateStatic<DateTime?>(
+        typeof(WorkAssignmentReportService),
+        "ResolveEffectiveReportDueAtUtc",
+        null,
+        assignment);
+
+    AssertEqual(laterThanAssignmentDue, preserved, "report due later than assignment due should not be silently capped");
+    AssertEqual(new DateTime(2026, 5, 20, 23, 59, 0, DateTimeKind.Utc), stricterReportDue, "report due earlier than assignment due should be kept");
+    AssertEqual(assignmentDueAtUtc, assignmentFallback, "missing report due should still fall back to assignment due for scheduled periods");
 }
 
 static void MatchesHistoricalReportSourceWindowForAggregation()
@@ -1577,6 +1792,53 @@ static void BuildsUploadEndpointFromForwardedRequest()
     AssertEqual("https://tdtd.conganthanhhoa.vn/api/uploads", endpoint, "forwarded request scheme and host should produce HTTPS TUS endpoint");
 }
 
+static WorkAssignment PeriodicAssignment(string workId, string assignmentId, DateTime startDate, DateTime dueDate) => new()
+{
+    Id = assignmentId,
+    WorkId = workId,
+    Path = $"/{assignmentId}",
+    AssignmentType = WorkAssignmentTypes.PeriodicReport,
+    StartDate = startDate.Date,
+    DueDate = dueDate.Date,
+    Schedule = new AssignmentSchedule
+    {
+        CycleType = ReportCycleTypes.Daily,
+        StartDate = startDate.Date,
+        QuarterDays = Array.Empty<int>(),
+        SemiAnnualDays = Array.Empty<int>()
+    },
+    IsActive = true
+};
+
+static WorkTemplateAssignee Binding(string workId, string assignmentId, string assigneeUserId) => new()
+{
+    Id = ObjectId(77),
+    WorkId = workId,
+    WorkAssignmentId = assignmentId,
+    AssigneeUserId = assigneeUserId,
+    IsActive = true
+};
+
+static WorkReportPeriod ScheduledPeriod(
+    string workId,
+    string assignmentId,
+    string assigneeUserId,
+    DateTime dueAtUtc,
+    WorkReportPeriodStatus status) => new()
+{
+    Id = ObjectId(78),
+    WorkId = workId,
+    WorkAssignmentId = assignmentId,
+    WorkTemplateAssigneeId = ObjectId(77),
+    AssigneeUserId = assigneeUserId,
+    PeriodKey = $"{dueAtUtc:yyyyMMdd}",
+    PeriodInstanceKey = $"{dueAtUtc:yyyyMMdd}",
+    PeriodKind = WorkReportPeriodKind.Scheduled,
+    DueAtUtc = dueAtUtc,
+    Status = status,
+    IsActive = true
+};
+
 static Work WorkOwnedBy(string userId) => new()
 {
     Id = ObjectId(1),
@@ -1639,6 +1901,61 @@ static WorkReportPayloadSnapshot MatchingPayloadSnapshot(
         PayloadStatus: report.PayloadStatus,
         IsExternalPayload: isExternalPayload,
         PayloadHashVerified: payloadHashVerified);
+
+static void AllowsFormOnlyReportWithoutDynamicExcelTemplate()
+{
+    var report = ReadyPayloadReport();
+    report.DynamicFormTemplateId = ObjectId(81);
+    report.DynamicExcelTemplateId = null;
+    report.DynamicExcelTemplateCode = string.Empty;
+    report.DynamicExcelTemplateName = string.Empty;
+
+    var doc = report.ToBsonDocument();
+    if (doc.TryGetValue("dynamicExcelTemplateId", out var value) && !value.IsBsonNull)
+        throw new InvalidOperationException("Form-only reports must not require dynamicExcelTemplateId.");
+}
+
+static void ResolvesDynamicExcelIdFromFormBlocks()
+{
+    var excelId = ObjectId(82);
+    var method = typeof(WorkAssignmentReportService).GetMethod(
+        "ExtractPrimaryDynamicExcelTemplateId",
+        BindingFlags.NonPublic | BindingFlags.Static)
+        ?? throw new MissingMethodException(nameof(WorkAssignmentReportService), "ExtractPrimaryDynamicExcelTemplateId");
+
+    var resolved = (string?)method.Invoke(null, new object?[]
+    {
+        null,
+        "[{\"blockId\":\"b1\",\"dynamicExcelTemplateId\":\"" + excelId + "\"}]"
+    });
+    if (resolved != excelId)
+        throw new InvalidOperationException($"Expected {excelId}, got {resolved ?? "<null>"}.");
+
+    var noExcel = (string?)method.Invoke(null, new object?[] { null, "[]" });
+    if (noExcel is not null)
+        throw new InvalidOperationException("A Dynamic Form with no Excel block should resolve no Excel template.");
+}
+
+static void CompactsReportPayloadHeader()
+{
+    var report = ReadyPayloadReport();
+    report.Values1DJson = "[1,2,3]";
+    report.FieldValuesJson = "{\"field\":\"value\"}";
+    report.TableValuesJson = "{\"blocks\":[{\"blockId\":\"b1\"}]}";
+    report.SummarySourceJson = "{\"kind\":\"AUTO_SUMMARY\"}";
+
+    var method = typeof(WorkAssignmentReportService).GetMethod(
+        "CompactEmbeddedPayloadHeader",
+        BindingFlags.NonPublic | BindingFlags.Static)
+        ?? throw new MissingMethodException(nameof(WorkAssignmentReportService), "CompactEmbeddedPayloadHeader");
+
+    method.Invoke(null, new object?[] { report });
+
+    if (report.Values1DJson != "[]")
+        throw new InvalidOperationException("Report header must keep an empty values vector after payload compaction.");
+    if (report.FieldValuesJson is not null || report.TableValuesJson is not null || report.SummarySourceJson is not null)
+        throw new InvalidOperationException("Report header must not keep heavy embedded payload fields after compaction.");
+}
 
 static Unit TestUnit(int seed, string code, int level, string? parentUnitId) => new()
 {

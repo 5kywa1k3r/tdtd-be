@@ -135,7 +135,7 @@ public sealed class WorkAssignmentReport : BaseEntity
 
     [BsonElement("dynamicExcelTemplateId")]
     [BsonRepresentation(BsonType.ObjectId)]
-    public string DynamicExcelTemplateId { get; set; } = default!;
+    public string? DynamicExcelTemplateId { get; set; }
 
     [BsonElement("dynamicExcelTemplateCode")]
     public string DynamicExcelTemplateCode { get; set; } = default!;
