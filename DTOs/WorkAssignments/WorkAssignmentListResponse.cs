@@ -6,6 +6,7 @@ public sealed class WorkAssignmentListResponse
 {
     public string Id { get; set; } = default!;
     public string WorkId { get; set; } = default!;
+    public string Name { get; set; } = string.Empty;
 
     public string DynamicExcelId { get; set; } = default!;
     public string DynamicExcelCode { get; set; } = string.Empty;

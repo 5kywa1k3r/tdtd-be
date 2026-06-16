@@ -42,7 +42,14 @@ public sealed record CreateDynamicExcelReq(
 );
 
 public sealed record UpdateDynamicExcelReq(
-    string Name
+    string Name,
+    string? TableMode = null,
+    int? ContractVersion = null,
+    string? RawWorkbookDataJson = null,
+    string? SpecJson = null,
+    DynamicExcelDataRectDto? DataRect = null,
+    int? W = null,
+    int? H = null
 );
 
 public sealed record DynamicExcelSearchReq(

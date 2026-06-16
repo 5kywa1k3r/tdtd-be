@@ -4,6 +4,7 @@ public sealed class ReviewReportFlatSearchRequest
 {
     public string WorkId { get; set; } = string.Empty;
     public string AssignmentId { get; set; } = string.Empty;
+    public string? ScopeAssignmentId { get; set; }
     public string? Q { get; set; }
     public string? DynamicExcelId { get; set; }
     public string? PeriodKey { get; set; }

@@ -1,5 +1,6 @@
 ﻿using MongoDB.Bson;
 using MongoDB.Driver;
+using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using tdtd_be.Common.Auth;
@@ -24,18 +25,28 @@ public interface IDynamicExcelService
 
 public sealed class DynamicExcelService : IDynamicExcelService
 {
-    private const int MaxDataCells = 250;
+    private const int MaxDataCells = DynamicExcelRuntimePolicy.MaxDirectTableAggregateInputCells;
     private const int MaxHeaderRows = 30;
     private const int MaxHeaderCols = 30;
-    private const int MaxSheetCells = 5000;
+    private const int MaxSheetCells = 20000;
+    private const int MaxJsonScanDepth = 80;
+
+    private static readonly Regex DangerousTemplateTextRegex = new(
+        @"<\s*(script|iframe|object|embed|svg|img|style|link|meta)\b|javascript\s*:|vbscript\s*:|data\s*:\s*text/html|on[a-z]+\s*=",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
 
     private readonly MongoDbContext _ctx;
     private readonly MeAccessor _me;
+    private readonly ILabelEnumCatalogService _enumCatalogs;
 
-    public DynamicExcelService(MongoDbContext ctx, MeAccessor me)
+    public DynamicExcelService(
+        MongoDbContext ctx,
+        MeAccessor me,
+        ILabelEnumCatalogService enumCatalogs)
     {
         _ctx = ctx;
         _me = me;
+        _enumCatalogs = enumCatalogs;
     }
 
     private void RequireCanMutate(MeResponse me, DynamicExcelTemplate doc)
@@ -49,6 +60,14 @@ public sealed class DynamicExcelService : IDynamicExcelService
     }
 
     private async Task EnsureNotLinkedToWorkAsync(string templateId, CancellationToken ct)
+    {
+        await EnsureNotLinkedToRuntimeAsync(templateId, ct);
+
+        if (await IsUsedByDynamicFormAsync(templateId, ct))
+            throw DynamicExcelInUse(AppErrorCode.DYNAMIC_EXCEL_IN_USE_BY_DYNAMIC_FORM, templateId);
+    }
+
+    private async Task EnsureNotLinkedToRuntimeAsync(string templateId, CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(templateId))
             throw DynamicExcelIdRequired(templateId);
@@ -76,9 +95,6 @@ public sealed class DynamicExcelService : IDynamicExcelService
             .AnyAsync(ct);
         if (usedByReport)
             throw DynamicExcelInUse(AppErrorCode.DYNAMIC_EXCEL_IN_USE_BY_REPORT, templateId);
-
-        if (await IsUsedByDynamicFormAsync(templateId, ct))
-            throw DynamicExcelInUse(AppErrorCode.DYNAMIC_EXCEL_IN_USE_BY_DYNAMIC_FORM, templateId);
     }
 
     private static string NormalizeSortDir(string? dir)
@@ -263,6 +279,7 @@ public sealed class DynamicExcelService : IDynamicExcelService
     {
         var me = _me.RequireMe();
         var tableMode = ValidateDynamicExcelPayload(req);
+        await _enumCatalogs.ValidateVisibleActiveCatalogsAsync(ExtractEnumCatalogIdsFromDynamicExcelSpec(req.SpecJson), ct);
 
         var now = DateTime.UtcNow;
         var y = now.Year;
@@ -324,6 +341,45 @@ public sealed class DynamicExcelService : IDynamicExcelService
             .Set(x => x.UpdatedAtUtc, now)
             .Set(x => x.UpdatedByUserId, me.Id);
 
+        var updatesWorkbook =
+            !string.IsNullOrWhiteSpace(req.TableMode) ||
+            req.ContractVersion.HasValue ||
+            !string.IsNullOrWhiteSpace(req.RawWorkbookDataJson) ||
+            !string.IsNullOrWhiteSpace(req.SpecJson) ||
+            req.DataRect is not null ||
+            req.W.HasValue ||
+            req.H.HasValue;
+
+        if (updatesWorkbook)
+        {
+            await EnsureNotLinkedToRuntimeAsync(id, ct);
+            var payload = new CreateDynamicExcelReq(
+                doc.Code,
+                req.Name,
+                string.IsNullOrWhiteSpace(req.TableMode) ? doc.TableMode : req.TableMode,
+                req.ContractVersion ?? doc.ContractVersion,
+                string.IsNullOrWhiteSpace(req.RawWorkbookDataJson) ? doc.RawWorkbookDataJson : req.RawWorkbookDataJson,
+                string.IsNullOrWhiteSpace(req.SpecJson) ? doc.SpecJson : req.SpecJson,
+                req.DataRect ?? new DynamicExcelDataRectDto(doc.DataRectR0, doc.DataRectC0, doc.DataRectR1, doc.DataRectC1),
+                req.W ?? doc.W,
+                req.H ?? doc.H);
+            var tableMode = ValidateDynamicExcelPayload(payload);
+            ValidateDynamicExcelSemanticUpdateContract(doc, payload);
+            await _enumCatalogs.ValidateVisibleActiveCatalogsAsync(ExtractEnumCatalogIdsFromDynamicExcelSpec(payload.SpecJson), ct);
+
+            update = update
+                .Set(x => x.TableMode, tableMode)
+                .Set(x => x.ContractVersion, Math.Max(1, payload.ContractVersion ?? 1))
+                .Set(x => x.RawWorkbookDataJson, payload.RawWorkbookDataJson.Trim())
+                .Set(x => x.SpecJson, payload.SpecJson.Trim())
+                .Set(x => x.DataRectR0, payload.DataRect?.R0 ?? 0)
+                .Set(x => x.DataRectC0, payload.DataRect?.C0 ?? 0)
+                .Set(x => x.DataRectR1, payload.DataRect?.R1 ?? 0)
+                .Set(x => x.DataRectC1, payload.DataRect?.C1 ?? 0)
+                .Set(x => x.W, payload.W)
+                .Set(x => x.H, payload.H);
+        }
+
         var res = await _ctx.DynamicExcelTemplates.UpdateOneAsync(filter, update, cancellationToken: ct);
         if (res.MatchedCount == 0)
             throw DynamicExcelNotFound(id);
@@ -384,8 +440,10 @@ public sealed class DynamicExcelService : IDynamicExcelService
 
         var w = width ?? 0;
         var h = height ?? 0;
-        if (w <= 0 || h <= 0 || w > 200 || h > 200)
-            throw DynamicExcelValidation("Kích thước vùng nhập dữ liệu của biểu mẫu Excel động phải nằm trong 1..200.", new { w, h });
+        if (w <= 0 || h <= 0 || w > MaxSheetCells || h > MaxSheetCells)
+            throw DynamicExcelValidation(
+                $"Kích thước vùng nhập dữ liệu của biểu mẫu Excel động phải nằm trong 1..{MaxSheetCells}.",
+                new { w, h, maxDimension = MaxSheetCells });
 
         if (dataRect.R0 < 0 || dataRect.C0 < 0 || dataRect.R1 < dataRect.R0 || dataRect.C1 < dataRect.C0)
             throw DynamicExcelValidation("Vùng nhập dữ liệu của biểu mẫu Excel động không hợp lệ.", new { dataRect });
@@ -402,6 +460,8 @@ public sealed class DynamicExcelService : IDynamicExcelService
             "rawWorkbookDataJson",
             JsonValueKind.Array);
         using var specDocument = ParseRequiredJson(specJson, "specJson", JsonValueKind.Object);
+        ValidateNoDangerousTemplateStrings(workbookDocument.RootElement, "rawWorkbookDataJson");
+        ValidateNoDangerousTemplateStrings(specDocument.RootElement, "specJson");
 
         var kind = ReadJsonString(specDocument.RootElement, "kind")?.ToUpperInvariant();
         if (kind is not ("TOP" or "LEFT" or "MATRIX"))
@@ -422,6 +482,7 @@ public sealed class DynamicExcelService : IDynamicExcelService
         var tableMode = NormalizeDynamicExcelTableMode(tableModeRaw);
         ValidateDynamicExcelTableMode(kind, tableMode);
         ValidateNumericGridSpec(specDocument.RootElement, kind, dataRect, w, h);
+        var specialRanges = ValidateDynamicExcelSpecialRanges(specDocument.RootElement, dataRect);
 
         if (workbookDocument.RootElement.GetArrayLength() == 0)
             throw DynamicExcelValidation("Dữ liệu bảng tính của biểu mẫu Excel động phải có ít nhất một sheet.", new { field = "rawWorkbookDataJson" });
@@ -438,7 +499,436 @@ public sealed class DynamicExcelService : IDynamicExcelService
         if (sheetCols > 0 && dataRect.C1 >= sheetCols)
             throw DynamicExcelValidation("Vùng nhập dữ liệu vượt quá số cột của bảng tính.", new { dataRect, sheetCols });
 
+        ValidateDynamicExcelWorkbookInputCellsAreEmpty(workbookDocument.RootElement, dataRect, specialRanges);
+
         return tableMode;
+    }
+
+    private static void ValidateDynamicExcelSemanticUpdateContract(
+        DynamicExcelTemplate current,
+        CreateDynamicExcelReq next)
+    {
+        var currentDataRect = new DynamicExcelDataRectDto(
+            current.DataRectR0,
+            current.DataRectC0,
+            current.DataRectR1,
+            current.DataRectC1);
+        var nextDataRect = next.DataRect
+            ?? throw DynamicExcelValidation("Thiếu vùng nhập dữ liệu của biểu mẫu Excel động.", new { field = "dataRect" });
+
+        if (!DynamicExcelDataRectEquals(currentDataRect, nextDataRect) ||
+            current.W != next.W ||
+            current.H != next.H)
+        {
+            throw DynamicExcelValidation(
+                "Không được sửa cấu trúc bảng Excel động ở màn hình cập nhật. Chỉ được cập nhật header, tiêu đề và công thức.",
+                new
+                {
+                    locked = new { dataRect = currentDataRect, current.W, current.H },
+                    requested = new { dataRect = nextDataRect, next.W, next.H }
+                });
+        }
+
+        var nextTableMode = NormalizeDynamicExcelTableMode(next.TableMode);
+        if (!string.Equals(current.TableMode, nextTableMode, StringComparison.Ordinal))
+        {
+            throw DynamicExcelValidation(
+                "Không được sửa kiểu nhập/tổng hợp bảng Excel động ở màn hình cập nhật.",
+                new { current.TableMode, requestedTableMode = nextTableMode });
+        }
+
+        var currentContractVersion = Math.Max(1, current.ContractVersion);
+        var nextContractVersion = Math.Max(1, next.ContractVersion ?? 1);
+        if (currentContractVersion != nextContractVersion)
+        {
+            throw DynamicExcelValidation(
+                "Không được sửa phiên bản contract của bảng Excel động ở màn hình cập nhật.",
+                new { currentContractVersion, nextContractVersion });
+        }
+
+        using var currentSpecDocument = ParseRequiredJson(current.SpecJson, "specJson", JsonValueKind.Object);
+        using var nextSpecDocument = ParseRequiredJson(next.SpecJson, "specJson", JsonValueKind.Object);
+        ValidateNoUnexpectedDynamicExcelSpecProperties(nextSpecDocument.RootElement);
+
+        var currentLockedSpec = CanonicalizeLockedDynamicExcelSpec(currentSpecDocument.RootElement);
+        var nextLockedSpec = CanonicalizeLockedDynamicExcelSpec(nextSpecDocument.RootElement);
+        if (!string.Equals(currentLockedSpec, nextLockedSpec, StringComparison.Ordinal))
+        {
+            throw DynamicExcelValidation(
+                "Không được sửa loại bảng, kích thước, vùng dữ liệu hoặc kiểu dữ liệu. Chỉ được cập nhật header, tiêu đề và công thức.",
+                new { field = "specJson" });
+        }
+
+        var currentLockedSpecialRanges = CanonicalizeLockedSpecialRanges(currentSpecDocument.RootElement, currentDataRect);
+        var nextLockedSpecialRanges = CanonicalizeLockedSpecialRanges(nextSpecDocument.RootElement, nextDataRect);
+        if (!string.Equals(currentLockedSpecialRanges, nextLockedSpecialRanges, StringComparison.Ordinal))
+        {
+            throw DynamicExcelValidation(
+                "Không được sửa các vùng đặc biệt đang khóa. Chỉ được thêm, sửa hoặc xóa vùng tiêu đề/công thức.",
+                new { field = "specJson.specialRanges" });
+        }
+    }
+
+    private static bool DynamicExcelDataRectEquals(DynamicExcelDataRectDto a, DynamicExcelDataRectDto b)
+        => a.R0 == b.R0 && a.C0 == b.C0 && a.R1 == b.R1 && a.C1 == b.C1;
+
+    private static string CanonicalizeLockedSpecialRanges(JsonElement spec, DynamicExcelDataRectDto dataRect)
+    {
+        var ranges = ValidateDynamicExcelSpecialRanges(spec, dataRect)
+            .Where(range => !IsEditableSemanticSpecialRangeRole(range.Role))
+            .OrderBy(range => range.R0)
+            .ThenBy(range => range.C0)
+            .ThenBy(range => range.R1)
+            .ThenBy(range => range.C1)
+            .ThenBy(range => range.Role, StringComparer.Ordinal)
+            .Select(range => new { range.Role, range.R0, range.C0, range.R1, range.C1 })
+            .ToList();
+
+        return JsonSerializer.Serialize(ranges);
+    }
+
+    private static bool IsEditableSemanticSpecialRangeRole(string? role)
+        => string.Equals(role, "FORMULA", StringComparison.Ordinal) ||
+           string.Equals(role, "TITLE", StringComparison.Ordinal);
+
+    private static void ValidateNoUnexpectedDynamicExcelSpecProperties(JsonElement spec)
+    {
+        var kind = ReadJsonString(spec, "kind")?.ToUpperInvariant();
+        var allowed = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "kind",
+            "defaultDataType",
+            "defaultOptions",
+            "dataTypeOverrides",
+            "specialRanges"
+        };
+
+        foreach (var propertyName in kind switch
+        {
+            "TOP" => new[] { "topRows", "topCols", "dataRows" },
+            "LEFT" => new[] { "leftRows", "leftCols", "dataCols" },
+            "MATRIX" => new[] { "topRows", "topCols", "leftRows", "leftCols" },
+            _ => Array.Empty<string>()
+        })
+        {
+            allowed.Add(propertyName);
+        }
+
+        var unexpected = spec.EnumerateObject()
+            .Select(property => property.Name)
+            .Where(propertyName => !allowed.Contains(propertyName))
+            .ToList();
+
+        if (unexpected.Count == 0)
+            return;
+
+        throw DynamicExcelValidation(
+            "specJson của Dynamic Excel có trường không thuộc contract cập nhật an toàn.",
+            new { field = "specJson", unexpected });
+    }
+
+    private static string CanonicalizeLockedDynamicExcelSpec(JsonElement spec)
+    {
+        var kind = ReadJsonString(spec, "kind")?.ToUpperInvariant();
+        var locked = new SortedDictionary<string, string?>(StringComparer.Ordinal)
+        {
+            ["kind"] = kind,
+            ["defaultDataType"] = spec.TryGetProperty("defaultDataType", out var defaultDataType)
+                ? NormalizeDynamicExcelDataType(ReadJsonString(spec, "defaultDataType"), "specJson.defaultDataType")
+                : LabelDataTypes.Number,
+            ["defaultOptions"] = spec.TryGetProperty("defaultOptions", out var defaultOptions) && defaultOptions.ValueKind != JsonValueKind.Null
+                ? CanonicalizeJson(defaultOptions)
+                : "[]",
+            ["dataTypeOverrides"] = CanonicalizeDynamicExcelDataTypeOverrides(spec),
+        };
+
+        switch (kind)
+        {
+            case "TOP":
+                locked["topRows"] = ReadRequiredPositiveInt(spec, "topRows").ToString();
+                locked["topCols"] = ReadRequiredPositiveInt(spec, "topCols").ToString();
+                locked["dataRows"] = ReadRequiredPositiveInt(spec, "dataRows").ToString();
+                break;
+            case "LEFT":
+                locked["leftRows"] = ReadRequiredPositiveInt(spec, "leftRows").ToString();
+                locked["leftCols"] = ReadRequiredPositiveInt(spec, "leftCols").ToString();
+                locked["dataCols"] = ReadRequiredPositiveInt(spec, "dataCols").ToString();
+                break;
+            case "MATRIX":
+                locked["topRows"] = ReadRequiredPositiveInt(spec, "topRows").ToString();
+                locked["topCols"] = ReadRequiredPositiveInt(spec, "topCols").ToString();
+                locked["leftRows"] = ReadRequiredPositiveInt(spec, "leftRows").ToString();
+                locked["leftCols"] = ReadRequiredPositiveInt(spec, "leftCols").ToString();
+                break;
+        }
+
+        return JsonSerializer.Serialize(locked);
+    }
+
+    private static string CanonicalizeDynamicExcelDataTypeOverrides(JsonElement spec)
+    {
+        if (!spec.TryGetProperty("dataTypeOverrides", out var overrides) ||
+            overrides.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined)
+        {
+            return "[]";
+        }
+
+        if (overrides.ValueKind != JsonValueKind.Array)
+            return CanonicalizeJson(overrides);
+
+        var items = overrides
+            .EnumerateArray()
+            .Where(item => item.ValueKind == JsonValueKind.Object)
+            .Select(CanonicalizeDynamicExcelDataTypeOverride)
+            .OrderBy(item => item, StringComparer.Ordinal)
+            .ToList();
+
+        return JsonSerializer.Serialize(items);
+    }
+
+    private static string CanonicalizeDynamicExcelDataTypeOverride(JsonElement item)
+    {
+        var scope = ReadJsonString(item, "scope")?.ToUpperInvariant();
+        var dataType = NormalizeDynamicExcelDataType(ReadJsonString(item, "dataType"), "specJson.dataTypeOverrides[].dataType");
+        var locked = new SortedDictionary<string, object?>(StringComparer.Ordinal)
+        {
+            ["scope"] = scope,
+            ["dataType"] = dataType,
+        };
+
+        if (scope == "COLUMN" || scope == "ROW")
+            locked["index"] = ReadRequiredNonNegativeInt(item, "index");
+        else if (scope == "RANGE")
+        {
+            locked["r0"] = ReadRequiredNonNegativeInt(item, "r0");
+            locked["c0"] = ReadRequiredNonNegativeInt(item, "c0");
+            locked["r1"] = ReadRequiredNonNegativeInt(item, "r1");
+            locked["c1"] = ReadRequiredNonNegativeInt(item, "c1");
+        }
+
+        if (item.TryGetProperty("options", out var options) &&
+            options.ValueKind == JsonValueKind.Array &&
+            options.GetArrayLength() > 0)
+        {
+            locked["options"] = CanonicalizeJson(options);
+        }
+
+        if (item.TryGetProperty("valueSource", out var valueSource) &&
+            valueSource.ValueKind == JsonValueKind.Object)
+        {
+            locked["valueSource"] = CanonicalizeJson(valueSource);
+        }
+
+        return JsonSerializer.Serialize(locked);
+    }
+
+    private static string CanonicalizeJson(JsonElement element, Func<string, bool>? skipProperty = null)
+    {
+        using var stream = new MemoryStream();
+        using (var writer = new Utf8JsonWriter(stream))
+        {
+            WriteCanonicalJson(writer, element, skipProperty);
+        }
+
+        return Encoding.UTF8.GetString(stream.ToArray());
+    }
+
+    private static void WriteCanonicalJson(
+        Utf8JsonWriter writer,
+        JsonElement element,
+        Func<string, bool>? skipProperty)
+    {
+        switch (element.ValueKind)
+        {
+            case JsonValueKind.Object:
+                writer.WriteStartObject();
+                foreach (var property in element.EnumerateObject().OrderBy(property => property.Name, StringComparer.Ordinal))
+                {
+                    if (skipProperty?.Invoke(property.Name) == true)
+                        continue;
+
+                    writer.WritePropertyName(property.Name);
+                    WriteCanonicalJson(writer, property.Value, skipProperty);
+                }
+                writer.WriteEndObject();
+                break;
+            case JsonValueKind.Array:
+                writer.WriteStartArray();
+                foreach (var item in element.EnumerateArray())
+                    WriteCanonicalJson(writer, item, skipProperty);
+                writer.WriteEndArray();
+                break;
+            case JsonValueKind.String:
+                writer.WriteStringValue(element.GetString());
+                break;
+            case JsonValueKind.Number:
+                writer.WriteRawValue(element.GetRawText());
+                break;
+            case JsonValueKind.True:
+                writer.WriteBooleanValue(true);
+                break;
+            case JsonValueKind.False:
+                writer.WriteBooleanValue(false);
+                break;
+            case JsonValueKind.Null:
+            case JsonValueKind.Undefined:
+                writer.WriteNullValue();
+                break;
+        }
+    }
+
+    private static void ValidateNoDangerousTemplateStrings(JsonElement element, string fieldName)
+        => ValidateNoDangerousTemplateStrings(element, fieldName, "$", 0);
+
+    private static void ValidateNoDangerousTemplateStrings(
+        JsonElement element,
+        string fieldName,
+        string path,
+        int depth)
+    {
+        if (depth > MaxJsonScanDepth)
+            throw DynamicExcelValidation(
+                "JSON template Excel động quá sâu, không an toàn để xử lý.",
+                new { field = fieldName, path, maxDepth = MaxJsonScanDepth });
+
+        switch (element.ValueKind)
+        {
+            case JsonValueKind.String:
+                var text = element.GetString();
+                if (!string.IsNullOrEmpty(text) && DangerousTemplateTextRegex.IsMatch(text))
+                    throw DynamicExcelValidation(
+                        "Nội dung template Excel động có chuỗi không an toàn.",
+                        new { field = fieldName, path });
+                break;
+            case JsonValueKind.Object:
+                foreach (var property in element.EnumerateObject())
+                {
+                    if (property.Name is "__proto__" or "constructor" or "prototype" ||
+                        DangerousTemplateTextRegex.IsMatch(property.Name))
+                    {
+                        throw DynamicExcelValidation(
+                            "Tên thuộc tính JSON trong template Excel động không an toàn.",
+                            new { field = fieldName, path = $"{path}.{property.Name}" });
+                    }
+
+                    ValidateNoDangerousTemplateStrings(property.Value, fieldName, $"{path}.{property.Name}", depth + 1);
+                }
+                break;
+            case JsonValueKind.Array:
+                var index = 0;
+                foreach (var item in element.EnumerateArray())
+                {
+                    ValidateNoDangerousTemplateStrings(item, fieldName, $"{path}[{index}]", depth + 1);
+                    index++;
+                }
+                break;
+        }
+    }
+
+    private static void ValidateDynamicExcelWorkbookInputCellsAreEmpty(
+        JsonElement workbook,
+        DynamicExcelDataRectDto dataRect,
+        IReadOnlyCollection<DynamicExcelSpecialRange> specialRanges)
+    {
+        if (workbook.ValueKind != JsonValueKind.Array || workbook.GetArrayLength() == 0)
+            return;
+
+        var firstSheet = workbook[0];
+        if (firstSheet.ValueKind != JsonValueKind.Object)
+            return;
+
+        if (firstSheet.TryGetProperty("data", out var data) && data.ValueKind == JsonValueKind.Array)
+        {
+            var rowIndex = 0;
+            foreach (var row in data.EnumerateArray())
+            {
+                if (row.ValueKind == JsonValueKind.Array)
+                {
+                    var colIndex = 0;
+                    foreach (var cell in row.EnumerateArray())
+                    {
+                        ValidateDynamicExcelTemplateInputCell(cell, rowIndex, colIndex, dataRect, specialRanges, "data");
+                        colIndex++;
+                    }
+                }
+
+                rowIndex++;
+            }
+        }
+
+        if (!firstSheet.TryGetProperty("celldata", out var celldata) || celldata.ValueKind != JsonValueKind.Array)
+            return;
+
+        foreach (var item in celldata.EnumerateArray())
+        {
+            if (item.ValueKind != JsonValueKind.Object)
+                continue;
+
+            var r = ReadJsonInt(item, "r");
+            var c = ReadJsonInt(item, "c");
+            if (!r.HasValue || !c.HasValue)
+                continue;
+
+            var cell = item.TryGetProperty("v", out var value) ? value : item;
+            ValidateDynamicExcelTemplateInputCell(cell, r.Value, c.Value, dataRect, specialRanges, "celldata");
+        }
+    }
+
+    private static void ValidateDynamicExcelTemplateInputCell(
+        JsonElement cell,
+        int r,
+        int c,
+        DynamicExcelDataRectDto dataRect,
+        IReadOnlyCollection<DynamicExcelSpecialRange> specialRanges,
+        string source)
+    {
+        if (!IsDynamicExcelInputCell(dataRect, specialRanges, r, c))
+            return;
+
+        if (!HasMeaningfulDynamicExcelTemplateCellValue(cell))
+            return;
+
+        throw DynamicExcelValidation(
+            "Template Excel động không được nhập sẵn dữ liệu trong vùng reporter nhập.",
+            new { source, cell = new { r, c }, dataRect });
+    }
+
+    private static bool IsDynamicExcelInputCell(
+        DynamicExcelDataRectDto dataRect,
+        IReadOnlyCollection<DynamicExcelSpecialRange> specialRanges,
+        int r,
+        int c)
+    {
+        if (r < dataRect.R0 || r > dataRect.R1 || c < dataRect.C0 || c > dataRect.C1)
+            return false;
+
+        return !specialRanges.Any(range => DynamicExcelRangeContains(range, r, c));
+    }
+
+    private static bool HasMeaningfulDynamicExcelTemplateCellValue(JsonElement cell)
+    {
+        return cell.ValueKind switch
+        {
+            JsonValueKind.String => !string.IsNullOrWhiteSpace(cell.GetString()),
+            JsonValueKind.Number => true,
+            JsonValueKind.True or JsonValueKind.False => true,
+            JsonValueKind.Object => HasMeaningfulDynamicExcelTemplateCellObject(cell),
+            _ => false
+        };
+    }
+
+    private static bool HasMeaningfulDynamicExcelTemplateCellObject(JsonElement cell)
+    {
+        foreach (var propertyName in new[] { "v", "m", "f" })
+        {
+            if (!cell.TryGetProperty(propertyName, out var value))
+                continue;
+
+            if (HasMeaningfulDynamicExcelTemplateCellValue(value))
+                return true;
+        }
+
+        return false;
     }
 
     private static string NormalizeDynamicExcelTableMode(string? value)
@@ -531,7 +1021,8 @@ public sealed class DynamicExcelService : IDynamicExcelService
                 "Cấu hình loại bảng Excel động không khớp chiều rộng/chiều cao vùng dữ liệu.",
                 new { kind, expectedWidth, expectedHeight, width, height });
 
-        ValidateNumericGridLimits(spec, kind, expectedDataRect);
+        var specialRanges = ValidateDynamicExcelSpecialRanges(spec, expectedDataRect);
+        ValidateNumericGridLimits(spec, kind, expectedDataRect, specialRanges);
         ValidateNumericGridDataTypeMetadata(spec, kind, expectedDataRect);
     }
 
@@ -563,14 +1054,15 @@ public sealed class DynamicExcelService : IDynamicExcelService
     private static void ValidateNumericGridLimits(
         JsonElement spec,
         string kind,
-        DynamicExcelDataRectDto dataRect)
+        DynamicExcelDataRectDto dataRect,
+        IReadOnlyCollection<DynamicExcelSpecialRange> specialRanges)
     {
         var dataRows = dataRect.R1 - dataRect.R0 + 1;
         var dataCols = dataRect.C1 - dataRect.C0 + 1;
-        var dataCells = dataRows * dataCols;
+        var dataCells = CountDynamicExcelInputCells(dataRect, specialRanges);
         if (dataCells > MaxDataCells)
             throw DynamicExcelValidation(
-                $"Vùng dữ liệu quá lớn ({dataCols}x{dataRows} = {dataCells} ô). Giới hạn values1D: {MaxDataCells} ô.",
+                $"Vùng dữ liệu có {dataCells} ô nhập trong dataRect {dataCols}x{dataRows}. Giới hạn values1D: {MaxDataCells} ô.",
                 new { dataCols, dataRows, dataCells, maxDataCells = MaxDataCells });
 
         var tableRows = kind switch
@@ -612,6 +1104,111 @@ public sealed class DynamicExcelService : IDynamicExcelService
                 $"Độ sâu vùng tiêu đề quá lớn ({headerCols} cột x {headerRows} hàng). Giới hạn: {MaxHeaderCols} cột và {MaxHeaderRows} hàng.",
                 new { headerCols, headerRows, maxHeaderCols = MaxHeaderCols, maxHeaderRows = MaxHeaderRows });
     }
+
+    private static List<DynamicExcelSpecialRange> ValidateDynamicExcelSpecialRanges(
+        JsonElement spec,
+        DynamicExcelDataRectDto dataRect)
+    {
+        if (!spec.TryGetProperty("specialRanges", out var ranges) || ranges.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined)
+            return new List<DynamicExcelSpecialRange>();
+
+        if (ranges.ValueKind != JsonValueKind.Array)
+            throw DynamicExcelValidation(
+                "specialRanges của Dynamic Excel phải là JSON array.",
+                new { field = "specJson.specialRanges", actualKind = ranges.ValueKind.ToString() });
+
+        var rows = new List<DynamicExcelSpecialRange>();
+        var index = 0;
+        foreach (var item in ranges.EnumerateArray())
+        {
+            if (item.ValueKind != JsonValueKind.Object)
+                throw DynamicExcelValidation(
+                    "specialRanges item phải là JSON object.",
+                    new { index, actualKind = item.ValueKind.ToString() });
+
+            var role = NormalizeDynamicExcelSpecialRole(ReadJsonString(item, "role") ?? ReadJsonString(item, "kind") ?? ReadJsonString(item, "type"));
+            if (string.IsNullOrWhiteSpace(role))
+                throw DynamicExcelValidation(
+                    "specialRanges.role không hợp lệ.",
+                    new { index, allowed = new[] { "FORMULA", "TITLE", "BLANK", "HEADER", "STYLE" } });
+
+            var range = new DynamicExcelSpecialRange(
+                ReadRequiredNonNegativeInt(item, "r0"),
+                ReadRequiredNonNegativeInt(item, "c0"),
+                ReadRequiredNonNegativeInt(item, "r1"),
+                ReadRequiredNonNegativeInt(item, "c1"),
+                role);
+
+            if (range.R1 < range.R0 || range.C1 < range.C0)
+                throw DynamicExcelValidation(
+                    "specialRanges có tọa độ không hợp lệ.",
+                    new { index, range });
+
+            if (range.R0 < dataRect.R0 || range.C0 < dataRect.C0 || range.R1 > dataRect.R1 || range.C1 > dataRect.C1)
+                throw DynamicExcelValidation(
+                    "specialRanges phải nằm trong vùng dữ liệu.",
+                    new { index, range, dataRect });
+
+            rows.Add(range);
+            index++;
+        }
+
+        for (var i = 0; i < rows.Count; i++)
+        {
+            for (var j = i + 1; j < rows.Count; j++)
+            {
+                if (!DynamicExcelRangesOverlap(rows[i], rows[j]))
+                    continue;
+
+                throw DynamicExcelValidation(
+                    "specialRanges không được overlap.",
+                    new { first = i, second = j, ranges = new[] { rows[i], rows[j] } });
+            }
+        }
+
+        if (rows.Count > 0 && CountDynamicExcelInputCells(dataRect, rows) == 0)
+            throw DynamicExcelValidation(
+                "Vùng dữ liệu phải còn ít nhất một ô nhập sau khi loại specialRanges.",
+                new { dataRect });
+
+        return rows;
+    }
+
+    private static int CountDynamicExcelInputCells(
+        DynamicExcelDataRectDto dataRect,
+        IReadOnlyCollection<DynamicExcelSpecialRange> specialRanges)
+    {
+        var count = 0;
+        for (var r = dataRect.R0; r <= dataRect.R1; r++)
+        {
+            for (var c = dataRect.C0; c <= dataRect.C1; c++)
+            {
+                if (specialRanges.Any(range => DynamicExcelRangeContains(range, r, c)))
+                    continue;
+                count++;
+            }
+        }
+
+        return count;
+    }
+
+    private static string? NormalizeDynamicExcelSpecialRole(string? value)
+    {
+        var role = value?.Trim().ToUpperInvariant();
+        if (role == "FORMULAR")
+            role = "FORMULA";
+        if (role == "HEADER")
+            role = "TITLE";
+        if (role is "STYLE" or "EMPTY" or "EMPTY_INPUT")
+            role = "BLANK";
+        return role is "FORMULA" or "TITLE" or "BLANK" ? role : null;
+    }
+
+    private static bool DynamicExcelRangeContains(DynamicExcelSpecialRange range, int r, int c)
+        => r >= range.R0 && r <= range.R1 && c >= range.C0 && c <= range.C1;
+
+    private static bool DynamicExcelRangesOverlap(DynamicExcelSpecialRange a, DynamicExcelSpecialRange b)
+        => a.R0 <= b.R1 && a.R1 >= b.R0 && a.C0 <= b.C1 && a.C1 >= b.C0;
 
     private static void ValidateNumericGridDataTypeMetadata(
         JsonElement spec,
@@ -808,6 +1405,7 @@ public sealed class DynamicExcelService : IDynamicExcelService
             "BOOLEAN" => LabelDataTypes.Boolean,
             "LONGTEXT" or "LONG_TEXT" or "LONGDATE" => LabelDataTypes.LongText,
             "MULTISELECT" or "MULTI_SELECT" => "MULTI_SELECT",
+            "IGNORE" or "IGNORED" or "SKIP" => "IGNORE",
             "STRINGLIST" or "STRING_LIST" => "__DYNAMIC_EXCEL_STRING_LIST_REMOVED__",
             _ => normalized
         };
@@ -829,6 +1427,7 @@ public sealed class DynamicExcelService : IDynamicExcelService
             LabelDataTypes.Boolean => LabelDataTypes.Boolean,
             LabelDataTypes.ShortText => LabelDataTypes.ShortText,
             "MULTI_SELECT" => "MULTI_SELECT",
+            "IGNORE" => "IGNORE",
             _ => throw DynamicExcelValidation(
                 "Kiểu dữ liệu Dynamic Excel không hợp lệ.",
                 new
@@ -842,7 +1441,8 @@ public sealed class DynamicExcelService : IDynamicExcelService
                         "FULL_DATE",
                         LabelDataTypes.Boolean,
                         LabelDataTypes.ShortText,
-                        "MULTI_SELECT"
+                        "MULTI_SELECT",
+                        "IGNORE"
                     }
                 })
         };
@@ -858,10 +1458,50 @@ public sealed class DynamicExcelService : IDynamicExcelService
             !string.Equals(dataType, "MULTI_SELECT", StringComparison.Ordinal))
             return;
 
+        if (TryGetDynamicExcelValueSource(owner, out var valueSource))
+        {
+            if (valueSource.SourceType == LabelValueSourceTypes.EnumCatalog)
+            {
+                if (!string.IsNullOrWhiteSpace(valueSource.CatalogId))
+                    return;
+
+                throw DynamicExcelValidation(
+                    "Nguồn ENUM_CATALOG phải chọn danh mục enum.",
+                    new { field, dataType, sourceType = valueSource.SourceType });
+            }
+
+            if (LabelValueSourceTypes.UsesCatalog(valueSource.SourceType))
+                return;
+
+            if (valueSource.SourceType == LabelValueSourceTypes.FixedEnum &&
+                valueSource.Options.HasValue &&
+                valueSource.Options.Value.ValueKind == JsonValueKind.Array)
+            {
+                ValidateDynamicExcelOptionArray(
+                    valueSource.Options.Value,
+                    dataType,
+                    $"{field}.valueSource.options");
+                return;
+            }
+        }
+
         if (!owner.TryGetProperty(propertyName, out var options) || options.ValueKind != JsonValueKind.Array)
             throw DynamicExcelValidation(
                 $"{dataType} phải cấu hình danh sách enum cố định.",
                 new { field, dataType, propertyName });
+
+        ValidateDynamicExcelOptionArray(options, dataType, field);
+    }
+
+    private static void ValidateDynamicExcelOptionArray(
+        JsonElement options,
+        string dataType,
+        string field)
+    {
+        if (options.ValueKind != JsonValueKind.Array)
+            throw DynamicExcelValidation(
+                $"{dataType} phải cấu hình danh sách enum cố định.",
+                new { field, dataType, actualKind = options.ValueKind.ToString() });
 
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var count = 0;
@@ -897,6 +1537,75 @@ public sealed class DynamicExcelService : IDynamicExcelService
             throw DynamicExcelValidation(
                 $"{dataType} phải có ít nhất một lựa chọn.",
                 new { field, dataType });
+    }
+
+    private static bool TryGetDynamicExcelValueSource(JsonElement owner, out DynamicExcelValueSourceSpec valueSource)
+    {
+        valueSource = default;
+        if (!owner.TryGetProperty("valueSource", out var source) || source.ValueKind != JsonValueKind.Object)
+            return false;
+
+        var sourceType = ReadJsonString(source, "sourceType")
+                         ?? ReadJsonString(source, "type")
+                         ?? ReadJsonString(source, "valueSourceType");
+        var normalized = LabelValueSourceTypes.Normalize(sourceType);
+        if (normalized == LabelValueSourceTypes.None)
+            return false;
+
+        var catalogId = ReadJsonString(source, "catalogId")
+                        ?? ReadJsonString(source, "valueSourceCatalogId")
+                        ?? ReadJsonString(source, "enumCatalogId");
+        JsonElement? options = null;
+        if (source.TryGetProperty("options", out var sourceOptions))
+            options = sourceOptions;
+
+        valueSource = new DynamicExcelValueSourceSpec(normalized, catalogId, options);
+        return true;
+    }
+
+    private readonly record struct DynamicExcelValueSourceSpec(
+        string SourceType,
+        string? CatalogId,
+        JsonElement? Options);
+
+    private static IReadOnlyList<string> ExtractEnumCatalogIdsFromDynamicExcelSpec(string? specJson)
+    {
+        var result = new HashSet<string>(StringComparer.Ordinal);
+        if (string.IsNullOrWhiteSpace(specJson))
+            return Array.Empty<string>();
+
+        try
+        {
+            using var document = JsonDocument.Parse(specJson);
+            CollectEnumCatalogIds(document.RootElement, result);
+        }
+        catch (JsonException)
+        {
+            return Array.Empty<string>();
+        }
+
+        return result.ToList();
+    }
+
+    private static void CollectEnumCatalogIds(JsonElement element, ISet<string> result)
+    {
+        if (element.ValueKind == JsonValueKind.Object)
+        {
+            if (TryGetDynamicExcelValueSource(element, out var source) &&
+                source.SourceType == LabelValueSourceTypes.EnumCatalog &&
+                !string.IsNullOrWhiteSpace(source.CatalogId))
+            {
+                result.Add(source.CatalogId.Trim());
+            }
+
+            foreach (var property in element.EnumerateObject())
+                CollectEnumCatalogIds(property.Value, result);
+        }
+        else if (element.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var item in element.EnumerateArray())
+                CollectEnumCatalogIds(item, result);
+        }
     }
 
     private static int ReadRequiredPositiveInt(JsonElement element, string name)
@@ -1051,6 +1760,7 @@ public sealed class DynamicExcelService : IDynamicExcelService
             : null;
 
     private sealed record DynamicExcelRange(int R0, int C0, int R1, int C1);
+    private sealed record DynamicExcelSpecialRange(int R0, int C0, int R1, int C1, string Role);
 
     private static AppException DynamicExcelValidation(string message, object? details = null)
         => AppExceptionFactory.BadRequest(

@@ -36,6 +36,22 @@ public sealed class LabelCatalogItem : BaseEntity
     [BsonElement("dataType")]
     public string DataType { get; set; } = LabelDataTypes.Number;
 
+    [BsonElement("valueSourceType")]
+    public string ValueSourceType { get; set; } = LabelValueSourceTypes.None;
+
+    [BsonElement("valueOptions")]
+    public List<LabelValueOption> ValueOptions { get; set; } = new();
+
+    [BsonElement("valueSourceCatalogId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? ValueSourceCatalogId { get; set; }
+
+    [BsonElement("valueSourceCatalogCode")]
+    public string? ValueSourceCatalogCode { get; set; }
+
+    [BsonElement("valueSourceCatalogName")]
+    public string? ValueSourceCatalogName { get; set; }
+
     [BsonElement("scopeType")]
     public string ScopeType { get; set; } = LabelScopeTypes.Global;
 
@@ -94,6 +110,62 @@ public static class LabelDataTypes
             "LONGTEXT" => StringList,
             _ => Number
         };
+    }
+}
+
+public sealed class LabelValueOption
+{
+    [BsonElement("code")]
+    public string Code { get; set; } = default!;
+
+    [BsonElement("label")]
+    public string Label { get; set; } = default!;
+}
+
+public static class LabelValueSourceTypes
+{
+    public const string None = "NONE";
+    public const string FixedEnum = "FIXED_ENUM";
+    public const string EnumCatalog = "ENUM_CATALOG";
+    public const string SystemUnit = "SYSTEM_UNIT";
+    public const string SystemUser = "SYSTEM_USER";
+    public const string SystemPosition = "SYSTEM_POSITION";
+    public const string SystemUnitType = "SYSTEM_UNIT_TYPE";
+
+    public static string Normalize(string? value)
+    {
+        var normalized = value?.Trim().ToUpperInvariant();
+        return normalized switch
+        {
+            FixedEnum => FixedEnum,
+            "ENUM" => FixedEnum,
+            "LIST" => FixedEnum,
+            "STATIC_ENUM" => FixedEnum,
+            EnumCatalog => EnumCatalog,
+            "LABEL_ENUM" => EnumCatalog,
+            "LABEL_ENUM_CATALOG" => EnumCatalog,
+            "CUSTOM_ENUM" => EnumCatalog,
+            "CUSTOM_ENUM_CATALOG" => EnumCatalog,
+            SystemUnit => SystemUnit,
+            "UNIT" => SystemUnit,
+            "UNITS" => SystemUnit,
+            SystemUser => SystemUser,
+            "USER" => SystemUser,
+            "USERS" => SystemUser,
+            SystemPosition => SystemPosition,
+            "POSITION" => SystemPosition,
+            "POSITIONS" => SystemPosition,
+            SystemUnitType => SystemUnitType,
+            "UNIT_TYPE" => SystemUnitType,
+            "UNIT_TYPES" => SystemUnitType,
+            _ => None
+        };
+    }
+
+    public static bool UsesCatalog(string? value)
+    {
+        var normalized = Normalize(value);
+        return normalized is EnumCatalog or SystemUnit or SystemUser or SystemPosition or SystemUnitType;
     }
 }
 

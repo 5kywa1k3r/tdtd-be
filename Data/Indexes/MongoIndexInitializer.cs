@@ -54,6 +54,12 @@
             var labels = db.GetCollection<LabelCatalogItem>(opt.LabelCollection);
             await EnsureLabelsAsync(labels, ct);
 
+            var labelEnumCatalogs = db.GetCollection<LabelEnumCatalog>(opt.LabelEnumCatalogCollection);
+            await EnsureLabelEnumCatalogsAsync(labelEnumCatalogs, ct);
+
+            var labelEnumOptionReadModels = db.GetCollection<LabelEnumOptionReadModel>(opt.LabelEnumOptionReadModelCollection);
+            await EnsureLabelEnumOptionReadModelsAsync(labelEnumOptionReadModels, ct);
+
             // WORKS
             var works = db.GetCollection<Work>(opt.WorkCollection);
             await EnsureWorksAsync(works, ct);
@@ -99,6 +105,15 @@
             // WORK ASSIGNMENTS
             var workAssignment = db.GetCollection<WorkAssignment>(opt.WorkAssignmentCollection);
             await EnsureWorkAssignmentsAsync(workAssignment, ct);
+
+            var workAssignmentAggregateConfigs = db.GetCollection<WorkAssignmentAggregateConfig>(opt.WorkAssignmentAggregateConfigCollection);
+            await EnsureWorkAssignmentAggregateConfigsAsync(workAssignmentAggregateConfigs, ct);
+
+            var workAssignmentBasicSummaryConfigs = db.GetCollection<WorkAssignmentBasicSummaryConfig>(opt.WorkAssignmentBasicSummaryConfigCollection);
+            await EnsureWorkAssignmentBasicSummaryConfigsAsync(workAssignmentBasicSummaryConfigs, ct);
+
+            var workAssignmentBasicSummarySnapshots = db.GetCollection<WorkAssignmentBasicSummarySnapshot>(opt.WorkAssignmentBasicSummarySnapshotCollection);
+            await EnsureWorkAssignmentBasicSummarySnapshotsAsync(workAssignmentBasicSummarySnapshots, ct);
 
             // WORK TEMPLATE ASSIGNEES
             var workTemplateAssignees = db.GetCollection<WorkTemplateAssignee>(opt.WorkTemplateAssigneeCollection);
@@ -607,6 +622,114 @@
                 key: new BsonDocument
                 {
                     { "updatedAtUtc", -1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_labels_value_source_catalog_active",
+                key: new BsonDocument
+                {
+                    { "valueSourceType", 1 },
+                    { "valueSourceCatalogId", 1 },
+                    { "isActive", 1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
+        }
+
+        private static async Task EnsureLabelEnumCatalogsAsync(IMongoCollection<LabelEnumCatalog> col, CancellationToken ct)
+        {
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(
+                col,
+                new IndexSpec("ix_labelEnumCatalogs_isDeleted", new BsonDocument("isDeleted", 1)),
+                ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ux_labelEnumCatalogs_scope_code_active",
+                key: new BsonDocument
+                {
+                    { "scopeType", 1 },
+                    { "scopeId", 1 },
+                    { "code", 1 }
+                },
+                unique: true,
+                partial: new BsonDocument("isDeleted", false)
+            ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_labelEnumCatalogs_scope_name_active",
+                key: new BsonDocument
+                {
+                    { "scopeType", 1 },
+                    { "scopeId", 1 },
+                    { "nameLower", 1 },
+                    { "isActive", 1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_labelEnumCatalogs_unit_scope_active",
+                key: new BsonDocument
+                {
+                    { "scopeType", 1 },
+                    { "scopeUnitCode", 1 },
+                    { "scopeLevel", 1 },
+                    { "isActive", 1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_labelEnumCatalogs_updatedAt_desc",
+                key: new BsonDocument
+                {
+                    { "updatedAtUtc", -1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
+        }
+
+        private static async Task EnsureLabelEnumOptionReadModelsAsync(IMongoCollection<LabelEnumOptionReadModel> col, CancellationToken ct)
+        {
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(
+                col,
+                new IndexSpec("ix_labelEnumOptions_isDeleted", new BsonDocument("isDeleted", 1)),
+                ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ux_labelEnumOptions_catalog_code_active",
+                key: new BsonDocument
+                {
+                    { "catalogId", 1 },
+                    { "code", 1 }
+                },
+                unique: true,
+                partial: new BsonDocument("isDeleted", false)
+            ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_labelEnumOptions_catalog_search_active",
+                key: new BsonDocument
+                {
+                    { "catalogId", 1 },
+                    { "isActive", 1 },
+                    { "searchText", 1 },
+                    { "order", 1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_labelEnumOptions_scope_search_active",
+                key: new BsonDocument
+                {
+                    { "scopeType", 1 },
+                    { "scopeUnitCode", 1 },
+                    { "scopeLevel", 1 },
+                    { "isActive", 1 },
+                    { "searchText", 1 },
                     { "isDeleted", 1 }
                 }
             ), ct);
@@ -1359,21 +1482,14 @@
                 }
             };
 
-            await MongoIndexPrecheckHelper.PrecheckUniqueByFieldsAsync(
-                col,
-                fields: new[] { "workId", "parentAssignmentId", "dynamicFormTemplateId" },
-                matchFilter: activeDynamicFormAssignmentFilter,
-                ct: ct);
-
             await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
-                name: "ux_workAssignments_sibling_dynamicForm_active",
+                name: "ix_workAssignments_sibling_dynamicForm_active",
                 key: new BsonDocument
                 {
                     { "workId", 1 },
                     { "parentAssignmentId", 1 },
                     { "dynamicFormTemplateId", 1 }
                 },
-                unique: true,
                 partial: activeDynamicFormAssignmentFilter
             ), ct);
 
@@ -1473,6 +1589,101 @@
                     { "isActive", 1 },
                     { "dueAtUtc", 1 },
                     { "isDeleted", 1 }
+                }
+            ), ct);
+        }
+
+        private static async Task EnsureWorkAssignmentAggregateConfigsAsync(
+            IMongoCollection<WorkAssignmentAggregateConfig> col,
+            CancellationToken ct)
+        {
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_workAssignmentAggregateConfigs_assignment_active",
+                key: new BsonDocument
+                {
+                    { "assignmentId", 1 },
+                    { "isActive", 1 },
+                    { "isDeleted", 1 },
+                    { "updatedAtUtc", -1 }
+                }
+            ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_workAssignmentAggregateConfigs_work_source_target",
+                key: new BsonDocument
+                {
+                    { "workId", 1 },
+                    { "sourceDynamicFormTemplateId", 1 },
+                    { "sourceBlockId", 1 },
+                    { "targetDynamicFormTemplateId", 1 },
+                    { "targetBlockId", 1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
+        }
+
+        private static async Task EnsureWorkAssignmentBasicSummarySnapshotsAsync(
+            IMongoCollection<WorkAssignmentBasicSummarySnapshot> col,
+            CancellationToken ct)
+        {
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ux_workAssignmentBasicSummarySnapshots_request_active",
+                key: new BsonDocument("requestHash", 1),
+                unique: true,
+                partial: new BsonDocument("isDeleted", false)
+            ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_workAssignmentBasicSummarySnapshots_scope",
+                key: new BsonDocument
+                {
+                    { "scopeAssignmentId", 1 },
+                    { "dynamicFormTemplateId", 1 },
+                    { "snapshotDirty", 1 },
+                    { "isDeleted", 1 },
+                    { "updatedAtUtc", -1 }
+                }
+            ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_workAssignmentBasicSummarySnapshots_dirty_scan",
+                key: new BsonDocument
+                {
+                    { "snapshotDirty", 1 },
+                    { "snapshotDirtyAtUtc", 1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
+        }
+
+        private static async Task EnsureWorkAssignmentBasicSummaryConfigsAsync(
+            IMongoCollection<WorkAssignmentBasicSummaryConfig> col,
+            CancellationToken ct)
+        {
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ux_workAssignmentBasicSummaryConfigs_assignment_template_active",
+                key: new BsonDocument
+                {
+                    { "assignmentId", 1 },
+                    { "dynamicFormTemplateId", 1 }
+                },
+                unique: true,
+                partial: new BsonDocument
+                {
+                    { "isDeleted", false },
+                    { "isActive", true }
+                }
+            ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_workAssignmentBasicSummaryConfigs_work",
+                key: new BsonDocument
+                {
+                    { "workId", 1 },
+                    { "assignmentId", 1 },
+                    { "dynamicFormTemplateId", 1 },
+                    { "isDeleted", 1 },
+                    { "updatedAtUtc", -1 }
                 }
             ), ct);
         }
@@ -2557,7 +2768,8 @@
                     { "workAssignmentReportId", 1 },
                     { "blockId", 1 },
                     { "metricKey", 1 },
-                    { "sourceKey", 1 }
+                    { "sourceKey", 1 },
+                    { "bucketKey", 1 }
                 },
                 unique: true,
                 partial: new BsonDocument("isDeleted", false)
@@ -2668,6 +2880,8 @@
                     { "blockId", 1 },
                     { "tableMode", 1 },
                     { "metricKey", 1 },
+                    { "dataType", 1 },
+                    { "bucketKey", 1 },
                     { "periodInstanceKey", 1 },
                     { "reportStatus", 1 }
                 },

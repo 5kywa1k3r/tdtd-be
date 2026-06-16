@@ -11,4 +11,13 @@ public interface IAggregateTableService
     Task<DynamicFormAggregateResponse> GetDynamicFormAggregateAsync(
         DynamicFormAggregateRequest req,
         CancellationToken ct);
+
+    Task<WorkAssignmentAggregateConfigDto?> GetAggregateConfigAsync(
+        string assignmentId,
+        CancellationToken ct);
+
+    Task<WorkAssignmentAggregateConfigDto> SaveAggregateConfigAsync(
+        string assignmentId,
+        SaveWorkAssignmentAggregateConfigRequest req,
+        CancellationToken ct);
 }

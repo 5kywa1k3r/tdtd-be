@@ -777,10 +777,6 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
                 .Set(x => x.LastDraftSavedAtUtc, (DateTime?)null)
                 .Set(x => x.LastSubmittedAtUtc, (DateTime?)null)
                 .Set(x => x.LastReviewedAtUtc, (DateTime?)null)
-                .Set(x => x.CurrentProgressStatus, null)
-                .Set(x => x.ReportReason, null)
-                .Set(x => x.Difficulties, null)
-                .Set(x => x.ProposedSolution, null)
                 .Set(x => x.LateReason, null)
                 .Set(x => x.ReviewerComment, null)
                 .Set(x => x.ReturnReason, null)
@@ -801,10 +797,6 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
             period.LastDraftSavedAtUtc = null;
             period.LastSubmittedAtUtc = null;
             period.LastReviewedAtUtc = null;
-            period.CurrentProgressStatus = null;
-            period.ReportReason = null;
-            period.Difficulties = null;
-            period.ProposedSolution = null;
             period.LateReason = null;
             period.ReviewerComment = null;
             period.ReturnReason = null;
@@ -944,10 +936,6 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
                 .Set(x => x.LastDraftSavedAtUtc, report.Status == WorkAssignmentReportStatus.Draft ? (DateTime?)report.UpdatedAtUtc : null)
                 .Set(x => x.LastSubmittedAtUtc, report.SubmittedAtUtc)
                 .Set(x => x.LastReviewedAtUtc, report.ApprovedAtUtc)
-                .Set(x => x.CurrentProgressStatus, report.CurrentProgressStatus)
-                .Set(x => x.ReportReason, report.ReportReason)
-                .Set(x => x.Difficulties, report.Difficulties)
-                .Set(x => x.ProposedSolution, report.ProposedSolution)
                 .Set(x => x.LateReason, report.LateReason)
                 .Set(x => x.ReviewerComment, report.ReviewerComment)
                 .Set(x => x.ReturnReason, report.ReturnReason)
@@ -963,10 +951,6 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
         period.LastDraftSavedAtUtc = report.Status == WorkAssignmentReportStatus.Draft ? report.UpdatedAtUtc : null;
         period.LastSubmittedAtUtc = report.SubmittedAtUtc;
         period.LastReviewedAtUtc = report.ApprovedAtUtc;
-        period.CurrentProgressStatus = report.CurrentProgressStatus;
-        period.ReportReason = report.ReportReason;
-        period.Difficulties = report.Difficulties;
-        period.ProposedSolution = report.ProposedSolution;
         period.LateReason = report.LateReason;
         period.ReviewerComment = report.ReviewerComment;
         period.ReturnReason = report.ReturnReason;
@@ -1032,18 +1016,37 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
 
         var page = req.Page < 0 ? 0 : req.Page;
         var pageSize = req.PageSize <= 0 ? 20 : req.PageSize;
+        var scopeAssignmentIds = await WorkAssignmentReadAccessHelper.ResolveReadableScopeIdsAsync(
+            _ctx,
+            req.WorkId,
+            req.ScopeAssignmentId,
+            me.Id,
+            ct);
+        var isScopedBranchView = scopeAssignmentIds is not null;
 
-        await EnsureReviewReportListDocRolesForUserWorkAsync(req.WorkId, me.Id, ct);
+        if (!isScopedBranchView)
+            await EnsureReviewReportListDocRolesForUserWorkAsync(req.WorkId, me.Id, ct);
 
         var reqAssigneeUserIds = GetAssigneeUserIds(req);
         var reqAssigneeUnitIds = GetAssigneeUnitIds(req);
         var fb = Builders<ReviewReportListDocRole>.Filter;
-        var filter = fb.Eq(x => x.ReviewerUserId, me.Id)
-                     & fb.Eq(x => x.WorkId, req.WorkId)
+        var filter = fb.Eq(x => x.WorkId, req.WorkId)
                      & fb.Eq(x => x.IsDeleted, false);
 
+        if (!isScopedBranchView)
+            filter &= fb.Eq(x => x.ReviewerUserId, me.Id);
+
         if (!string.IsNullOrWhiteSpace(req.AssignmentId))
+        {
+            var assignmentId = req.AssignmentId.Trim();
             filter &= fb.Eq(x => x.AssignmentId, req.AssignmentId.Trim());
+            if (isScopedBranchView && !scopeAssignmentIds!.Contains(assignmentId))
+                filter &= fb.Eq(x => x.AssignmentId, "__none__");
+        }
+        else if (scopeAssignmentIds is not null)
+            filter &= scopeAssignmentIds.Count == 0
+                ? fb.Eq(x => x.AssignmentId, "__none__")
+                : fb.In(x => x.AssignmentId, scopeAssignmentIds);
 
         if (!string.IsNullOrWhiteSpace(req.DynamicExcelId))
             filter &= fb.Eq(x => x.DynamicExcelId, req.DynamicExcelId.Trim());
@@ -1359,15 +1362,30 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
 
         var page = req.Page < 0 ? 0 : req.Page;
         var pageSize = req.PageSize <= 0 ? 20 : req.PageSize;
+        var scopeAssignmentIds = await WorkAssignmentReadAccessHelper.ResolveReadableScopeIdsAsync(
+            _ctx,
+            req.WorkId,
+            req.ScopeAssignmentId,
+            me.Id,
+            ct);
+        var isScopedBranchView = scopeAssignmentIds is not null;
 
-        await EnsureReviewAssignmentSummaryDocRolesForUserWorkAsync(req.WorkId, me.Id, ct);
+        if (!isScopedBranchView)
+            await EnsureReviewAssignmentSummaryDocRolesForUserWorkAsync(req.WorkId, me.Id, ct);
 
         var reqAssigneeUserIds = GetAssigneeUserIds(req);
         var reqAssigneeUnitIds = GetAssigneeUnitIds(req);
         var fb = Builders<ReviewAssignmentSummaryDocRole>.Filter;
-        var filter = fb.Eq(x => x.ReviewerUserId, me.Id)
-                     & fb.Eq(x => x.WorkId, req.WorkId)
+        var filter = fb.Eq(x => x.WorkId, req.WorkId)
                      & fb.Eq(x => x.IsDeleted, false);
+
+        if (!isScopedBranchView)
+            filter &= fb.Eq(x => x.ReviewerUserId, me.Id);
+
+        if (scopeAssignmentIds is not null)
+            filter &= scopeAssignmentIds.Count == 0
+                ? fb.Eq(x => x.AssignmentId, "__none__")
+                : fb.In(x => x.AssignmentId, scopeAssignmentIds);
 
         if (!string.IsNullOrWhiteSpace(req.DynamicExcelId))
             filter &= fb.Eq(x => x.DynamicExcelId, req.DynamicExcelId.Trim());
@@ -1464,6 +1482,36 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
     {
         var text = value?.Trim();
         return string.IsNullOrWhiteSpace(text) ? null : text;
+    }
+
+    private async Task<HashSet<string>?> ResolveAssignmentScopeIdsAsync(
+        string workId,
+        string? scopeAssignmentId,
+        CancellationToken ct)
+    {
+        var scopeId = NormalizeOptionalText(scopeAssignmentId);
+        if (string.IsNullOrWhiteSpace(scopeId))
+            return null;
+
+        var assignments = await _ctx.WorkAssignments
+            .Find(x => x.WorkId == workId && !x.IsDeleted)
+            .Project(x => new { x.Id, x.Path })
+            .ToListAsync(ct);
+
+        var scope = assignments.FirstOrDefault(x => string.Equals(x.Id, scopeId, StringComparison.Ordinal));
+        if (scope is null)
+            return new HashSet<string>(StringComparer.Ordinal);
+
+        var scopePath = scope.Path?.Trim();
+        return assignments
+            .Where(x =>
+                string.Equals(x.Id, scope.Id, StringComparison.Ordinal) ||
+                (!string.IsNullOrWhiteSpace(scopePath) &&
+                 !string.IsNullOrWhiteSpace(x.Path) &&
+                 x.Path.StartsWith($"{scopePath}/", StringComparison.Ordinal)))
+            .Select(x => x.Id)
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .ToHashSet(StringComparer.Ordinal);
     }
 
     private static AppException ReviewWorkIdRequired(string? workId)

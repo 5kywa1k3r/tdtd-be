@@ -222,22 +222,6 @@ public sealed class WorkAssignmentReport : BaseEntity
     [BsonElement("aggregateRefreshError")]
     public string? AggregateRefreshError { get; set; }
 
-    /// <summary>
-    /// Các trường trải phẳng mà lãnh đạo quan tâm.
-    /// Không nhốt riêng trong workbook.
-    /// </summary>
-    [BsonElement("currentProgressStatus")]
-    public string? CurrentProgressStatus { get; set; }
-
-    [BsonElement("reportReason")]
-    public string? ReportReason { get; set; }
-
-    [BsonElement("difficulties")]
-    public string? Difficulties { get; set; }
-
-    [BsonElement("proposedSolution")]
-    public string? ProposedSolution { get; set; }
-
     [BsonElement("isLateSubmission")]
     public bool IsLateSubmission { get; set; }
 

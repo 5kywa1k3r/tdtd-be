@@ -22,6 +22,7 @@ public sealed class WorkAssignmentReportResponse
     /// Id assignment gốc.
     /// </summary>
     public string WorkAssignmentId { get; set; } = string.Empty;
+    public string AssignmentType { get; set; } = string.Empty;
 
     /// <summary>
     /// Id kỳ runtime mà report này thuộc về.
@@ -101,14 +102,6 @@ public sealed class WorkAssignmentReportResponse
     public DateTime? AggregateSnapshotDirtyAtUtc { get; set; }
     public DateTime? AggregateSnapshotRefreshedAtUtc { get; set; }
     public string? AggregateRefreshError { get; set; }
-
-    /// <summary>
-    /// Bộ field trải phẳng mà lãnh đạo quan tâm.
-    /// </summary>
-    public string? CurrentProgressStatus { get; set; }
-    public string? ReportReason { get; set; }
-    public string? Difficulties { get; set; }
-    public string? ProposedSolution { get; set; }
 
     public bool IsLateSubmission { get; set; }
     public string? LateReason { get; set; }

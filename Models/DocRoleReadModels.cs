@@ -110,6 +110,9 @@ public sealed class AssignmentListDocRole : DocRoleReadModelBase
     [BsonElement("code")]
     public string Code { get; set; } = string.Empty;
 
+    [BsonElement("name")]
+    public string Name { get; set; } = string.Empty;
+
     [BsonElement("dynamicExcelId")]
     [BsonRepresentation(BsonType.ObjectId)]
     public string? DynamicExcelId { get; set; }

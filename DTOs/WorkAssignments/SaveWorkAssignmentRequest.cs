@@ -2,6 +2,7 @@
 
 public sealed class SaveWorkAssignmentRequest
 {
+    public string? Name { get; set; }
     public string? DynamicFormTemplateId { get; set; }
     public string AssignmentType { get; set; } = default!;
     public string AggregationType { get; set; } = default!;

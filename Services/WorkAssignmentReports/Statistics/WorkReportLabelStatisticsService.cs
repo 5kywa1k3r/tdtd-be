@@ -8,6 +8,7 @@ using tdtd_be.DTOs.Statistics;
 using tdtd_be.Models;
 using tdtd_be.Models.Enums;
 using tdtd_be.Models.Statistics;
+using tdtd_be.Services;
 using tdtd_be.Services.WorkAssignmentReports;
 using tdtd_be.Services.WorkAssignmentReports.Payloads;
 
@@ -532,6 +533,9 @@ public sealed class WorkReportLabelStatisticsService : IWorkReportLabelStatistic
             var result = new List<ParsedRowLabel>();
             foreach (var block in root.Blocks)
             {
+                if (ShouldDisableRuntimeBlockTableStatistics(block))
+                    continue;
+
                 var blockId = string.IsNullOrWhiteSpace(block.BlockId)
                     ? "excel_block"
                     : block.BlockId.Trim();
@@ -644,6 +648,24 @@ public sealed class WorkReportLabelStatisticsService : IWorkReportLabelStatistic
     private static string? NormalizeObjectIdOrNull(string? value)
         => ObjectId.TryParse(value, out _) ? value : null;
 
+    private static bool ShouldDisableRuntimeBlockTableStatistics(TableValuesBlock block)
+    {
+        if (block.StatisticsDisabled == true)
+            return true;
+
+        var metadataInputCellCount = block.StatisticsInputCellCount.GetValueOrDefault();
+        var valuesInputCellCount = block.Values1D?.Count ?? 0;
+        var inputCellCount = Math.Max(metadataInputCellCount, valuesInputCellCount);
+        if (inputCellCount <= 0)
+        {
+            var w = block.W.GetValueOrDefault();
+            var h = block.H.GetValueOrDefault();
+            inputCellCount = w > 0 && h > 0 ? w * h : 0;
+        }
+
+        return DynamicExcelRuntimePolicy.ShouldDisableBackgroundTableStatistics(inputCellCount);
+    }
+
     private sealed class TableValuesRoot
     {
         public List<TableValuesBlock>? Blocks { get; set; }
@@ -653,6 +675,13 @@ public sealed class WorkReportLabelStatisticsService : IWorkReportLabelStatistic
     {
         public string? BlockId { get; set; }
         public string? DynamicExcelTemplateId { get; set; }
+        public int? W { get; set; }
+        public int? H { get; set; }
+        public bool? StatisticsDisabled { get; set; }
+        public int? StatisticsInputCellCount { get; set; }
+        public int? StatisticsInputCellLimit { get; set; }
+        public string? StatisticsDisabledReason { get; set; }
+        public List<JsonElement>? Values1D { get; set; }
         public List<TableValuesRowLabel>? RowLabels { get; set; }
     }
 

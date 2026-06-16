@@ -19,6 +19,7 @@ using tdtd_be.Uploads;
 using System.Reflection;
 using System.Text.Json;
 using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Options;
 using Hangfire;
 using MongoDB.Bson;
 using tdtd_be.Jobs;
@@ -34,6 +35,8 @@ var tests = new (string Name, Action Run)[]
     ("unrelated actor cannot create a child assignment even when assigning to themself", BlocksUnrelatedChildSelfAssignment),
     ("unit manager can assign peer unit manager", AllowsUnitManagerPeerUnitManagerAssignment),
     ("unit manager can assign descendant unit manager", AllowsUnitManagerDescendantUnitManagerAssignment),
+    ("configured PHONG unit manager can assign PHUONG_XA unit manager", AllowsConfiguredPhongToPhuongXaUnitManagerAssignment),
+    ("configured PHONG to PHUONG_XA rule does not allow normal user by default", BlocksConfiguredPhongToPhuongXaNormalUserAssignment),
     ("unit manager cannot assign normal user before final unit", BlocksUnitManagerNormalUserBeforeFinalUnit),
     ("final unit manager can assign normal user in own unit", AllowsFinalUnitManagerOwnUnitNormalUserAssignment),
     ("unit manager cannot assign normal user outside own final unit", BlocksUnitManagerNormalUserOutsideOwnUnit),
@@ -68,6 +71,7 @@ var tests = new (string Name, Action Run)[]
     ("aggregate draft partial mapping clears previous target cells", ClearsPreviousAggregateDraftTargetCells),
     ("dynamic form field display name is separated from statistic labels", ValidatesDynamicFormFieldDisplayName),
     ("dynamic form section title is required", BlocksBlankDynamicFormSectionTitle),
+    ("dynamic form supports monthly BT 25 table blocks", SupportsMonthlyBtTwentyFiveTableBlocks),
     ("short text field statistics bucket by trimmed value", BucketsShortTextFieldStatistics),
     ("stat projection accepts verified external payload snapshot", AcceptsVerifiedExternalPayloadForStatisticProjection),
     ("stat projection rejects embedded payload fallback", RejectsEmbeddedPayloadForStatisticProjection),
@@ -76,6 +80,7 @@ var tests = new (string Name, Action Run)[]
     ("report service resolves dynamic excel id from form blocks", ResolvesDynamicExcelIdFromFormBlocks),
     ("report payload header compaction clears embedded detail fields", CompactsReportPayloadHeader),
     ("auto approve condition normalizes and matches report fields", MatchesAutoApproveCondition),
+    ("automatic child aggregation source rules normalize to manual", NormalizesAutomaticChildSourceRulesToManual),
     ("dynamic form table target labels use dynamic excel default type", ValidatesDynamicFormTableTargetDefaultDataType),
     ("dynamic form metric label targets validate range type and uniqueness", ValidatesDynamicFormMetricLabelTargets),
     ("dynamic excel numeric grid validates spec metadata", ValidatesDynamicExcelNumericGridSpecMetadata),
@@ -247,6 +252,42 @@ static void AllowsUnitManagerDescendantUnitManagerAssignment()
         new[] { childManager },
         units,
         actorUnitHasAssignableDescendants: true);
+}
+
+static void AllowsConfiguredPhongToPhuongXaUnitManagerAssignment()
+{
+    var actorUnit = TestUnit(11, "100001002", 2, parentUnitId: ObjectId(10), primaryUnitTypeCode: "PHONG");
+    var targetUnit = TestUnit(12, "200001001", 3, parentUnitId: ObjectId(99), primaryUnitTypeCode: "PHUONG_XA");
+    var actor = TestUser(11, "mu_phong", ManagementAccountKind.UnitManager, actorUnit.Id);
+    var targetManager = TestUser(12, "mu_phuong_xa", ManagementAccountKind.UnitManager, targetUnit.Id);
+    var units = UnitMap(actorUnit, targetUnit);
+
+    WorkAssignmentTargetScopeValidator.EnsureCanAssignTargets(
+        actor,
+        actorUnit,
+        new[] { targetManager },
+        units,
+        actorUnitHasAssignableDescendants: true,
+        ConfiguredPhongToPhuongXaPolicy());
+}
+
+static void BlocksConfiguredPhongToPhuongXaNormalUserAssignment()
+{
+    var actorUnit = TestUnit(13, "100001003", 2, parentUnitId: ObjectId(10), primaryUnitTypeCode: "PHONG");
+    var targetUnit = TestUnit(14, "200001002", 3, parentUnitId: ObjectId(99), primaryUnitTypeCode: "PHUONG_XA");
+    var actor = TestUser(13, "mu_phong", ManagementAccountKind.UnitManager, actorUnit.Id);
+    var staff = TestUser(14, "staff_phuong_xa", ManagementAccountKind.NormalUser, targetUnit.Id);
+    var units = UnitMap(actorUnit, targetUnit);
+
+    AssertThrows(
+        AppErrorCode.WORK_ASSIGNMENT_ASSIGNEE_SCOPE_INVALID,
+        () => WorkAssignmentTargetScopeValidator.EnsureCanAssignTargets(
+            actor,
+            actorUnit,
+            new[] { staff },
+            units,
+            actorUnitHasAssignableDescendants: true,
+            ConfiguredPhongToPhuongXaPolicy()));
 }
 
 static void BlocksUnitManagerNormalUserBeforeFinalUnit()
@@ -981,10 +1022,15 @@ static void ClearsPreviousAggregateDraftTargetCells()
             DynamicFormTemplateId = "form_1",
             BlockId = "block_1"
         },
+        "MANUAL_MAP",
         "SUM",
         "block_1",
         false,
-        new List<int> { 0, 2 })
+        new List<int> { 0, 2 },
+        new List<string>(),
+        new List<string>(),
+        "form_1",
+        null)
         ?? throw new InvalidOperationException("AggregateDraftSummary helper instance was not created.");
 
     var isSameTarget = InvokePrivateStatic<bool>(
@@ -1294,6 +1340,16 @@ static void BlocksBlankDynamicFormSectionTitle()
             "[]"));
 }
 
+static void SupportsMonthlyBtTwentyFiveTableBlocks()
+{
+    var field = typeof(DynamicFormService).GetField(
+        "MaxTableBlocksPerForm",
+        BindingFlags.NonPublic | BindingFlags.Static);
+
+    var limit = (int)(field?.GetRawConstantValue() ?? 0);
+    AssertTrue(limit >= 25, "monthly BT dynamic form must allow at least 25 table blocks");
+}
+
 static void MatchesAutoApproveCondition()
 {
     var fieldsJson = """
@@ -1346,6 +1402,21 @@ static void MatchesAutoApproveCondition()
             """{ "values": { "nhom": ["B", "A"] } }"""),
         "multi select condition should match contained option codes");
 
+    var alwaysConditionJson = WorkAssignmentAutoApproveConditionNormalizer.NormalizeOrNull(
+        """
+        { "enabled": true }
+        """,
+        fieldsJson);
+    AssertTrue(!string.IsNullOrWhiteSpace(alwaysConditionJson), "no-field auto approve should normalize");
+    using var alwaysDoc = JsonDocument.Parse(alwaysConditionJson!);
+    AssertEqual("always", alwaysDoc.RootElement.GetProperty("operator").GetString(), "no-field auto approve should store always operator");
+    AssertTrue(
+        WorkAssignmentAutoApproveConditionNormalizer.Matches(alwaysConditionJson, null),
+        "no-field auto approve should match without report field values");
+    AssertTrue(
+        WorkAssignmentAutoApproveConditionNormalizer.Matches(alwaysConditionJson, """{ "values": {} }"""),
+        "no-field auto approve should match empty report field values");
+
     AssertThrows(
         AppErrorCode.COMMON_VALIDATION_FAILED,
         () => WorkAssignmentAutoApproveConditionNormalizer.NormalizeOrNull(
@@ -1360,6 +1431,39 @@ static void MatchesAutoApproveCondition()
             { "enabled": true, "fieldKey": "danh_sach", "operator": "contains", "value": "x" }
             """,
             fieldsJson));
+}
+
+static void NormalizesAutomaticChildSourceRulesToManual()
+{
+    var sectionsJson = """
+    [
+      { "id": "s1", "title": "Phần một" },
+      { "id": "s2", "title": "Phần hai" }
+    ]
+    """;
+    var rulesJson = """
+    {
+      "version": 1,
+      "sectionRules": [
+        { "sectionId": "s1", "sourceRule": "AGGREGATE_CHILDREN", "sourceAssignmentIds": ["child-a"] },
+        { "sectionId": "s2", "sourceRule": "MAP_CHILD", "sourceAssignmentIds": ["child-b"] }
+      ],
+      "fieldRules": [],
+      "blockRules": []
+    }
+    """;
+
+    var normalized = DynamicFormDataSourceRuleNormalizer.NormalizeOrDefault(rulesJson, sectionsJson);
+    using var doc = JsonDocument.Parse(normalized);
+    var sectionRules = doc.RootElement.GetProperty("sectionRules").EnumerateArray().ToList();
+
+    AssertEqual("MANUAL", sectionRules[0].GetProperty("sourceRule").GetString(), "automatic child source rule should be disabled");
+    AssertEqual(0, sectionRules[0].GetProperty("sourceAssignmentIds").GetArrayLength(), "disabled automatic rule should clear saved source ids");
+    AssertEqual("MAP_CHILD", sectionRules[1].GetProperty("sourceRule").GetString(), "manual mapping source rule should stay available");
+    AssertEqual(
+        WorkReportDataOrigin.ManualInput,
+        DynamicFormDataSourceRuleNormalizer.ResolveDefaultReportDataOrigin(normalized),
+        "disabled automatic source rules should keep report data origin manual");
 }
 
 static void ValidatesDynamicFormTableTargetDefaultDataType()
@@ -1553,6 +1657,149 @@ static void ValidatesDynamicExcelNumericGridSpecMetadata()
         3,
         2);
 
+    InvokePrivateStatic<object?>(
+        serviceType,
+        "ValidateDynamicExcelPayloadCore",
+        "Mau bang rong 250 cot",
+        "FIXED_GRID",
+        """
+        [
+          { "row": 2, "column": 250, "data": [] }
+        ]
+        """,
+        """
+        {
+          "kind": "TOP",
+          "topRows": 1,
+          "topCols": 250,
+          "dataRows": 1
+        }
+        """,
+        new DynamicExcelDataRectDto(1, 0, 1, 249),
+        250,
+        1);
+
+    InvokePrivateStatic<object?>(
+        serviceType,
+        "ValidateDynamicExcelPayloadCore",
+        "Mau ma tran lon 14x85",
+        "FIXED_GRID",
+        """
+        [
+          { "row": 14, "column": 85, "data": [] }
+        ]
+        """,
+        """
+        {
+          "kind": "MATRIX",
+          "topRows": 2,
+          "topCols": 81,
+          "leftRows": 12,
+          "leftCols": 4,
+          "specialRanges": [
+            { "role": "FORMULA", "r0": 2, "c0": 4, "r1": 2, "c1": 84 }
+          ]
+        }
+        """,
+        new DynamicExcelDataRectDto(2, 4, 13, 84),
+        81,
+        12);
+
+    InvokePrivateStatic<object?>(
+        serviceType,
+        "ValidateDynamicExcelPayloadCore",
+        "Mau BT03 334x18",
+        "FIXED_GRID",
+        """
+        [
+          { "row": 334, "column": 18, "data": [] }
+        ]
+        """,
+        """
+        {
+          "kind": "MATRIX",
+          "topRows": 5,
+          "topCols": 14,
+          "leftRows": 329,
+          "leftCols": 4
+        }
+        """,
+        new DynamicExcelDataRectDto(5, 4, 333, 17),
+        14,
+        329);
+
+    InvokePrivateStatic<object?>(
+        serviceType,
+        "ValidateDynamicExcelPayloadCore",
+        "Mau BT15 334x37 co vung dac biet",
+        "FIXED_GRID",
+        """
+        [
+          { "row": 334, "column": 37, "data": [] }
+        ]
+        """,
+        """
+        {
+          "kind": "MATRIX",
+          "topRows": 5,
+          "topCols": 34,
+          "leftRows": 329,
+          "leftCols": 3,
+          "specialRanges": [
+            { "role": "FORMULA", "r0": 5, "c0": 3, "r1": 72, "c1": 36 }
+          ]
+        }
+        """,
+        new DynamicExcelDataRectDto(5, 3, 333, 36),
+        34,
+        329);
+
+    AssertTrue(
+        DynamicExcelRuntimePolicy.ShouldDisableBackgroundTableStatistics(891),
+        "large 891-cell Dynamic Excel matrix should save but disable background table statistics");
+    AssertTrue(
+        DynamicExcelRuntimePolicy.CanRunDirectTableAggregation(891),
+        "large 891-cell Dynamic Excel matrix should still support direct table aggregation");
+
+    InvokePrivateStatic<object?>(
+        serviceType,
+        "ValidateDynamicExcelPayloadCore",
+        "Mau cong thuc tieu de va bo trong dang vung",
+        "FIXED_GRID",
+        workbookJson,
+        """
+        {
+          "kind": "TOP",
+          "topRows": 1,
+          "topCols": 5,
+          "dataRows": 4,
+          "specialRanges": [
+            { "role": "FORMULA", "r0": 1, "c0": 0, "r1": 2, "c1": 1 },
+            { "role": "TITLE", "r0": 1, "c0": 3, "r1": 2, "c1": 4 },
+            { "role": "BLANK", "r0": 3, "c0": 3, "r1": 4, "c1": 4 }
+          ]
+        }
+        """,
+        new DynamicExcelDataRectDto(1, 0, 4, 4),
+        5,
+        4);
+
+    using (var nonInputPolicyDoc = JsonDocument.Parse("""
+        {
+          "specialRanges": [
+            { "role": "FORMULA", "r0": 1, "c0": 0, "r1": 2, "c1": 1 },
+            { "role": "TITLE", "r0": 1, "c0": 3, "r1": 2, "c1": 4 },
+            { "role": "BLANK", "r0": 3, "c0": 3, "r1": 4, "c1": 4 }
+          ]
+        }
+        """))
+    {
+        var dataRect = new DynamicExcelRuntimeRect(1, 0, 4, 4);
+        var ranges = DynamicExcelRuntimePolicy.ReadSpecialRanges(nonInputPolicyDoc.RootElement, dataRect);
+        AssertEqual(3, ranges.Count, "formula/title/blank rectangular ranges should be accepted by runtime policy");
+        AssertEqual(8, DynamicExcelRuntimePolicy.CountInputCells(dataRect, ranges), "formula/title/blank ranges should be skipped from input cell count");
+    }
+
     AssertThrowsFromReflection(
         AppErrorCode.COMMON_VALIDATION_FAILED,
         () => InvokePrivateStatic<object?>(
@@ -1642,6 +1889,30 @@ static void ValidatesDynamicExcelNumericGridSpecMetadata()
         3,
         2);
 
+    InvokePrivateStatic<object?>(
+        serviceType,
+        "ValidateDynamicExcelPayloadCore",
+        "Mau ignore va bo trong",
+        "FIXED_GRID",
+        workbookJson,
+        """
+        {
+          "kind": "TOP",
+          "topRows": 1,
+          "topCols": 3,
+          "dataRows": 2,
+          "dataTypeOverrides": [
+            { "scope": "COLUMN", "index": 2, "dataType": "IGNORE" }
+          ],
+          "specialRanges": [
+            { "role": "BLANK", "r0": 2, "c0": 0, "r1": 2, "c1": 2 }
+          ]
+        }
+        """,
+        new DynamicExcelDataRectDto(1, 0, 2, 2),
+        3,
+        2);
+
     AssertThrowsFromReflection(
         AppErrorCode.COMMON_VALIDATION_FAILED,
         () => InvokePrivateStatic<object?>(
@@ -1711,6 +1982,169 @@ static void ValidatesDynamicExcelNumericGridSpecMetadata()
             new DynamicExcelDataRectDto(1, 1, 2, 3),
             3,
             2));
+
+    AssertThrowsFromReflection(
+        AppErrorCode.COMMON_VALIDATION_FAILED,
+        () => InvokePrivateStatic<object?>(
+            serviceType,
+            "ValidateDynamicExcelPayloadCore",
+            "Mau co du lieu trong o nhap",
+            "FIXED_GRID",
+            """
+            [
+              {
+                "row": 3,
+                "column": 3,
+                "data": [
+                  [{ "v": "Header" }, null, null],
+                  [{ "v": 123 }, null, null]
+                ]
+              }
+            ]
+            """,
+            """
+            { "kind": "TOP", "topRows": 1, "topCols": 3, "dataRows": 2 }
+            """,
+            new DynamicExcelDataRectDto(1, 0, 2, 2),
+            3,
+            2));
+
+    AssertThrowsFromReflection(
+        AppErrorCode.COMMON_VALIDATION_FAILED,
+        () => InvokePrivateStatic<object?>(
+            serviceType,
+            "ValidateDynamicExcelPayloadCore",
+            "Mau co script",
+            "FIXED_GRID",
+            """
+            [
+              {
+                "row": 3,
+                "column": 3,
+                "data": [
+                  [{ "v": "<script>alert(1)</script>" }, null, null]
+                ]
+              }
+            ]
+            """,
+            """
+            { "kind": "TOP", "topRows": 1, "topCols": 3, "dataRows": 2 }
+            """,
+            new DynamicExcelDataRectDto(1, 0, 2, 2),
+            3,
+            2));
+
+    var semanticTemplate = new DynamicExcelTemplate
+    {
+        Id = ObjectId(90),
+        Code = "DX_SEMANTIC",
+        Name = "Mau semantic",
+        TableMode = "FIXED_GRID",
+        ContractVersion = 1,
+        CreatedByUsername = "tester",
+        RawWorkbookDataJson = workbookJson,
+        SpecJson = """
+        {
+          "kind": "TOP",
+          "topRows": 1,
+          "topCols": 3,
+          "dataRows": 2,
+          "specialRanges": [
+            { "role": "BLANK", "r0": 2, "c0": 2, "r1": 2, "c1": 2 }
+          ]
+        }
+        """,
+        DataRectR0 = 1,
+        DataRectC0 = 0,
+        DataRectR1 = 2,
+        DataRectC1 = 2,
+        W = 3,
+        H = 2
+    };
+
+    InvokePrivateStatic<object?>(
+        serviceType,
+        "ValidateDynamicExcelSemanticUpdateContract",
+        semanticTemplate,
+        new CreateDynamicExcelReq(
+            semanticTemplate.Code,
+            "Mau semantic update",
+            "FIXED_GRID",
+            1,
+            workbookJson,
+            """
+            {
+              "kind": "TOP",
+              "topRows": 1,
+              "topCols": 3,
+              "dataRows": 2,
+              "defaultDataType": "NUMBER",
+              "defaultOptions": [],
+              "dataTypeOverrides": [],
+              "specialRanges": [
+                { "role": "FORMULA", "r0": 1, "c0": 1, "r1": 1, "c1": 1 },
+                { "role": "TITLE", "r0": 1, "c0": 2, "r1": 1, "c1": 2 },
+                { "role": "BLANK", "r0": 2, "c0": 2, "r1": 2, "c1": 2 }
+              ]
+            }
+            """,
+            new DynamicExcelDataRectDto(1, 0, 2, 2),
+            3,
+            2));
+
+    AssertThrowsFromReflection(
+        AppErrorCode.COMMON_VALIDATION_FAILED,
+        () => InvokePrivateStatic<object?>(
+            serviceType,
+            "ValidateDynamicExcelSemanticUpdateContract",
+            semanticTemplate,
+            new CreateDynamicExcelReq(
+                semanticTemplate.Code,
+                "Mau doi schema",
+                "FIXED_GRID",
+                1,
+                workbookJson,
+                """
+                {
+                  "kind": "TOP",
+                  "topRows": 1,
+                  "topCols": 4,
+                  "dataRows": 2,
+                  "specialRanges": [
+                    { "role": "BLANK", "r0": 2, "c0": 2, "r1": 2, "c1": 2 }
+                  ]
+                }
+                """,
+                new DynamicExcelDataRectDto(1, 0, 2, 2),
+                3,
+                2)));
+
+    AssertThrowsFromReflection(
+        AppErrorCode.COMMON_VALIDATION_FAILED,
+        () => InvokePrivateStatic<object?>(
+            serviceType,
+            "ValidateDynamicExcelSemanticUpdateContract",
+            semanticTemplate,
+            new CreateDynamicExcelReq(
+                semanticTemplate.Code,
+                "Mau doi blank",
+                "FIXED_GRID",
+                1,
+                workbookJson,
+                """
+                {
+                  "kind": "TOP",
+                  "topRows": 1,
+                  "topCols": 3,
+                  "dataRows": 2,
+                  "specialRanges": [
+                    { "role": "BLANK", "r0": 2, "c0": 1, "r1": 2, "c1": 1 }
+                  ]
+                }
+                """,
+                new DynamicExcelDataRectDto(1, 0, 2, 2),
+                3,
+                2)));
 }
 
 static void ResolvesLegacyWorkBasisFileAsWorkDocument()
@@ -1957,12 +2391,33 @@ static void CompactsReportPayloadHeader()
         throw new InvalidOperationException("Report header must not keep heavy embedded payload fields after compaction.");
 }
 
-static Unit TestUnit(int seed, string code, int level, string? parentUnitId) => new()
+static WorkAssignmentTargetScopePolicy ConfiguredPhongToPhuongXaPolicy()
+    => new(Options.Create(new tdtd_be.Options.WorkAssignmentScopeOptions
+    {
+        UnitTypeAssignmentRules = new List<tdtd_be.Options.UnitTypeAssignmentRuleOptions>
+        {
+            new()
+            {
+                ActorUnitTypeCodes = new List<string> { "PHONG" },
+                TargetUnitTypeCodes = new List<string> { "PHUONG_XA" },
+                TargetAccountKinds = new List<string> { ManagementAccountKind.UnitManager }
+            }
+        }
+    }));
+
+static Unit TestUnit(
+    int seed,
+    string code,
+    int level,
+    string? parentUnitId,
+    string? primaryUnitTypeCode = null) => new()
 {
     Id = ObjectId(seed),
     Code = code,
     Level = level,
     ParentUnitId = parentUnitId,
+    PrimaryUnitTypeCode = primaryUnitTypeCode,
+    UnitTypeCodes = string.IsNullOrWhiteSpace(primaryUnitTypeCode) ? new List<string>() : new List<string> { primaryUnitTypeCode },
     FullName = $"Unit {seed}"
 };
 

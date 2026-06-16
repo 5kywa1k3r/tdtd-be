@@ -28,10 +28,14 @@ public sealed class WorkAssignmentReportsController : ControllerBase
     }
 
     [HttpGet("works/{workId}/my-report-templates/{dynamicFormTemplateId}")]
-    public async Task<IActionResult> GetMyReportTemplateDetail([FromRoute] string workId, [FromRoute] string dynamicFormTemplateId, CancellationToken ct)
+    public async Task<IActionResult> GetMyReportTemplateDetail(
+        [FromRoute] string workId,
+        [FromRoute] string dynamicFormTemplateId,
+        [FromQuery] string? scopeAssignmentId,
+        CancellationToken ct)
     {
         var actorUserId = GetActorUserId();
-        var rs = await _service.GetMyReportTemplateDetailAsync(workId, dynamicFormTemplateId, actorUserId, ct);
+        var rs = await _service.GetMyReportTemplateDetailAsync(workId, dynamicFormTemplateId, actorUserId, scopeAssignmentId, ct);
         return Ok(rs);
     }
 

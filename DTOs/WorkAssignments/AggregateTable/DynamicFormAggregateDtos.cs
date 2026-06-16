@@ -18,6 +18,8 @@ public sealed class DynamicFormAggregateRequest
     public string? PeriodKeyTo { get; set; }
     public string? SourceStatusMode { get; set; }
     public List<string>? SelectedUnitIds { get; set; }
+    public string? AggregateConfigId { get; set; }
+    public List<string>? IdentityColumns { get; set; }
 }
 
 public sealed class DynamicFormAggregateResponse
@@ -25,6 +27,7 @@ public sealed class DynamicFormAggregateResponse
     public DynamicFormAggregateMetaDto Meta { get; set; } = new();
     public List<DynamicFormAggregateColumnDto> Columns { get; set; } = new();
     public List<DynamicFormAggregateRowDto> Rows { get; set; } = new();
+    public DynamicFormStackedTableDto? StackedTable { get; set; }
     public List<AggregateSourceRowDto> Sources { get; set; } = new();
     public List<string> Warnings { get; set; } = new();
 }
@@ -47,10 +50,38 @@ public sealed class DynamicFormAggregateMetaDto
     public string? PeriodKeyTo { get; set; }
     public string? SourceStatusMode { get; set; }
     public List<string> SelectedUnitIds { get; set; } = new();
+    public string? AggregateConfigId { get; set; }
+    public List<string> IdentityColumns { get; set; } = new();
 
     public int SourceAssignmentCount { get; set; }
     public int SourceReportCount { get; set; }
     public int MetricCount { get; set; }
+}
+
+public sealed class DynamicFormStackedTableDto
+{
+    public string SourceTableMode { get; set; } = string.Empty;
+    public string RowMode { get; set; } = "DIRECT_STACK";
+    public List<DynamicFormStackedTableColumnDto> Columns { get; set; } = new();
+    public List<DynamicFormStackedTableRowDto> Rows { get; set; } = new();
+}
+
+public sealed class DynamicFormStackedTableColumnDto
+{
+    public string Key { get; set; } = default!;
+    public string Label { get; set; } = default!;
+    public string Role { get; set; } = "METRIC";
+    public string Type { get; set; } = "text";
+    public string? MetricKey { get; set; }
+    public string? SourceKey { get; set; }
+}
+
+public sealed class DynamicFormStackedTableRowDto
+{
+    public string RowKey { get; set; } = default!;
+    public Dictionary<string, object?> Cells { get; set; } = new();
+    public List<string> SourceReportIds { get; set; } = new();
+    public List<string> SourceAssignmentIds { get; set; } = new();
 }
 
 public sealed class DynamicFormAggregateColumnDto

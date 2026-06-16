@@ -16,6 +16,7 @@ using tdtd_be.Enum;
 using tdtd_be.Models;
 using tdtd_be.Models.Enums;
 using tdtd_be.Services.Common;
+using tdtd_be.Services.Common.Time;
 using tdtd_be.Services;
 using tdtd_be.Services.WorkAssignments.Domain;
 using tdtd_be.Services.WorkAssignments.Internal;
@@ -41,6 +42,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
     private const string RuntimeDataTypeShortTextList = "SHORT_TEXT_LIST";
     private const string RuntimeDataTypeLongText = "LONG_TEXT";
     private const string RuntimeDataTypeStringList = "STRING_LIST";
+    private const string RuntimeDataTypeIgnore = "IGNORE";
 
     private readonly MongoDbContext _ctx;
     private readonly IWorkAssignmentQueueService _queueService;
@@ -56,6 +58,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
     private readonly IWorkReportTableStatisticsService _tableStatistics;
     private readonly IWorkReportFieldStatisticsService _fieldStatistics;
     private readonly IAggregateTableService _aggregateTableService;
+    private readonly ILabelEnumCatalogService _enumCatalogs;
     private readonly ILogger<WorkAssignmentReportService> _log;
 
     private static readonly JsonSerializerOptions _jsonOptions = new(JsonSerializerDefaults.Web)
@@ -79,6 +82,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         IWorkReportTableStatisticsService tableStatistics,
         IWorkReportFieldStatisticsService fieldStatistics,
         IAggregateTableService aggregateTableService,
+        ILabelEnumCatalogService enumCatalogs,
         ILogger<WorkAssignmentReportService> log)
     {
         _ctx = ctx;
@@ -95,6 +99,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         _tableStatistics = tableStatistics;
         _fieldStatistics = fieldStatistics;
         _aggregateTableService = aggregateTableService;
+        _enumCatalogs = enumCatalogs;
         _log = log;
     }
 
@@ -112,28 +117,71 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         req ??= new MyReportTemplateSearchRequest();
         var page = req.Page < 0 ? 0 : req.Page;
         var pageSize = req.PageSize <= 0 ? 20 : req.PageSize;
+        var scopeAssignmentIds = await WorkAssignmentReadAccessHelper.ResolveReadableScopeIdsAsync(
+            _ctx,
+            workId,
+            req.ScopeAssignmentId,
+            actorUserId,
+            ct);
+        var isScopedBranchView = scopeAssignmentIds is not null;
 
-        await EnsureMyReportListDocRolesForUserWorkAsync(workId, actorUserId, ct);
-
-        var projectionFilter = Builders<MyReportTemplateListDocRole>.Filter.Eq(x => x.UserId, actorUserId)
-            & Builders<MyReportTemplateListDocRole>.Filter.Eq(x => x.WorkId, workId)
-            & Builders<MyReportTemplateListDocRole>.Filter.Eq(x => x.IsDeleted, false);
-
-        var projectionRows = await _ctx.MyReportTemplateListDocRoles
-            .Find(projectionFilter)
-            .ToListAsync(ct);
+        if (!isScopedBranchView)
+            await EnsureMyReportListDocRolesForUserWorkAsync(workId, actorUserId, ct);
 
         var rowsByTemplate = new Dictionary<string, MyReportTemplateRow>(StringComparer.Ordinal);
-        foreach (var row in projectionRows.Select(MapTemplateDocRoleToRow))
+        if (!isScopedBranchView)
         {
-            var key = BuildTemplateGroupKey(row.DynamicFormTemplateId, row.DynamicExcelId);
-            if (string.IsNullOrWhiteSpace(key))
-                continue;
+            var projectionFilter = Builders<MyReportTemplateListDocRole>.Filter.Eq(x => x.UserId, actorUserId)
+                & Builders<MyReportTemplateListDocRole>.Filter.Eq(x => x.WorkId, workId)
+                & Builders<MyReportTemplateListDocRole>.Filter.Eq(x => x.IsDeleted, false);
 
-            rowsByTemplate[key] = row;
+            var projectionRows = await _ctx.MyReportTemplateListDocRoles
+                .Find(projectionFilter)
+                .ToListAsync(ct);
+
+            foreach (var row in projectionRows.Select(MapTemplateDocRoleToRow))
+            {
+                var key = BuildTemplateGroupKey(row.DynamicFormTemplateId, row.DynamicExcelId);
+                if (string.IsNullOrWhiteSpace(key))
+                    continue;
+
+                rowsByTemplate[key] = row;
+            }
         }
 
-        var bindings = await LoadVisibleReportBindingsAsync(workId, actorUserId, ct);
+        var bindings = isScopedBranchView
+            ? scopeAssignmentIds!.Count == 0
+                ? new List<WorkTemplateAssignee>()
+                : await _ctx.WorkTemplateAssignees
+                    .Find(x =>
+                        x.WorkId == workId &&
+                        !x.IsDeleted &&
+                        scopeAssignmentIds.Contains(x.WorkAssignmentId))
+                    .ToListAsync(ct)
+            : await LoadVisibleReportBindingsAsync(workId, actorUserId, ct);
+
+        if (isScopedBranchView)
+        {
+            var scopedIds = scopeAssignmentIds!;
+            var periodRows = scopedIds.Count == 0
+                ? new List<MyReportPeriodListDocRole>()
+                : await _ctx.MyReportPeriodListDocRoles
+                    .Find(x =>
+                        x.WorkId == workId &&
+                        scopedIds.Contains(x.AssignmentId) &&
+                        !x.IsDeleted)
+                    .ToListAsync(ct);
+
+            foreach (var row in BuildTemplateRowsFromReportPeriodRows(periodRows))
+            {
+                var key = BuildTemplateGroupKey(row.DynamicFormTemplateId, row.DynamicExcelId);
+                if (string.IsNullOrWhiteSpace(key))
+                    continue;
+
+                rowsByTemplate[key] = row;
+            }
+        }
+
         foreach (var group in bindings
             .Where(x => x.IsActive)
             .GroupBy(x => BuildTemplateGroupKey(x.DynamicFormTemplateId, x.DynamicExcelId), StringComparer.Ordinal))
@@ -288,8 +336,12 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         }
 
         var canReview = !isOwner && !isAssignee && await HasReviewReportReadAccessAsync(report, actorUserId, ct);
+        var canReadAsAggregateSource = !isOwner &&
+                                       !isAssignee &&
+                                       !canReview &&
+                                       await HasAggregateAncestorReadAccessAsync(assignment, actorUserId, ct);
 
-        if (!isOwner && !isAssignee && !canReview)
+        if (!isOwner && !isAssignee && !canReview && !canReadAsAggregateSource)
             throw AppExceptionFactory.Forbidden(
                 AppErrorCode.WORK_ASSIGNMENT_REPORT_ACCESS_FORBIDDEN,
                 ReportDetails(report, actorUserId));
@@ -313,10 +365,30 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             .Limit(1)
             .AnyAsync(ct);
     }
+
+    private async Task<bool> HasAggregateAncestorReadAccessAsync(
+        WorkAssignment reportAssignment,
+        string actorUserId,
+        CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(actorUserId) ||
+            string.IsNullOrWhiteSpace(reportAssignment.WorkId) ||
+            string.IsNullOrWhiteSpace(reportAssignment.Path))
+        {
+            return false;
+        }
+
+        return await WorkAssignmentReadAccessHelper.CanReadAssignmentOrAncestorAsync(
+            _ctx,
+            reportAssignment,
+            actorUserId,
+            ct);
+    }
     public async Task<MyReportTemplateDetailResponse> GetMyReportTemplateDetailAsync(
         string workId,
         string dynamicFormTemplateId,
         string actorUserId,
+        string? scopeAssignmentId = null,
         CancellationToken ct = default)
     {
         EnsureActor(actorUserId);
@@ -329,7 +401,25 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                 AppErrorCode.WORK_ASSIGNMENT_REPORT_DYNAMIC_FORM_TEMPLATE_ID_REQUIRED,
                 new { workId, dynamicFormTemplateId });
 
-        var bindings = await LoadVisibleReportBindingsByTemplateAsync(workId, dynamicFormTemplateId, actorUserId, ct);
+        var scopeAssignmentIds = await WorkAssignmentReadAccessHelper.ResolveReadableScopeIdsAsync(
+            _ctx,
+            workId,
+            scopeAssignmentId,
+            actorUserId,
+            ct);
+        var isScopedBranchView = scopeAssignmentIds is not null;
+
+        var bindings = isScopedBranchView
+            ? scopeAssignmentIds!.Count == 0
+                ? new List<WorkTemplateAssignee>()
+                : await _ctx.WorkTemplateAssignees
+                    .Find(x =>
+                        x.WorkId == workId &&
+                        x.DynamicFormTemplateId == dynamicFormTemplateId &&
+                        scopeAssignmentIds.Contains(x.WorkAssignmentId) &&
+                        !x.IsDeleted)
+                    .ToListAsync(ct)
+            : await LoadVisibleReportBindingsByTemplateAsync(workId, dynamicFormTemplateId, actorUserId, ct);
 
         if (bindings.Count == 0)
             throw AppExceptionFactory.Forbidden(
@@ -356,7 +446,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             .ToListAsync(ct);
 
         // Self-heal mềm: có binding nhưng chưa có period -> đánh thức materialize job
-        if (periods.Count == 0)
+        if (periods.Count == 0 && !isScopedBranchView)
         {
             await TouchMaterializeJobsIfNoPeriodsAsync(bindings, actorUserId, ct);
 
@@ -571,6 +661,14 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
 
         await EnsureReportMutationScopeOpenAsync(assignment, actorUserId, ct);
 
+        var work = await _ctx.Works
+            .Find(x => x.Id == assignment.WorkId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct)
+            ?? throw AppExceptionFactory.NotFound(
+                AppErrorCode.WORK_ASSIGNMENT_WORK_NOT_FOUND,
+                new { workAssignmentId, assignment.WorkId, actorUserId });
+        var parentAssignment = await LoadParentAssignmentForReportDatesAsync(assignment, ct);
+
         WorkReportPeriod? linkedScheduledPeriod = null;
         if (!string.IsNullOrWhiteSpace(req.LinkedScheduledPeriodId))
         {
@@ -600,32 +698,27 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         }
 
         var now = DateTime.UtcNow;
-        var reportDate = NormalizeDate(req.ReportDate ?? now)!.Value;
-        var periodKey = NormalizeUserCreatedPeriodKey(req.PeriodKey, reportDate);
-        var periodStart = NormalizeDate(req.PeriodStart) ?? reportDate;
-        var periodEnd = NormalizeDate(req.PeriodEnd) ?? reportDate;
-        var startedDate = NormalizeDate(req.StartedDate ?? periodStart);
+        var reportDate = ResolveUserCreatedReportDate(req, linkedScheduledPeriod, now);
+        var periodKey = NormalizeUserCreatedPeriodKey(null, reportDate);
+        var (periodStart, periodEnd) = ResolveUserCreatedReportWindow(
+            assignment,
+            work,
+            parentAssignment,
+            linkedScheduledPeriod,
+            reportDate,
+            now);
+        var startedDate = periodStart;
         EnsureReportDateRange(periodStart, periodEnd, "PeriodStart", "PeriodEnd");
         var isHistoricalData = IsHistoricalReportData(reportDate, periodStart, periodEnd, now);
-        var completedDatePolicy = ResolveReportCompletedDatePolicy(
-            assignment,
-            report: null,
-            period: new WorkReportPeriod
-            {
-                PeriodKind = WorkReportPeriodKind.UserCreated,
-                ReportDate = reportDate,
-                PeriodStart = periodStart,
-                PeriodEnd = periodEnd
-            },
-            now: now);
-        var completedDate = ValidateReportCompletedDateInput(
-            completedDatePolicy,
-            NormalizeDate(req.CompletedDate),
-            new { workAssignmentId, actorUserId, reportDate, periodStart, periodEnd },
-            requireWhenMissing: completedDatePolicy.RequiresCompletedDate);
+        DateTime? completedDate = null;
         EnsureReportDateRange(startedDate, completedDate, "StartedDate", "CompletedDate");
-        var requestedDueAtUtc = req.DueAtUtc ?? linkedScheduledPeriod?.DueAtUtc;
-        EnsureUserCreatedReportHasDueAtUtc(WorkReportPeriodKind.UserCreated, requestedDueAtUtc, new
+        var dueAtUtc = ResolveUserCreatedReportDueAtUtc(
+            assignment,
+            work,
+            parentAssignment,
+            linkedScheduledPeriod,
+            reportDate);
+        EnsureUserCreatedReportHasDueAtUtc(WorkReportPeriodKind.UserCreated, dueAtUtc, new
         {
             workAssignmentId,
             actorUserId,
@@ -635,7 +728,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         });
         EnsureUserCreatedReportDueAtOrBeforeAssignmentDueAtUtc(
             WorkReportPeriodKind.UserCreated,
-            requestedDueAtUtc,
+            dueAtUtc,
             assignment,
             new
             {
@@ -645,7 +738,6 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                 reportDate,
                 linkedScheduledPeriodId = linkedScheduledPeriod?.Id
             });
-        var dueAtUtc = ResolveEffectiveReportDueAtUtc(requestedDueAtUtc, assignment);
         var initialStatus = ResolveDraftPeriodStatus(isHistoricalData, completedDate, dueAtUtc, now);
         var periodInstanceKey = $"{periodKey}:{ObjectId.GenerateNewId()}";
 
@@ -833,13 +925,36 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         if (string.IsNullOrWhiteSpace(workAssignmentId))
             throw ReportAssignmentIdRequired(workAssignmentId);
 
-        var access = await EnsureAssignmentReportAccessAsync(workAssignmentId, actorUserId, ct);
+        var assignment = await _ctx.WorkAssignments
+            .Find(x => x.Id == workAssignmentId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct)
+            ?? throw ReportAssignmentNotFound(workAssignmentId);
+
+        var isOwner = assignment.CreatedByUserId == actorUserId;
+        var isAssignee = await _ctx.WorkTemplateAssignees
+            .Find(x =>
+                x.WorkAssignmentId == workAssignmentId &&
+                x.AssigneeUserId == actorUserId &&
+                !x.IsDeleted)
+            .Limit(1)
+            .AnyAsync(ct);
+        var canReadAssignment = await WorkAssignmentReadAccessHelper.CanReadAssignmentAsync(
+            _ctx,
+            workAssignmentId,
+            actorUserId,
+            ct);
+
+        if (!isOwner && !isAssignee && !canReadAssignment)
+            throw AppExceptionFactory.Forbidden(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_ASSIGNMENT_ACCESS_FORBIDDEN,
+                new { workAssignmentId, actorUserId });
 
         var reportFilter = Builders<WorkAssignmentReport>.Filter.Eq(x => x.WorkAssignmentId, workAssignmentId)
             & Builders<WorkAssignmentReport>.Filter.Eq(x => x.IsDeleted, false)
             & Builders<WorkAssignmentReport>.Filter.Ne(x => x.IsActive, false);
 
-        if (!access.isOwner)
+        var canReadWholeAssignment = isOwner || (!isAssignee && canReadAssignment);
+        if (!canReadWholeAssignment)
             reportFilter &= Builders<WorkAssignmentReport>.Filter.Eq(x => x.AssigneeUserId, actorUserId);
 
         var rows = await _ctx.WorkAssignmentReports
@@ -917,13 +1032,14 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
 
         var total = await _ctx.MyReportPeriodListDocRoles.CountDocumentsAsync(filter, cancellationToken: ct);
 
-        var rows = await _ctx.MyReportPeriodListDocRoles
+        var docs = await _ctx.MyReportPeriodListDocRoles
             .Find(filter)
             .Sort(BuildReportPeriodListDocRoleSort(req.SortField, req.SortDirection))
             .Skip(page * pageSize)
             .Limit(pageSize)
-            .Project(MapToListRowProjection())
             .ToListAsync(ct);
+        var mapper = MapToListRowProjection().Compile();
+        var rows = docs.Select(mapper).ToList();
 
         return new PagedResult<WorkAssignmentReportListRow>(
             rows,
@@ -972,11 +1088,17 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                 WorkAssignmentReportStatus.Draft,
                 actorUserId);
 
-        var expectedLength = entity.W * entity.H;
         var actualLength = req.Values1D?.Count ?? 0;
+        var runtimeTopLevelBlock = await ResolveRuntimeTopLevelBlockShapeAsync(entity, req.TableValuesJson, actualLength, ct);
+        var expectedLength = runtimeTopLevelBlock is not null
+            ? ResolveRuntimeInputCells(runtimeTopLevelBlock.Block, runtimeTopLevelBlock.DataRect, runtimeTopLevelBlock.W, runtimeTopLevelBlock.H).Count
+            : ResolveReportRuntimeInputCells(entity).Count;
 
         if (actualLength != expectedLength)
             throw InvalidReportValues(entity, expectedLength, actualLength, actorUserId);
+
+        if (runtimeTopLevelBlock is not null)
+            ApplyRuntimeTopLevelShape(entity, runtimeTopLevelBlock);
 
         var now = DateTime.UtcNow;
         var fromStatus = entity.Status;
@@ -986,7 +1108,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             .FirstOrDefaultAsync(ct);
         var isHistoricalData = IsHistoricalReportData(entity, period, now);
         var completedDatePolicy = ResolveReportCompletedDatePolicy(reportAccess.assignment, entity, period, now);
-        var startedDate = NormalizeDate(req.StartedDate) ?? entity.StartedDate ?? entity.PeriodStart ?? entity.ReportDate;
+        var startedDate = ResolveServerReportStartedDate(entity, period);
         var requestedCompletedDate = NormalizeDate(req.CompletedDate);
         var completedDate = ValidateReportCompletedDateInput(
             completedDatePolicy,
@@ -1022,12 +1144,13 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             actorUserId);
         var nextAggregateSources = ExtractAggregateSourceSnapshot(nextSummarySourceJson);
         var acceptsReportDataPayload = ShouldAcceptReportDataPayload(entity, nextDataOrigin, nextSummarySourceJson);
+        var isStackedAggregatePayload = IsStackedAggregateSummary(nextSummarySourceJson);
 
         await ValidateRuntimeRowLabelsAsync(
             entity,
             acceptsReportDataPayload ? req.TableValuesJson : entity.TableValuesJson,
             ct);
-        if (acceptsReportDataPayload)
+        if (acceptsReportDataPayload && !isStackedAggregatePayload)
             await ValidateRuntimeDataPayloadAsync(
                 entity,
                 req.Values1D,
@@ -1079,10 +1202,12 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                 .Set(x => x.AggregateSnapshotDirtyAtUtc, nextAggregateSnapshotDirtyAtUtc)
                 .Set(x => x.AggregateSnapshotRefreshedAtUtc, nextAggregateSnapshotRefreshedAtUtc)
                 .Set(x => x.AggregateRefreshError, (string?)null)
-                .Set(x => x.CurrentProgressStatus, req.CurrentProgressStatus)
-                .Set(x => x.ReportReason, req.ReportReason)
-                .Set(x => x.Difficulties, req.Difficulties)
-                .Set(x => x.ProposedSolution, req.ProposedSolution)
+                .Set(x => x.W, entity.W)
+                .Set(x => x.H, entity.H)
+                .Set(x => x.DataRectR0, entity.DataRectR0)
+                .Set(x => x.DataRectC0, entity.DataRectC0)
+                .Set(x => x.DataRectR1, entity.DataRectR1)
+                .Set(x => x.DataRectC1, entity.DataRectC1)
                 .Set(x => x.StartedDate, startedDate)
                 .Set(x => x.CompletedDate, completedDate)
                 .Set(x => x.IsHistoricalData, isHistoricalData)
@@ -1109,10 +1234,6 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         entity.AggregateSnapshotDirtyAtUtc = nextAggregateSnapshotDirtyAtUtc;
         entity.AggregateSnapshotRefreshedAtUtc = nextAggregateSnapshotRefreshedAtUtc;
         entity.AggregateRefreshError = null;
-        entity.CurrentProgressStatus = req.CurrentProgressStatus;
-        entity.ReportReason = req.ReportReason;
-        entity.Difficulties = req.Difficulties;
-        entity.ProposedSolution = req.ProposedSolution;
         entity.StartedDate = startedDate;
         entity.CompletedDate = completedDate;
         entity.IsHistoricalData = isHistoricalData;
@@ -1133,10 +1254,6 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                     .Set(x => x.Status, periodStatus)
                     .Set(x => x.IsOverdue, WorkReportPeriodStatusHelper.IsOverdue(periodStatus))
                     .Set(x => x.LastDraftSavedAtUtc, now)
-                    .Set(x => x.CurrentProgressStatus, req.CurrentProgressStatus)
-                    .Set(x => x.ReportReason, req.ReportReason)
-                    .Set(x => x.Difficulties, req.Difficulties)
-                    .Set(x => x.ProposedSolution, req.ProposedSolution)
                     .Set(x => x.StartedDate, startedDate)
                     .Set(x => x.CompletedDate, completedDate)
                     .Set(x => x.IsHistoricalData, isHistoricalData)
@@ -1149,10 +1266,6 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             period.Status = periodStatus;
             period.IsOverdue = WorkReportPeriodStatusHelper.IsOverdue(periodStatus);
             period.LastDraftSavedAtUtc = now;
-            period.CurrentProgressStatus = req.CurrentProgressStatus;
-            period.ReportReason = req.ReportReason;
-            period.Difficulties = req.Difficulties;
-            period.ProposedSolution = req.ProposedSolution;
             period.StartedDate = startedDate;
             period.CompletedDate = completedDate;
             period.IsHistoricalData = isHistoricalData;
@@ -1171,8 +1284,8 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             fromStatus: fromStatus.ToString(),
             toStatus: nextStatus.ToString(),
             actionByUserId: actorUserId,
-            reason: req.ReportReason,
-            comment: req.Difficulties,
+            reason: null,
+            comment: null,
             snapshotJson: null,
             ct: ct);
 
@@ -1242,17 +1355,13 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
 
         var saveReq = new SaveWorkAssignmentReportDraftRequest
         {
-            Values1D = projection.TopLevelValues.Select(x => (object?)x).ToList(),
+            Values1D = projection.TopLevelValues,
             FieldValuesJson = entity.FieldValuesJson,
             TableValuesJson = projection.TableValuesJson,
             DataOrigin = projection.DataOrigin,
             CumulativeContributionMode = projection.ContributionMode,
             CumulativeContributionPolicyJson = projection.ContributionPolicyJson,
             SummarySourceJson = projection.SummarySourceJson,
-            CurrentProgressStatus = entity.CurrentProgressStatus,
-            ReportReason = entity.ReportReason,
-            Difficulties = entity.Difficulties,
-            ProposedSolution = entity.ProposedSolution,
             LateReason = entity.LateReason,
             Note = entity.Note
         };
@@ -1338,33 +1447,41 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         CancellationToken ct)
     {
         var aggregateReq = NormalizeAggregateDraftRequest(req.AggregateRequest);
-        var dynamicFormTemplateId = NormalizeOptionalTextOrNull(entity.DynamicFormTemplateId)
+        var targetDynamicFormTemplateId = NormalizeOptionalTextOrNull(entity.DynamicFormTemplateId)
             ?? throw AppExceptionFactory.BadRequest(
                 AppErrorCode.WORK_ASSIGNMENT_REPORT_AGGREGATE_DRAFT_TEMPLATE_MISMATCH,
                 ReportDetails(entity));
 
-        if (!string.Equals(dynamicFormTemplateId, aggregateReq.DynamicFormTemplateId, StringComparison.Ordinal))
-            throw AppExceptionFactory.BadRequest(
-                AppErrorCode.WORK_ASSIGNMENT_REPORT_AGGREGATE_DRAFT_TEMPLATE_MISMATCH,
-                new
-                {
-                    reportId = entity.Id,
-                    reportTemplateId = dynamicFormTemplateId,
-                    aggregateTemplateId = aggregateReq.DynamicFormTemplateId
-                });
-
         var aggregate = await _aggregateTableService.GetDynamicFormAggregateAsync(aggregateReq, ct);
 
         var form = await _ctx.DynamicFormTemplates
-            .Find(x => x.Id == dynamicFormTemplateId && !x.IsDeleted)
+            .Find(x => x.Id == targetDynamicFormTemplateId && !x.IsDeleted)
             .FirstOrDefaultAsync(ct);
 
         if (form is null)
             throw AppExceptionFactory.NotFound(
                 AppErrorCode.WORK_REPORT_STATISTICS_DYNAMIC_FORM_TEMPLATE_NOT_FOUND,
-                new { dynamicFormTemplateId, reportId = entity.Id });
+                new { dynamicFormTemplateId = targetDynamicFormTemplateId, reportId = entity.Id });
 
-        var targetBlockId = NormalizeBlockId(req.TargetBlockId ?? aggregateReq.BlockId ?? aggregate.Meta.BlockId);
+        var sourceAndTargetShareTemplate = string.Equals(
+            targetDynamicFormTemplateId,
+            aggregateReq.DynamicFormTemplateId,
+            StringComparison.Ordinal);
+        var requestedTargetBlockId = NormalizeOptionalTextOrNull(req.TargetBlockId);
+        if (!sourceAndTargetShareTemplate && string.IsNullOrWhiteSpace(requestedTargetBlockId))
+        {
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_AGGREGATE_DRAFT_REQUEST_INVALID,
+                new
+                {
+                    reportId = entity.Id,
+                    sourceDynamicFormTemplateId = aggregateReq.DynamicFormTemplateId,
+                    targetDynamicFormTemplateId,
+                    reason = "TARGET_BLOCK_REQUIRED_WHEN_SOURCE_FORM_DIFFERS"
+                });
+        }
+
+        var targetBlockId = NormalizeBlockId(requestedTargetBlockId ?? aggregateReq.BlockId ?? aggregate.Meta.BlockId);
         var block = ResolveAggregateDraftBlock(form, targetBlockId)
             ?? throw AppExceptionFactory.NotFound(
                 AppErrorCode.WORK_ASSIGNMENT_REPORT_AGGREGATE_DRAFT_BLOCK_NOT_FOUND,
@@ -1372,6 +1489,24 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
 
         var dataOrigin = WorkReportDataOrigin.Normalize(req.DataOrigin ?? WorkReportDataOrigin.AutoSummary);
         var valueSelector = NormalizeAggregateDraftValueSelector(req.ValueSelector);
+        var reportMapConfigJson = NormalizeReportMapConfigJson(req.ReportMapConfigJson, entity.Id);
+
+        if (aggregate.StackedTable is not null &&
+            string.Equals(block.TableMode, "APPEND_ROWS", StringComparison.Ordinal))
+        {
+            return BuildStackedAggregateDraftProjection(
+                entity,
+                req,
+                aggregateReq,
+                aggregate,
+                form,
+                block,
+                dataOrigin,
+                valueSelector,
+                targetBlockId,
+                reportMapConfigJson);
+        }
+
         var previousSummary = TryReadAggregateDraftSummary(entity.SummarySourceJson);
         var existingTopLevelValues = DeserializeValues1D(entity.Values1DJson);
         var isTopLevelBlock = string.Equals(targetBlockId, ResolveTopLevelBlockId(form), StringComparison.Ordinal);
@@ -1380,31 +1515,103 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             ? existingTopLevelValues
             : ExtractBlockDecimalValues(entity.TableValuesJson, targetBlockId);
         var targetValues = clearExisting
-            ? CreateEmptyValues1D(block.W, block.H)
-            : NormalizeDecimalValues(currentBlockValues, block.W * block.H);
+            ? CreateEmptyValues1D(block.ValueLength, 1)
+            : NormalizeDecimalValues(currentBlockValues, block.ValueLength);
 
-        if (!clearExisting && IsSameAggregateDraftTarget(previousSummary, dynamicFormTemplateId, targetBlockId))
+        if (!clearExisting && IsSameAggregateDraftTarget(previousSummary, targetDynamicFormTemplateId, targetBlockId))
             ClearAggregateDraftTargetIndexes(targetValues, previousSummary!.TargetIndexes);
 
-        ApplyAggregateRowsToValues(targetValues, aggregate.Rows, block, valueSelector);
+        var draftAggregate = ResolveMetricDraftAggregate(aggregate, block, valueSelector);
+        ApplyAggregateRowsToValues(targetValues, draftAggregate.Rows, block, valueSelector);
 
-        var tableValuesJson = BuildAggregateDraftTableValuesJson(entity, form, block, targetValues, aggregate);
+        var tableValuesJson = BuildAggregateDraftTableValuesJson(entity, form, block, targetValues, draftAggregate);
         var topLevelValues = isTopLevelBlock
-            ? targetValues
-            : NormalizeDecimalValues(existingTopLevelValues, entity.W * entity.H);
+            ? targetValues.Select(x => (object?)x).ToList()
+            : NormalizeDecimalValues(existingTopLevelValues, ResolveReportRuntimeInputCells(entity).Count).Select(x => (object?)x).ToList();
         var contributionMode = string.IsNullOrWhiteSpace(req.CumulativeContributionMode)
             ? WorkReportDataOrigin.DefaultContributionMode(dataOrigin)
             : WorkReportCumulativeContributionMode.Normalize(req.CumulativeContributionMode);
         var contributionPolicyJson = NormalizeOptionalTextOrNull(req.CumulativeContributionPolicyJson)
-            ?? BuildAggregateDraftContributionPolicyJson(dataOrigin, aggregate.Rows, block.BlockId);
+            ?? BuildAggregateDraftContributionPolicyJson(dataOrigin, draftAggregate.Rows, block.BlockId);
         var summarySourceJson = BuildAggregateDraftSummarySourceJson(
             dataOrigin,
             aggregateReq,
-            aggregate,
+            draftAggregate,
             block,
             valueSelector,
             targetBlockId,
-            clearExisting);
+            clearExisting,
+            targetDynamicFormTemplateId,
+            reportMapConfigJson);
+
+        return new DynamicFormAggregateDraftProjection(
+            topLevelValues,
+            tableValuesJson,
+            dataOrigin,
+            contributionMode,
+            contributionPolicyJson,
+            summarySourceJson);
+    }
+
+    private DynamicFormAggregateDraftProjection BuildStackedAggregateDraftProjection(
+        WorkAssignmentReport entity,
+        ApplyDynamicFormAggregateDraftRequest req,
+        DynamicFormAggregateRequest aggregateReq,
+        DynamicFormAggregateResponse aggregate,
+        DynamicFormTemplate form,
+        AggregateDraftBlockContract block,
+        string dataOrigin,
+        string valueSelector,
+        string targetBlockId,
+        string? reportMapConfigJson)
+    {
+        if (!string.Equals(block.TableMode, "APPEND_ROWS", StringComparison.Ordinal))
+        {
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.DYNAMIC_FORM_TABLE_MODE_MISMATCH,
+                new
+                {
+                    reportId = entity.Id,
+                    targetBlockId,
+                    expectedTableMode = "APPEND_ROWS",
+                    actualTableMode = block.TableMode,
+                    reason = "STACKED_AGGREGATE_TARGET_REQUIRES_APPEND_ROWS"
+                });
+        }
+
+        var stacked = aggregate.StackedTable!;
+        var columnCount = Math.Max(block.W, stacked.Columns.Count);
+        var rowCount = Math.Max(1, stacked.Rows.Count);
+        var effectiveBlock = block with
+        {
+            W = columnCount,
+            H = rowCount,
+            ValueLength = columnCount * rowCount,
+            DataRect = BuildExpandedAggregateDraftDataRect(block.DataRect, columnCount, rowCount)
+        };
+
+        var values = BuildStackedAggregateValues(stacked, columnCount);
+        var tableValuesJson = BuildStackedAggregateDraftTableValuesJson(entity, form, effectiveBlock, values, aggregate);
+        var isTopLevelBlock = string.Equals(targetBlockId, ResolveTopLevelBlockId(form), StringComparison.Ordinal);
+        var topLevelValues = isTopLevelBlock
+            ? values
+            : NormalizeDecimalValues(DeserializeValues1D(entity.Values1DJson), ResolveReportRuntimeInputCells(entity).Count)
+                .Select(x => (object?)x)
+                .ToList();
+
+        var contributionMode = string.IsNullOrWhiteSpace(req.CumulativeContributionMode)
+            ? WorkReportDataOrigin.DefaultContributionMode(dataOrigin)
+            : WorkReportCumulativeContributionMode.Normalize(req.CumulativeContributionMode);
+        var contributionPolicyJson = NormalizeOptionalTextOrNull(req.CumulativeContributionPolicyJson)
+            ?? BuildStackedAggregateDraftContributionPolicyJson(dataOrigin, stacked, effectiveBlock.BlockId);
+        var summarySourceJson = BuildStackedAggregateDraftSummarySourceJson(
+            dataOrigin,
+            aggregateReq,
+            aggregate,
+            valueSelector,
+            targetBlockId,
+            form.Id,
+            reportMapConfigJson);
 
         return new DynamicFormAggregateDraftProjection(
             topLevelValues,
@@ -1484,7 +1691,10 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         string? requestedValues1DJson = null;
         if (req.Values1D is { Count: > 0 })
         {
-            var expectedLength = entity.W * entity.H;
+            var runtimeTopLevelBlock = await ResolveRuntimeTopLevelBlockShapeAsync(entity, req.TableValuesJson, req.Values1D.Count, ct);
+            var expectedLength = runtimeTopLevelBlock is not null
+                ? ResolveRuntimeInputCells(runtimeTopLevelBlock.Block, runtimeTopLevelBlock.DataRect, runtimeTopLevelBlock.W, runtimeTopLevelBlock.H).Count
+                : ResolveReportRuntimeInputCells(entity).Count;
             if (req.Values1D.Count != expectedLength)
                 throw InvalidReportValues(entity, expectedLength, req.Values1D.Count, actorUserId);
 
@@ -1509,12 +1719,13 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             actorUserId);
         var nextAggregateSources = ExtractAggregateSourceSnapshot(nextSummarySourceJson);
         var acceptsReportDataPayload = ShouldAcceptReportDataPayload(entity, nextDataOrigin, nextSummarySourceJson);
+        var isStackedAggregatePayload = IsStackedAggregateSummary(nextSummarySourceJson);
 
         await ValidateRuntimeRowLabelsAsync(
             entity,
             acceptsReportDataPayload ? req.TableValuesJson ?? entity.TableValuesJson : entity.TableValuesJson,
             ct);
-        if (acceptsReportDataPayload)
+        if (acceptsReportDataPayload && !isStackedAggregatePayload)
             await ValidateRuntimeDataPayloadAsync(
                 entity,
                 req.Values1D is { Count: > 0 } ? req.Values1D : DeserializeRawValues1D(entity.Values1DJson),
@@ -1566,7 +1777,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
 
         var isHistoricalData = IsHistoricalReportData(entity, period, now);
         var completedDatePolicy = ResolveReportCompletedDatePolicy(reportAccess.assignment, entity, period, now);
-        var startedDate = NormalizeDate(req.StartedDate) ?? entity.StartedDate ?? entity.PeriodStart ?? entity.ReportDate;
+        var startedDate = ResolveServerReportStartedDate(entity, period);
         var requestedCompletedDate = NormalizeDate(req.CompletedDate);
         var completedDate = ValidateReportCompletedDateInput(
             completedDatePolicy,
@@ -1596,30 +1807,37 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                 AppErrorCode.WORK_ASSIGNMENT_REPORT_LATE_REASON_REQUIRED,
                 ReportDetails(entity, actorUserId));
 
-        var autoApproveActorUserId = ResolveAutoApproveActorUserId(reportAccess.assignment, actorUserId);
-        var autoApproveMatches =
+        var autoApproveByCondition =
             !isHistoricalData &&
             WorkAssignmentAutoApproveConditionNormalizer.Matches(
                 reportAccess.assignment.AutoApproveConditionJson,
                 entity.FieldValuesJson);
-        var previousOpenPeriod = autoApproveMatches
+        var approveWithoutManualReview = autoApproveByCondition;
+        var approvalActorUserId = ResolveAutoApproveActorUserId(reportAccess.assignment, actorUserId);
+        var previousOpenPeriod = approveWithoutManualReview
             ? await FindPreviousOpenPeriodAsync(period, ct)
             : null;
         if (previousOpenPeriod is not null)
-            autoApproveMatches = false;
+        {
+            autoApproveByCondition = false;
+            approveWithoutManualReview = false;
+            approvalActorUserId = actorUserId;
+        }
 
-        var nextStatus = autoApproveMatches
+        var nextStatus = approveWithoutManualReview
             ? WorkAssignmentReportStatus.Approved
             : WorkAssignmentReportStatus.Submitted;
-        var autoApproveComment = autoApproveMatches
+        var autoApproveComment = autoApproveByCondition
             ? WorkAssignmentAutoApprovalState.AutoApproveReviewerComment
+            : null;
+        var autoApproveReason = autoApproveByCondition
+            ? "AUTO_APPROVE_CONDITION"
+            : null;
+        var autoApproveSnapshotJson = autoApproveByCondition
+            ? reportAccess.assignment.AutoApproveConditionJson
             : null;
 
         entity.Status = nextStatus;
-        entity.CurrentProgressStatus = req.CurrentProgressStatus ?? entity.CurrentProgressStatus;
-        entity.ReportReason = req.ReportReason ?? entity.ReportReason;
-        entity.Difficulties = req.Difficulties ?? entity.Difficulties;
-        entity.ProposedSolution = req.ProposedSolution ?? entity.ProposedSolution;
         entity.StartedDate = startedDate;
         entity.CompletedDate = completedDate;
         entity.IsHistoricalData = isHistoricalData;
@@ -1630,17 +1848,17 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         entity.SubmittedByUserId = actorUserId;
         entity.ReturnedAtUtc = null;
         entity.ReturnedByUserId = null;
-        entity.ReviewerComment = autoApproveMatches ? autoApproveComment : entity.ReviewerComment;
-        entity.ApprovedAtUtc = autoApproveMatches ? now : entity.ApprovedAtUtc;
-        entity.ApprovedByUserId = autoApproveMatches ? autoApproveActorUserId : entity.ApprovedByUserId;
-        entity.AutoApprovedAtUtc = autoApproveMatches ? now : null;
-        entity.AutoApprovedByUserId = autoApproveMatches ? autoApproveActorUserId : null;
-        entity.AutoApproveConditionSnapshotJson = autoApproveMatches ? reportAccess.assignment.AutoApproveConditionJson : null;
+        entity.ReviewerComment = approveWithoutManualReview ? autoApproveComment : entity.ReviewerComment;
+        entity.ApprovedAtUtc = approveWithoutManualReview ? now : entity.ApprovedAtUtc;
+        entity.ApprovedByUserId = approveWithoutManualReview ? approvalActorUserId : entity.ApprovedByUserId;
+        entity.AutoApprovedAtUtc = approveWithoutManualReview ? now : null;
+        entity.AutoApprovedByUserId = approveWithoutManualReview ? approvalActorUserId : null;
+        entity.AutoApproveConditionSnapshotJson = autoApproveSnapshotJson;
         entity.AutoApprovalConfirmedAtUtc = null;
         entity.AutoApprovalConfirmedByUserId = null;
         entity.CreatedByUserId = string.IsNullOrWhiteSpace(entity.CreatedByUserId) ? actorUserId : entity.CreatedByUserId;
         entity.UpdatedAtUtc = now;
-        entity.UpdatedByUserId = autoApproveMatches ? autoApproveActorUserId : actorUserId;
+        entity.UpdatedByUserId = approveWithoutManualReview ? approvalActorUserId : actorUserId;
         var payloadResult = await _payloadWriter.SaveReportPayloadAsync(
             entity,
             entity.Values1DJson,
@@ -1669,10 +1887,6 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                 .Set(x => x.AggregateSnapshotRefreshedAtUtc, entity.AggregateSnapshotRefreshedAtUtc)
                 .Set(x => x.AggregateRefreshError, entity.AggregateRefreshError)
                 .Set(x => x.Status, entity.Status)
-                .Set(x => x.CurrentProgressStatus, entity.CurrentProgressStatus)
-                .Set(x => x.ReportReason, entity.ReportReason)
-                .Set(x => x.Difficulties, entity.Difficulties)
-                .Set(x => x.ProposedSolution, entity.ProposedSolution)
                 .Set(x => x.StartedDate, entity.StartedDate)
                 .Set(x => x.CompletedDate, entity.CompletedDate)
                 .Set(x => x.IsHistoricalData, entity.IsHistoricalData)
@@ -1698,7 +1912,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
 
         if (period is not null)
         {
-            var periodStatus = autoApproveMatches
+            var periodStatus = approveWithoutManualReview
                 ? ResolveApprovedPeriodStatus(period, entity, now)
                 : ResolveSubmittedPeriodStatus(period, entity, now);
 
@@ -1709,42 +1923,34 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                     .Set(x => x.IsOverdue, WorkReportPeriodStatusHelper.IsOverdue(periodStatus))
                     .Set(x => x.LastSubmittedAtUtc, now)
                     .Set(x => x.CurrentReportId, entity.Id)
-                    .Set(x => x.CurrentProgressStatus, entity.CurrentProgressStatus)
-                    .Set(x => x.ReportReason, entity.ReportReason)
-                    .Set(x => x.Difficulties, entity.Difficulties)
-                    .Set(x => x.ProposedSolution, entity.ProposedSolution)
                     .Set(x => x.StartedDate, entity.StartedDate)
                     .Set(x => x.CompletedDate, entity.CompletedDate)
                     .Set(x => x.IsHistoricalData, entity.IsHistoricalData)
                     .Set(x => x.DueAtUtc, entity.DueAtUtc)
                     .Set(x => x.LateReason, entity.LateReason)
                     .Set(x => x.RequiresLateReason, isLate)
-                    .Set(x => x.LastReviewedAtUtc, autoApproveMatches ? now : period.LastReviewedAtUtc)
-                    .Set(x => x.ReviewerComment, autoApproveMatches ? autoApproveComment : period.ReviewerComment)
-                    .Set(x => x.AcceptedLateReason, autoApproveMatches ? lateReason : period.AcceptedLateReason)
+                    .Set(x => x.LastReviewedAtUtc, approveWithoutManualReview ? now : period.LastReviewedAtUtc)
+                    .Set(x => x.ReviewerComment, approveWithoutManualReview ? autoApproveComment : period.ReviewerComment)
+                    .Set(x => x.AcceptedLateReason, approveWithoutManualReview ? lateReason : period.AcceptedLateReason)
                     .Set(x => x.UpdatedAtUtc, now)
-                    .Set(x => x.UpdatedByUserId, autoApproveMatches ? autoApproveActorUserId : actorUserId),
+                    .Set(x => x.UpdatedByUserId, approveWithoutManualReview ? approvalActorUserId : actorUserId),
                 cancellationToken: ct);
 
             period.Status = periodStatus;
             period.IsOverdue = WorkReportPeriodStatusHelper.IsOverdue(periodStatus);
             period.LastSubmittedAtUtc = now;
             period.CurrentReportId = entity.Id;
-            period.CurrentProgressStatus = entity.CurrentProgressStatus;
-            period.ReportReason = entity.ReportReason;
-            period.Difficulties = entity.Difficulties;
-            period.ProposedSolution = entity.ProposedSolution;
             period.StartedDate = entity.StartedDate;
             period.CompletedDate = entity.CompletedDate;
             period.IsHistoricalData = entity.IsHistoricalData;
             period.DueAtUtc = entity.DueAtUtc;
             period.LateReason = entity.LateReason;
             period.RequiresLateReason = isLate;
-            period.LastReviewedAtUtc = autoApproveMatches ? now : period.LastReviewedAtUtc;
-            period.ReviewerComment = autoApproveMatches ? autoApproveComment : period.ReviewerComment;
-            period.AcceptedLateReason = autoApproveMatches ? lateReason : period.AcceptedLateReason;
+            period.LastReviewedAtUtc = approveWithoutManualReview ? now : period.LastReviewedAtUtc;
+            period.ReviewerComment = approveWithoutManualReview ? autoApproveComment : period.ReviewerComment;
+            period.AcceptedLateReason = approveWithoutManualReview ? lateReason : period.AcceptedLateReason;
             period.UpdatedAtUtc = now;
-            period.UpdatedByUserId = autoApproveMatches ? autoApproveActorUserId : actorUserId;
+            period.UpdatedByUserId = approveWithoutManualReview ? approvalActorUserId : actorUserId;
         }
 
         await InsertLogAsync(
@@ -1756,12 +1962,12 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             fromStatus: fromStatus.ToString(),
             toStatus: WorkAssignmentReportStatus.Submitted.ToString(),
             actionByUserId: actorUserId,
-            reason: entity.ReportReason,
+            reason: null,
             comment: lateReason,
             snapshotJson: null,
             ct: ct);
 
-        if (autoApproveMatches)
+        if (approveWithoutManualReview)
         {
             await InsertLogAsync(
                 workId: entity.WorkId,
@@ -1771,24 +1977,24 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                 action: "AUTO_APPROVE",
                 fromStatus: WorkAssignmentReportStatus.Submitted.ToString(),
                 toStatus: WorkAssignmentReportStatus.Approved.ToString(),
-                actionByUserId: autoApproveActorUserId,
-                reason: "AUTO_APPROVE_CONDITION",
+                actionByUserId: approvalActorUserId,
+                reason: autoApproveReason,
                 comment: autoApproveComment,
-                snapshotJson: reportAccess.assignment.AutoApproveConditionJson,
+                snapshotJson: autoApproveSnapshotJson,
                 ct: ct);
         }
 
-        if (period is not null || autoApproveMatches)
+        if (period is not null || approveWithoutManualReview)
         {
             await FinalizeReportStatusOperationAsync(
-                autoApproveMatches ? "SUBMIT_AUTO_APPROVE" : "SUBMIT",
+                approveWithoutManualReview ? "SUBMIT_AUTO_APPROVE" : "SUBMIT",
                 entity,
                 period,
                 fromStatus.ToString(),
                 nextStatus.ToString(),
-                autoApproveMatches ? autoApproveActorUserId : actorUserId,
-                upsertQueue: !autoApproveMatches,
-                disableQueue: autoApproveMatches && period is not null,
+                approveWithoutManualReview ? approvalActorUserId : actorUserId,
+                upsertQueue: !approveWithoutManualReview,
+                disableQueue: approveWithoutManualReview && period is not null,
                 rebuildProjection: true,
                 syncAssignment: true,
                 ct);
@@ -1822,18 +2028,18 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                 { "toStatus", nextStatus.ToString() },
                 { "isLateSubmission", isLate.ToString() },
                 { "isHistoricalData", isHistoricalData.ToString() },
-                { "autoApproved", autoApproveMatches.ToString() }
+                { "autoApproved", approveWithoutManualReview.ToString() }
             },
             OccurredAtUtc = now
         }, CancellationToken.None);
 
-        if (autoApproveMatches)
+        if (approveWithoutManualReview)
         {
             await _userActionLog.RecordAsync(new UserActionLogSeed
             {
                 Action = UserActionLogActions.ReportApproved,
                 Scope = "report",
-                ActorUserId = autoApproveActorUserId,
+                ActorUserId = approvalActorUserId,
                 WorkId = entity.WorkId,
                 WorkAssignmentId = entity.WorkAssignmentId,
                 WorkReportPeriodId = entity.WorkReportPeriodId,
@@ -2521,7 +2727,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             H = template?.H ?? 0,
 
             Values1DJson = JsonSerializer.Serialize(
-                template is null ? new List<decimal?>() : CreateEmptyValues1D(template.W, template.H),
+                template is null ? new List<decimal?>() : CreateEmptyValues1D(ResolveTemplateRuntimeInputCellCount(template), 1),
                 _jsonOptions),
             DataOrigin = defaultDataOrigin,
             CumulativeContributionMode = WorkReportDataOrigin.DefaultContributionMode(defaultDataOrigin),
@@ -2802,41 +3008,59 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         bool validateRequiredFields,
         CancellationToken ct)
     {
-        ValidateTopLevelRuntimeValues(report, values1D ?? Array.Empty<object?>());
-
         if (string.IsNullOrWhiteSpace(report.DynamicFormTemplateId))
+        {
+            var topLevelOptionSets = await _enumCatalogs.LoadActiveOptionSetsAsync(
+                ExtractRuntimeEnumCatalogIds(report.SpecJson),
+                ct);
+            ValidateTopLevelRuntimeValues(report, values1D ?? Array.Empty<object?>(), topLevelOptionSets);
             return;
+        }
 
         var form = await _ctx.DynamicFormTemplates
             .Find(x => x.Id == report.DynamicFormTemplateId && !x.IsDeleted)
             .FirstOrDefaultAsync(ct);
         if (form is null)
+        {
+            var topLevelOptionSets = await _enumCatalogs.LoadActiveOptionSetsAsync(
+                ExtractRuntimeEnumCatalogIds(report.SpecJson),
+                ct);
+            ValidateTopLevelRuntimeValues(report, values1D ?? Array.Empty<object?>(), topLevelOptionSets);
             return;
+        }
 
-        ValidateDynamicFieldRuntimeValues(report, form, fieldValuesJson, validateRequiredFields);
-        ValidateDynamicTableRuntimeValues(report, form, tableValuesJson);
+        var optionSets = await _enumCatalogs.LoadActiveOptionSetsAsync(
+            ExtractRuntimeEnumCatalogIds(report.SpecJson, form.FieldsJson, form.ExcelBlockJson, form.BlocksJson),
+            ct);
+
+        ValidateTopLevelRuntimeValues(report, values1D ?? Array.Empty<object?>(), optionSets);
+        ValidateDynamicFieldRuntimeValues(report, form, fieldValuesJson, validateRequiredFields, optionSets);
+        ValidateDynamicTableRuntimeValues(report, form, tableValuesJson, optionSets);
     }
 
     private static void ValidateTopLevelRuntimeValues(
         WorkAssignmentReport report,
-        IReadOnlyList<object?> values1D)
+        IReadOnlyList<object?> values1D,
+        IReadOnlyDictionary<string, RuntimeEnumOptionSet> optionSets)
     {
-        var expectedLength = report.W * report.H;
+        using var specDocument = TryParseRuntimeJsonObject(report.SpecJson);
+        var spec = specDocument?.RootElement;
+        var inputCells = ResolveReportRuntimeInputCells(report, spec);
+        var expectedLength = inputCells.Count;
         if (values1D.Count != expectedLength)
             throw InvalidReportValues(report, expectedLength, values1D.Count);
 
-        using var specDocument = TryParseRuntimeJsonObject(report.SpecJson);
-        var spec = specDocument?.RootElement;
-
         for (var index = 0; index < values1D.Count; index++)
         {
-            var r = report.DataRectR0 + index / Math.Max(1, report.W);
-            var c = report.DataRectC0 + index % Math.Max(1, report.W);
+            var cell = inputCells[index];
+            var r = cell.R;
+            var c = cell.C;
             var cellContract = spec.HasValue
                 ? ResolveRuntimeCellContract(spec.Value, r, c)
-                : new RuntimeCellContract(RuntimeDataTypeNumber, Array.Empty<RuntimeOption>());
+                : new RuntimeCellContract(RuntimeDataTypeNumber, Array.Empty<RuntimeOption>(), null, null);
+            var options = ResolveRuntimeOptions(cellContract.Options, cellContract.EnumCatalogId, optionSets);
 
-            if (IsRuntimeValueValid(values1D[index], cellContract.DataType, cellContract.Options))
+            if (IsRuntimeValueValid(values1D[index], cellContract.DataType, options, AllowsRawRuntimeCode(cellContract.ValueSourceType)))
                 continue;
 
             throw InvalidReportRuntimeValue(
@@ -2851,11 +3075,31 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         }
     }
 
+    private static List<RuntimeInputCellRef> ResolveReportRuntimeInputCells(
+        WorkAssignmentReport report,
+        JsonElement? parsedSpec = null)
+    {
+        var dataRect = new RuntimeDataRect(report.DataRectR0, report.DataRectC0, report.DataRectR1, report.DataRectC1);
+        return parsedSpec.HasValue
+            ? ResolveRuntimeInputCells(parsedSpec.Value, dataRect, report.W, report.H)
+            : ResolveRuntimeInputCells(default, dataRect, report.W, report.H);
+    }
+
+    private static int ResolveTemplateRuntimeInputCellCount(DynamicExcelTemplate template)
+    {
+        using var specDocument = TryParseRuntimeJsonObject(template.SpecJson);
+        var dataRect = new RuntimeDataRect(template.DataRectR0, template.DataRectC0, template.DataRectR1, template.DataRectC1);
+        return specDocument is null
+            ? ResolveRuntimeInputCells(default, dataRect, template.W, template.H).Count
+            : ResolveRuntimeInputCells(specDocument.RootElement, dataRect, template.W, template.H).Count;
+    }
+
     private static void ValidateDynamicFieldRuntimeValues(
         WorkAssignmentReport report,
         DynamicFormTemplate form,
         string? fieldValuesJson,
-        bool validateRequiredFields)
+        bool validateRequiredFields,
+        IReadOnlyDictionary<string, RuntimeEnumOptionSet> optionSets)
     {
         var fields = ReadRuntimeFields(form.FieldsJson);
         if (fields.Count == 0)
@@ -2882,7 +3126,8 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                     "required");
             }
 
-            if (!hasValue || IsRuntimeValueValid(value, field.DataType, field.Options))
+            var options = ResolveRuntimeOptions(field.Options, field.EnumCatalogId, optionSets);
+            if (!hasValue || IsRuntimeValueValid(value, field.DataType, options, AllowsRawRuntimeCode(field.ValueSourceType)))
                 continue;
 
             throw InvalidReportRuntimeValue(
@@ -2900,7 +3145,8 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
     private static void ValidateDynamicTableRuntimeValues(
         WorkAssignmentReport report,
         DynamicFormTemplate form,
-        string? tableValuesJson)
+        string? tableValuesJson,
+        IReadOnlyDictionary<string, RuntimeEnumOptionSet> optionSets)
     {
         if (string.IsNullOrWhiteSpace(tableValuesJson))
             return;
@@ -2936,7 +3182,8 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                 if (contract is null)
                     continue;
 
-                var expectedLength = contract.W * contract.H;
+                var inputCells = ResolveRuntimeInputCells(contract.Block, contract.DataRect, contract.W, contract.H);
+                var expectedLength = inputCells.Count;
                 var actualLength = values.GetArrayLength();
                 if (actualLength != expectedLength)
                     throw RuntimeTableValuesInvalid(
@@ -2947,10 +3194,12 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                 var index = 0;
                 foreach (var value in values.EnumerateArray())
                 {
-                    var r = contract.DataRect.R0 + index / Math.Max(1, contract.W);
-                    var c = contract.DataRect.C0 + index % Math.Max(1, contract.W);
+                    var cell = inputCells[index];
+                    var r = cell.R;
+                    var c = cell.C;
                     var cellContract = ResolveRuntimeCellContract(contract.Block, r, c);
-                    if (!IsRuntimeValueValid(value, cellContract.DataType, cellContract.Options))
+                    var options = ResolveRuntimeOptions(cellContract.Options, cellContract.EnumCatalogId, optionSets);
+                    if (!IsRuntimeValueValid(value, cellContract.DataType, options, AllowsRawRuntimeCode(cellContract.ValueSourceType)))
                     {
                         throw InvalidReportRuntimeValue(
                             report,
@@ -3007,7 +3256,9 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                     string.IsNullOrWhiteSpace(displayName) ? key.Trim() : displayName.Trim(),
                     NormalizeRuntimeFieldDataType(ReadJsonString(item, "type")),
                     ReadJsonBool(item, "required") == true,
-                    ReadRuntimeOptions(item)));
+                    ReadRuntimeOptions(item),
+                    ReadRuntimeEnumCatalogId(item),
+                    ReadRuntimeValueSourceType(item)));
             }
 
             return result;
@@ -3083,6 +3334,31 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         return rows.ToArray();
     }
 
+    private static string? ReadRuntimeEnumCatalogId(JsonElement owner)
+    {
+        if (!TryGetJsonProperty(owner, "valueSource", out var source) || source.ValueKind != JsonValueKind.Object)
+            return null;
+
+        var sourceType = ReadRuntimeValueSourceType(owner);
+        if (sourceType != LabelValueSourceTypes.EnumCatalog)
+            return null;
+
+        return ReadJsonString(source, "catalogId") ??
+               ReadJsonString(source, "valueSourceCatalogId") ??
+               ReadJsonString(source, "enumCatalogId");
+    }
+
+    private static string? ReadRuntimeValueSourceType(JsonElement owner)
+    {
+        if (!TryGetJsonProperty(owner, "valueSource", out var source) || source.ValueKind != JsonValueKind.Object)
+            return null;
+
+        return LabelValueSourceTypes.Normalize(
+            ReadJsonString(source, "sourceType") ??
+            ReadJsonString(source, "type") ??
+            ReadJsonString(source, "valueSourceType"));
+    }
+
     private static Dictionary<string, RuntimeTableBlockContract> ReadRuntimeTableBlocks(
         DynamicFormTemplate form)
     {
@@ -3124,6 +3400,132 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             return new List<JsonElement>();
         }
     }
+
+    private static List<JsonElement> ReadRuntimeTableValueBlockElements(string? tableValuesJson)
+    {
+        if (string.IsNullOrWhiteSpace(tableValuesJson))
+            return new List<JsonElement>();
+
+        try
+        {
+            using var document = JsonDocument.Parse(tableValuesJson);
+            if (document.RootElement.ValueKind == JsonValueKind.Object &&
+                TryGetJsonProperty(document.RootElement, "blocks", out var blocks) &&
+                blocks.ValueKind == JsonValueKind.Array)
+            {
+                return blocks
+                    .EnumerateArray()
+                    .Where(item => item.ValueKind == JsonValueKind.Object)
+                    .Select(item => item.Clone())
+                    .ToList();
+            }
+
+            return document.RootElement.ValueKind == JsonValueKind.Array
+                ? document.RootElement
+                    .EnumerateArray()
+                    .Where(item => item.ValueKind == JsonValueKind.Object)
+                    .Select(item => item.Clone())
+                    .ToList()
+                : new List<JsonElement>();
+        }
+        catch (JsonException)
+        {
+            return new List<JsonElement>();
+        }
+    }
+
+    private static RuntimeTableBlockContract? ResolveRuntimeTopLevelBlockShape(string? tableValuesJson, int valuesLength)
+    {
+        if (valuesLength <= 0)
+            return null;
+
+        foreach (var block in ReadRuntimeTableValueBlockElements(tableValuesJson))
+        {
+            var contract = ParseRuntimeTableBlock(block);
+            if (contract is null)
+                continue;
+
+            var inputLength = ResolveRuntimeInputCells(contract.Block, contract.DataRect, contract.W, contract.H).Count;
+            if (inputLength == valuesLength || ReadJsonArrayLength(block, "values1D") == valuesLength)
+                return contract;
+        }
+
+        return null;
+    }
+
+    private async Task<RuntimeTableBlockContract?> ResolveRuntimeTopLevelBlockShapeAsync(
+        WorkAssignmentReport report,
+        string? tableValuesJson,
+        int valuesLength,
+        CancellationToken ct)
+    {
+        if (valuesLength <= 0)
+            return null;
+
+        var valueBlocks = ReadRuntimeTableValueBlockElements(tableValuesJson);
+        if (valueBlocks.Count == 0)
+            return null;
+
+        Dictionary<string, RuntimeTableBlockContract>? templateContracts = null;
+        if (!string.IsNullOrWhiteSpace(report.DynamicFormTemplateId))
+        {
+            var dynamicFormTemplateId = report.DynamicFormTemplateId.Trim();
+            var form = await _ctx.DynamicFormTemplates
+                .Find(x => x.Id == dynamicFormTemplateId && !x.IsDeleted)
+                .FirstOrDefaultAsync(ct);
+            if (form is not null)
+                templateContracts = ReadRuntimeTableBlocks(form);
+        }
+
+        foreach (var block in valueBlocks)
+        {
+            var blockId = NormalizeBlockId(ReadJsonString(block, "blockId") ?? ReadJsonString(block, "id"));
+            var blockValuesLength = ReadJsonArrayLength(block, "values1D");
+            if (blockValuesLength.HasValue && blockValuesLength.Value != valuesLength)
+                continue;
+
+            if (templateContracts is not null &&
+                templateContracts.TryGetValue(blockId, out var templateContract))
+            {
+                var templateInputLength = ResolveRuntimeInputCells(
+                    templateContract.Block,
+                    templateContract.DataRect,
+                    templateContract.W,
+                    templateContract.H).Count;
+                if (templateInputLength == valuesLength || blockValuesLength == valuesLength)
+                    return templateContract;
+            }
+
+            var payloadContract = ParseRuntimeTableBlock(block);
+            if (payloadContract is null)
+                continue;
+
+            var payloadInputLength = ResolveRuntimeInputCells(
+                payloadContract.Block,
+                payloadContract.DataRect,
+                payloadContract.W,
+                payloadContract.H).Count;
+            if (payloadInputLength == valuesLength || blockValuesLength == valuesLength)
+                return payloadContract;
+        }
+
+        return null;
+    }
+
+    private static void ApplyRuntimeTopLevelShape(WorkAssignmentReport report, RuntimeTableBlockContract block)
+    {
+        report.W = block.W;
+        report.H = block.H;
+        report.DataRectR0 = block.DataRect.R0;
+        report.DataRectC0 = block.DataRect.C0;
+        report.DataRectR1 = block.DataRect.R1;
+        report.DataRectC1 = block.DataRect.C1;
+    }
+
+    private static int? ReadJsonArrayLength(JsonElement element, string name)
+        => TryGetJsonProperty(element, name, out var array) && array.ValueKind == JsonValueKind.Array
+            ? array.GetArrayLength()
+            : null;
 
     private static RuntimeTableBlockContract? ParseRuntimeTableBlock(JsonElement block)
     {
@@ -3167,6 +3569,94 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
     private static int RuntimeRectHeight(RuntimeDataRect rect)
         => rect.R1 >= rect.R0 ? rect.R1 - rect.R0 + 1 : 0;
 
+    private static List<RuntimeInputCellRef> ResolveRuntimeInputCells(
+        JsonElement specOrBlock,
+        RuntimeDataRect dataRect,
+        int width,
+        int height)
+    {
+        var rect = RuntimeRectWidth(dataRect) > 0 && RuntimeRectHeight(dataRect) > 0
+            ? dataRect
+            : new RuntimeDataRect(0, 0, Math.Max(0, height - 1), Math.Max(0, width - 1));
+        var specialRanges = ReadRuntimeSpecialRanges(specOrBlock, rect);
+        var cells = new List<RuntimeInputCellRef>();
+        var index = 0;
+
+        for (var r = rect.R0; r <= rect.R1; r++)
+        {
+            for (var c = rect.C0; c <= rect.C1; c++)
+            {
+                if (specialRanges.Any(range => RuntimeRectContains(range, r, c)))
+                    continue;
+
+                cells.Add(new RuntimeInputCellRef(index++, r, c));
+            }
+        }
+
+        return cells;
+    }
+
+    private static List<RuntimeDataRect> ReadRuntimeSpecialRanges(JsonElement owner, RuntimeDataRect dataRect)
+    {
+        var ranges = new List<RuntimeDataRect>();
+        if (owner.ValueKind != JsonValueKind.Object ||
+            !TryGetJsonProperty(owner, "specialRanges", out var items) ||
+            items.ValueKind != JsonValueKind.Array)
+        {
+            return ranges;
+        }
+
+        foreach (var item in items.EnumerateArray())
+        {
+            if (item.ValueKind != JsonValueKind.Object)
+                continue;
+
+            var role = NormalizeRuntimeSpecialRole(ReadJsonString(item, "role") ?? ReadJsonString(item, "kind") ?? ReadJsonString(item, "type"));
+            if (string.IsNullOrWhiteSpace(role))
+                continue;
+
+            var r0 = ReadJsonInt(item, "r0") ?? ReadJsonInt(item, "R0");
+            var c0 = ReadJsonInt(item, "c0") ?? ReadJsonInt(item, "C0");
+            var r1 = ReadJsonInt(item, "r1") ?? ReadJsonInt(item, "R1");
+            var c1 = ReadJsonInt(item, "c1") ?? ReadJsonInt(item, "C1");
+            if (!r0.HasValue || !c0.HasValue || !r1.HasValue || !c1.HasValue)
+                continue;
+            if (r1.Value < r0.Value || c1.Value < c0.Value)
+                continue;
+
+            var range = new RuntimeDataRect(r0.Value, c0.Value, r1.Value, c1.Value);
+            if (!RuntimeRectContains(dataRect, range))
+                continue;
+            if (ranges.Any(existing => RuntimeRectsOverlap(existing, range)))
+                continue;
+
+            ranges.Add(range);
+        }
+
+        return ranges;
+    }
+
+    private static string? NormalizeRuntimeSpecialRole(string? value)
+    {
+        var role = value?.Trim().ToUpperInvariant();
+        if (role == "FORMULAR")
+            role = "FORMULA";
+        if (role == "HEADER")
+            role = "TITLE";
+        if (role is "STYLE" or "EMPTY" or "EMPTY_INPUT")
+            role = "BLANK";
+        return role is "FORMULA" or "TITLE" or "BLANK" ? role : null;
+    }
+
+    private static bool RuntimeRectContains(RuntimeDataRect rect, int r, int c)
+        => r >= rect.R0 && r <= rect.R1 && c >= rect.C0 && c <= rect.C1;
+
+    private static bool RuntimeRectContains(RuntimeDataRect outer, RuntimeDataRect inner)
+        => inner.R0 >= outer.R0 && inner.C0 >= outer.C0 && inner.R1 <= outer.R1 && inner.C1 <= outer.C1;
+
+    private static bool RuntimeRectsOverlap(RuntimeDataRect a, RuntimeDataRect b)
+        => a.R0 <= b.R1 && a.R1 >= b.R0 && a.C0 <= b.C1 && a.C1 >= b.C0;
+
     private static RuntimeCellContract ResolveRuntimeCellContract(JsonElement specOrBlock, int rowIndex, int columnIndex)
     {
         var kind = (ReadJsonString(specOrBlock, "kind") ??
@@ -3178,11 +3668,13 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             ReadJsonString(specOrBlock, "defaultDataType") ??
             ReadJsonString(specOrBlock, "dataType"));
         var options = ReadRuntimeOptions(specOrBlock, "defaultOptions");
+        var enumCatalogId = ReadRuntimeEnumCatalogId(specOrBlock);
+        var valueSourceType = ReadRuntimeValueSourceType(specOrBlock);
 
         if (!TryGetJsonProperty(specOrBlock, "dataTypeOverrides", out var overrides) ||
             overrides.ValueKind != JsonValueKind.Array)
         {
-            return new RuntimeCellContract(dataType, options);
+            return new RuntimeCellContract(dataType, options, enumCatalogId, valueSourceType);
         }
 
         foreach (var item in overrides.EnumerateArray())
@@ -3200,10 +3692,12 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             {
                 dataType = NormalizeRuntimeDataType(ReadJsonString(item, "dataType"));
                 options = ReadRuntimeOptions(item, "options");
+                enumCatalogId = ReadRuntimeEnumCatalogId(item);
+                valueSourceType = ReadRuntimeValueSourceType(item);
             }
         }
 
-        return new RuntimeCellContract(dataType, options);
+        return new RuntimeCellContract(dataType, options, enumCatalogId, valueSourceType);
     }
 
     private static RuntimeOption[] ReadRuntimeOptions(JsonElement owner, string propertyName)
@@ -3237,6 +3731,59 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         }
 
         return rows.ToArray();
+    }
+
+    private static RuntimeOption[] ResolveRuntimeOptions(
+        RuntimeOption[] inlineOptions,
+        string? enumCatalogId,
+        IReadOnlyDictionary<string, RuntimeEnumOptionSet> optionSets)
+    {
+        if (string.IsNullOrWhiteSpace(enumCatalogId))
+            return inlineOptions;
+
+        return optionSets.TryGetValue(enumCatalogId.Trim(), out var optionSet)
+            ? optionSet.Codes.Select(code => new RuntimeOption(code, code)).ToArray()
+            : Array.Empty<RuntimeOption>();
+    }
+
+    private static IReadOnlyList<string> ExtractRuntimeEnumCatalogIds(params string?[] jsonValues)
+    {
+        var result = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var json in jsonValues)
+        {
+            if (string.IsNullOrWhiteSpace(json))
+                continue;
+
+            try
+            {
+                using var document = JsonDocument.Parse(json);
+                CollectRuntimeEnumCatalogIds(document.RootElement, result);
+            }
+            catch (JsonException)
+            {
+                continue;
+            }
+        }
+
+        return result.ToList();
+    }
+
+    private static void CollectRuntimeEnumCatalogIds(JsonElement element, ISet<string> result)
+    {
+        if (element.ValueKind == JsonValueKind.Object)
+        {
+            var catalogId = ReadRuntimeEnumCatalogId(element);
+            if (!string.IsNullOrWhiteSpace(catalogId))
+                result.Add(catalogId.Trim());
+
+            foreach (var property in element.EnumerateObject())
+                CollectRuntimeEnumCatalogIds(property.Value, result);
+        }
+        else if (element.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var item in element.EnumerateArray())
+                CollectRuntimeEnumCatalogIds(item, result);
+        }
     }
 
     private static bool RuntimeRangeContains(JsonElement item, int rowIndex, int columnIndex)
@@ -3277,6 +3824,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             RuntimeDataTypeLongText or "LONGTEXT" => RuntimeDataTypeStringList,
             RuntimeDataTypeStringList or "STRINGLIST" => RuntimeDataTypeStringList,
             RuntimeDataTypeShortTextList or "MULTI_SELECT" or "MULTISELECT" => RuntimeDataTypeShortTextList,
+            RuntimeDataTypeIgnore or "IGNORED" or "SKIP" => RuntimeDataTypeIgnore,
             _ => RuntimeDataTypeNumber
         };
     }
@@ -3284,10 +3832,20 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
     private static bool IsRuntimeValueValid(
         object? value,
         string dataType,
-        IReadOnlyCollection<RuntimeOption>? options = null)
+        IReadOnlyCollection<RuntimeOption>? options = null,
+        bool allowRawExternalCode = false)
     {
+        if (dataType == RuntimeDataTypeIgnore)
+            return true;
+
         if (IsBlankRuntimeValue(value))
             return true;
+
+        if (allowRawExternalCode &&
+            (dataType == RuntimeDataTypeShortText || dataType == RuntimeDataTypeShortTextList))
+        {
+            return IsRuntimeExternalCodeValueValid(value, dataType);
+        }
 
         if (value is JsonElement element)
             return IsJsonRuntimeValueValid(element, dataType, options);
@@ -3305,6 +3863,42 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             RuntimeDataTypeStringList or RuntimeDataTypeLongText => IsRuntimeFreeStringListValueValid(value),
             _ => true
         };
+    }
+
+    private static bool AllowsRawRuntimeCode(string? valueSourceType)
+    {
+        var sourceType = LabelValueSourceTypes.Normalize(valueSourceType);
+        return LabelValueSourceTypes.UsesCatalog(sourceType) &&
+               sourceType != LabelValueSourceTypes.EnumCatalog;
+    }
+
+    private static bool IsRuntimeExternalCodeValueValid(object? value, string dataType)
+    {
+        if (dataType == RuntimeDataTypeShortText)
+        {
+            if (value is string text)
+                return !string.IsNullOrWhiteSpace(text);
+            if (value is JsonElement element)
+                return element.ValueKind == JsonValueKind.String &&
+                       !string.IsNullOrWhiteSpace(element.GetString());
+            return false;
+        }
+
+        if (dataType == RuntimeDataTypeShortTextList)
+        {
+            if (value is IEnumerable<string> list)
+                return list.All(item => !string.IsNullOrWhiteSpace(item));
+            if (value is JsonElement element)
+            {
+                return element.ValueKind == JsonValueKind.Array &&
+                       element.EnumerateArray().All(item =>
+                           item.ValueKind == JsonValueKind.String &&
+                           !string.IsNullOrWhiteSpace(item.GetString()));
+            }
+            return false;
+        }
+
+        return false;
     }
 
     private static bool IsJsonRuntimeValueValid(
@@ -3645,6 +4239,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             RuntimeDataTypeShortText => "mã enum SHORT_TEXT",
             RuntimeDataTypeShortTextList => "mảng mã enum MULTI_SELECT",
             RuntimeDataTypeStringList or RuntimeDataTypeLongText => "string[]",
+            RuntimeDataTypeIgnore => "ignore",
             _ => dataType
         };
 
@@ -4047,11 +4642,6 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             AggregateSnapshotRefreshedAtUtc = x.AggregateSnapshotRefreshedAtUtc,
             AggregateRefreshError = x.AggregateRefreshError,
 
-            CurrentProgressStatus = x.CurrentProgressStatus,
-            ReportReason = x.ReportReason,
-            Difficulties = x.Difficulties,
-            ProposedSolution = x.ProposedSolution,
-
             IsLateSubmission = x.IsLateSubmission,
             LateReason = x.LateReason,
 
@@ -4372,7 +4962,8 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
 
             if (!mayInclude)
             {
-                continue;
+                if (!AggregateSummaryReferencesSource(summary, source))
+                    continue;
             }
 
             await RefreshAggregateDependentAfterSourceChangeAsync(
@@ -4865,8 +5456,6 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             return null;
 
         var aggregateReq = NormalizeAggregateDraftRequest(summary.AggregateRequest);
-        if (!string.Equals(report.DynamicFormTemplateId, aggregateReq.DynamicFormTemplateId, StringComparison.Ordinal))
-            return null;
 
         var aggregate = await _aggregateTableService.GetDynamicFormAggregateAsync(aggregateReq, ct);
 
@@ -4883,6 +5472,22 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             return null;
 
         var dataOrigin = WorkReportDataOrigin.Normalize(summary.DataOrigin);
+        if (aggregate.StackedTable is not null &&
+            string.Equals(block.TableMode, "APPEND_ROWS", StringComparison.Ordinal))
+        {
+            return await RefreshStackedDynamicFormAggregateReportFromSummaryAsync(
+                report,
+                summary,
+                aggregateReq,
+                aggregate,
+                form,
+                block,
+                targetBlockId,
+                dataOrigin,
+                actorUserId,
+                ct);
+        }
+
         var existingTopLevelValues = DeserializeValues1D(report.Values1DJson);
         var isTopLevelBlock = string.Equals(targetBlockId, ResolveTopLevelBlockId(form), StringComparison.Ordinal);
         var currentBlockValues = isTopLevelBlock
@@ -4890,32 +5495,37 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             : ExtractBlockDecimalValues(report.TableValuesJson, targetBlockId);
         var clearExisting = summary.ClearExistingValues ?? dataOrigin != WorkReportDataOrigin.PartialMapping;
         var targetValues = clearExisting
-            ? CreateEmptyValues1D(block.W, block.H)
-            : NormalizeDecimalValues(currentBlockValues, block.W * block.H);
+            ? CreateEmptyValues1D(block.ValueLength, 1)
+            : NormalizeDecimalValues(currentBlockValues, block.ValueLength);
 
         if (!clearExisting)
             ClearAggregateDraftTargetIndexes(targetValues, summary.TargetIndexes);
 
+        var valueSelector = NormalizeAggregateDraftValueSelector(summary.ValueSelector);
+        var draftAggregate = ResolveMetricDraftAggregate(aggregate, block, valueSelector);
+
         ApplyAggregateRowsToValues(
             targetValues,
-            aggregate.Rows,
+            draftAggregate.Rows,
             block,
-            NormalizeAggregateDraftValueSelector(summary.ValueSelector));
+            valueSelector);
 
-        var tableValuesJson = BuildAggregateDraftTableValuesJson(report, form, block, targetValues, aggregate);
+        var tableValuesJson = BuildAggregateDraftTableValuesJson(report, form, block, targetValues, draftAggregate);
         var topLevelValues = isTopLevelBlock
             ? targetValues
-            : NormalizeDecimalValues(existingTopLevelValues, report.W * report.H);
+            : NormalizeDecimalValues(existingTopLevelValues, ResolveReportRuntimeInputCells(report).Count);
         var values1DJson = JsonSerializer.Serialize(topLevelValues, _jsonOptions);
-        var contributionPolicyJson = BuildAggregateDraftContributionPolicyJson(dataOrigin, aggregate.Rows, block.BlockId);
+        var contributionPolicyJson = BuildAggregateDraftContributionPolicyJson(dataOrigin, draftAggregate.Rows, block.BlockId);
         var summarySourceJson = BuildAggregateDraftSummarySourceJson(
             dataOrigin,
             aggregateReq,
-            aggregate,
+            draftAggregate,
             block,
-            NormalizeAggregateDraftValueSelector(summary.ValueSelector),
+            valueSelector,
             targetBlockId,
-            clearExisting);
+            clearExisting,
+            report.DynamicFormTemplateId,
+            summary.ReportMapConfigJson);
         var sourceSnapshot = ExtractAggregateSourceSnapshot(summarySourceJson);
         var now = DateTime.UtcNow;
         var payloadResult = await _payloadWriter.SaveReportPayloadAsync(
@@ -4992,6 +5602,120 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         return report;
     }
 
+    private async Task<WorkAssignmentReport?> RefreshStackedDynamicFormAggregateReportFromSummaryAsync(
+        WorkAssignmentReport report,
+        AggregateDraftSummary summary,
+        DynamicFormAggregateRequest aggregateReq,
+        DynamicFormAggregateResponse aggregate,
+        DynamicFormTemplate form,
+        AggregateDraftBlockContract block,
+        string targetBlockId,
+        string dataOrigin,
+        string actorUserId,
+        CancellationToken ct)
+    {
+        if (!string.Equals(block.TableMode, "APPEND_ROWS", StringComparison.Ordinal))
+            return null;
+
+        var stacked = aggregate.StackedTable ?? new DynamicFormStackedTableDto();
+        var columnCount = Math.Max(block.W, stacked.Columns.Count);
+        var rowCount = Math.Max(1, stacked.Rows.Count);
+        var effectiveBlock = block with
+        {
+            W = columnCount,
+            H = rowCount,
+            ValueLength = columnCount * rowCount,
+            DataRect = BuildExpandedAggregateDraftDataRect(block.DataRect, columnCount, rowCount)
+        };
+
+        var values = BuildStackedAggregateValues(stacked, columnCount, rowCount);
+        var tableValuesJson = BuildStackedAggregateDraftTableValuesJson(report, form, effectiveBlock, values, aggregate);
+        var isTopLevelBlock = string.Equals(targetBlockId, ResolveTopLevelBlockId(form), StringComparison.Ordinal);
+        var existingTopLevelValues = DeserializeValues1D(report.Values1DJson);
+        var topLevelValues = isTopLevelBlock
+            ? values
+            : NormalizeDecimalValues(existingTopLevelValues, ResolveReportRuntimeInputCells(report).Count)
+                .Select(x => (object?)x)
+                .ToList();
+        var values1DJson = JsonSerializer.Serialize(topLevelValues, _jsonOptions);
+        var contributionPolicyJson = BuildStackedAggregateDraftContributionPolicyJson(dataOrigin, stacked, effectiveBlock.BlockId);
+        var summarySourceJson = BuildStackedAggregateDraftSummarySourceJson(
+            dataOrigin,
+            aggregateReq,
+            aggregate,
+            NormalizeAggregateDraftValueSelector(summary.ValueSelector),
+            targetBlockId,
+            form.Id,
+            summary.ReportMapConfigJson);
+        var sourceSnapshot = ExtractAggregateSourceSnapshot(summarySourceJson);
+        var now = DateTime.UtcNow;
+        var payloadResult = await _payloadWriter.SaveReportPayloadAsync(
+            report,
+            values1DJson,
+            report.FieldValuesJson,
+            tableValuesJson,
+            summarySourceJson,
+            actorUserId,
+            now,
+            ct);
+
+        await _ctx.WorkAssignmentReports.UpdateOneAsync(
+            x => x.Id == report.Id && !x.IsDeleted,
+            ApplyPayloadHeaderUpdate(
+                Builders<WorkAssignmentReport>.Update,
+                payloadResult,
+                now)
+                .Set(x => x.DataOrigin, dataOrigin)
+                .Set(x => x.CumulativeContributionMode, WorkReportDataOrigin.DefaultContributionMode(dataOrigin))
+                .Set(x => x.CumulativeContributionPolicyJson, contributionPolicyJson)
+                .Set(x => x.AggregateSourceReportIds, sourceSnapshot.ReportIds)
+                .Set(x => x.AggregateSourceAssignmentIds, sourceSnapshot.AssignmentIds)
+                .Set(x => x.AggregateSourceUpdatedAtUtc, now)
+                .Set(x => x.AggregateSnapshotDirty, false)
+                .Set(x => x.AggregateSnapshotDirtyAtUtc, (DateTime?)null)
+                .Set(x => x.AggregateSnapshotRefreshedAtUtc, now)
+                .Set(x => x.AggregateRefreshError, (string?)null)
+                .Set(x => x.UpdatedAtUtc, now)
+                .Set(x => x.UpdatedByUserId, actorUserId),
+            cancellationToken: ct);
+
+        report.Values1DJson = values1DJson;
+        report.TableValuesJson = tableValuesJson;
+        ApplyPayloadMetadata(report, payloadResult, now);
+        report.DataOrigin = dataOrigin;
+        report.CumulativeContributionMode = WorkReportDataOrigin.DefaultContributionMode(dataOrigin);
+        report.CumulativeContributionPolicyJson = contributionPolicyJson;
+        report.SummarySourceJson = summarySourceJson;
+        report.AggregateSourceReportIds = sourceSnapshot.ReportIds;
+        report.AggregateSourceAssignmentIds = sourceSnapshot.AssignmentIds;
+        report.AggregateSourceUpdatedAtUtc = now;
+        report.AggregateSnapshotDirty = false;
+        report.AggregateSnapshotDirtyAtUtc = null;
+        report.AggregateSnapshotRefreshedAtUtc = now;
+        report.AggregateRefreshError = null;
+        report.UpdatedAtUtc = now;
+        report.UpdatedByUserId = actorUserId;
+
+        await InsertLogAsync(
+            workId: report.WorkId,
+            workAssignmentId: report.WorkAssignmentId,
+            workReportPeriodId: report.WorkReportPeriodId,
+            workAssignmentReportId: report.Id,
+            action: "REFRESH_AGGREGATE_STACKED_DRAFT",
+            fromStatus: report.Status.ToString(),
+            toStatus: report.Status.ToString(),
+            actionByUserId: actorUserId,
+            reason: "SOURCE_CHANGED",
+            comment: $"sourceReportCount={sourceSnapshot.ReportIds.Count}",
+            snapshotJson: summarySourceJson,
+            ct: ct);
+
+        if (!string.IsNullOrWhiteSpace(report.WorkReportPeriodId))
+            await _docRoleReadModelProjection.RebuildReportPeriodAsync(report.WorkReportPeriodId, actorUserId, ct);
+
+        return report;
+    }
+
     private static void ClearAggregateDraftTargetIndexes(
         List<decimal?> targetValues,
         IReadOnlyCollection<int> targetIndexes)
@@ -5005,14 +5729,14 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
 
     private static bool IsSameAggregateDraftTarget(
         AggregateDraftSummary? summary,
-        string dynamicFormTemplateId,
+        string targetDynamicFormTemplateId,
         string targetBlockId)
     {
         if (summary is null || summary.TargetIndexes.Count == 0)
             return false;
 
-        if (!string.IsNullOrWhiteSpace(summary.AggregateRequest.DynamicFormTemplateId) &&
-            !string.Equals(summary.AggregateRequest.DynamicFormTemplateId.Trim(), dynamicFormTemplateId, StringComparison.Ordinal))
+        if (!string.IsNullOrWhiteSpace(summary.TargetDynamicFormTemplateId) &&
+            !string.Equals(summary.TargetDynamicFormTemplateId.Trim(), targetDynamicFormTemplateId, StringComparison.Ordinal))
         {
             return false;
         }
@@ -5031,6 +5755,87 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         log.DurationMs = (long)(completedAtUtc - startedAtUtc).TotalMilliseconds;
         await _statusLog.WriteAsync(log, ct);
     }
+
+    private async Task<HashSet<string>?> ResolveAssignmentScopeIdsAsync(
+        string workId,
+        string? scopeAssignmentId,
+        CancellationToken ct)
+    {
+        var scopeId = NormalizeOptionalTextOrNull(scopeAssignmentId);
+        if (string.IsNullOrWhiteSpace(scopeId))
+            return null;
+
+        var assignments = await _ctx.WorkAssignments
+            .Find(x => x.WorkId == workId && !x.IsDeleted)
+            .Project(x => new { x.Id, x.Path })
+            .ToListAsync(ct);
+
+        var scope = assignments.FirstOrDefault(x => string.Equals(x.Id, scopeId, StringComparison.Ordinal));
+        if (scope is null)
+            return new HashSet<string>(StringComparer.Ordinal);
+
+        var scopePath = scope.Path?.Trim();
+        return assignments
+            .Where(x =>
+                string.Equals(x.Id, scope.Id, StringComparison.Ordinal) ||
+                (!string.IsNullOrWhiteSpace(scopePath) &&
+                 !string.IsNullOrWhiteSpace(x.Path) &&
+                 x.Path.StartsWith($"{scopePath}/", StringComparison.Ordinal)))
+            .Select(x => x.Id)
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .ToHashSet(StringComparer.Ordinal);
+    }
+
+    private static List<MyReportTemplateRow> BuildTemplateRowsFromReportPeriodRows(
+        List<MyReportPeriodListDocRole> periodRows)
+        => periodRows
+            .GroupBy(x => BuildTemplateGroupKey(x.DynamicFormTemplateId, x.DynamicExcelId), StringComparer.Ordinal)
+            .Where(g => !string.IsNullOrWhiteSpace(g.Key))
+            .Select(g =>
+            {
+                var rows = g.ToList();
+                var latest = rows
+                    .OrderByDescending(x => x.SortUpdatedAtUtc)
+                    .ThenByDescending(x => x.SourceCreatedAtUtc)
+                    .First();
+                var latestPeriod = rows
+                    .OrderByDescending(x => x.PeriodKey)
+                    .ThenByDescending(x => x.SortUpdatedAtUtc)
+                    .First();
+
+                return new MyReportTemplateRow
+                {
+                    DynamicFormTemplateId = latest.DynamicFormTemplateId ?? string.Empty,
+                    DynamicFormTemplateCode = latest.DynamicFormTemplateCode ?? string.Empty,
+                    DynamicFormTemplateName = latest.DynamicFormTemplateName ?? string.Empty,
+                    DynamicExcelId = latest.DynamicExcelId,
+                    DynamicExcelCode = latest.DynamicExcelCode ?? string.Empty,
+                    DynamicExcelName = latest.DynamicExcelName ?? string.Empty,
+                    BindingCount = rows
+                        .Select(x => x.WorkTemplateAssigneeId)
+                        .Where(x => !string.IsNullOrWhiteSpace(x))
+                        .Distinct(StringComparer.Ordinal)
+                        .Count(),
+                    PeriodCount = rows
+                        .Select(x => x.WorkReportPeriodId)
+                        .Where(x => !string.IsNullOrWhiteSpace(x))
+                        .Distinct(StringComparer.Ordinal)
+                        .Count(),
+                    ReportCount = rows
+                        .Select(x => x.CurrentReportId)
+                        .Where(x => !string.IsNullOrWhiteSpace(x))
+                        .Distinct(StringComparer.Ordinal)
+                        .Count(),
+                    LatestPeriodId = latestPeriod.WorkReportPeriodId,
+                    LatestPeriodKey = latestPeriod.PeriodKey,
+                    LatestPeriodStatus = (int)latestPeriod.PeriodStatus,
+                    LatestDueAtUtc = latestPeriod.DueAtUtc,
+                    LatestReportId = latest.CurrentReportId,
+                    LatestUpdatedAtUtc = latest.SortUpdatedAtUtc,
+                    HasOverduePeriod = rows.Any(x => x.IsOverdue)
+                };
+            })
+            .ToList();
 
     private static MyReportTemplateRow MapTemplateDocRoleToRow(MyReportTemplateListDocRole x)
         => new()
@@ -5274,6 +6079,17 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
 
     private static DateTime? NormalizeDate(DateTime? value)
         => WorkAssignmentReportHistoricalDataHelper.NormalizeDate(value);
+
+    private static DateTime? ResolveServerReportStartedDate(
+        WorkAssignmentReport report,
+        WorkReportPeriod? period)
+        => NormalizeDate(
+            report.StartedDate
+            ?? period?.StartedDate
+            ?? report.PeriodStart
+            ?? period?.PeriodStart
+            ?? report.ReportDate
+            ?? period?.ReportDate);
 
     private sealed record ReportCompletedDatePolicy(
         bool CanEditCompletedDate,
@@ -5568,6 +6384,135 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                ?? period.CreatedAtUtc;
     }
 
+    private async Task<WorkAssignment?> LoadParentAssignmentForReportDatesAsync(
+        WorkAssignment assignment,
+        CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(assignment.ParentAssignmentId))
+            return null;
+
+        return await _ctx.WorkAssignments
+            .Find(x =>
+                x.Id == assignment.ParentAssignmentId &&
+                x.WorkId == assignment.WorkId &&
+                !x.IsDeleted)
+            .FirstOrDefaultAsync(ct);
+    }
+
+    private static DateTime ResolveUserCreatedReportDate(
+        CreateUserCreatedReportRequest req,
+        WorkReportPeriod? linkedScheduledPeriod,
+        DateTime now)
+    {
+        var value = linkedScheduledPeriod?.ReportDate
+                    ?? linkedScheduledPeriod?.PeriodEnd
+                    ?? linkedScheduledPeriod?.PeriodStart
+                    ?? linkedScheduledPeriod?.DueAtUtc
+                    ?? req.ReportDate
+                    ?? now;
+
+        return (NormalizeDate(value) ?? now.Date).Date;
+    }
+
+    private static (DateTime PeriodStart, DateTime PeriodEnd) ResolveUserCreatedReportWindow(
+        WorkAssignment assignment,
+        Work work,
+        WorkAssignment? parentAssignment,
+        WorkReportPeriod? linkedScheduledPeriod,
+        DateTime reportDate,
+        DateTime now)
+    {
+        if (linkedScheduledPeriod is not null)
+        {
+            var linkedStart = NormalizeDate(
+                    linkedScheduledPeriod.PeriodStart
+                    ?? linkedScheduledPeriod.ReportDate
+                    ?? linkedScheduledPeriod.DueAtUtc)
+                ?? reportDate.Date;
+            var linkedEnd = NormalizeDate(
+                    linkedScheduledPeriod.PeriodEnd
+                    ?? linkedScheduledPeriod.ReportDate
+                    ?? linkedScheduledPeriod.DueAtUtc
+                    ?? linkedStart)
+                ?? linkedStart;
+
+            return NormalizeUserCreatedReportWindow(linkedStart, linkedEnd);
+        }
+
+        if (assignment.AssignmentType == WorkAssignmentTypes.PeriodicReport &&
+            assignment.Schedule is not null)
+        {
+            var (start, end) = AssignmentScheduleTimeHelper.GetPeriodRange(
+                assignment.Schedule,
+                reportDate);
+            return NormalizeUserCreatedReportWindow(start, end);
+        }
+
+        var periodStart = WorkAssignmentDatePolicy.ResolveEffectiveStartDate(assignment, now);
+        var dueAtUtc = ResolveUserCreatedReportDueAtUtc(
+            assignment,
+            work,
+            parentAssignment,
+            linkedScheduledPeriod: null,
+            reportDate);
+        var periodEnd = WorkAssignmentDatePolicy.ResolveEffectiveCompletedDate(
+                assignment,
+                work,
+                parentAssignment)
+            ?? dueAtUtc?.Date
+            ?? reportDate.Date;
+
+        return NormalizeUserCreatedReportWindow(periodStart, periodEnd);
+    }
+
+    private static DateTime? ResolveUserCreatedReportDueAtUtc(
+        WorkAssignment assignment,
+        Work work,
+        WorkAssignment? parentAssignment,
+        WorkReportPeriod? linkedScheduledPeriod,
+        DateTime reportDate)
+    {
+        if (linkedScheduledPeriod?.DueAtUtc.HasValue == true)
+            return linkedScheduledPeriod.DueAtUtc.Value;
+
+        if (assignment.AssignmentType == WorkAssignmentTypes.PeriodicReport &&
+            assignment.Schedule is not null)
+        {
+            var (periodStart, periodEnd) = AssignmentScheduleTimeHelper.GetPeriodRange(
+                assignment.Schedule,
+                reportDate);
+            var dueItems = AssignmentScheduleDueHelper
+                .GetDueItemsInRange(assignment.Schedule, periodStart, periodEnd);
+            var scheduledDueAtUtc = dueItems.FirstOrDefault(x => x.DueAtUtc.Date >= reportDate.Date)?.DueAtUtc
+                                    ?? dueItems.LastOrDefault()?.DueAtUtc;
+            if (scheduledDueAtUtc.HasValue)
+                return scheduledDueAtUtc.Value;
+        }
+
+        if (assignment.DueAtUtc.HasValue)
+            return assignment.DueAtUtc.Value;
+
+        var dueDate = WorkAssignmentDatePolicy.ResolveEffectiveDueDate(
+            assignment,
+            work,
+            parentAssignment);
+
+        return dueDate.HasValue
+            ? NormalizeDueAtUtc(dueDate.Value)
+            : null;
+    }
+
+    private static (DateTime PeriodStart, DateTime PeriodEnd) NormalizeUserCreatedReportWindow(
+        DateTime periodStart,
+        DateTime periodEnd)
+    {
+        var start = periodStart.Date;
+        var end = periodEnd.Date;
+        return end < start
+            ? (end, start)
+            : (start, end);
+    }
+
     private async Task EnsureNoDuplicateUserCreatedPeriodAsync(
         WorkAssignment assignment,
         WorkTemplateAssignee binding,
@@ -5775,6 +6720,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             Id = x.Id,
             WorkId = x.WorkId,
             WorkAssignmentId = x.WorkAssignmentId,
+            AssignmentType = assignment?.AssignmentType ?? string.Empty,
             WorkTemplateAssigneeId = x.WorkTemplateAssigneeId,
             DynamicExcelId = x.DynamicExcelId,
             DynamicExcelCode = x.DynamicExcelCode,
@@ -5807,10 +6753,6 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             LastDraftSavedAtUtc = x.LastDraftSavedAtUtc,
             LastSubmittedAtUtc = x.LastSubmittedAtUtc,
             LastReviewedAtUtc = x.LastReviewedAtUtc,
-            CurrentProgressStatus = x.CurrentProgressStatus,
-            ReportReason = x.ReportReason,
-            Difficulties = x.Difficulties,
-            ProposedSolution = x.ProposedSolution,
             LateReason = x.LateReason,
             ReviewerComment = x.ReviewerComment,
             ReturnReason = x.ReturnReason
@@ -5874,10 +6816,6 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             AggregateSnapshotDirtyAtUtc = x.AggregateSnapshotDirtyAtUtc,
             AggregateSnapshotRefreshedAtUtc = x.AggregateSnapshotRefreshedAtUtc,
             AggregateRefreshError = x.AggregateRefreshError,
-            CurrentProgressStatus = x.CurrentProgressStatus,
-            ReportReason = x.ReportReason,
-            Difficulties = x.Difficulties,
-            ProposedSolution = x.ProposedSolution,
             VersionNo = x.VersionNo,
             IsCurrent = x.IsCurrent,
             IsActive = x.IsActive,
@@ -5901,7 +6839,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
     private static System.Linq.Expressions.Expression<Func<MyReportPeriodListDocRole, WorkAssignmentReportListRow>> MapToListRowProjection()
         => x => new WorkAssignmentReportListRow
         {
-            Id = x.CurrentReportId ?? string.Empty,
+            Id = x.CurrentReportId,
             WorkId = x.WorkId,
             WorkAssignmentId = x.AssignmentId,
             WorkReportPeriodId = x.WorkReportPeriodId,
@@ -5932,10 +6870,6 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             DynamicFormTemplateId = x.DynamicFormTemplateId,
             DynamicFormTemplateCode = x.DynamicFormTemplateCode,
             DynamicFormTemplateName = x.DynamicFormTemplateName,
-            CurrentProgressStatus = null,
-            ReportReason = null,
-            Difficulties = null,
-            ProposedSolution = null,
             VersionNo = x.VersionNo,
             IsCurrent = x.IsCurrentReport,
             IsActive = x.ReportIsActive,
@@ -6173,6 +7107,35 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             StringComparison.Ordinal);
     }
 
+    private static bool IsStackedAggregateSummary(string? summarySourceJson)
+    {
+        if (string.IsNullOrWhiteSpace(summarySourceJson))
+            return false;
+
+        try
+        {
+            using var doc = JsonDocument.Parse(summarySourceJson);
+            return doc.RootElement.ValueKind == JsonValueKind.Object &&
+                   string.Equals(
+                       ReadJsonString(doc.RootElement, "mapKind"),
+                       "STACKED_TABLE",
+                       StringComparison.OrdinalIgnoreCase);
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+    }
+
+    private static bool IsStackedAggregateSummary(AggregateDraftSummary summary)
+        => string.Equals(summary.MapKind, "STACKED_TABLE", StringComparison.OrdinalIgnoreCase);
+
+    private static bool AggregateSummaryReferencesSource(AggregateDraftSummary summary, WorkAssignmentReport source)
+    {
+        return summary.SourceReportIds.Any(id => string.Equals(id, source.Id, StringComparison.Ordinal))
+               || summary.SourceAssignmentIds.Any(id => string.Equals(id, source.WorkAssignmentId, StringComparison.Ordinal));
+    }
+
     private static string ResolveCumulativeContributionMode(
         string? requestedMode,
         string? requestedOrigin,
@@ -6308,15 +7271,45 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             return new AggregateDraftSummary(
                 WorkReportDataOrigin.Normalize(ReadJsonString(doc.RootElement, "dataOrigin")),
                 aggregateRequest,
+                ReadJsonString(doc.RootElement, "mapKind"),
                 ReadJsonString(doc.RootElement, "valueSelector"),
                 ReadJsonString(doc.RootElement, "targetBlockId"),
                 ReadJsonBool(doc.RootElement, "clearExistingValues"),
-                ReadJsonIntArray(doc.RootElement, "targetIndexes"));
+                ReadJsonIntArray(doc.RootElement, "targetIndexes"),
+                ReadJsonStringArray(doc.RootElement, "sourceReportIds"),
+                ReadJsonStringArray(doc.RootElement, "sourceAssignmentIds"),
+                ReadJsonString(doc.RootElement, "targetDynamicFormTemplateId"),
+                TryGetJsonProperty(doc.RootElement, "reportMapConfig", out var mapConfigElement) &&
+                mapConfigElement.ValueKind == JsonValueKind.Object
+                    ? mapConfigElement.GetRawText()
+                    : null);
         }
         catch (JsonException)
         {
             return null;
         }
+    }
+
+    private static string? NormalizeReportMapConfigJson(string? value, string reportId)
+    {
+        var json = NormalizeOptionalTextOrNull(value);
+        if (json is null)
+            return null;
+
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            if (doc.RootElement.ValueKind == JsonValueKind.Object)
+                return doc.RootElement.GetRawText();
+        }
+        catch (JsonException)
+        {
+            // Throw the coded error below so FE and automation receive a stable contract.
+        }
+
+        throw AppExceptionFactory.BadRequest(
+            AppErrorCode.WORK_ASSIGNMENT_REPORT_SUMMARY_SOURCE_JSON_INVALID,
+            new { field = "reportMapConfigJson", reportId });
     }
 
     private static bool? ReadJsonBool(JsonElement element, string name)
@@ -6477,11 +7470,15 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             ? JsonNode.Parse(dataRectNode.GetRawText())
             : BuildDefaultDataRectNode(w, h);
 
-        var indexMap = ReadAggregateDraftIndexMap(element, blockId, tableMode, w, h);
+        var runtimeDataRect = ReadRuntimeDataRect(element);
+        if (RuntimeRectWidth(runtimeDataRect) <= 0 || RuntimeRectHeight(runtimeDataRect) <= 0)
+            runtimeDataRect = new RuntimeDataRect(0, 0, Math.Max(0, h - 1), Math.Max(0, w - 1));
+        var indexMap = ReadAggregateDraftIndexMap(element, blockId, tableMode, w, h, runtimeDataRect);
+        var valueLength = ResolveRuntimeInputCells(element, runtimeDataRect, w, h).Count;
         var dynamicExcelTemplateId = ReadJsonString(element, "dynamicExcelTemplateId")
             ?? ReadJsonString(element, "excelBlockDynamicExcelTemplateId");
 
-        return new AggregateDraftBlockContract(blockId, tableMode, w, h, dynamicExcelTemplateId, dataRect, indexMap);
+        return new AggregateDraftBlockContract(blockId, tableMode, w, h, valueLength, dynamicExcelTemplateId, dataRect, indexMap);
     }
 
     private static string NormalizeAggregateTableMode(string? value)
@@ -6510,7 +7507,8 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         string blockId,
         string tableMode,
         int w,
-        int h)
+        int h,
+        RuntimeDataRect dataRect)
     {
         var result = new List<AggregateDraftIndexMapItem>();
         if (TryGetJsonProperty(block, "indexMap", out var items) && items.ValueKind == JsonValueKind.Array)
@@ -6538,12 +7536,12 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                 .OrderBy(x => x.Index)
                 .ToList();
 
-        return Enumerable.Range(0, Math.Max(0, w * h))
-            .Select(index =>
+        return ResolveRuntimeInputCells(block, dataRect, w, h)
+            .Select(cell =>
             {
-                var rowKey = $"row_{(index / Math.Max(1, w)) + 1}";
-                var columnKey = $"col_{(index % Math.Max(1, w)) + 1}";
-                return new AggregateDraftIndexMapItem(index, rowKey, columnKey, BuildAggregateMetricKey(blockId, rowKey, columnKey));
+                var rowKey = $"row_{cell.R - dataRect.R0 + 1}";
+                var columnKey = $"col_{cell.C - dataRect.C0 + 1}";
+                return new AggregateDraftIndexMapItem(cell.Index, rowKey, columnKey, BuildAggregateMetricKey(blockId, rowKey, columnKey));
             })
             .ToList();
     }
@@ -6670,6 +7668,119 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         };
     }
 
+    private static DynamicFormAggregateResponse ResolveMetricDraftAggregate(
+        DynamicFormAggregateResponse aggregate,
+        AggregateDraftBlockContract block,
+        string valueSelector)
+    {
+        if (aggregate.StackedTable is null ||
+            string.Equals(block.TableMode, "APPEND_ROWS", StringComparison.Ordinal))
+        {
+            return aggregate;
+        }
+
+        var stackedRows = BuildAggregateRowsFromStackedTable(aggregate.StackedTable, block);
+        if (stackedRows.Count == 0 ||
+            !stackedRows.Any(row => SelectAggregateDraftValue(row, valueSelector).HasValue))
+        {
+            return aggregate;
+        }
+
+        return new DynamicFormAggregateResponse
+        {
+            Meta = aggregate.Meta,
+            Columns = aggregate.Columns,
+            Rows = stackedRows,
+            StackedTable = aggregate.StackedTable,
+            Sources = aggregate.Sources,
+            Warnings = aggregate.Warnings
+        };
+    }
+
+    private static List<DynamicFormAggregateRowDto> BuildAggregateRowsFromStackedTable(
+        DynamicFormStackedTableDto stacked,
+        AggregateDraftBlockContract block)
+    {
+        return block.IndexMap
+            .OrderBy(x => x.Index)
+            .Select(metric =>
+            {
+                var count = 0;
+                var numericCount = 0;
+                var sum = 0m;
+                decimal? min = null;
+                decimal? max = null;
+
+                foreach (var row in stacked.Rows)
+                {
+                    if (!row.Cells.TryGetValue(metric.MetricKey, out var raw) ||
+                        !HasStackedMetricCellValue(raw))
+                    {
+                        continue;
+                    }
+
+                    count++;
+                    var number = ToNullableDecimalObject(raw);
+                    if (!number.HasValue)
+                        continue;
+
+                    numericCount++;
+                    sum += number.Value;
+                    min = min.HasValue ? Math.Min(min.Value, number.Value) : number.Value;
+                    max = max.HasValue ? Math.Max(max.Value, number.Value) : number.Value;
+                }
+
+                return new DynamicFormAggregateRowDto
+                {
+                    MetricKey = metric.MetricKey,
+                    RowKey = metric.RowKey,
+                    ColumnKey = metric.ColumnKey,
+                    Index = metric.Index,
+                    Label = $"{metric.RowKey} / {metric.ColumnKey}",
+                    Count = count,
+                    Sum = numericCount > 0 ? sum : null,
+                    Min = min,
+                    Max = max,
+                    Average = numericCount > 0 ? sum / numericCount : null
+                };
+            })
+            .ToList();
+    }
+
+    private static bool HasStackedMetricCellValue(object? value)
+    {
+        return value switch
+        {
+            null => false,
+            string text => !string.IsNullOrWhiteSpace(text),
+            JsonElement element => element.ValueKind switch
+            {
+                JsonValueKind.Null or JsonValueKind.Undefined => false,
+                JsonValueKind.String => !string.IsNullOrWhiteSpace(element.GetString()),
+                JsonValueKind.Array => element.EnumerateArray().Any(x => HasStackedMetricCellValue(x)),
+                _ => true
+            },
+            IEnumerable<object?> list => list.Any(HasStackedMetricCellValue),
+            _ => true
+        };
+    }
+
+    private static decimal? ToNullableDecimalObject(object? value)
+    {
+        return value switch
+        {
+            null => null,
+            decimal v => v,
+            int v => v,
+            long v => v,
+            double v when !double.IsNaN(v) && !double.IsInfinity(v) => Convert.ToDecimal(v, CultureInfo.InvariantCulture),
+            float v when !float.IsNaN(v) && !float.IsInfinity(v) => Convert.ToDecimal(v, CultureInfo.InvariantCulture),
+            JsonElement element => ToNullableDecimal(element),
+            string text when decimal.TryParse(text, NumberStyles.Any, CultureInfo.InvariantCulture, out var parsed) => parsed,
+            _ => null
+        };
+    }
+
     private static int ResolveAggregateDraftValueIndex(DynamicFormAggregateRowDto row, AggregateDraftBlockContract block)
     {
         if (string.Equals(block.TableMode, "SUMMARY_TEMPLATE", StringComparison.Ordinal) &&
@@ -6718,6 +7829,100 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         blocks.Add(BuildAggregateDraftTableBlockNode(block, values, aggregate, existingRowLabels));
         return root.ToJsonString(_jsonOptions);
     }
+
+    private static string BuildStackedAggregateDraftTableValuesJson(
+        WorkAssignmentReport report,
+        DynamicFormTemplate form,
+        AggregateDraftBlockContract block,
+        List<object?> values,
+        DynamicFormAggregateResponse aggregate)
+    {
+        var root = ParseTableValuesRoot(report.TableValuesJson) ?? new JsonObject();
+        root["dynamicFormTemplateId"] = report.DynamicFormTemplateId ?? form.Id;
+        root["dynamicFormTemplateCode"] = report.DynamicFormTemplateCode ?? form.Code;
+        root["dynamicFormTemplateName"] = report.DynamicFormTemplateName ?? form.Name;
+        root["updatedAtUtc"] = DateTime.UtcNow.ToString("O", CultureInfo.InvariantCulture);
+
+        var blocks = root["blocks"] as JsonArray;
+        if (blocks is null)
+        {
+            blocks = new JsonArray();
+            root["blocks"] = blocks;
+        }
+
+        for (var i = blocks.Count - 1; i >= 0; i--)
+        {
+            var item = blocks[i] as JsonObject;
+            var itemBlockId = item?["blockId"]?.GetValue<string>();
+            if (string.Equals(NormalizeBlockId(itemBlockId), block.BlockId, StringComparison.Ordinal))
+                blocks.RemoveAt(i);
+        }
+
+        blocks.Add(BuildStackedAggregateDraftTableBlockNode(block, values, aggregate));
+        return root.ToJsonString(_jsonOptions);
+    }
+
+    private static List<object?> BuildStackedAggregateValues(
+        DynamicFormStackedTableDto stacked,
+        int width,
+        int? minimumRows = null)
+    {
+        var columns = stacked.Columns.Take(width).ToList();
+        var rowCount = Math.Max(minimumRows ?? 0, stacked.Rows.Count);
+        var values = new List<object?>(Math.Max(0, rowCount * width));
+        foreach (var row in stacked.Rows)
+        {
+            foreach (var column in columns)
+            {
+                values.Add(row.Cells.TryGetValue(column.Key, out var value) ? value : null);
+            }
+
+            while (values.Count % width != 0)
+                values.Add(null);
+        }
+
+        while (values.Count < rowCount * width)
+            values.Add(null);
+
+        return values;
+    }
+
+    private static JsonNode BuildExpandedAggregateDraftDataRect(
+        JsonNode? current,
+        int width,
+        int height)
+    {
+        var r0 = 0;
+        var c0 = 0;
+        if (current is JsonObject obj)
+        {
+            r0 = ReadJsonNodeInt(obj, "r0") ?? ReadJsonNodeInt(obj, "R0") ?? 0;
+            c0 = ReadJsonNodeInt(obj, "c0") ?? ReadJsonNodeInt(obj, "C0") ?? 0;
+        }
+
+        return new JsonObject
+        {
+            ["r0"] = r0,
+            ["c0"] = c0,
+            ["r1"] = r0 + Math.Max(1, height) - 1,
+            ["c1"] = c0 + Math.Max(1, width) - 1
+        };
+    }
+
+    private static int? ReadJsonNodeInt(JsonObject obj, string key)
+        => obj.TryGetPropertyValue(key, out var node) &&
+           node is JsonValue value &&
+           value.TryGetValue<int>(out var number)
+            ? number
+            : null;
+
+    private static string? ReadJsonNodeString(JsonNode? node, string key)
+        => node is JsonObject obj &&
+           obj.TryGetPropertyValue(key, out var child) &&
+           child is JsonValue value &&
+           value.TryGetValue<string>(out var text)
+            ? NormalizeOptionalTextOrNull(text)
+            : null;
 
     private static JsonObject? ParseTableValuesRoot(string? tableValuesJson)
     {
@@ -6791,6 +7996,84 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         };
     }
 
+    private static JsonObject BuildStackedAggregateDraftTableBlockNode(
+        AggregateDraftBlockContract block,
+        List<object?> values,
+        DynamicFormAggregateResponse aggregate)
+    {
+        var stacked = aggregate.StackedTable ?? new DynamicFormStackedTableDto();
+        var indexMap = BuildStackedAggregateDraftIndexMap(stacked, block.W);
+        return new JsonObject
+        {
+            ["blockId"] = block.BlockId,
+            ["dynamicExcelTemplateId"] = block.DynamicExcelTemplateId,
+            ["tableMode"] = "APPEND_ROWS",
+            ["w"] = block.W,
+            ["h"] = block.H,
+            ["dataRect"] = block.DataRect?.DeepClone() ?? BuildDefaultDataRectNode(block.W, block.H),
+            ["values1D"] = JsonSerializer.SerializeToNode(values, _jsonOptions),
+            ["indexMap"] = JsonSerializer.SerializeToNode(indexMap, _jsonOptions),
+            ["metricDefinitions"] = JsonSerializer.SerializeToNode(BuildStackedAggregateMetricDefinitions(stacked, block.BlockId, block.W), _jsonOptions),
+            ["rowLabels"] = new JsonArray(),
+            ["rows"] = JsonSerializer.SerializeToNode(BuildStackedAggregateAppendRows(block, values), _jsonOptions),
+            ["columns"] = new JsonArray(),
+            ["cells"] = new JsonArray(),
+            ["aggregateMeta"] = JsonSerializer.SerializeToNode(new
+            {
+                aggregate.Meta.ScopeAssignmentId,
+                aggregate.Meta.ScopeMode,
+                aggregate.Meta.PeriodScopeMode,
+                aggregate.Meta.PeriodKey,
+                aggregate.Meta.PeriodKeyFrom,
+                aggregate.Meta.PeriodKeyTo,
+                aggregate.Meta.SourceStatusMode,
+                aggregate.Meta.SourceReportCount,
+                aggregate.Meta.MetricCount,
+                stacked.SourceTableMode,
+                stacked.RowMode
+            }, _jsonOptions)
+        };
+    }
+
+    private static List<AggregateDraftIndexMapItem> BuildStackedAggregateDraftIndexMap(
+        DynamicFormStackedTableDto stacked,
+        int width)
+    {
+        return stacked.Columns
+            .Take(width)
+            .Select((column, index) => new AggregateDraftIndexMapItem(
+                index,
+                "APPEND_ROWS",
+                $"col_{index + 1}",
+                column.MetricKey ?? $"aggregate:{NormalizeMetricPart(column.Key, $"col_{index + 1}")}"))
+            .ToList();
+    }
+
+    private static List<object> BuildStackedAggregateMetricDefinitions(
+        DynamicFormStackedTableDto stacked,
+        string blockId,
+        int width)
+    {
+        return stacked.Columns
+            .Take(width)
+            .Select((column, index) => new
+            {
+                blockId,
+                metricKey = column.MetricKey ?? $"aggregate:{NormalizeMetricPart(column.Key, $"col_{index + 1}")}",
+                rowKey = "APPEND_ROWS",
+                columnKey = $"col_{index + 1}",
+                index,
+                displayLabel = column.Label,
+                dataType = column.Type == "number" ? "NUMBER" : "SHORT_TEXT",
+                sourceKind = "APPEND_ROWS",
+                supportedOps = column.Type == "number"
+                    ? new[] { "count", "sum", "min", "max", "average" }
+                    : new[] { "count" }
+            })
+            .Cast<object>()
+            .ToList();
+    }
+
     private static List<AggregateDraftIndexMapItem> BuildAggregateDraftIndexMap(
         AggregateDraftBlockContract block,
         IReadOnlyCollection<DynamicFormAggregateRowDto> rows)
@@ -6837,6 +8120,38 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                     cells
                 });
             }
+        }
+
+        return rows;
+    }
+
+    private static List<object> BuildStackedAggregateAppendRows(AggregateDraftBlockContract block, List<object?> values)
+    {
+        var rows = new List<object>();
+        var width = Math.Max(1, block.W);
+        var rowCount = values.Count == 0 ? 0 : (int)Math.Ceiling(values.Count / (double)width);
+        for (var r = 0; r < rowCount; r++)
+        {
+            var cells = new Dictionary<string, object?>(StringComparer.Ordinal);
+            for (var c = 0; c < width; c++)
+            {
+                var index = r * width + c;
+                if (index >= values.Count)
+                    break;
+
+                var value = values[index];
+                if (value is not null)
+                    cells[$"col_{c + 1}"] = value;
+            }
+
+            rows.Add(new
+            {
+                rowInstanceId = $"{block.BlockId}:stack-row:{r + 1}",
+                rowOrder = r + 1,
+                rowKey = $"stack:R{r + 1}",
+                rowLabelCodes = Array.Empty<string>(),
+                cells
+            });
         }
 
         return rows;
@@ -6941,6 +8256,36 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         }, _jsonOptions);
     }
 
+    private static string? BuildStackedAggregateDraftContributionPolicyJson(
+        string dataOrigin,
+        DynamicFormStackedTableDto stacked,
+        string blockId)
+    {
+        if (!string.Equals(WorkReportDataOrigin.Normalize(dataOrigin), WorkReportDataOrigin.PartialMapping, StringComparison.Ordinal))
+            return null;
+
+        var rules = stacked.Columns
+            .Where(x => string.Equals(x.Role, "METRIC", StringComparison.OrdinalIgnoreCase))
+            .Select(x => new
+            {
+                targetKind = "TABLE_METRIC",
+                blockId,
+                metricKey = x.MetricKey ?? x.Key,
+                rowKey = "APPEND_ROWS",
+                columnKey = NormalizeOptionalTextOrNull(x.SourceKey),
+                mode = WorkReportCumulativeContributionMode.Exclude
+            })
+            .GroupBy(x => $"{x.blockId}|{x.metricKey}|{x.rowKey}|{x.columnKey}", StringComparer.Ordinal)
+            .Select(x => x.First())
+            .ToList();
+
+        return JsonSerializer.Serialize(new
+        {
+            defaultMode = WorkReportCumulativeContributionMode.Include,
+            rules
+        }, _jsonOptions);
+    }
+
     private static string BuildAggregateDraftSummarySourceJson(
         string dataOrigin,
         DynamicFormAggregateRequest aggregateRequest,
@@ -6948,32 +8293,45 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         AggregateDraftBlockContract block,
         string valueSelector,
         string targetBlockId,
-        bool clearExistingValues)
+        bool clearExistingValues,
+        string targetDynamicFormTemplateId,
+        string? reportMapConfigJson)
     {
         var sourceReportIds = aggregate.Sources
             .Select(x => x.ReportId)
             .Where(x => !string.IsNullOrWhiteSpace(x))
             .Distinct(StringComparer.Ordinal)
             .ToArray();
-        var sourceAssignmentIds = aggregate.Sources
+        var sourceAssignmentIdList = aggregate.Sources
             .Select(x => x.WorkAssignmentId)
             .Where(x => !string.IsNullOrWhiteSpace(x))
-            .Distinct(StringComparer.Ordinal)
-            .ToArray();
+            .Select(x => x!)
+            .ToList();
         var targetIndexes = aggregate.Rows
             .Select(row => ResolveAggregateDraftValueIndex(row, block))
-            .Where(index => index >= 0 && index < block.W * block.H)
+            .Where(index => index >= 0 && index < block.ValueLength)
             .Distinct()
             .OrderBy(x => x)
+            .ToArray();
+        var reportMapConfig = string.IsNullOrWhiteSpace(reportMapConfigJson)
+            ? null
+            : JsonNode.Parse(reportMapConfigJson);
+        var configuredSourceAssignmentId = ReadJsonNodeString(reportMapConfig, "sourceAssignmentId");
+        if (!string.IsNullOrWhiteSpace(configuredSourceAssignmentId))
+            sourceAssignmentIdList.Add(configuredSourceAssignmentId);
+        var sourceAssignmentIds = sourceAssignmentIdList
+            .Distinct(StringComparer.Ordinal)
             .ToArray();
 
         return JsonSerializer.Serialize(new
         {
             kind = "DYNAMIC_FORM_AGGREGATE_DRAFT",
+            mapKind = string.IsNullOrWhiteSpace(reportMapConfigJson) ? null : "REPORT_TABLE_TO_TABLE",
             dataOrigin = WorkReportDataOrigin.Normalize(dataOrigin),
             appliedAtUtc = DateTime.UtcNow,
             valueSelector,
             targetBlockId,
+            targetDynamicFormTemplateId,
             clearExistingValues,
             aggregateRequest = new DynamicFormAggregateRequest
             {
@@ -6990,12 +8348,83 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                 SourceStatusMode = "APPROVED_ONLY",
                 SelectedUnitIds = aggregate.Meta.SelectedUnitIds.Count > 0
                     ? aggregate.Meta.SelectedUnitIds
-                    : aggregateRequest.SelectedUnitIds
+                    : aggregateRequest.SelectedUnitIds,
+                AggregateConfigId = aggregateRequest.AggregateConfigId,
+                IdentityColumns = aggregate.Meta.IdentityColumns
             },
             sourceReportIds,
             sourceAssignmentIds,
+            reportMapConfig,
             targetIndexes,
             rowCount = aggregate.Rows.Count,
+            sourceReportCount = aggregate.Sources.Count
+        }, _jsonOptions);
+    }
+
+    private static string BuildStackedAggregateDraftSummarySourceJson(
+        string dataOrigin,
+        DynamicFormAggregateRequest aggregateRequest,
+        DynamicFormAggregateResponse aggregate,
+        string valueSelector,
+        string targetBlockId,
+        string targetDynamicFormTemplateId,
+        string? reportMapConfigJson)
+    {
+        var sourceReportIds = aggregate.Sources
+            .Select(x => x.ReportId)
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+        var sourceAssignmentIdList = aggregate.Sources
+            .Select(x => x.WorkAssignmentId)
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Select(x => x!)
+            .ToList();
+        var stacked = aggregate.StackedTable ?? new DynamicFormStackedTableDto();
+        var reportMapConfig = string.IsNullOrWhiteSpace(reportMapConfigJson)
+            ? null
+            : JsonNode.Parse(reportMapConfigJson);
+        var configuredSourceAssignmentId = ReadJsonNodeString(reportMapConfig, "sourceAssignmentId");
+        if (!string.IsNullOrWhiteSpace(configuredSourceAssignmentId))
+            sourceAssignmentIdList.Add(configuredSourceAssignmentId);
+        var sourceAssignmentIds = sourceAssignmentIdList
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+
+        return JsonSerializer.Serialize(new
+        {
+            kind = "DYNAMIC_FORM_AGGREGATE_DRAFT",
+            mapKind = string.IsNullOrWhiteSpace(reportMapConfigJson) ? "STACKED_TABLE" : "REPORT_TABLE_TO_TABLE",
+            dataOrigin = WorkReportDataOrigin.Normalize(dataOrigin),
+            appliedAtUtc = DateTime.UtcNow,
+            valueSelector,
+            targetBlockId,
+            targetDynamicFormTemplateId,
+            clearExistingValues = true,
+            aggregateRequest = new DynamicFormAggregateRequest
+            {
+                ScopeAssignmentId = aggregateRequest.ScopeAssignmentId,
+                ScopeMode = aggregateRequest.ScopeMode,
+                DynamicFormTemplateId = aggregateRequest.DynamicFormTemplateId,
+                BlockId = aggregateRequest.BlockId,
+                TableMode = aggregateRequest.TableMode,
+                MetricKeys = aggregateRequest.MetricKeys,
+                PeriodScopeMode = aggregateRequest.PeriodScopeMode,
+                PeriodKey = aggregateRequest.PeriodKey,
+                PeriodKeyFrom = aggregateRequest.PeriodKeyFrom,
+                PeriodKeyTo = aggregateRequest.PeriodKeyTo,
+                SourceStatusMode = "APPROVED_ONLY",
+                SelectedUnitIds = aggregate.Meta.SelectedUnitIds.Count > 0
+                    ? aggregate.Meta.SelectedUnitIds
+                    : aggregateRequest.SelectedUnitIds,
+                AggregateConfigId = aggregateRequest.AggregateConfigId,
+                IdentityColumns = aggregate.Meta.IdentityColumns
+            },
+            sourceReportIds,
+            sourceAssignmentIds,
+            reportMapConfig,
+            stackedColumns = stacked.Columns.Select(x => new { x.Key, x.Label, x.Role, x.MetricKey, x.SourceKey }).ToArray(),
+            rowCount = stacked.Rows.Count,
             sourceReportCount = aggregate.Sources.Count
         }, _jsonOptions);
     }
@@ -7031,6 +8460,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         string TableMode,
         int W,
         int H,
+        int ValueLength,
         string? DynamicExcelTemplateId,
         JsonNode? DataRect,
         List<AggregateDraftIndexMapItem> IndexMap);
@@ -7049,10 +8479,15 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
     private sealed record AggregateDraftSummary(
         string DataOrigin,
         DynamicFormAggregateRequest AggregateRequest,
+        string? MapKind,
         string? ValueSelector,
         string? TargetBlockId,
         bool? ClearExistingValues,
-        List<int> TargetIndexes);
+        List<int> TargetIndexes,
+        List<string> SourceReportIds,
+        List<string> SourceAssignmentIds,
+        string? TargetDynamicFormTemplateId,
+        string? ReportMapConfigJson);
 
     private readonly record struct RuntimeDataRect(
         int R0,
@@ -7060,13 +8495,20 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         int R1,
         int C1);
 
+    private sealed record RuntimeInputCellRef(
+        int Index,
+        int R,
+        int C);
+
     private sealed record RuntimeFieldContract(
         string Id,
         string Key,
         string DisplayName,
         string DataType,
         bool Required,
-        RuntimeOption[] Options);
+        RuntimeOption[] Options,
+        string? EnumCatalogId,
+        string? ValueSourceType);
 
     private sealed record RuntimeOption(
         string Code,
@@ -7074,7 +8516,9 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
 
     private sealed record RuntimeCellContract(
         string DataType,
-        RuntimeOption[] Options);
+        RuntimeOption[] Options,
+        string? EnumCatalogId,
+        string? ValueSourceType);
 
     private sealed record RuntimeTableBlockContract(
         string BlockId,
@@ -7084,7 +8528,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         JsonElement Block);
 
     private sealed record DynamicFormAggregateDraftProjection(
-        List<decimal?> TopLevelValues,
+        List<object?> TopLevelValues,
         string TableValuesJson,
         string DataOrigin,
         string ContributionMode,

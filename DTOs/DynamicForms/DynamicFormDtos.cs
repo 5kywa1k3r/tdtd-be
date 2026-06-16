@@ -139,7 +139,12 @@ public sealed record DynamicFormExcelBlockSnapshot(
     string? ExcelSpecKind = null,
     string? DefaultDataType = null,
     JsonElement[]? DefaultOptions = null,
-    JsonElement[]? DataTypeOverrides = null
+    JsonElement[]? DataTypeOverrides = null,
+    JsonElement[]? SpecialRanges = null,
+    bool? StatisticsDisabled = null,
+    int? StatisticsInputCellCount = null,
+    int? StatisticsInputCellLimit = null,
+    string? StatisticsDisabledReason = null
 );
 
 public sealed record DynamicFormTableIndexMapItem(

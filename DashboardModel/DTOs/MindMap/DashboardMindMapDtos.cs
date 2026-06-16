@@ -38,6 +38,7 @@ public sealed class DashboardMindMapTemplateGroupDto
     public int ReportCount { get; set; }
     public int OverdueCount { get; set; }
     public DateTime? LatestDueAtUtc { get; set; }
+    public DashboardMindMapCoverageDto Coverage { get; set; } = new();
     public DashboardStackedBarDto ReportBar { get; set; } = new();
 }
 
@@ -56,6 +57,7 @@ public sealed class DashboardMindMapTemplateUserDto
     public int TotalReports { get; set; }
     public int OverdueCount { get; set; }
     public DateTime? LatestDueAtUtc { get; set; }
+    public DashboardMindMapCoverageDto Coverage { get; set; } = new();
     public DashboardStackedBarDto ReportBar { get; set; } = new();
 }
 
@@ -141,6 +143,18 @@ public sealed class DashboardStackedBarSegmentDto
     public string Color { get; set; } = string.Empty;
 }
 
+public sealed class DashboardMindMapCoverageDto
+{
+    public int RequiredCount { get; set; }
+    public int ScheduledPeriodCount { get; set; }
+    public int ReportedCount { get; set; }
+    public int SubmittedCount { get; set; }
+    public int ApprovedCount { get; set; }
+    public int MissingCount { get; set; }
+    public int OverdueMissingCount { get; set; }
+    public int AdHocCount { get; set; }
+}
+
 public sealed class DashboardMindMapNodeSummaryDto
 {
     public DashboardTreeNodeDto Node { get; set; } = new();
@@ -148,6 +162,7 @@ public sealed class DashboardMindMapNodeSummaryDto
     public int ActiveAssignmentCount { get; set; }
     public int TotalAssigneeCount { get; set; }
     public DashboardNodeReportSummaryDto ReportSummary { get; set; } = new();
+    public DashboardMindMapCoverageDto Coverage { get; set; } = new();
     public DashboardStackedBarDto UnitBar { get; set; } = new();
     public DashboardStackedBarDto ReportBar { get; set; } = new();
     public List<DashboardMindMapLabelSummaryDto> LabelSummaries { get; set; } = new();
@@ -228,8 +243,6 @@ public sealed class DashboardMindMapUnitRowDto
     public int OverdueCount { get; set; }
     public string? LatestPeriodKey { get; set; }
     public DateTime? LatestDueAtUtc { get; set; }
-    public string? CurrentProgressStatus { get; set; }
-    public string? Difficulties { get; set; }
     public string? LateReason { get; set; }
     public string? ReturnReason { get; set; }
     public string? ReviewerComment { get; set; }
@@ -251,15 +264,12 @@ public sealed class DashboardMindMapReportRowDto
     public string? UnitLabel { get; set; }
     public string Bucket { get; set; } = string.Empty;
     public string PeriodKey { get; set; } = string.Empty;
+    public string PeriodKind { get; set; } = string.Empty;
     public int PeriodStatus { get; set; }
     public int? ReportStatus { get; set; }
     public DateTime? DueAtUtc { get; set; }
     public DateTime? SubmittedAtUtc { get; set; }
     public DateTime? ApprovedAtUtc { get; set; }
-    public string? CurrentProgressStatus { get; set; }
-    public string? Difficulties { get; set; }
-    public string? ReportReason { get; set; }
-    public string? ProposedSolution { get; set; }
     public string? LateReason { get; set; }
     public string? ReturnReason { get; set; }
     public string? ReviewerComment { get; set; }

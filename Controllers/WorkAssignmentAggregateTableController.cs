@@ -56,4 +56,43 @@ public sealed class WorkAssignmentAggregateTableController : ControllerBase
             return BadRequest(new { message = ex.Message });
         }
     }
+
+    [HttpGet("assignments/{assignmentId}/config")]
+    public async Task<IActionResult> GetConfig([FromRoute] string assignmentId, CancellationToken ct)
+    {
+        try
+        {
+            var result = await _service.GetAggregateConfigAsync(assignmentId, ct);
+            return Ok(result);
+        }
+        catch (UnauthorizedAccessException ex)
+        {
+            return StatusCode(403, new { message = ex.Message });
+        }
+        catch (InvalidOperationException ex)
+        {
+            return BadRequest(new { message = ex.Message });
+        }
+    }
+
+    [HttpPut("assignments/{assignmentId}/config")]
+    public async Task<IActionResult> SaveConfig(
+        [FromRoute] string assignmentId,
+        [FromBody] SaveWorkAssignmentAggregateConfigRequest req,
+        CancellationToken ct)
+    {
+        try
+        {
+            var result = await _service.SaveAggregateConfigAsync(assignmentId, req, ct);
+            return Ok(result);
+        }
+        catch (UnauthorizedAccessException ex)
+        {
+            return StatusCode(403, new { message = ex.Message });
+        }
+        catch (InvalidOperationException ex)
+        {
+            return BadRequest(new { message = ex.Message });
+        }
+    }
 }

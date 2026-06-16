@@ -10,6 +10,7 @@ public sealed class WorkReportPeriodRow
 
     public string WorkId { get; set; } = string.Empty;
     public string WorkAssignmentId { get; set; } = string.Empty;
+    public string AssignmentType { get; set; } = string.Empty;
     public string WorkTemplateAssigneeId { get; set; } = string.Empty;
 
     public string DynamicExcelId { get; set; } = string.Empty;
@@ -49,10 +50,6 @@ public sealed class WorkReportPeriodRow
     public DateTime? LastSubmittedAtUtc { get; set; }
     public DateTime? LastReviewedAtUtc { get; set; }
 
-    public string? CurrentProgressStatus { get; set; }
-    public string? ReportReason { get; set; }
-    public string? Difficulties { get; set; }
-    public string? ProposedSolution { get; set; }
     public string? LateReason { get; set; }
 
     public string? ReviewerComment { get; set; }

@@ -139,21 +139,6 @@ public sealed class WorkReportPeriod : BaseEntity
     [BsonElement("acceptedLateReason")]
     public string? AcceptedLateReason { get; set; }
 
-    /// <summary>
-    /// Các field trải phẳng để list nhanh ngoài detail.
-    /// </summary>
-    [BsonElement("currentProgressStatus")]
-    public string? CurrentProgressStatus { get; set; }
-
-    [BsonElement("reportReason")]
-    public string? ReportReason { get; set; }
-
-    [BsonElement("difficulties")]
-    public string? Difficulties { get; set; }
-
-    [BsonElement("proposedSolution")]
-    public string? ProposedSolution { get; set; }
-
     [BsonElement("lateReason")]
     public string? LateReason { get; set; }
 

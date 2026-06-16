@@ -46,11 +46,6 @@ public sealed class WorkAssignmentReportListRow
     public DateTime? AggregateSnapshotRefreshedAtUtc { get; set; }
     public string? AggregateRefreshError { get; set; }
 
-    public string? CurrentProgressStatus { get; set; }
-    public string? ReportReason { get; set; }
-    public string? Difficulties { get; set; }
-    public string? ProposedSolution { get; set; }
-
     public int VersionNo { get; set; }
     public bool IsCurrent { get; set; }
     public bool IsActive { get; set; } = true;

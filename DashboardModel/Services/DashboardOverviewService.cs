@@ -98,25 +98,26 @@ public sealed class DashboardOverviewService : IDashboardOverviewService
         return assignments
             .OrderBy(x => x.WorkId, StringComparer.Ordinal)
             .ThenBy(x => x.Code, StringComparer.Ordinal)
-            .ThenBy(x => x.DynamicExcelName, StringComparer.Ordinal)
+            .ThenBy(ResolveAssignmentName, StringComparer.Ordinal)
             .Select(x =>
             {
                 workMap.TryGetValue(x.WorkId, out var work);
                 var workCode = work is null ? null : (string.IsNullOrWhiteSpace(work.Code) ? work.AutoCode : work.Code);
                 var workName = work?.Name;
+                var assignmentName = ResolveAssignmentName(x);
                 return new DashboardReportAssignmentOptionDto
                 {
                     AssignmentId = x.Id,
                     WorkId = x.WorkId,
                     WorkName = workName,
                     AssignmentCode = x.Code,
-                    AssignmentName = x.DynamicExcelName,
+                    AssignmentName = assignmentName,
                     Label = string.Join(" • ", new[]
                     {
                         string.IsNullOrWhiteSpace(workCode) ? null : workCode,
                         string.IsNullOrWhiteSpace(workName) ? null : workName,
                         string.IsNullOrWhiteSpace(x.Code) ? x.Id : x.Code,
-                        string.IsNullOrWhiteSpace(x.DynamicExcelName) ? null : x.DynamicExcelName,
+                        string.IsNullOrWhiteSpace(assignmentName) ? null : assignmentName,
                     }.Where(s => !string.IsNullOrWhiteSpace(s)))
                 };
             })
@@ -331,7 +332,7 @@ public sealed class DashboardOverviewService : IDashboardOverviewService
                     WorkName = work?.Name,
                     AssignmentId = x.Id,
                     AssignmentCode = x.Code,
-                    AssignmentName = x.DynamicExcelName,
+                    AssignmentName = ResolveAssignmentName(x),
                     AssignmentProgressStatus = x.ProgressStatus,
                     FirstAssigneeName = assignee?.FullName,
                     FirstAssigneeUsername = assignee?.Username,
@@ -454,7 +455,7 @@ public sealed class DashboardOverviewService : IDashboardOverviewService
                     WorkName = work?.Name,
                     AssignmentId = x.Id,
                     AssignmentCode = x.Code,
-                    AssignmentName = x.DynamicExcelName,
+                    AssignmentName = ResolveAssignmentName(x),
                     AssignmentProgressStatus = x.ProgressStatus,
                     FirstAssigneeName = assignee?.FullName,
                     FirstAssigneeUsername = assignee?.Username,
@@ -587,7 +588,7 @@ public sealed class DashboardOverviewService : IDashboardOverviewService
                         WorkName = work?.Name,
                         AssignmentId = assignment.Id,
                         AssignmentCode = assignment.Code,
-                        AssignmentName = assignment.DynamicExcelName,
+                        AssignmentName = ResolveAssignmentName(assignment),
                         FirstAssigneeName = assignee.FullName,
                         FirstAssigneeUsername = assignee.Username,
                         UnitId = assignee.UnitId,
@@ -1005,7 +1006,15 @@ public sealed class DashboardOverviewService : IDashboardOverviewService
 
     private static DashboardOverviewPieSliceDto BuildWorkStatusSlice(string key, int value)
     {
-        return BuildProgressSlice(key, value);
+        return key switch
+        {
+            "1" => new DashboardOverviewPieSliceDto { Key = key, Label = "Chưa bắt đầu", Value = value, Color = "#94a3b8" },
+            "2" => new DashboardOverviewPieSliceDto { Key = key, Label = "Đang thực hiện", Value = value, Color = "#0ea5e9" },
+            "3" => new DashboardOverviewPieSliceDto { Key = key, Label = "Hoàn thành", Value = value, Color = "#22c55e" },
+            "4" => new DashboardOverviewPieSliceDto { Key = key, Label = "Có nguy cơ quá hạn", Value = value, Color = "#f59e0b" },
+            "5" => new DashboardOverviewPieSliceDto { Key = key, Label = "Quá hạn", Value = value, Color = "#ef4444" },
+            _ => new DashboardOverviewPieSliceDto { Key = key, Label = key, Value = value, Color = "#6b7280" },
+        };
     }
 
     private static List<DashboardOverviewPieSliceDto> BuildReportPie(List<WorkReportPeriod> periods)
@@ -1619,6 +1628,19 @@ public sealed class DashboardOverviewService : IDashboardOverviewService
         );
 
         return fb.Or(byDueDate, fallbackUpdated);
+    }
+
+    private static string ResolveAssignmentName(WorkAssignment assignment)
+    {
+        var name = assignment.Name?.Trim();
+        if (!string.IsNullOrWhiteSpace(name))
+            return name;
+
+        return assignment.DynamicFormTemplateName?.Trim()
+               ?? assignment.DynamicExcelName?.Trim()
+               ?? assignment.Code?.Trim()
+               ?? assignment.Id
+               ?? string.Empty;
     }
 
     private static string? PickUnitLabel(string? unitSymbol, string? unitShortName, string? unitName)

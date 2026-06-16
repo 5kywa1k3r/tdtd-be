@@ -2,8 +2,7 @@
 
 /// <summary>
 /// Request lưu draft report.
-/// FE gửi workbook hiện tại + values1D đã flatten từ dataRect,
-/// đồng thời gửi thêm các field nghiệp vụ trải phẳng mà lãnh đạo quan tâm.
+/// FE gửi Dynamic Form payload hiện tại; nội dung nghiệp vụ nằm trong FieldValuesJson/TableValuesJson.
 /// </summary>
 public sealed class SaveWorkAssignmentReportDraftRequest
 {
@@ -43,29 +42,6 @@ public sealed class SaveWorkAssignmentReportDraftRequest
     /// JSON mô tả nguồn tổng hợp/mapping để audit và mở lại draft.
     /// </summary>
     public string? SummarySourceJson { get; set; }
-
-    /// <summary>
-    /// Tình trạng hiện tại / trạng thái thực tế của công việc theo góc nhìn nghiệp vụ.
-    /// Đây là text nghiệp vụ, không phải enum lifecycle.
-    /// </summary>
-    public string? CurrentProgressStatus { get; set; }
-
-    /// <summary>
-    /// Lý do / diễn giải chính của báo cáo.
-    /// </summary>
-    public string? ReportReason { get; set; }
-
-    /// <summary>
-    /// Khó khăn, vướng mắc.
-    /// </summary>
-    public string? Difficulties { get; set; }
-
-    /// <summary>
-    /// Phương án giải quyết / đề xuất.
-    /// </summary>
-    public string? ProposedSolution { get; set; }
-
-    public DateTime? StartedDate { get; set; }
 
     public DateTime? CompletedDate { get; set; }
 

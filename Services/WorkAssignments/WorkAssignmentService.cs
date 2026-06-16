@@ -44,6 +44,7 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
     private readonly INotificationService _notifications;
     private readonly IUnitSelectionService _unitSelection;
     private readonly IUserActionLogService _userActionLog;
+    private readonly WorkAssignmentTargetScopePolicy _targetScopePolicy;
     private readonly MeAccessor _me;
     private readonly ILogger<WorkAssignmentService> _log;
 
@@ -63,6 +64,7 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
         INotificationService notifications,
         IUnitSelectionService unitSelection,
         IUserActionLogService userActionLog,
+        WorkAssignmentTargetScopePolicy targetScopePolicy,
         MeAccessor me,
         ILogger<WorkAssignmentService> log)
     {
@@ -81,6 +83,7 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
         _notifications = notifications;
         _unitSelection = unitSelection;
         _userActionLog = userActionLog;
+        _targetScopePolicy = targetScopePolicy;
         _me = me;
         _log = log;
     }
@@ -277,20 +280,18 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
                 AppErrorCode.WORK_ASSIGNMENT_PARENT_NOT_FOUND,
                 new { parentAssignmentId });
 
-        WorkAssignmentCreateScopeGuard.EnsureCanCreateBranch(parent, actorUserId);
+        if (!await CanReadAssignmentDetailAsync(parent, actorUserId, ct))
+            throw AppExceptionFactory.NotFound(
+                AppErrorCode.WORK_ASSIGNMENT_PARENT_NOT_FOUND,
+                new { parentAssignmentId });
 
-        await EnsureAssignmentListDocRolesForUserWorkAsync(parent.WorkId, actorUserId, ct);
-
-        var fb = Builders<AssignmentListDocRole>.Filter;
-        var filter = fb.Eq(x => x.WorkId, parent.WorkId)
-                     & fb.Eq(x => x.UserId, actorUserId)
-                     & fb.Eq(x => x.ParentAssignmentId, parent.Id)
-                     & fb.Eq(x => x.IsDeleted, false);
-
-        var items = await _ctx.AssignmentListDocRoles
-            .Find(filter)
+        var items = await _ctx.WorkAssignments
+            .Find(x =>
+                x.WorkId == parent.WorkId &&
+                x.ParentAssignmentId == parent.Id &&
+                !x.IsDeleted)
             .SortByDescending(x => x.IsActive)
-            .ThenByDescending(x => x.AssignmentUpdatedAtUtc)
+            .ThenByDescending(x => x.UpdatedAtUtc)
             .ThenBy(x => x.Path)
             .ToListAsync(ct);
 
@@ -342,11 +343,15 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
         await EnsureCreateScopeOpenAsync(work, parent, actorUserId, ct);
 
         var now = DateTime.UtcNow;
+        var inheritedParentDueDate = parent is null
+            ? null
+            : await ResolveInheritedParentDueDateAsync(work, parent, ct);
         normalizedReq = WorkAssignmentScheduleHelper.ApplyEffectiveDateDefaults(
             normalizedReq,
             work,
             parent,
-            now);
+            now,
+            inheritedParentDueDate);
 
         WorkAssignmentScheduleHelper.ValidateRequest(normalizedReq, work);
 
@@ -387,14 +392,6 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
 
         var willBeActive = normalizedReq.IsActive ?? true;
 
-        await EnsureNoActiveSiblingDynamicFormConflictAsync(
-            workId,
-            parent?.Id,
-            template.DynamicFormTemplateId,
-            exceptAssignmentId: null,
-            onlyWhenActive: willBeActive,
-            ct: ct);
-
         await EnsureNoActiveAssigneeDynamicFormBindingConflictAsync(
             workId,
             template.DynamicFormTemplateId,
@@ -411,6 +408,11 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
             RootAssignmentId = string.Empty,
             Level = parent is null ? 0 : parent.Level + 1,
             Code = code,
+            Name = ResolveAssignmentName(
+                normalizedReq.Name,
+                template.DynamicFormTemplateName,
+                template.DynamicExcelName,
+                code),
             Path = string.Empty,
 
             DynamicExcelId = template.DynamicExcelId,
@@ -977,14 +979,6 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
             .Distinct(StringComparer.Ordinal)
             .ToList();
 
-        await EnsureNoActiveSiblingDynamicFormConflictAsync(
-            entity.WorkId,
-            entity.ParentAssignmentId,
-            entity.DynamicFormTemplateId,
-            exceptAssignmentId: entity.Id,
-            onlyWhenActive: true,
-            ct: ct);
-
         await EnsureNoActiveAssigneeDynamicFormBindingConflictAsync(
             entity.WorkId,
             entity.DynamicFormTemplateId,
@@ -1109,7 +1103,8 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
             actorUnit,
             targetUsers,
             unitById,
-            actorUnitHasAssignableDescendants);
+            actorUnitHasAssignableDescendants,
+            _targetScopePolicy);
     }
 
     private async Task<bool> HasAssignableDescendantUnitAsync(Unit actorUnit, CancellationToken ct)
@@ -1304,13 +1299,11 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
         if (CanConfigureDataSourceRules(assignment, actorUserId))
             return true;
 
-        return await _ctx.AssignmentListDocRoles
-            .Find(x =>
-                x.AssignmentId == assignment.Id &&
-                x.UserId == actorUserId &&
-                !x.IsDeleted &&
-                x.Roles.Any())
-            .AnyAsync(ct);
+        return await WorkAssignmentReadAccessHelper.CanReadAssignmentOrAncestorAsync(
+            _ctx,
+            assignment,
+            actorUserId,
+            ct);
     }
 
     private static bool CanConfigureDataSourceRules(WorkAssignment assignment, string actorUserId)
@@ -1647,6 +1640,7 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
         {
             Id = detail.Id,
             WorkId = detail.WorkId,
+            Name = detail.Name,
 
             DynamicExcelId = detail.DynamicExcelId,
             DynamicExcelCode = detail.DynamicExcelCode,
@@ -1711,6 +1705,11 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
         {
             Id = entity.AssignmentId,
             WorkId = entity.WorkId,
+            Name = ResolveAssignmentName(
+                entity.Name,
+                entity.DynamicFormTemplateName,
+                entity.DynamicExcelName,
+                entity.Code),
 
             DynamicExcelId = entity.DynamicExcelId,
             DynamicExcelCode = entity.DynamicExcelCode,
@@ -1767,6 +1766,61 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
             WorstOverdueReasonLabel = entity.WorstOverdueReasonLabel,
             DueAtUtc = entity.DueAtUtc,
         };
+    }
+
+    private static string ResolveAssignmentName(
+        string? name,
+        string? dynamicFormTemplateName,
+        string? dynamicExcelName,
+        string? fallback)
+    {
+        var normalizedName = name?.Trim();
+        if (!string.IsNullOrWhiteSpace(normalizedName))
+            return normalizedName;
+
+        return dynamicFormTemplateName?.Trim()
+               ?? dynamicExcelName?.Trim()
+               ?? fallback?.Trim()
+               ?? string.Empty;
+    }
+
+    private async Task<DateTime?> ResolveInheritedParentDueDateAsync(
+        Work work,
+        WorkAssignment parent,
+        CancellationToken ct)
+    {
+        var current = parent;
+        var visited = new HashSet<string>(StringComparer.Ordinal);
+
+        while (current is not null && !string.IsNullOrWhiteSpace(current.Id))
+        {
+            if (!visited.Add(current.Id))
+                break;
+
+            var ownDueDate = ResolveAssignmentOwnDueDate(current);
+            if (ownDueDate.HasValue)
+                return ownDueDate.Value.Date;
+
+            if (string.IsNullOrWhiteSpace(current.ParentAssignmentId))
+                break;
+
+            current = await _ctx.WorkAssignments
+                .Find(x =>
+                    x.Id == current.ParentAssignmentId &&
+                    x.WorkId == work.Id &&
+                    !x.IsDeleted)
+                .FirstOrDefaultAsync(ct);
+        }
+
+        return WorkAssignmentDatePolicy.ResolveWorkRootDueDate(work);
+    }
+
+    private static DateTime? ResolveAssignmentOwnDueDate(WorkAssignment assignment)
+    {
+        return assignment.DueDate?.Date
+               ?? (!assignment.CompletedAtUtc.HasValue ? assignment.CompletedDate?.Date : null)
+               ?? assignment.DueAtUtc?.Date
+               ?? assignment.LatestDueAtUtc?.Date;
     }
 
     private static UserRefDTO ToUserRefDto(UserRef x) => new(

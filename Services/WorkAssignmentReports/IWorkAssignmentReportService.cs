@@ -32,6 +32,7 @@ public interface IWorkAssignmentReportService
         string workId,
         string dynamicFormTemplateId,
         string currentUserId,
+        string? scopeAssignmentId = null,
         CancellationToken ct = default);
 
     /// <summary>

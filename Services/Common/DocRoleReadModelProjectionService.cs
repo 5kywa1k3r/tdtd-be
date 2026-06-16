@@ -177,6 +177,7 @@ public sealed class DocRoleReadModelProjectionService : IDocRoleReadModelProject
                     .Set(x => x.Path, assignment.Path ?? string.Empty)
                     .Set(x => x.Level, assignment.Level)
                     .Set(x => x.Code, assignment.Code ?? string.Empty)
+                    .Set(x => x.Name, ResolveAssignmentName(assignment))
                     .Set(x => x.DynamicExcelId, assignment.DynamicExcelId)
                     .Set(x => x.DynamicExcelCode, assignment.DynamicExcelCode ?? string.Empty)
                     .Set(x => x.DynamicExcelName, assignment.DynamicExcelName ?? string.Empty)
@@ -1095,6 +1096,19 @@ public sealed class DocRoleReadModelProjectionService : IDocRoleReadModelProject
             .Where(x => !string.IsNullOrWhiteSpace(x.UserId))
             .Select(CloneUserRef)
             .ToList();
+
+    private static string ResolveAssignmentName(WorkAssignment assignment)
+    {
+        var name = assignment.Name?.Trim();
+        if (!string.IsNullOrWhiteSpace(name))
+            return name;
+
+        return assignment.DynamicFormTemplateName?.Trim()
+               ?? assignment.DynamicExcelName?.Trim()
+               ?? assignment.Code?.Trim()
+               ?? assignment.Id
+               ?? string.Empty;
+    }
 
     private static DateTime MaxDate(DateTime left, DateTime? right)
         => right.HasValue && right.Value > left ? right.Value : left;

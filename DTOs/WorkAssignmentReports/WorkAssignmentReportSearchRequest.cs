@@ -19,8 +19,6 @@ public sealed class WorkAssignmentReportSearchRequest
     /// - PeriodKey
     /// - DynamicExcelTemplateCode
     /// - DynamicExcelTemplateName
-    /// - CurrentProgressStatus
-    /// - ReportReason
     /// </summary>
     public string? Q { get; set; }
 

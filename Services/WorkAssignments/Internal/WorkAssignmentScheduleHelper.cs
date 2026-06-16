@@ -99,13 +99,16 @@ internal static class WorkAssignmentScheduleHelper
         SaveWorkAssignmentRequest req,
         Work work,
         WorkAssignment? parent,
-        DateTime nowUtc)
+        DateTime nowUtc,
+        DateTime? inheritedParentDueDate = null)
     {
         var effectiveStartDate = WorkAssignmentDatePolicy.ResolveEffectiveStartDate(req.StartDate, nowUtc);
-        var effectiveDueDate = WorkAssignmentDatePolicy.ResolveEffectiveDueDate(
-            req.DueDate,
-            work,
-            parent);
+        var effectiveDueDate = req.DueDate?.Date
+            ?? inheritedParentDueDate?.Date
+            ?? WorkAssignmentDatePolicy.ResolveEffectiveDueDate(
+                req.DueDate,
+                work,
+                parent);
 
         var effectiveSchedule = req.Schedule;
         if (req.AssignmentType == WorkAssignmentTypes.PeriodicReport &&

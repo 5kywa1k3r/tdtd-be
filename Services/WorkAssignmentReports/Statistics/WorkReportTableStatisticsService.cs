@@ -9,6 +9,7 @@ using tdtd_be.DTOs.Statistics;
 using tdtd_be.Models;
 using tdtd_be.Models.Enums;
 using tdtd_be.Models.Statistics;
+using tdtd_be.Services;
 using tdtd_be.Services.WorkAssignmentReports;
 using tdtd_be.Services.WorkAssignmentReports.Payloads;
 
@@ -103,6 +104,14 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
         }
 
         var metricTargets = await LoadMetricTargetMapAsync(report.DynamicFormTemplateId, ct);
+        if (metricTargets.AllowedMetrics.Count == 0)
+        {
+            return new ReportStatisticAggregateKey(
+                report.WorkId,
+                report.PeriodInstanceKey,
+                report.DynamicFormTemplateId);
+        }
+
         WorkReportPayloadConsistency.EnsureReadyForStatisticProjection(report);
         var payload = await _payloadReader.LoadReportPayloadAsync(report, ct);
         WorkReportPayloadConsistency.EnsureSnapshotFreshForStatisticProjection(report, payload);
@@ -319,8 +328,23 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
             .Project(x => x.Id)
             .ToListAsync(ct);
 
+        var aggregateKeys = new List<ReportStatisticAggregateKey>();
         foreach (var reportId in reports)
-            await RebuildForReportAsync(reportId, actorId, ct);
+        {
+            var aggregateKey = await RebuildValuesForReportAsync(reportId, actorId, ct);
+            if (aggregateKey is not null)
+                aggregateKeys.Add(aggregateKey);
+        }
+
+        foreach (var aggregateKey in aggregateKeys.Distinct())
+        {
+            await RebuildAggregatesForWorkPeriodAsync(
+                aggregateKey.WorkId,
+                aggregateKey.PeriodInstanceKey,
+                aggregateKey.DynamicFormTemplateId,
+                actorId,
+                ct);
+        }
 
         if (reports.Count == 0 && !string.IsNullOrWhiteSpace(normalized.PeriodInstanceKey))
         {
@@ -506,6 +530,9 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
             return map;
 
         AddMetricTargetsFromBlockJson(form.BlocksJson, map);
+        if (map.DisableAllTableStatistics)
+            return map;
+
         AddMetricTargetsFromBlockJson(form.ExcelBlockJson, map);
         return map;
     }
@@ -524,7 +551,11 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
             if (root.ValueKind == JsonValueKind.Array)
             {
                 foreach (var block in root.EnumerateArray())
+                {
                     AddMetricTargetsFromBlock(block, map);
+                    if (map.DisableAllTableStatistics)
+                        return;
+                }
                 return;
             }
 
@@ -542,12 +573,21 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
     {
         if (block.ValueKind != JsonValueKind.Object)
             return;
+        if (map.DisableAllTableStatistics)
+            return;
 
         var blockId = NormalizeBlockId(
             ReadOptionalString(block, "blockId")
             ?? ReadOptionalString(block, "id"));
         var tableMode = NormalizeTableMode(ReadOptionalString(block, "tableMode"));
         var hasDataRect = TryReadBlockDataRect(block, out var dataRect);
+        if (ShouldDisableConfiguredBlockTableStatistics(block, hasDataRect ? dataRect : null))
+        {
+            map.DisableAllTableStatistics = true;
+            map.AllowedMetrics.Clear();
+            map.LabelByMetric.Clear();
+            return;
+        }
 
         if (block.TryGetProperty("metricRules", out var rules)
             && rules.ValueKind == JsonValueKind.Array)
@@ -765,6 +805,9 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
             var rows = new List<ParsedMetricValue>();
             foreach (var block in root.Blocks)
             {
+                if (ShouldDisableRuntimeBlockTableStatistics(block))
+                    continue;
+
                 var blockId = NormalizeBlockId(block.BlockId);
                 var tableMode = NormalizeTableMode(block.TableMode);
                 var dynamicExcelTemplateId = NormalizeObjectIdOrNull(block.DynamicExcelTemplateId);
@@ -811,6 +854,8 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
         var metrics = NormalizeMetricDefinitions(block.MetricDefinitions, blockId, "FIXED_GRID");
         if (metrics.Count == 0)
             metrics = NormalizeIndexMap(block.IndexMap, blockId);
+        if (metrics.Count == 0 && block.HasSpecialRanges)
+            yield break;
         if (metrics.Count == 0)
             metrics = BuildFallbackMetricMap(blockId, block.W, block.H, block.Values1D.Count, metricTargets);
 
@@ -992,6 +1037,8 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
     {
         var dataType = NormalizeDataType(metric.DataType);
         if (IsBlankJsonElement(rawValue))
+            yield break;
+        if (dataType == "IGNORE")
             yield break;
 
         if (dataType == "NUMBER")
@@ -1337,6 +1384,7 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
             "BOOLEAN" or "BOOL" => "BOOLEAN",
             "DATE" => "DATE",
             "FULL_DATE" or "FULLDATE" or "STRICT_DATE" => "FULL_DATE",
+            "IGNORE" or "IGNORED" or "SKIP" => "IGNORE",
             _ => "NUMBER"
         };
     }
@@ -1552,6 +1600,71 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
         return true;
     }
 
+    private static bool ShouldDisableConfiguredBlockTableStatistics(
+        JsonElement block,
+        MetricLabelRange? dataRect)
+    {
+        if (ReadOptionalBool(block, "statisticsDisabled") == true)
+            return true;
+
+        var inputCellCount =
+            ReadOptionalNonNegativeInt(block, "statisticsInputCellCount") ??
+            CountConfiguredBlockInputCells(block, dataRect);
+
+        return DynamicExcelRuntimePolicy.ShouldDisableBackgroundTableStatistics(inputCellCount);
+    }
+
+    private static int CountConfiguredBlockInputCells(
+        JsonElement block,
+        MetricLabelRange? dataRect)
+    {
+        if (dataRect.HasValue)
+        {
+            var rect = ToRuntimeRect(dataRect.Value);
+            var specialRanges = DynamicExcelRuntimePolicy.ReadSpecialRanges(block, rect);
+            return DynamicExcelRuntimePolicy.CountInputCells(rect, specialRanges);
+        }
+
+        var w = ReadOptionalNonNegativeInt(block, "w") ?? ReadOptionalNonNegativeInt(block, "W") ?? 0;
+        var h = ReadOptionalNonNegativeInt(block, "h") ?? ReadOptionalNonNegativeInt(block, "H") ?? 0;
+        return w > 0 && h > 0 ? w * h : 0;
+    }
+
+    private static bool ShouldDisableRuntimeBlockTableStatistics(TableValuesBlock block)
+    {
+        if (block.StatisticsDisabled == true)
+            return true;
+
+        var metadataInputCellCount = block.StatisticsInputCellCount.GetValueOrDefault();
+        var valuesInputCellCount = block.Values1D?.Count ?? 0;
+        var inputCellCount = Math.Max(metadataInputCellCount, valuesInputCellCount);
+        if (inputCellCount <= 0)
+        {
+            var w = block.W.GetValueOrDefault();
+            var h = block.H.GetValueOrDefault();
+            inputCellCount = w > 0 && h > 0 ? w * h : 0;
+        }
+
+        return DynamicExcelRuntimePolicy.ShouldDisableBackgroundTableStatistics(inputCellCount);
+    }
+
+    private static bool? ReadOptionalBool(JsonElement element, string name)
+    {
+        if (!element.TryGetProperty(name, out var value))
+            return null;
+
+        return value.ValueKind switch
+        {
+            JsonValueKind.True => true,
+            JsonValueKind.False => false,
+            JsonValueKind.String when bool.TryParse(value.GetString(), out var parsed) => parsed,
+            _ => null
+        };
+    }
+
+    private static DynamicExcelRuntimeRect ToRuntimeRect(MetricLabelRange range)
+        => new(range.R0, range.C0, range.R1, range.C1);
+
     private static string BuildMetricLabelMapKey(string blockId, string metricKey)
         => $"{NormalizeBlockId(blockId)}:{metricKey.Trim()}";
 
@@ -1587,6 +1700,11 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
         public string? TableMode { get; set; }
         public int? W { get; set; }
         public int? H { get; set; }
+        public bool HasSpecialRanges { get; set; }
+        public bool? StatisticsDisabled { get; set; }
+        public int? StatisticsInputCellCount { get; set; }
+        public int? StatisticsInputCellLimit { get; set; }
+        public string? StatisticsDisabledReason { get; set; }
         public List<JsonElement>? Values1D { get; set; }
         public List<TableIndexMapItem>? IndexMap { get; set; }
         public List<TableMetricDefinition>? MetricDefinitions { get; set; }
@@ -1643,6 +1761,7 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
 
     private sealed class MetricTargetMap
     {
+        public bool DisableAllTableStatistics { get; set; }
         public HashSet<string> AllowedMetrics { get; } = new(StringComparer.OrdinalIgnoreCase);
         public Dictionary<string, string> LabelByMetric { get; } = new(StringComparer.OrdinalIgnoreCase);
 

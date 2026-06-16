@@ -15,10 +15,15 @@
         public string DynamicExcelTemplateCollection { get; set; } = "dynamic_excel_templates";
         public string DynamicFormTemplateCollection { get; set; } = "dynamic_form_templates";
         public string LabelCollection { get; set; } = "labels";
+        public string LabelEnumCatalogCollection { get; set; } = "label_enum_catalogs";
+        public string LabelEnumOptionReadModelCollection { get; set; } = "label_enum_option_read_models";
         public string WorkCollection { get; set; } = "works";
         public string WorkHistoryCollection { get; set; } = "work_histories";
         public string CounterCollection { get; set; } = "counters";
         public string WorkAssignmentCollection { get; set; } = "work_assignments";
+        public string WorkAssignmentAggregateConfigCollection { get; set; } = "work_assignment_aggregate_configs";
+        public string WorkAssignmentBasicSummaryConfigCollection { get; set; } = "work_assignment_basic_summary_configs";
+        public string WorkAssignmentBasicSummarySnapshotCollection { get; set; } = "work_assignment_basic_summary_snapshots";
         public string WorkTemplateAssigneeCollection { get; set; } = "work_template_assignees";
         public string DocRoleCollection { get; set; } = "doc_roles";
         public string WorkListDocRoleCollection { get; set; } = "work_list_doc_roles";

@@ -7,10 +7,12 @@ using tdtd_be.DashboardModel.DTOs;
 using tdtd_be.DashboardModel.DTOs.MindMap;
 using tdtd_be.Data;
 using tdtd_be.DTOs.Common;
+using tdtd_be.Enum;
 using tdtd_be.Models;
 using tdtd_be.Models.Enums;
 using tdtd_be.Models.Statistics;
 using tdtd_be.Services.Common;
+using tdtd_be.Services.Common.Time;
 
 namespace tdtd_be.DashboardModel.Services;
 
@@ -414,6 +416,15 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
                     .ToList();
                 var sampleBinding = templateBindings.FirstOrDefault();
                 var samplePeriod = templatePeriods.FirstOrDefault();
+                var templateCoverage = BuildCoverage(
+                    new[]
+                    {
+                        new CoverageAssignment(
+                            node,
+                            templateBindings.Select(ToCoverageAssignee).ToList())
+                    },
+                    templatePeriods,
+                    EmptyScope());
 
                 return new DashboardMindMapTemplateGroupDto
                 {
@@ -437,6 +448,7 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
                         .OrderByDescending(x => x.DueAtUtc)
                         .Select(x => x.DueAtUtc)
                         .FirstOrDefault(),
+                    Coverage = templateCoverage,
                     ReportBar = BuildReportBar(BuildReportSummary(templatePeriods)),
                 };
             })
@@ -480,7 +492,15 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
             .ToDictionary(x => x.Key, x => x.ToList(), StringComparer.Ordinal);
 
         var rows = bindings
-            .Select(x => MapTemplateUser(node.Id, dynamicFormTemplateId, x, periodsByUser.GetValueOrDefault(x.AssigneeUserId) ?? new List<WorkReportPeriod>()))
+            .Select(x =>
+            {
+                var userPeriods = periodsByUser.GetValueOrDefault(x.AssigneeUserId) ?? new List<WorkReportPeriod>();
+                var coverage = BuildCoverage(
+                    new[] { new CoverageAssignment(node, new List<CoverageAssignee> { ToCoverageAssignee(x) }) },
+                    userPeriods,
+                    EmptyScope());
+                return MapTemplateUser(node.Id, dynamicFormTemplateId, x, userPeriods, coverage);
+            })
             .ToList();
 
         var missingPeriodUsers = periodsByUser.Keys
@@ -490,7 +510,12 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
 
         foreach (var userId in missingPeriodUsers)
         {
-            rows.Add(MapTemplateUserFromPeriods(node.Id, dynamicFormTemplateId, userId, periodsByUser[userId]));
+            var userPeriods = periodsByUser[userId];
+            var coverage = BuildCoverage(
+                new[] { new CoverageAssignment(node, new List<CoverageAssignee> { ToCoverageAssignee(userId, userPeriods) }) },
+                userPeriods,
+                EmptyScope());
+            rows.Add(MapTemplateUserFromPeriods(node.Id, dynamicFormTemplateId, userId, userPeriods, coverage));
         }
 
         if (!string.IsNullOrWhiteSpace(q))
@@ -552,10 +577,6 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
             var fb = Builders<WorkReportPeriod>.Filter;
             filter &= fb.Or(
                 fb.Regex(x => x.PeriodKey, regex),
-                fb.Regex(x => x.CurrentProgressStatus, regex),
-                fb.Regex(x => x.ReportReason, regex),
-                fb.Regex(x => x.Difficulties, regex),
-                fb.Regex(x => x.ProposedSolution, regex),
                 fb.Regex(x => x.LateReason, regex),
                 fb.Regex(x => x.ReviewerComment, regex),
                 fb.Regex(x => x.ReviewerEvaluation, regex));
@@ -624,6 +645,10 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
 
         var unitRows = BuildUnitRows(ctx);
         var reportSummary = BuildReportSummary(ctx.Periods);
+        var coverage = BuildCoverage(
+            ctx.Assignments.Select(x => new CoverageAssignment(x, GetCoverageAssignees(x, normalizedScope))),
+            ctx.Periods,
+            normalizedScope);
         var labelSummaries = await LoadLabelSummariesAsync(ctx, normalizedScope, ct);
         var tableSummaries = await LoadTableSummariesAsync(ctx, normalizedScope, ct);
         var fieldSummaries = await LoadFieldSummariesAsync(ctx, normalizedScope, ct);
@@ -635,6 +660,7 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
             ActiveAssignmentCount = ctx.Assignments.Count,
             TotalAssigneeCount = unitRows.Count,
             ReportSummary = reportSummary,
+            Coverage = coverage,
             UnitBar = BuildUnitBar(unitRows),
             ReportBar = BuildReportBar(reportSummary),
             LabelSummaries = labelSummaries,
@@ -1645,7 +1671,7 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
             WorkReportPeriodId = periodId,
             AssignmentId = assignmentId,
             AssignmentCode = assignment?.Code,
-            AssignmentName = assignment?.DynamicExcelName ?? period?.DynamicExcelName ?? string.Empty,
+            AssignmentName = ResolveAssignmentName(assignment, period?.DynamicExcelName),
             AssigneeUserId = period?.AssigneeUserId,
             AssigneeFullName = assignee?.FullName ?? assignee?.Username ?? period?.AssigneeUserId,
             AssigneeUsername = assignee?.Username,
@@ -1698,7 +1724,7 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
             WorkReportPeriodId = periodId,
             AssignmentId = assignmentId,
             AssignmentCode = assignment?.Code,
-            AssignmentName = assignment?.DynamicExcelName ?? period?.DynamicExcelName ?? string.Empty,
+            AssignmentName = ResolveAssignmentName(assignment, period?.DynamicExcelName),
             AssigneeUserId = period?.AssigneeUserId,
             AssigneeFullName = assignee?.FullName ?? assignee?.Username ?? period?.AssigneeUserId,
             AssigneeUsername = assignee?.Username,
@@ -1756,7 +1782,7 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
             WorkReportPeriodId = periodId,
             AssignmentId = assignmentId,
             AssignmentCode = assignment?.Code,
-            AssignmentName = assignment?.DynamicExcelName ?? period?.DynamicExcelName ?? string.Empty,
+            AssignmentName = ResolveAssignmentName(assignment, period?.DynamicExcelName),
             AssigneeUserId = period?.AssigneeUserId,
             AssigneeFullName = assignee?.FullName ?? assignee?.Username ?? period?.AssigneeUserId,
             AssigneeUsername = assignee?.Username,
@@ -2461,11 +2487,180 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
         return string.Join("; ", parts);
     }
 
+    private static DashboardMindMapCoverageDto BuildCoverage(
+        IEnumerable<CoverageAssignment> assignmentRows,
+        IEnumerable<WorkReportPeriod> periods,
+        MindMapScope scope)
+    {
+        var periodRows = periods.ToList();
+        var scheduledPeriods = periodRows
+            .Where(x => WorkReportPeriodKind.IsScheduled(x.PeriodKind))
+            .ToList();
+
+        var result = new DashboardMindMapCoverageDto
+        {
+            ScheduledPeriodCount = scheduledPeriods.Count,
+            AdHocCount = periodRows.Count(x => WorkReportPeriodKind.IsUserCreated(x.PeriodKind)),
+            ReportedCount = scheduledPeriods.Count(HasCurrentReport),
+            SubmittedCount = scheduledPeriods.Count(x =>
+                x.Status is WorkReportPeriodStatus.Submitted or WorkReportPeriodStatus.OverdueSubmitted),
+            ApprovedCount = scheduledPeriods.Count(x =>
+                x.Status is WorkReportPeriodStatus.Approved or WorkReportPeriodStatus.OverdueApproved),
+        };
+
+        var expectedDueByKey = new Dictionary<string, DateTime?>(StringComparer.Ordinal);
+
+        if (scope.Range != null)
+        {
+            foreach (var row in assignmentRows)
+            {
+                var assignment = row.Assignment;
+                var assignees = row.Assignees
+                    .Where(x => !string.IsNullOrWhiteSpace(x.UserId))
+                    .GroupBy(x => x.UserId, StringComparer.Ordinal)
+                    .Select(x => x.First())
+                    .ToList();
+
+                if (assignees.Count == 0)
+                    continue;
+
+                var dueItems = BuildExpectedDueItems(assignment, scope.Range);
+                if (dueItems.Count == 0)
+                    continue;
+
+                foreach (var assignee in assignees)
+                {
+                    foreach (var dueItem in dueItems)
+                    {
+                        var key = BuildCoverageKey(assignment.Id, assignee.UserId, dueItem.PeriodKey);
+                        if (!expectedDueByKey.ContainsKey(key))
+                            expectedDueByKey[key] = dueItem.DueAtUtc;
+                    }
+                }
+            }
+        }
+
+        foreach (var period in scheduledPeriods)
+        {
+            var key = BuildCoverageKey(period.WorkAssignmentId, period.AssigneeUserId, period.PeriodKey);
+            if (string.IsNullOrWhiteSpace(key))
+                continue;
+
+            if (!expectedDueByKey.ContainsKey(key))
+                expectedDueByKey[key] = period.DueAtUtc;
+        }
+
+        var reportedKeys = scheduledPeriods
+            .Where(HasCurrentReport)
+            .Select(x => BuildCoverageKey(x.WorkAssignmentId, x.AssigneeUserId, x.PeriodKey))
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .ToHashSet(StringComparer.Ordinal);
+
+        var nowUtc = DateTime.UtcNow;
+        result.RequiredCount = expectedDueByKey.Count;
+        result.MissingCount = Math.Max(result.RequiredCount - reportedKeys.Count, 0);
+        result.OverdueMissingCount = expectedDueByKey
+            .Where(x => !reportedKeys.Contains(x.Key))
+            .Count(x => x.Value.HasValue && x.Value.Value < nowUtc);
+
+        return result;
+    }
+
+    private static List<AssignmentScheduleDueItem> BuildExpectedDueItems(
+        WorkAssignment assignment,
+        DashboardNormalizedRange range)
+    {
+        if (IsOnceAssignment(assignment))
+        {
+            if (!assignment.DueAtUtc.HasValue)
+                return new List<AssignmentScheduleDueItem>();
+
+            var dueAtUtc = assignment.DueAtUtc.Value;
+            if (dueAtUtc < range.FromUtc || dueAtUtc > range.ToUtc)
+                return new List<AssignmentScheduleDueItem>();
+
+            return new List<AssignmentScheduleDueItem>
+            {
+                new()
+                {
+                    DueAtUtc = dueAtUtc,
+                    PeriodKey = dueAtUtc.Date.ToString("yyyyMMdd")
+                }
+            };
+        }
+
+        if (assignment.Schedule is null)
+            return new List<AssignmentScheduleDueItem>();
+
+        return AssignmentScheduleDueHelper.GetDueItemsInRange(
+            assignment.Schedule,
+            range.FromUtc,
+            range.ToUtc);
+    }
+
+    private static bool HasCurrentReport(WorkReportPeriod period)
+        => !string.IsNullOrWhiteSpace(period.CurrentReportId);
+
+    private static string BuildCoverageKey(string? assignmentId, string? assigneeUserId, string? periodKey)
+    {
+        if (string.IsNullOrWhiteSpace(assignmentId) ||
+            string.IsNullOrWhiteSpace(assigneeUserId) ||
+            string.IsNullOrWhiteSpace(periodKey))
+        {
+            return string.Empty;
+        }
+
+        return $"{assignmentId.Trim()}::{assigneeUserId.Trim()}::{periodKey.Trim()}";
+    }
+
+    private static List<CoverageAssignee> GetCoverageAssignees(
+        WorkAssignment assignment,
+        MindMapScope scope)
+    {
+        var rows = (assignment.Assignees ?? new List<UserRef>())
+            .Where(x => !string.IsNullOrWhiteSpace(x.UserId))
+            .Where(x => scope.UnitIds.Count == 0 ||
+                        (!string.IsNullOrWhiteSpace(x.UnitId) && scope.UnitIds.Contains(x.UnitId)))
+            .Select(x => new CoverageAssignee(x.UserId, x.UnitId))
+            .ToList();
+
+        return DistinctCoverageAssignees(rows);
+    }
+
+    private static CoverageAssignee ToCoverageAssignee(WorkTemplateAssignee binding)
+        => new(binding.AssigneeUserId, binding.AssigneeUnitId);
+
+    private static CoverageAssignee ToCoverageAssignee(
+        string assigneeUserId,
+        List<WorkReportPeriod> periods)
+        => new(
+            assigneeUserId,
+            periods.FirstOrDefault(x => !string.IsNullOrWhiteSpace(x.AssigneeUnitId))?.AssigneeUnitId);
+
+    private static List<CoverageAssignee> DistinctCoverageAssignees(IEnumerable<CoverageAssignee> rows)
+        => rows
+            .Where(x => !string.IsNullOrWhiteSpace(x.UserId))
+            .GroupBy(x => x.UserId, StringComparer.Ordinal)
+            .Select(x => x.First())
+            .ToList();
+
+    private static MindMapScope EmptyScope()
+        => new(null, new HashSet<string>(StringComparer.OrdinalIgnoreCase));
+
+    private static bool IsOnceAssignment(WorkAssignment assignment)
+        => string.Equals(assignment.AssignmentType, WorkAssignmentTypes.Once, StringComparison.OrdinalIgnoreCase);
+
+    private static string NormalizePeriodKind(string? value)
+        => WorkReportPeriodKind.IsUserCreated(value)
+            ? WorkReportPeriodKind.UserCreated
+            : WorkReportPeriodKind.Scheduled;
+
     private static DashboardMindMapTemplateUserDto MapTemplateUser(
         string assignmentId,
         string dynamicFormTemplateId,
         WorkTemplateAssignee binding,
-        List<WorkReportPeriod> periods)
+        List<WorkReportPeriod> periods,
+        DashboardMindMapCoverageDto coverage)
     {
         return new DashboardMindMapTemplateUserDto
         {
@@ -2491,6 +2686,7 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
                 .OrderByDescending(x => x.DueAtUtc)
                 .Select(x => x.DueAtUtc)
                 .FirstOrDefault(),
+            Coverage = coverage,
             ReportBar = BuildReportBar(BuildReportSummary(periods)),
         };
     }
@@ -2499,7 +2695,8 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
         string assignmentId,
         string dynamicFormTemplateId,
         string assigneeUserId,
-        List<WorkReportPeriod> periods)
+        List<WorkReportPeriod> periods,
+        DashboardMindMapCoverageDto coverage)
     {
         var sample = periods.FirstOrDefault();
         return new DashboardMindMapTemplateUserDto
@@ -2521,6 +2718,7 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
                 .OrderByDescending(x => x.DueAtUtc)
                 .Select(x => x.DueAtUtc)
                 .FirstOrDefault(),
+            Coverage = coverage,
             ReportBar = BuildReportBar(BuildReportSummary(periods)),
         };
     }
@@ -2537,7 +2735,7 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
             ReportId = report?.Id,
             AssignmentId = assignment.Id,
             AssignmentCode = assignment.Code,
-            AssignmentName = assignment.DynamicExcelName ?? period.DynamicExcelName,
+            AssignmentName = ResolveAssignmentName(assignment, period.DynamicExcelName),
             AssigneeUserId = period.AssigneeUserId,
             AssigneeFullName = binding?.AssigneeFullName ?? binding?.AssigneeUsername ?? period.AssigneeUserId,
             AssigneeUsername = binding?.AssigneeUsername,
@@ -2549,15 +2747,12 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
                 ?? period.AssigneeUnitId,
             Bucket = MapReportBucket(period.Status),
             PeriodKey = period.PeriodKey,
+            PeriodKind = NormalizePeriodKind(period.PeriodKind),
             PeriodStatus = (int)period.Status,
             ReportStatus = report == null ? null : (int)report.Status,
             DueAtUtc = period.DueAtUtc,
             SubmittedAtUtc = report?.SubmittedAtUtc ?? period.LastSubmittedAtUtc,
             ApprovedAtUtc = report?.ApprovedAtUtc ?? period.LastReviewedAtUtc,
-            CurrentProgressStatus = period.CurrentProgressStatus,
-            ReportReason = period.ReportReason,
-            Difficulties = period.Difficulties,
-            ProposedSolution = period.ProposedSolution,
             LateReason = period.LateReason,
             ReturnReason = period.ReturnReason,
             ReviewerComment = period.ReviewerComment,
@@ -2624,7 +2819,7 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
         return new DashboardStackedBarDto
         {
             Key = "unit",
-            Label = "Theo don vi / nguoi",
+            Label = "Theo đơn vị / người",
             Total = rows.Count,
             Segments = BuildUnitSegments(rows.GroupBy(x => x.Bucket).ToDictionary(g => g.Key, g => g.Count(), StringComparer.OrdinalIgnoreCase)),
         };
@@ -2640,7 +2835,7 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
         return new DashboardStackedBarDto
         {
             Key = "report",
-            Label = "Theo tong report",
+            Label = "Theo tổng số báo cáo",
             Total = summary.Total,
             Segments = new List<DashboardStackedBarSegmentDto>
             {
@@ -2711,8 +2906,6 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
                 OverdueCount = overdueCount,
                 LatestPeriodKey = sample.PeriodKey,
                 LatestDueAtUtc = sample.DueAtUtc,
-                CurrentProgressStatus = sample.CurrentProgressStatus,
-                Difficulties = sample.Difficulties,
                 LateReason = sample.LateReason,
                 ReturnReason = sample.ReturnReason,
                 ReviewerComment = sample.ReviewerComment,
@@ -2744,7 +2937,7 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
                 ReportId = report?.Id,
                 AssignmentId = period.WorkAssignmentId,
                 AssignmentCode = assignment?.Code,
-                AssignmentName = assignment?.DynamicExcelName ?? period.DynamicExcelName,
+                AssignmentName = ResolveAssignmentName(assignment, period.DynamicExcelName),
                 AssigneeUserId = period.AssigneeUserId,
                 AssigneeFullName = assignee?.FullName ?? assignee?.Username ?? period.AssigneeUserId,
                 AssigneeUsername = assignee?.Username,
@@ -2752,15 +2945,12 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
                 UnitLabel = PickUnitLabel(assignee?.UnitSymbol, assignee?.UnitShortName, assignee?.UnitName) ?? period.AssigneeUnitId,
                 Bucket = MapReportBucket(period.Status),
                 PeriodKey = period.PeriodKey,
+                PeriodKind = NormalizePeriodKind(period.PeriodKind),
                 PeriodStatus = (int)period.Status,
                 ReportStatus = report == null ? null : (int)report.Status,
                 DueAtUtc = period.DueAtUtc,
                 SubmittedAtUtc = report?.SubmittedAtUtc,
                 ApprovedAtUtc = report?.ApprovedAtUtc,
-                CurrentProgressStatus = period.CurrentProgressStatus,
-                ReportReason = period.ReportReason,
-                Difficulties = period.Difficulties,
-                ProposedSolution = period.ProposedSolution,
                 LateReason = period.LateReason,
                 ReturnReason = period.ReturnReason,
                 ReviewerComment = period.ReviewerComment,
@@ -2941,6 +3131,20 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
                 ? shortName
                 : unitName;
 
+    private static string ResolveAssignmentName(WorkAssignment? assignment, string? fallback)
+    {
+        var name = assignment?.Name?.Trim();
+        if (!string.IsNullOrWhiteSpace(name))
+            return name;
+
+        return assignment?.DynamicFormTemplateName?.Trim()
+               ?? assignment?.DynamicExcelName?.Trim()
+               ?? fallback?.Trim()
+               ?? assignment?.Code
+               ?? assignment?.Id
+               ?? string.Empty;
+    }
+
     private sealed record MindMapScope(
         DashboardNormalizedRange? Range,
         HashSet<string> UnitIds)
@@ -2952,6 +3156,14 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
         Work Work,
         bool FullAccess,
         List<WorkAssignment> EntryAssignments);
+
+    private sealed record CoverageAssignment(
+        WorkAssignment Assignment,
+        List<CoverageAssignee> Assignees);
+
+    private sealed record CoverageAssignee(
+        string UserId,
+        string? UnitId);
 
     private sealed record SubtreeContext(
         WorkAssignment Node,

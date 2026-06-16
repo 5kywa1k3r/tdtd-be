@@ -16,11 +16,6 @@ public sealed class SubmitWorkAssignmentReportRequest
     public string? CumulativeContributionMode { get; set; }
     public string? CumulativeContributionPolicyJson { get; set; }
     public string? SummarySourceJson { get; set; }
-    public string? CurrentProgressStatus { get; set; }
-    public string? ReportReason { get; set; }
-    public string? Difficulties { get; set; }
-    public string? ProposedSolution { get; set; }
-    public DateTime? StartedDate { get; set; }
     public DateTime? CompletedDate { get; set; }
 
     /// <summary>

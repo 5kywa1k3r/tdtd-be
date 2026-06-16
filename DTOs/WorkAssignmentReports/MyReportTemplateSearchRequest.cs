@@ -41,6 +41,12 @@ public sealed class MyReportTemplateSearchRequest
     public bool? HasOverduePeriod { get; set; }
 
     /// <summary>
+    /// Giới hạn danh sách trong một nhánh assignment.
+    /// null = toàn bộ work.
+    /// </summary>
+    public string? ScopeAssignmentId { get; set; }
+
+    /// <summary>
     /// Trường sắp xếp.
     /// Hỗ trợ:
     /// - dynamicFormTemplateCode

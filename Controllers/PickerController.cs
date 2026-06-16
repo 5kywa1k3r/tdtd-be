@@ -8,10 +8,12 @@ using tdtd_be.Common.Pickers;
 using tdtd_be.Data;
 using tdtd_be.DTOs.Auth;
 using tdtd_be.DTOs.Common;
+using tdtd_be.DTOs.Labels;
 using tdtd_be.DTOs.Pickers;
 using tdtd_be.Enum;
 using tdtd_be.Models;
 using tdtd_be.Services;
+using tdtd_be.Services.WorkAssignments.Internal;
 
 namespace tdtd_be.Controllers;
 
@@ -22,11 +24,19 @@ public sealed class PickersController : ControllerBase
 {
     private readonly MongoDbContext _ctx;
     private readonly MeAccessor _me;
+    private readonly WorkAssignmentTargetScopePolicy _targetScopePolicy;
+    private readonly ILabelEnumCatalogService _labelEnumCatalogs;
 
-    public PickersController(MongoDbContext ctx, MeAccessor me)
+    public PickersController(
+        MongoDbContext ctx,
+        MeAccessor me,
+        WorkAssignmentTargetScopePolicy targetScopePolicy,
+        ILabelEnumCatalogService labelEnumCatalogs)
     {
         _ctx = ctx;
         _me = me;
+        _targetScopePolicy = targetScopePolicy;
+        _labelEnumCatalogs = labelEnumCatalogs;
     }
 
     private static FilterDefinition<Unit> ExcludeHiddenRoot(FilterDefinitionBuilder<Unit> fb)
@@ -205,6 +215,142 @@ public sealed class PickersController : ControllerBase
         ));
     }
 
+    [HttpGet("users/search")]
+    public async Task<ActionResult<PagedResult<UserPickRow>>> SearchUsers(
+        [FromQuery] string? q,
+        [FromQuery] string? unitId,
+        [FromQuery] int page = 0,
+        [FromQuery] int pageSize = 20,
+        CancellationToken ct = default)
+    {
+        _ = _me.RequireMe();
+
+        page = Math.Max(0, page);
+        pageSize = PickQueryHelper.ClampPageSize(pageSize, 20, 50);
+
+        var fb = Builders<AppUser>.Filter;
+        var filter = fb.Eq(x => x.IsDeleted, false);
+
+        if (!string.IsNullOrWhiteSpace(unitId))
+            filter = fb.And(filter, fb.Eq(x => x.UnitId, unitId.Trim()));
+
+        if (!string.IsNullOrWhiteSpace(q))
+        {
+            var s = Regex.Escape(q.Trim());
+            var rx = new BsonRegularExpression(s, "i");
+            filter = fb.And(filter, fb.Or(fb.Regex(x => x.Username, rx), fb.Regex(x => x.FullName, rx)));
+        }
+
+        var total = await _ctx.Users.CountDocumentsAsync(filter, cancellationToken: ct);
+        var rows = await _ctx.Users.Find(filter)
+            .SortBy(x => x.Username)
+            .Skip(page * pageSize)
+            .Limit(pageSize)
+            .Project(x => new UserPickRow
+            {
+                Id = x.Id,
+                Username = x.Username,
+                FullName = x.FullName,
+                UnitId = x.UnitId,
+                PositionCode = x.PositionCode
+            })
+            .ToListAsync(ct);
+
+        return Ok(new PagedResult<UserPickRow>(
+            rows: rows,
+            total: total,
+            page: page,
+            pageSize: pageSize
+        ));
+    }
+
+    [HttpGet("positions/search")]
+    public async Task<ActionResult<PagedResult<CatalogPickRow>>> SearchPositions(
+        [FromQuery] string? q,
+        [FromQuery] int page = 0,
+        [FromQuery] int pageSize = 20,
+        CancellationToken ct = default)
+    {
+        _ = _me.RequireMe();
+
+        page = Math.Max(0, page);
+        pageSize = PickQueryHelper.ClampPageSize(pageSize, 20, 50);
+
+        var fb = Builders<Position>.Filter;
+        var filter = fb.Eq(x => x.IsDeleted, false);
+        if (!string.IsNullOrWhiteSpace(q))
+        {
+            var s = Regex.Escape(q.Trim());
+            var rx = new BsonRegularExpression(s, "i");
+            filter = fb.And(filter, fb.Or(fb.Regex(x => x.Code, rx), fb.Regex(x => x.Name, rx)));
+        }
+
+        var total = await _ctx.Positions.CountDocumentsAsync(filter, cancellationToken: ct);
+        var rows = await _ctx.Positions.Find(filter)
+            .SortBy(x => x.Order)
+            .ThenBy(x => x.Code)
+            .Skip(page * pageSize)
+            .Limit(pageSize)
+            .Project(x => new CatalogPickRow
+            {
+                Id = x.Id,
+                Code = x.Code,
+                Name = x.Name
+            })
+            .ToListAsync(ct);
+
+        return Ok(new PagedResult<CatalogPickRow>(rows, total, page, pageSize));
+    }
+
+    [HttpGet("unit-types/search")]
+    public async Task<ActionResult<PagedResult<CatalogPickRow>>> SearchUnitTypes(
+        [FromQuery] string? q,
+        [FromQuery] int page = 0,
+        [FromQuery] int pageSize = 20,
+        CancellationToken ct = default)
+    {
+        _ = _me.RequireMe();
+
+        page = Math.Max(0, page);
+        pageSize = PickQueryHelper.ClampPageSize(pageSize, 20, 50);
+
+        var fb = Builders<UnitType>.Filter;
+        var filter = fb.Eq(x => x.IsDeleted, false);
+        if (!string.IsNullOrWhiteSpace(q))
+        {
+            var s = Regex.Escape(q.Trim());
+            var rx = new BsonRegularExpression(s, "i");
+            filter = fb.And(filter, fb.Or(fb.Regex(x => x.Code, rx), fb.Regex(x => x.Name, rx)));
+        }
+
+        var total = await _ctx.UnitTypes.CountDocumentsAsync(filter, cancellationToken: ct);
+        var rows = await _ctx.UnitTypes.Find(filter)
+            .SortBy(x => x.Code)
+            .Skip(page * pageSize)
+            .Limit(pageSize)
+            .Project(x => new CatalogPickRow
+            {
+                Id = x.Id,
+                Code = x.Code,
+                Name = x.Name
+            })
+            .ToListAsync(ct);
+
+        return Ok(new PagedResult<CatalogPickRow>(rows, total, page, pageSize));
+    }
+
+    [HttpGet("label-enums/{catalogId}/options/search")]
+    public async Task<ActionResult<PagedResult<LabelEnumOptionPickRow>>> SearchLabelEnumOptions(
+        [FromRoute] string catalogId,
+        [FromQuery] string? q,
+        [FromQuery] int page = 0,
+        [FromQuery] int pageSize = 20,
+        CancellationToken ct = default)
+    {
+        var result = await _labelEnumCatalogs.SearchOptionsAsync(catalogId, q, page, pageSize, ct);
+        return Ok(result);
+    }
+
     // =========================
     // LEADERS: by unit (PositionCode ∈ Positions.KnownCodes)
     // =========================
@@ -355,7 +501,8 @@ public sealed class PickersController : ControllerBase
                 me,
                 actorUnit,
                 selectedUnit,
-                actorUnitHasAssignableDescendants);
+                actorUnitHasAssignableDescendants,
+                _targetScopePolicy);
 
             if (assignmentTargetFilter is null)
                 return EmptyUserPickPage(page, pageSize);
@@ -438,7 +585,8 @@ public sealed class PickersController : ControllerBase
                     actorUnit,
                     u,
                     unit,
-                    actorUnitHasAssignableDescendants))
+                    actorUnitHasAssignableDescendants,
+                    _targetScopePolicy))
             {
                 return Ok(null);
             }
@@ -502,7 +650,8 @@ public sealed class PickersController : ControllerBase
         MeResponse me,
         Unit actorUnit,
         Unit selectedUnit,
-        bool actorUnitHasAssignableDescendants)
+        bool actorUnitHasAssignableDescendants,
+        WorkAssignmentTargetScopePolicy targetScopePolicy)
     {
         if (string.Equals(actorUnit.Id, selectedUnit.Id, StringComparison.Ordinal))
         {
@@ -521,6 +670,30 @@ public sealed class PickersController : ControllerBase
                 fb.Ne(x => x.Id, me.Id));
         }
 
+        var configuredFilters = new List<FilterDefinition<AppUser>>();
+        if (targetScopePolicy.AllowsConfiguredTargetAccountKind(
+                actorUnit,
+                selectedUnit,
+                ManagementAccountKind.UnitManager))
+        {
+            configuredFilters.Add(UnitManagerAccountFilter(fb));
+        }
+
+        if (targetScopePolicy.AllowsConfiguredTargetAccountKind(
+                actorUnit,
+                selectedUnit,
+                ManagementAccountKind.NormalUser))
+        {
+            configuredFilters.Add(NormalUserAccountFilter(fb));
+        }
+
+        if (configuredFilters.Count > 0)
+        {
+            return fb.And(
+                configuredFilters.Count == 1 ? configuredFilters[0] : fb.Or(configuredFilters),
+                fb.Ne(x => x.Id, me.Id));
+        }
+
         return null;
     }
 
@@ -529,18 +702,22 @@ public sealed class PickersController : ControllerBase
         Unit actorUnit,
         AppUser targetUser,
         Unit targetUnit,
-        bool actorUnitHasAssignableDescendants)
+        bool actorUnitHasAssignableDescendants,
+        WorkAssignmentTargetScopePolicy targetScopePolicy)
     {
         if (string.Equals(me.Id, targetUser.Id, StringComparison.Ordinal))
             return false;
 
         if (IsUnitManager(targetUser))
-            return IsPeerUnit(actorUnit, targetUnit) || IsDescendantUnit(actorUnit, targetUnit);
+            return IsPeerUnit(actorUnit, targetUnit) ||
+                   IsDescendantUnit(actorUnit, targetUnit) ||
+                   targetScopePolicy.AllowsConfiguredTarget(actorUnit, targetUnit, targetUser);
 
         if (IsNormalUser(targetUser))
         {
-            return !actorUnitHasAssignableDescendants &&
-                   string.Equals(actorUnit.Id, targetUnit.Id, StringComparison.Ordinal);
+            return (!actorUnitHasAssignableDescendants &&
+                    string.Equals(actorUnit.Id, targetUnit.Id, StringComparison.Ordinal)) ||
+                   targetScopePolicy.AllowsConfiguredTarget(actorUnit, targetUnit, targetUser);
         }
 
         return false;

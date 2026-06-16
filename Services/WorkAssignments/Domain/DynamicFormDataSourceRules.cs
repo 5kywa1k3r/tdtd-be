@@ -16,11 +16,11 @@ public static class DynamicFormDataSourceRuleTypes
         var normalized = value?.Trim().ToUpperInvariant();
         return normalized switch
         {
-            AggregateChildren => AggregateChildren,
+            AggregateChildren => Manual,
             MapChild => MapChild,
             Mixed => Mixed,
             Manual or null or "" => Manual,
-            _ => throw Invalid("sourceRule khong hop le.", new { sourceRule = value })
+            _ => throw Invalid("sourceRule không hợp lệ.", new { sourceRule = value })
         };
     }
 
@@ -101,7 +101,7 @@ public static class DynamicFormDataSourceRuleNormalizer
         foreach (var sectionId in byConfiguredSection.Keys)
         {
             if (!bySectionId.Contains(sectionId))
-                throw Invalid("sectionId trong cau hinh nguon du lieu khong ton tai trong dynamic form.", new { sectionId });
+                throw Invalid("sectionId trong cấu hình nguồn dữ liệu không tồn tại trong dynamic form.", new { sectionId });
         }
 
         var normalized = new DynamicFormDataSourceRulesDocument
@@ -162,11 +162,14 @@ public static class DynamicFormDataSourceRuleNormalizer
         DynamicFormSectionDataSourceRule? input,
         string sectionId)
     {
+        var sourceRule = DynamicFormDataSourceRuleTypes.Normalize(input?.SourceRule);
         return new DynamicFormSectionDataSourceRule
         {
             SectionId = sectionId,
-            SourceRule = DynamicFormDataSourceRuleTypes.Normalize(input?.SourceRule),
-            SourceAssignmentIds = NormalizeStringList(input?.SourceAssignmentIds),
+            SourceRule = sourceRule,
+            SourceAssignmentIds = sourceRule == DynamicFormDataSourceRuleTypes.Manual
+                ? new List<string>()
+                : NormalizeStringList(input?.SourceAssignmentIds),
             SourceSectionId = NormalizeOptional(input?.SourceSectionId),
             SourceBlockId = NormalizeOptional(input?.SourceBlockId),
             SourceFieldId = NormalizeOptional(input?.SourceFieldId),
@@ -179,12 +182,18 @@ public static class DynamicFormDataSourceRuleNormalizer
     {
         return (input ?? new List<DynamicFormFieldDataSourceRule>())
             .Where(x => !string.IsNullOrWhiteSpace(x.FieldId))
-            .Select(x => new DynamicFormFieldDataSourceRule
+            .Select(x =>
             {
-                FieldId = x.FieldId.Trim(),
-                SourceRule = DynamicFormDataSourceRuleTypes.Normalize(x.SourceRule),
-                SourceAssignmentId = NormalizeOptional(x.SourceAssignmentId),
-                SourceFieldId = NormalizeOptional(x.SourceFieldId)
+                var sourceRule = DynamicFormDataSourceRuleTypes.Normalize(x.SourceRule);
+                return new DynamicFormFieldDataSourceRule
+                {
+                    FieldId = x.FieldId.Trim(),
+                    SourceRule = sourceRule,
+                    SourceAssignmentId = sourceRule == DynamicFormDataSourceRuleTypes.Manual
+                        ? null
+                        : NormalizeOptional(x.SourceAssignmentId),
+                    SourceFieldId = NormalizeOptional(x.SourceFieldId)
+                };
             })
             .GroupBy(x => x.FieldId, StringComparer.Ordinal)
             .Select(x => x.First())
@@ -196,12 +205,18 @@ public static class DynamicFormDataSourceRuleNormalizer
     {
         return (input ?? new List<DynamicFormBlockDataSourceRule>())
             .Where(x => !string.IsNullOrWhiteSpace(x.BlockId))
-            .Select(x => new DynamicFormBlockDataSourceRule
+            .Select(x =>
             {
-                BlockId = x.BlockId.Trim(),
-                SourceRule = DynamicFormDataSourceRuleTypes.Normalize(x.SourceRule),
-                SourceAssignmentId = NormalizeOptional(x.SourceAssignmentId),
-                SourceBlockId = NormalizeOptional(x.SourceBlockId)
+                var sourceRule = DynamicFormDataSourceRuleTypes.Normalize(x.SourceRule);
+                return new DynamicFormBlockDataSourceRule
+                {
+                    BlockId = x.BlockId.Trim(),
+                    SourceRule = sourceRule,
+                    SourceAssignmentId = sourceRule == DynamicFormDataSourceRuleTypes.Manual
+                        ? null
+                        : NormalizeOptional(x.SourceAssignmentId),
+                    SourceBlockId = NormalizeOptional(x.SourceBlockId)
+                };
             })
             .GroupBy(x => x.BlockId, StringComparer.Ordinal)
             .Select(x => x.First())
@@ -217,7 +232,7 @@ public static class DynamicFormDataSourceRuleNormalizer
         }
         catch (JsonException ex)
         {
-            throw Invalid("dynamicFormDataSourceRulesJson phai la JSON object hop le.", new { error = ex.Message });
+            throw Invalid("dynamicFormDataSourceRulesJson phải là JSON object hợp lệ.", new { error = ex.Message });
         }
     }
 
@@ -230,7 +245,7 @@ public static class DynamicFormDataSourceRuleNormalizer
         {
             using var document = JsonDocument.Parse(sectionsJson);
             if (document.RootElement.ValueKind != JsonValueKind.Array)
-                throw Invalid("sectionsJson cua dynamic form phai la JSON array.");
+                throw Invalid("sectionsJson của dynamic form phải là JSON array.");
 
             var result = new List<SectionRef>();
             foreach (var item in document.RootElement.EnumerateArray())
@@ -252,7 +267,7 @@ public static class DynamicFormDataSourceRuleNormalizer
         }
         catch (JsonException ex)
         {
-            throw Invalid("sectionsJson cua dynamic form khong hop le.", new { error = ex.Message });
+            throw Invalid("sectionsJson của dynamic form không hợp lệ.", new { error = ex.Message });
         }
     }
 

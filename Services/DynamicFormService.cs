@@ -68,7 +68,7 @@ public sealed class DynamicFormService : IDynamicFormService
         "co khong"
     };
     private const int MaxFieldsPerForm = 200;
-    private const int MaxTableBlocksPerForm = 10;
+    private const int MaxTableBlocksPerForm = 30;
     private const int MaxLabelStatisticTargetsPerForm = 30;
     private static readonly HashSet<string> AllowedTableModes = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -103,15 +103,18 @@ public sealed class DynamicFormService : IDynamicFormService
     private readonly MongoDbContext _ctx;
     private readonly MeAccessor _me;
     private readonly IWorkReportStatisticRebuildJobService _statisticRebuildJobs;
+    private readonly ILabelEnumCatalogService _enumCatalogs;
 
     public DynamicFormService(
         MongoDbContext ctx,
         MeAccessor me,
-        IWorkReportStatisticRebuildJobService statisticRebuildJobs)
+        IWorkReportStatisticRebuildJobService statisticRebuildJobs,
+        ILabelEnumCatalogService enumCatalogs)
     {
         _ctx = ctx;
         _me = me;
         _statisticRebuildJobs = statisticRebuildJobs;
+        _enumCatalogs = enumCatalogs;
     }
 
     public async Task<NextCodeResp> GetNextCodeAsync(int? year, CancellationToken ct)
@@ -216,6 +219,7 @@ public sealed class DynamicFormService : IDynamicFormService
         EnsureTableStatisticContract(excelBlockJson, "ExcelBlockJson");
         EnsureBlocksTableStatisticContract(blocksJson, "BlocksJson");
         await EnsureLabelReferencesAsync(me, tagCodes, sectionsJson, fieldsJson, excelBlockJson, blocksJson, ct);
+        await _enumCatalogs.ValidateVisibleActiveCatalogsAsync(ExtractEnumCatalogIds(fieldsJson, excelBlockJson, blocksJson), ct);
         EnsureUniqueLabelStatisticTargets(fieldsJson, blocksJson);
 
         var doc = new DynamicFormTemplate
@@ -270,6 +274,7 @@ public sealed class DynamicFormService : IDynamicFormService
         EnsureTableStatisticContract(excelBlockJson, "ExcelBlockJson");
         EnsureBlocksTableStatisticContract(blocksJson, "BlocksJson");
         await EnsureLabelReferencesAsync(me, tagCodes, sectionsJson, fieldsJson, excelBlockJson, blocksJson, ct);
+        await _enumCatalogs.ValidateVisibleActiveCatalogsAsync(ExtractEnumCatalogIds(fieldsJson, excelBlockJson, blocksJson), ct);
         EnsureUniqueLabelStatisticTargets(fieldsJson, blocksJson);
 
         var update = Builders<DynamicFormTemplate>.Update
@@ -333,6 +338,7 @@ public sealed class DynamicFormService : IDynamicFormService
         EnsureTableStatisticContract(excelBlockJson, "ExcelBlockJson");
         EnsureBlocksTableStatisticContract(blocksJson, "BlocksJson");
         await EnsureLabelReferencesAsync(me, doc.TagCodes, doc.SectionsJson, fieldsJson, excelBlockJson, blocksJson, ct);
+        await _enumCatalogs.ValidateVisibleActiveCatalogsAsync(ExtractEnumCatalogIds(fieldsJson, excelBlockJson, blocksJson), ct);
         EnsureUniqueLabelStatisticTargets(fieldsJson, blocksJson);
 
         var update = Builders<DynamicFormTemplate>.Update
@@ -1754,6 +1760,8 @@ public sealed class DynamicFormService : IDynamicFormService
         var typeMetadata = ReadDynamicExcelTypeMetadata(excel.SpecJson);
         var specKind = ReadDynamicExcelSpecKind(excel.SpecJson);
         var tableMode = NormalizeDynamicExcelTemplateTableMode(excel.TableMode, specKind);
+        var statisticsInputCellCount = CountDynamicExcelTemplateInputCells(excel);
+        var statisticsDisabled = DynamicExcelRuntimePolicy.ShouldDisableBackgroundTableStatistics(statisticsInputCellCount);
         return new DynamicFormExcelBlockSnapshot(
             excel.Id,
             excel.Code,
@@ -1772,7 +1780,14 @@ public sealed class DynamicFormService : IDynamicFormService
             specKind,
             typeMetadata.DefaultDataType,
             typeMetadata.DefaultOptions,
-            typeMetadata.DataTypeOverrides);
+            typeMetadata.DataTypeOverrides,
+            typeMetadata.SpecialRanges,
+            statisticsDisabled,
+            statisticsInputCellCount,
+            DynamicExcelRuntimePolicy.MaxBackgroundTableStatisticInputCells,
+            statisticsDisabled
+                ? DynamicExcelRuntimePolicy.BuildBackgroundTableStatisticsDisabledReason(statisticsInputCellCount)
+                : null);
     }
 
     private static string NormalizeDynamicExcelTemplateTableMode(string? tableMode, string? specKind)
@@ -1796,13 +1811,13 @@ public sealed class DynamicFormService : IDynamicFormService
     {
         const string fallbackType = LabelDataTypes.Number;
         if (string.IsNullOrWhiteSpace(specJson))
-            return new DynamicExcelTypeMetadata(fallbackType, Array.Empty<JsonElement>(), Array.Empty<JsonElement>());
+            return new DynamicExcelTypeMetadata(fallbackType, Array.Empty<JsonElement>(), Array.Empty<JsonElement>(), Array.Empty<JsonElement>());
 
         try
         {
             using var document = JsonDocument.Parse(specJson);
             if (document.RootElement.ValueKind != JsonValueKind.Object)
-                return new DynamicExcelTypeMetadata(fallbackType, Array.Empty<JsonElement>(), Array.Empty<JsonElement>());
+                return new DynamicExcelTypeMetadata(fallbackType, Array.Empty<JsonElement>(), Array.Empty<JsonElement>(), Array.Empty<JsonElement>());
 
             var defaultType = NormalizeDynamicExcelMetadataDataType(
                 ReadOptionalString(document.RootElement, "defaultDataType"));
@@ -1829,18 +1844,53 @@ public sealed class DynamicFormService : IDynamicFormService
                     .ToArray();
             }
 
-            return new DynamicExcelTypeMetadata(defaultType, defaultOptions, overrides);
+            var specialRanges = Array.Empty<JsonElement>();
+            if (document.RootElement.TryGetProperty("specialRanges", out var specialRangeElement)
+                && specialRangeElement.ValueKind == JsonValueKind.Array)
+            {
+                specialRanges = specialRangeElement
+                    .EnumerateArray()
+                    .Where(item => item.ValueKind == JsonValueKind.Object)
+                    .Select(item => item.Clone())
+                    .ToArray();
+            }
+
+            return new DynamicExcelTypeMetadata(defaultType, defaultOptions, overrides, specialRanges);
         }
         catch (JsonException)
         {
-            return new DynamicExcelTypeMetadata(fallbackType, Array.Empty<JsonElement>(), Array.Empty<JsonElement>());
+            return new DynamicExcelTypeMetadata(fallbackType, Array.Empty<JsonElement>(), Array.Empty<JsonElement>(), Array.Empty<JsonElement>());
+        }
+    }
+
+    private static int CountDynamicExcelTemplateInputCells(DynamicExcelTemplate template)
+    {
+        var dataRect = new DynamicExcelRuntimeRect(
+            template.DataRectR0,
+            template.DataRectC0,
+            template.DataRectR1,
+            template.DataRectC1);
+
+        if (string.IsNullOrWhiteSpace(template.SpecJson))
+            return DynamicExcelRuntimePolicy.CountInputCells(dataRect);
+
+        try
+        {
+            using var document = JsonDocument.Parse(template.SpecJson);
+            var specialRanges = DynamicExcelRuntimePolicy.ReadSpecialRanges(document.RootElement, dataRect);
+            return DynamicExcelRuntimePolicy.CountInputCells(dataRect, specialRanges);
+        }
+        catch (JsonException)
+        {
+            return DynamicExcelRuntimePolicy.CountInputCells(dataRect);
         }
     }
 
     private sealed record DynamicExcelTypeMetadata(
         string DefaultDataType,
         JsonElement[] DefaultOptions,
-        JsonElement[] DataTypeOverrides);
+        JsonElement[] DataTypeOverrides,
+        JsonElement[] SpecialRanges);
 
     private static string NormalizeDynamicExcelMetadataDataType(string? value)
     {
@@ -1849,6 +1899,8 @@ public sealed class DynamicFormService : IDynamicFormService
             return "FULL_DATE";
         if (raw is "MULTI_SELECT" or "MULTISELECT")
             return "MULTI_SELECT";
+        if (raw is "IGNORE" or "IGNORED" or "SKIP")
+            return "IGNORE";
 
         var normalized = LabelDataTypes.Normalize(value);
         return normalized == LabelDataTypes.LongText ? LabelDataTypes.StringList : normalized;
@@ -2273,6 +2325,66 @@ public sealed class DynamicFormService : IDynamicFormService
 
     private static string? NormalizeFieldDisplayAliases(string? fieldsJson)
         => NormalizeFieldPayload(fieldsJson, existingFieldsJson: null);
+
+    private static IReadOnlyList<string> ExtractEnumCatalogIds(params string?[] jsonValues)
+    {
+        var result = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var json in jsonValues)
+        {
+            if (string.IsNullOrWhiteSpace(json))
+                continue;
+
+            try
+            {
+                using var document = JsonDocument.Parse(json);
+                CollectEnumCatalogIds(document.RootElement, result);
+            }
+            catch (JsonException)
+            {
+                continue;
+            }
+        }
+
+        return result.ToList();
+    }
+
+    private static void CollectEnumCatalogIds(JsonElement element, ISet<string> result)
+    {
+        if (element.ValueKind == JsonValueKind.Object)
+        {
+            if (element.TryGetProperty("valueSource", out var source) &&
+                source.ValueKind == JsonValueKind.Object)
+            {
+                var sourceType = LabelValueSourceTypes.Normalize(
+                    ReadOptionalString(source, "sourceType")
+                    ?? ReadOptionalString(source, "type")
+                    ?? ReadOptionalString(source, "valueSourceType"));
+                var catalogId = ReadOptionalString(source, "catalogId")
+                                ?? ReadOptionalString(source, "valueSourceCatalogId")
+                                ?? ReadOptionalString(source, "enumCatalogId");
+                if (sourceType == LabelValueSourceTypes.EnumCatalog && string.IsNullOrWhiteSpace(catalogId))
+                {
+                    throw DynamicFormValidation(
+                        AppErrorCode.DYNAMIC_FORM_JSON_INVALID,
+                        "Nguồn ENUM_CATALOG phải chọn danh mục enum.",
+                        new { sourceType });
+                }
+
+                if (sourceType == LabelValueSourceTypes.EnumCatalog)
+                {
+                    result.Add(catalogId.Trim());
+                }
+            }
+
+            foreach (var property in element.EnumerateObject())
+                CollectEnumCatalogIds(property.Value, result);
+        }
+        else if (element.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var item in element.EnumerateArray())
+                CollectEnumCatalogIds(item, result);
+        }
+    }
 
     private static string? NormalizeFieldPayload(string? fieldsJson, string? existingFieldsJson)
     {
@@ -3358,9 +3470,29 @@ public sealed class DynamicFormService : IDynamicFormService
         block.Remove("dataTypeOverrides");
         block.Remove("DefaultOptions");
         block.Remove("defaultOptions");
+        block.Remove("SpecialRanges");
+        block.Remove("specialRanges");
+        block.Remove("StatisticsDisabled");
+        block.Remove("statisticsDisabled");
+        block.Remove("StatisticsInputCellCount");
+        block.Remove("statisticsInputCellCount");
+        block.Remove("StatisticsInputCellLimit");
+        block.Remove("statisticsInputCellLimit");
+        block.Remove("StatisticsDisabledReason");
+        block.Remove("statisticsDisabledReason");
 
         var metadata = ReadDynamicExcelTypeMetadata(template.SpecJson);
         block["defaultDataType"] = metadata.DefaultDataType;
+        var statisticsInputCellCount = CountDynamicExcelTemplateInputCells(template);
+        var statisticsDisabled = DynamicExcelRuntimePolicy.ShouldDisableBackgroundTableStatistics(statisticsInputCellCount);
+        block["statisticsDisabled"] = statisticsDisabled;
+        block["statisticsInputCellCount"] = statisticsInputCellCount;
+        block["statisticsInputCellLimit"] = DynamicExcelRuntimePolicy.MaxBackgroundTableStatisticInputCells;
+        if (statisticsDisabled)
+        {
+            block["statisticsDisabledReason"] =
+                DynamicExcelRuntimePolicy.BuildBackgroundTableStatisticsDisabledReason(statisticsInputCellCount);
+        }
 
         if (metadata.DefaultOptions.Length > 0)
         {
@@ -3371,12 +3503,25 @@ public sealed class DynamicFormService : IDynamicFormService
         }
 
         if (metadata.DataTypeOverrides.Length == 0)
-            return;
+        {
+            if (metadata.SpecialRanges.Length == 0)
+                return;
+        }
+        else
+        {
+            var overrides = new JsonArray();
+            foreach (var item in metadata.DataTypeOverrides)
+                overrides.Add(JsonNode.Parse(item.GetRawText()));
+            block["dataTypeOverrides"] = overrides;
+        }
 
-        var overrides = new JsonArray();
-        foreach (var item in metadata.DataTypeOverrides)
-            overrides.Add(JsonNode.Parse(item.GetRawText()));
-        block["dataTypeOverrides"] = overrides;
+        if (metadata.SpecialRanges.Length > 0)
+        {
+            var specialRanges = new JsonArray();
+            foreach (var item in metadata.SpecialRanges)
+                specialRanges.Add(JsonNode.Parse(item.GetRawText()));
+            block["specialRanges"] = specialRanges;
+        }
     }
 
     private static string NormalizeImportSectionId(string? sectionId, string sectionsJson)

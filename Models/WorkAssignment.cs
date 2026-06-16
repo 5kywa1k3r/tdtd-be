@@ -93,6 +93,9 @@ public sealed class WorkAssignment : BaseEntity
     [BsonElement("code")]
     public string Code { get; set; } = default!;
 
+    [BsonElement("name")]
+    public string Name { get; set; } = string.Empty;
+
     [BsonElement("path")]
     public string Path { get; set; } = default!;
 

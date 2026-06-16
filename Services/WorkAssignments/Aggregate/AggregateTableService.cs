@@ -1,4 +1,5 @@
 using System.Text.Json;
+using MongoDB.Bson;
 using MongoDB.Driver;
 using tdtd_be.Common.Auth;
 using tdtd_be.Common.Errors;
@@ -9,6 +10,8 @@ using tdtd_be.Models;
 using tdtd_be.Models.Enums;
 using tdtd_be.Models.Statistics;
 using tdtd_be.Services;
+using tdtd_be.Services.WorkAssignments.Internal;
+using tdtd_be.Services.WorkAssignmentReports.Payloads;
 
 namespace tdtd_be.Services.WorkAssignments.Aggregate;
 
@@ -19,15 +22,31 @@ public sealed class AggregateTableService : IAggregateTableService
         PropertyNameCaseInsensitive = true
     };
 
+    private static readonly string[] DefaultStackIdentityColumns =
+    {
+        "periodKey",
+        "unitSymbol",
+        "unitShortName",
+        "fullName",
+        "userName",
+        "sourceReportCount"
+    };
+
     private readonly MongoDbContext _ctx;
     private readonly MeAccessor _me;
     private readonly IUnitSelectionService _unitSelection;
+    private readonly IWorkReportPayloadReader _payloadReader;
 
-    public AggregateTableService(MongoDbContext ctx, MeAccessor me, IUnitSelectionService unitSelection)
+    public AggregateTableService(
+        MongoDbContext ctx,
+        MeAccessor me,
+        IUnitSelectionService unitSelection,
+        IWorkReportPayloadReader payloadReader)
     {
         _ctx = ctx;
         _me = me;
         _unitSelection = unitSelection;
+        _payloadReader = payloadReader;
     }
 
     public async Task<AggregateTableResponse> GetTableAsync(
@@ -39,7 +58,7 @@ public sealed class AggregateTableService : IAggregateTableService
 
         ValidateAggregateRequest(normalized);
 
-        await LoadAggregateParentAsync(normalized.ParentAssignmentId!, me.Id, ct);
+        await LoadAggregateParentAsync(normalized.ParentAssignmentId!, me.Id, ct, allowBranchRead: true);
         normalized.SelectedUnitIds = await ResolveSelectedUnitIdsAsync(normalized.SelectedUnitIds, ct);
 
         var assignments = await LoadAggregateChildrenAsync(
@@ -76,7 +95,7 @@ public sealed class AggregateTableService : IAggregateTableService
 
         ValidateDynamicFormRequest(normalized);
 
-        var scopeRoot = await LoadAggregateParentAsync(normalized.ScopeAssignmentId, me.Id, ct);
+        var scopeRoot = await LoadAggregateParentAsync(normalized.ScopeAssignmentId, me.Id, ct, allowBranchRead: true);
 
         var template = await _ctx.DynamicFormTemplates
             .Find(x =>
@@ -134,6 +153,9 @@ public sealed class AggregateTableService : IAggregateTableService
 
         var reports = await LoadDynamicFormAggregateReportsAsync(assignments, normalized, ct);
         var sources = BuildAggregateSources(assignments, reports);
+        var stackedTable = contract.TableMode is "APPEND_ROWS" or "APPEND_COLUMNS"
+            ? BuildDynamicFormStackedTable(assignments, reports, contract, metrics, normalized, warnings)
+            : null;
         var rows = contract.TableMode == "SUMMARY_TEMPLATE"
             ? await BuildDynamicFormSummaryTemplateRowsAsync(scopeRoot, assignments, normalized, contract, metrics, warnings, ct)
             : await BuildDynamicFormProjectedMetricRowsAsync(reports, contract, metrics, warnings, ct)
@@ -150,6 +172,7 @@ public sealed class AggregateTableService : IAggregateTableService
                 reports.Count),
             Columns = BuildDynamicFormColumns(),
             Rows = rows,
+            StackedTable = stackedTable,
             Sources = sources,
             Warnings = warnings
                 .Distinct(StringComparer.Ordinal)
@@ -157,6 +180,92 @@ public sealed class AggregateTableService : IAggregateTableService
                 .ToList(),
         };
     }
+
+    public async Task<WorkAssignmentAggregateConfigDto?> GetAggregateConfigAsync(
+        string assignmentId,
+        CancellationToken ct)
+    {
+        var me = _me.RequireMe();
+        var assignment = await LoadAggregateParentAsync(assignmentId, me.Id, ct, allowBranchRead: true);
+        var config = await _ctx.WorkAssignmentAggregateConfigs
+            .Find(x => x.AssignmentId == assignment.Id && x.IsActive && !x.IsDeleted)
+            .SortByDescending(x => x.UpdatedAtUtc)
+            .FirstOrDefaultAsync(ct);
+
+        return config is null ? null : MapAggregateConfig(config);
+    }
+
+    public async Task<WorkAssignmentAggregateConfigDto> SaveAggregateConfigAsync(
+        string assignmentId,
+        SaveWorkAssignmentAggregateConfigRequest req,
+        CancellationToken ct)
+    {
+        var me = _me.RequireMe();
+        var assignment = await LoadAggregateParentAsync(assignmentId, me.Id, ct, allowBranchRead: false);
+        var now = DateTime.UtcNow;
+        var existing = await _ctx.WorkAssignmentAggregateConfigs
+            .Find(x => x.AssignmentId == assignment.Id && x.IsActive && !x.IsDeleted)
+            .SortByDescending(x => x.UpdatedAtUtc)
+            .FirstOrDefaultAsync(ct);
+
+        var entity = existing ?? new WorkAssignmentAggregateConfig
+        {
+            Id = ObjectId.GenerateNewId().ToString(),
+            WorkId = assignment.WorkId,
+            AssignmentId = assignment.Id,
+            CreatedAtUtc = now,
+            CreatedByUserId = me.Id,
+            IsDeleted = false,
+            IsActive = true,
+        };
+
+        entity.SourceDynamicFormTemplateId = NormalizeOptionalText(req.SourceDynamicFormTemplateId);
+        entity.SourceBlockId = NormalizeOptionalText(req.SourceBlockId);
+        entity.SourceTableMode = NormalizeOptionalText(req.SourceTableMode)?.ToUpperInvariant();
+        entity.TargetDynamicFormTemplateId = NormalizeOptionalText(req.TargetDynamicFormTemplateId);
+        entity.TargetBlockId = NormalizeOptionalText(req.TargetBlockId);
+        entity.AggregateKind = NormalizeAggregateConfigKind(req.AggregateKind);
+        entity.IdentityColumns = NormalizeIdentityColumns(req.IdentityColumns);
+        entity.PeriodAggregationRule = NormalizeOptionalText(req.PeriodAggregationRule) ?? "STACK_SINGLE_PERIOD_SUM_RANGE";
+        entity.MetricMappingsJson = NormalizeOptionalText(req.MetricMappingsJson);
+        entity.VersionNo = existing is null ? 1 : existing.VersionNo + 1;
+        entity.UpdatedAtUtc = now;
+        entity.UpdatedByUserId = me.Id;
+
+        if (existing is null)
+            await _ctx.WorkAssignmentAggregateConfigs.InsertOneAsync(entity, cancellationToken: ct);
+        else
+            await _ctx.WorkAssignmentAggregateConfigs.ReplaceOneAsync(x => x.Id == entity.Id, entity, cancellationToken: ct);
+
+        return MapAggregateConfig(entity);
+    }
+
+    private static string NormalizeAggregateConfigKind(string? value)
+    {
+        var normalized = value?.Trim().ToUpperInvariant();
+        return normalized is "AUTO_MAP" or "MANUAL_MAP" or "STACK_ROWS" or "STACK_COLUMNS"
+            ? normalized
+            : "AUTO_MAP";
+    }
+
+    private static WorkAssignmentAggregateConfigDto MapAggregateConfig(WorkAssignmentAggregateConfig x)
+        => new()
+        {
+            Id = x.Id,
+            WorkId = x.WorkId,
+            AssignmentId = x.AssignmentId,
+            SourceDynamicFormTemplateId = x.SourceDynamicFormTemplateId,
+            SourceBlockId = x.SourceBlockId,
+            SourceTableMode = x.SourceTableMode,
+            TargetDynamicFormTemplateId = x.TargetDynamicFormTemplateId,
+            TargetBlockId = x.TargetBlockId,
+            AggregateKind = x.AggregateKind,
+            IdentityColumns = x.IdentityColumns ?? new List<string>(),
+            PeriodAggregationRule = x.PeriodAggregationRule,
+            MetricMappingsJson = x.MetricMappingsJson,
+            VersionNo = x.VersionNo,
+            IsActive = x.IsActive
+        };
 
     private static AggregateTableRequest NormalizeRequest(AggregateTableRequest req)
     {
@@ -274,9 +383,7 @@ public sealed class AggregateTableService : IAggregateTableService
         var normalized = new DynamicFormAggregateRequest
         {
             ScopeAssignmentId = req.ScopeAssignmentId?.Trim() ?? string.Empty,
-            ScopeMode = string.IsNullOrWhiteSpace(req.ScopeMode)
-                ? "DIRECT_CHILDREN"
-                : req.ScopeMode.Trim().ToUpperInvariant(),
+            ScopeMode = "DIRECT_CHILDREN",
             DynamicFormTemplateId = req.DynamicFormTemplateId?.Trim() ?? string.Empty,
             BlockId = string.IsNullOrWhiteSpace(req.BlockId) ? null : req.BlockId.Trim(),
             TableMode = string.IsNullOrWhiteSpace(req.TableMode)
@@ -293,6 +400,8 @@ public sealed class AggregateTableService : IAggregateTableService
             PeriodKeyTo = NormalizeDayKey(req.PeriodKeyTo),
             SourceStatusMode = NormalizeSourceStatusMode(req.SourceStatusMode),
             SelectedUnitIds = NormalizeStringList(req.SelectedUnitIds),
+            AggregateConfigId = NormalizeOptionalText(req.AggregateConfigId),
+            IdentityColumns = NormalizeIdentityColumns(req.IdentityColumns),
         };
 
         if (!string.IsNullOrWhiteSpace(normalized.PeriodKeyFrom) &&
@@ -305,12 +414,43 @@ public sealed class AggregateTableService : IAggregateTableService
         return normalized;
     }
 
+    private static string? NormalizeOptionalText(string? value)
+    {
+        var trimmed = value?.Trim();
+        return string.IsNullOrWhiteSpace(trimmed) ? null : trimmed;
+    }
+
+    private static List<string> NormalizeIdentityColumns(IEnumerable<string>? values)
+    {
+        var allowed = new HashSet<string>(StringComparer.Ordinal)
+        {
+            "periodKey",
+            "periodInstanceKey",
+            "unitSymbol",
+            "unitShortName",
+            "userName",
+            "fullName",
+            "workAssignmentId",
+            "reportId",
+            "approvedAtUtc",
+            "sourceReportCount"
+        };
+
+        var normalized = NormalizeStringList(values)
+            .Where(allowed.Contains)
+            .ToList();
+
+        return normalized.Count > 0
+            ? normalized
+            : DefaultStackIdentityColumns.ToList();
+    }
+
     private static void ValidateDynamicFormRequest(DynamicFormAggregateRequest req)
     {
         if (string.IsNullOrWhiteSpace(req.ScopeAssignmentId))
             throw AppExceptionFactory.BadRequest(AppErrorCode.WORK_ASSIGNMENT_AGGREGATE_SCOPE_ID_REQUIRED);
 
-        if (req.ScopeMode is not ("DIRECT_CHILDREN" or "SUBTREE"))
+        if (req.ScopeMode != "DIRECT_CHILDREN")
             throw AppExceptionFactory.BadRequest(
                 AppErrorCode.WORK_ASSIGNMENT_AGGREGATE_SCOPE_MODE_INVALID,
                 new { req.ScopeMode });
@@ -391,7 +531,8 @@ public sealed class AggregateTableService : IAggregateTableService
     private async Task<WorkAssignment> LoadAggregateParentAsync(
         string parentAssignmentId,
         string actorUserId,
-        CancellationToken ct)
+        CancellationToken ct,
+        bool allowBranchRead = false)
     {
         var parent = await _ctx.WorkAssignments
             .Find(x => x.Id == parentAssignmentId && !x.IsDeleted)
@@ -403,6 +544,15 @@ public sealed class AggregateTableService : IAggregateTableService
         var canView = string.Equals(parent.CreatedByUserId, actorUserId, StringComparison.Ordinal)
             || (parent.LeaderWatcherUserIds?.Contains(actorUserId) ?? false)
             || (parent.Assignees?.Any(x => string.Equals(x.UserId, actorUserId, StringComparison.Ordinal)) ?? false);
+
+        if (!canView && allowBranchRead)
+        {
+            canView = await WorkAssignmentReadAccessHelper.CanReadAssignmentOrAncestorAsync(
+                _ctx,
+                parent,
+                actorUserId,
+                ct);
+        }
 
         if (!canView)
             throw AppExceptionFactory.Forbidden(
@@ -497,7 +647,7 @@ public sealed class AggregateTableService : IAggregateTableService
         var assignmentIds = assignments.Select(x => x.Id).ToList();
         var filter = BuildAggregateReportFilter(assignmentIds, req);
 
-        return await _ctx.WorkAssignmentReports
+        var reports = await _ctx.WorkAssignmentReports
             .Find(filter)
             .SortBy(x => x.PeriodKey)
             .ThenBy(x => x.PeriodInstanceKey)
@@ -505,6 +655,9 @@ public sealed class AggregateTableService : IAggregateTableService
             .ThenBy(x => x.AssigneeUserId)
             .ThenByDescending(x => x.UpdatedAtUtc)
             .ToListAsync(ct);
+
+        await HydrateReportPayloadsAsync(reports, ct);
+        return reports;
     }
 
     private async Task<DynamicExcelTemplate?> LoadDynamicExcelTemplateAsync(string dynamicExcelId, CancellationToken ct)
@@ -523,7 +676,7 @@ public sealed class AggregateTableService : IAggregateTableService
         var assignmentIds = assignments.Select(x => x.Id).ToList();
         var filter = BuildDynamicFormAggregateReportFilter(assignmentIds, req);
 
-        return await _ctx.WorkAssignmentReports
+        var reports = await _ctx.WorkAssignmentReports
             .Find(filter)
             .SortBy(x => x.PeriodKey)
             .ThenBy(x => x.PeriodInstanceKey)
@@ -531,6 +684,21 @@ public sealed class AggregateTableService : IAggregateTableService
             .ThenBy(x => x.AssigneeUserId)
             .ThenByDescending(x => x.UpdatedAtUtc)
             .ToListAsync(ct);
+
+        await HydrateReportPayloadsAsync(reports, ct);
+        return reports;
+    }
+
+    private async Task HydrateReportPayloadsAsync(List<WorkAssignmentReport> reports, CancellationToken ct)
+    {
+        foreach (var report in reports)
+        {
+            var payload = await _payloadReader.LoadReportPayloadAsync(report, ct);
+            report.Values1DJson = payload.Values1DJson;
+            report.FieldValuesJson = payload.FieldValuesJson;
+            report.TableValuesJson = payload.TableValuesJson;
+            report.SummarySourceJson = payload.SummarySourceJson;
+        }
     }
 
     private static FilterDefinition<WorkAssignmentReport> BuildAggregateReportFilter(
@@ -632,9 +800,11 @@ public sealed class AggregateTableService : IAggregateTableService
             var key = NormalizeDayKey(periodKey);
             if (TryParseNormalizedDayKey(key, out var date))
             {
+                var dayStart = date.Date;
+                var dayEndExclusive = dayStart.AddDays(1);
                 var window = fb.And(
-                    fb.Lte(x => x.PeriodStart, date.Date),
-                    fb.Gte(x => x.PeriodEnd, date.Date));
+                    fb.Lt(x => x.PeriodStart, dayEndExclusive),
+                    fb.Gte(x => x.PeriodEnd, dayStart));
                 return filter & fb.Or(window, fb.Eq(x => x.PeriodKey, key));
             }
 
@@ -651,9 +821,11 @@ public sealed class AggregateTableService : IAggregateTableService
                 if (to < from)
                     (from, to) = (to, from);
 
+                var fromStart = from.Date;
+                var toEndExclusive = to.Date.AddDays(1);
                 var window = fb.And(
-                    fb.Lte(x => x.PeriodStart, to.Date),
-                    fb.Gte(x => x.PeriodEnd, from.Date));
+                    fb.Lt(x => x.PeriodStart, toEndExclusive),
+                    fb.Gte(x => x.PeriodEnd, fromStart));
                 var keyRange = fb.And(
                     fb.Gte(x => x.PeriodKey, fromKey),
                     fb.Lte(x => x.PeriodKey, toKey));
@@ -668,7 +840,7 @@ public sealed class AggregateTableService : IAggregateTableService
             var toKey = NormalizeDayKey(periodKeyTo);
             if (TryParseNormalizedDayKey(toKey, out var to))
             {
-                var window = fb.Lte(x => x.PeriodStart, to.Date);
+                var window = fb.Lt(x => x.PeriodStart, to.Date.AddDays(1));
                 return filter & fb.Or(window, fb.Lte(x => x.PeriodKey, toKey));
             }
 
@@ -696,9 +868,11 @@ public sealed class AggregateTableService : IAggregateTableService
             var key = NormalizeDayKey(periodKey);
             if (TryParseNormalizedDayKey(key, out var date))
             {
+                var dayStart = date.Date;
+                var dayEndExclusive = dayStart.AddDays(1);
                 var window = fb.And(
-                    fb.Lte(x => x.PeriodStartDate, date.Date),
-                    fb.Gte(x => x.PeriodEndDate, date.Date));
+                    fb.Lt(x => x.PeriodStartDate, dayEndExclusive),
+                    fb.Gte(x => x.PeriodEndDate, dayStart));
                 return filter & fb.Or(window, fb.Eq(x => x.PeriodKey, key));
             }
 
@@ -715,9 +889,11 @@ public sealed class AggregateTableService : IAggregateTableService
                 if (to < from)
                     (from, to) = (to, from);
 
+                var fromStart = from.Date;
+                var toEndExclusive = to.Date.AddDays(1);
                 var window = fb.And(
-                    fb.Lte(x => x.PeriodStartDate, to.Date),
-                    fb.Gte(x => x.PeriodEndDate, from.Date));
+                    fb.Lt(x => x.PeriodStartDate, toEndExclusive),
+                    fb.Gte(x => x.PeriodEndDate, fromStart));
                 var keyRange = fb.And(
                     fb.Gte(x => x.PeriodKey, fromKey),
                     fb.Lte(x => x.PeriodKey, toKey));
@@ -732,7 +908,7 @@ public sealed class AggregateTableService : IAggregateTableService
             var toKey = NormalizeDayKey(periodKeyTo);
             if (TryParseNormalizedDayKey(toKey, out var to))
             {
-                var window = fb.Lte(x => x.PeriodStartDate, to.Date);
+                var window = fb.Lt(x => x.PeriodStartDate, to.Date.AddDays(1));
                 return filter & fb.Or(window, fb.Lte(x => x.PeriodKey, toKey));
             }
 
@@ -797,6 +973,9 @@ public sealed class AggregateTableService : IAggregateTableService
             Rows = contract.TableMode == "SUMMARY_TEMPLATE"
                 ? new List<DynamicFormAggregateRowDto>()
                 : BuildDynamicFormMetricRows(new List<WorkAssignmentReport>(), contract, metrics, warnings),
+            StackedTable = contract.TableMode is "APPEND_ROWS" or "APPEND_COLUMNS"
+                ? BuildEmptyStackedTable(contract, metrics, req)
+                : null,
             Sources = new List<AggregateSourceRowDto>(),
             Warnings = warnings,
         };
@@ -825,6 +1004,8 @@ public sealed class AggregateTableService : IAggregateTableService
             PeriodKeyTo = req.PeriodKeyTo,
             SourceStatusMode = req.SourceStatusMode,
             SelectedUnitIds = req.SelectedUnitIds ?? new List<string>(),
+            AggregateConfigId = req.AggregateConfigId,
+            IdentityColumns = req.IdentityColumns ?? DefaultStackIdentityColumns.ToList(),
             SourceAssignmentCount = sourceAssignmentCount,
             SourceReportCount = sourceReportCount,
             MetricCount = metricCount,
@@ -834,9 +1015,7 @@ public sealed class AggregateTableService : IAggregateTableService
     private static List<DynamicFormAggregateColumnDto> BuildDynamicFormColumns()
         => new()
         {
-            new DynamicFormAggregateColumnDto { Key = "metricKey", Label = "Mã chỉ số", Type = "text" },
-            new DynamicFormAggregateColumnDto { Key = "rowKey", Label = "Dòng", Type = "text" },
-            new DynamicFormAggregateColumnDto { Key = "columnKey", Label = "Cột", Type = "text" },
+            new DynamicFormAggregateColumnDto { Key = "label", Label = "Chỉ tiêu", Type = "text" },
             new DynamicFormAggregateColumnDto { Key = "count", Label = "Số ô có dữ liệu", Type = "number" },
             new DynamicFormAggregateColumnDto { Key = "sum", Label = "Tổng", Type = "number" },
             new DynamicFormAggregateColumnDto { Key = "min", Label = "Nhỏ nhất", Type = "number" },
@@ -1069,6 +1248,346 @@ public sealed class AggregateTableService : IAggregateTableService
 
         return rows;
     }
+
+    private static DynamicFormStackedTableDto BuildEmptyStackedTable(
+        DynamicFormTableContract contract,
+        List<MetricContract> metrics,
+        DynamicFormAggregateRequest req)
+        => new()
+        {
+            SourceTableMode = contract.TableMode,
+            RowMode = ShouldAggregateStackBeforeStack(req.PeriodScopeMode) ? "PERIOD_GROUPED_STACK" : "DIRECT_STACK",
+            Columns = BuildStackedTableColumns(contract, metrics, req.IdentityColumns ?? DefaultStackIdentityColumns.ToList()),
+            Rows = new List<DynamicFormStackedTableRowDto>()
+        };
+
+    private static DynamicFormStackedTableDto BuildDynamicFormStackedTable(
+        List<WorkAssignment> assignments,
+        List<WorkAssignmentReport> reports,
+        DynamicFormTableContract contract,
+        List<MetricContract> metrics,
+        DynamicFormAggregateRequest req,
+        List<string> warnings)
+    {
+        var identityColumns = req.IdentityColumns ?? DefaultStackIdentityColumns.ToList();
+        var aggregateBeforeStack = ShouldAggregateStackBeforeStack(req.PeriodScopeMode);
+        var table = new DynamicFormStackedTableDto
+        {
+            SourceTableMode = contract.TableMode,
+            RowMode = aggregateBeforeStack ? "PERIOD_GROUPED_STACK" : "DIRECT_STACK",
+            Columns = BuildStackedTableColumns(contract, metrics, identityColumns)
+        };
+
+        if (reports.Count == 0 || metrics.Count == 0)
+            return table;
+
+        var assignmentMap = assignments.ToDictionary(x => x.Id, x => x, StringComparer.Ordinal);
+        table.Rows = aggregateBeforeStack
+            ? BuildGroupedStackedRows(assignmentMap, reports, contract, metrics, identityColumns, warnings)
+            : BuildDirectStackedRows(assignmentMap, reports, contract, metrics, identityColumns, warnings);
+
+        return table;
+    }
+
+    private static bool ShouldAggregateStackBeforeStack(string? periodScopeMode)
+        => !string.Equals(periodScopeMode, "SINGLE_PERIOD", StringComparison.Ordinal);
+
+    private static List<DynamicFormStackedTableColumnDto> BuildStackedTableColumns(
+        DynamicFormTableContract contract,
+        List<MetricContract> metrics,
+        IReadOnlyCollection<string> identityColumns)
+    {
+        var columns = identityColumns
+            .Select(x => new DynamicFormStackedTableColumnDto
+            {
+                Key = x,
+                Label = FormatIdentityColumnLabel(x),
+                Role = "IDENTITY",
+                Type = x == "sourceReportCount" ? "number" : "text"
+            })
+            .ToList();
+
+        if (contract.TableMode == "APPEND_ROWS")
+        {
+            columns.Add(new DynamicFormStackedTableColumnDto { Key = "sourceRowNumber", Label = "Dòng nguồn", Role = "IDENTITY", Type = "number" });
+            columns.Add(new DynamicFormStackedTableColumnDto { Key = "sourceRowKey", Label = "Khóa dòng nguồn", Role = "IDENTITY", Type = "text" });
+        }
+        else
+        {
+            columns.Add(new DynamicFormStackedTableColumnDto { Key = "sourceColumnNumber", Label = "Cột nguồn", Role = "IDENTITY", Type = "number" });
+            columns.Add(new DynamicFormStackedTableColumnDto { Key = "sourceColumnKey", Label = "Khóa cột nguồn", Role = "IDENTITY", Type = "text" });
+        }
+
+        columns.AddRange(metrics
+            .OrderBy(x => x.Index)
+            .Select(metric => new DynamicFormStackedTableColumnDto
+            {
+                Key = metric.MetricKey,
+                Label = FormatStackMetricLabel(contract, metric),
+                Role = "METRIC",
+                Type = "mixed",
+                MetricKey = metric.MetricKey,
+                SourceKey = contract.TableMode == "APPEND_ROWS" ? metric.ColumnKey : metric.RowKey
+            }));
+
+        return columns;
+    }
+
+    private static string FormatIdentityColumnLabel(string key)
+        => key switch
+        {
+            "periodKey" => "Kỳ",
+            "periodInstanceKey" => "Lần báo cáo",
+            "unitSymbol" => "Mã đơn vị",
+            "unitShortName" => "Đơn vị",
+            "userName" => "Tài khoản",
+            "fullName" => "Người báo cáo",
+            "workAssignmentId" => "Công việc nguồn",
+            "reportId" => "Báo cáo nguồn",
+            "approvedAtUtc" => "Duyệt lúc",
+            "sourceReportCount" => "Số báo cáo nguồn",
+            _ => key
+        };
+
+    private static string FormatStackMetricLabel(DynamicFormTableContract contract, MetricContract metric)
+        => contract.TableMode == "APPEND_ROWS"
+            ? FirstNonBlank(metric.ColumnKey, metric.MetricKey) ?? metric.MetricKey
+            : FirstNonBlank(metric.RowKey, metric.MetricKey) ?? metric.MetricKey;
+
+    private static List<DynamicFormStackedTableRowDto> BuildDirectStackedRows(
+        Dictionary<string, WorkAssignment> assignmentMap,
+        List<WorkAssignmentReport> reports,
+        DynamicFormTableContract contract,
+        List<MetricContract> metrics,
+        IReadOnlyCollection<string> identityColumns,
+        List<string> warnings)
+    {
+        var rows = new List<DynamicFormStackedTableRowDto>();
+        foreach (var report in reports)
+        {
+            assignmentMap.TryGetValue(report.WorkAssignmentId, out var assignment);
+            var assignee = ResolveReportAssignee(assignment, report);
+            var block = ExtractReportTableBlock(report.TableValuesJson, contract.BlockId);
+            if (block is null)
+            {
+                warnings.Add("Một số báo cáo nguồn thiếu block bảng để stack nên đã được bỏ qua.");
+                continue;
+            }
+
+            if (contract.TableMode == "APPEND_ROWS")
+            {
+                foreach (var row in block.Rows ?? new List<ReportTableAppendRow>())
+                    rows.Add(BuildDirectStackedAppendRow(report, assignment, assignee, row, metrics, identityColumns));
+            }
+            else
+            {
+                foreach (var column in block.Columns ?? new List<ReportTableAppendColumn>())
+                    rows.Add(BuildDirectStackedAppendColumn(report, assignment, assignee, column, metrics, identityColumns));
+            }
+        }
+
+        return OrderStackedRows(rows);
+    }
+
+    private static DynamicFormStackedTableRowDto BuildDirectStackedAppendRow(
+        WorkAssignmentReport report,
+        WorkAssignment? assignment,
+        UserRef? assignee,
+        ReportTableAppendRow row,
+        List<MetricContract> metrics,
+        IReadOnlyCollection<string> identityColumns)
+    {
+        var cells = BuildStackIdentityCells(report, assignment, assignee, identityColumns, 1);
+        var sourceRowNumber = row.RowOrder.GetValueOrDefault();
+        cells["sourceRowNumber"] = sourceRowNumber > 0 ? sourceRowNumber : null;
+        cells["sourceRowKey"] = FirstNonBlank(row.RowKey, row.RowInstanceId, $"row:{sourceRowNumber}") ?? $"row:{sourceRowNumber}";
+
+        foreach (var metric in metrics.OrderBy(x => x.Index))
+        {
+            cells[metric.MetricKey] = row.Cells is not null && row.Cells.TryGetValue(metric.ColumnKey, out var value)
+                ? ToStackCellObject(value)
+                : null;
+        }
+
+        return new DynamicFormStackedTableRowDto
+        {
+            RowKey = $"{report.Id}:{row.RowInstanceId ?? row.RowKey ?? sourceRowNumber.ToString(System.Globalization.CultureInfo.InvariantCulture)}",
+            Cells = cells,
+            SourceReportIds = new List<string> { report.Id },
+            SourceAssignmentIds = new List<string> { report.WorkAssignmentId }
+        };
+    }
+
+    private static DynamicFormStackedTableRowDto BuildDirectStackedAppendColumn(
+        WorkAssignmentReport report,
+        WorkAssignment? assignment,
+        UserRef? assignee,
+        ReportTableAppendColumn column,
+        List<MetricContract> metrics,
+        IReadOnlyCollection<string> identityColumns)
+    {
+        var cells = BuildStackIdentityCells(report, assignment, assignee, identityColumns, 1);
+        var sourceColumnNumber = column.ColumnOrder.GetValueOrDefault();
+        cells["sourceColumnNumber"] = sourceColumnNumber > 0 ? sourceColumnNumber : null;
+        cells["sourceColumnKey"] = FirstNonBlank(column.ColumnKey, column.ColumnInstanceId, $"column:{sourceColumnNumber}") ?? $"column:{sourceColumnNumber}";
+
+        foreach (var metric in metrics.OrderBy(x => x.Index))
+        {
+            cells[metric.MetricKey] = column.Cells is not null && column.Cells.TryGetValue(metric.RowKey, out var value)
+                ? ToStackCellObject(value)
+                : null;
+        }
+
+        return new DynamicFormStackedTableRowDto
+        {
+            RowKey = $"{report.Id}:{column.ColumnInstanceId ?? column.ColumnKey ?? sourceColumnNumber.ToString(System.Globalization.CultureInfo.InvariantCulture)}",
+            Cells = cells,
+            SourceReportIds = new List<string> { report.Id },
+            SourceAssignmentIds = new List<string> { report.WorkAssignmentId }
+        };
+    }
+
+    private static List<DynamicFormStackedTableRowDto> BuildGroupedStackedRows(
+        Dictionary<string, WorkAssignment> assignmentMap,
+        List<WorkAssignmentReport> reports,
+        DynamicFormTableContract contract,
+        List<MetricContract> metrics,
+        IReadOnlyCollection<string> identityColumns,
+        List<string> warnings)
+    {
+        var buckets = new Dictionary<string, StackedRowAccumulator>(StringComparer.Ordinal);
+        foreach (var report in reports)
+        {
+            assignmentMap.TryGetValue(report.WorkAssignmentId, out var assignment);
+            var assignee = ResolveReportAssignee(assignment, report);
+            var block = ExtractReportTableBlock(report.TableValuesJson, contract.BlockId);
+            if (block is null)
+            {
+                warnings.Add("Một số báo cáo nguồn thiếu block bảng để stack nên đã được bỏ qua.");
+                continue;
+            }
+
+            if (contract.TableMode == "APPEND_ROWS")
+            {
+                foreach (var row in block.Rows ?? new List<ReportTableAppendRow>())
+                {
+                    var sourceNumber = row.RowOrder.GetValueOrDefault();
+                    var sourceKey = FirstNonBlank(row.RowKey, row.RowInstanceId, $"row:{sourceNumber}") ?? $"row:{sourceNumber}";
+                    var bucket = GetStackBucket(buckets, report, assignment, assignee, identityColumns, "sourceRowNumber", sourceNumber > 0 ? sourceNumber : null, "sourceRowKey", sourceKey);
+                    foreach (var metric in metrics)
+                    {
+                        if (row.Cells is not null && row.Cells.TryGetValue(metric.ColumnKey, out var value))
+                            bucket.AddMetric(metric.MetricKey, value);
+                    }
+                }
+            }
+            else
+            {
+                foreach (var column in block.Columns ?? new List<ReportTableAppendColumn>())
+                {
+                    var sourceNumber = column.ColumnOrder.GetValueOrDefault();
+                    var sourceKey = FirstNonBlank(column.ColumnKey, column.ColumnInstanceId, $"column:{sourceNumber}") ?? $"column:{sourceNumber}";
+                    var bucket = GetStackBucket(buckets, report, assignment, assignee, identityColumns, "sourceColumnNumber", sourceNumber > 0 ? sourceNumber : null, "sourceColumnKey", sourceKey);
+                    foreach (var metric in metrics)
+                    {
+                        if (column.Cells is not null && column.Cells.TryGetValue(metric.RowKey, out var value))
+                            bucket.AddMetric(metric.MetricKey, value);
+                    }
+                }
+            }
+        }
+
+        return OrderStackedRows(buckets.Values.Select(x => x.ToDto(metrics)).ToList());
+    }
+
+    private static StackedRowAccumulator GetStackBucket(
+        Dictionary<string, StackedRowAccumulator> buckets,
+        WorkAssignmentReport report,
+        WorkAssignment? assignment,
+        UserRef? assignee,
+        IReadOnlyCollection<string> identityColumns,
+        string sourceNumberKey,
+        int? sourceNumber,
+        string sourceKeyKey,
+        string sourceKey)
+    {
+        var cells = BuildStackIdentityCells(report, assignment, assignee, identityColumns, 0);
+        cells[sourceNumberKey] = sourceNumber;
+        cells[sourceKeyKey] = sourceKey;
+
+        var key = string.Join("|", cells.OrderBy(x => x.Key, StringComparer.Ordinal).Select(x => $"{x.Key}:{Convert.ToString(x.Value, System.Globalization.CultureInfo.InvariantCulture)}"));
+        if (!buckets.TryGetValue(key, out var bucket))
+        {
+            bucket = new StackedRowAccumulator(key, cells);
+            buckets[key] = bucket;
+        }
+
+        bucket.AddSource(report);
+        return bucket;
+    }
+
+    private static List<DynamicFormStackedTableRowDto> OrderStackedRows(List<DynamicFormStackedTableRowDto> rows)
+        => rows
+            .OrderBy(x => Convert.ToString(x.Cells.GetValueOrDefault("periodKey")), StringComparer.Ordinal)
+            .ThenBy(x => Convert.ToString(x.Cells.GetValueOrDefault("unitShortName")), StringComparer.Ordinal)
+            .ThenBy(x => Convert.ToString(x.Cells.GetValueOrDefault("fullName")), StringComparer.Ordinal)
+            .ThenBy(x => x.RowKey, StringComparer.Ordinal)
+            .ToList();
+
+    private static Dictionary<string, object?> BuildStackIdentityCells(
+        WorkAssignmentReport report,
+        WorkAssignment? assignment,
+        UserRef? assignee,
+        IReadOnlyCollection<string> identityColumns,
+        int sourceReportCount)
+    {
+        var cells = new Dictionary<string, object?>(StringComparer.Ordinal);
+        foreach (var column in identityColumns)
+        {
+            cells[column] = column switch
+            {
+                "periodKey" => report.PeriodKey,
+                "periodInstanceKey" => report.PeriodInstanceKey,
+                "unitSymbol" => assignee?.UnitSymbol,
+                "unitShortName" => FirstNonBlank(assignee?.UnitShortName, assignee?.UnitName, assignee?.UnitSymbol),
+                "userName" => assignee?.Username,
+                "fullName" => FirstNonBlank(assignee?.FullName, assignee?.Username),
+                "workAssignmentId" => assignment?.Id ?? report.WorkAssignmentId,
+                "reportId" => report.Id,
+                "approvedAtUtc" => report.ApprovedAtUtc?.ToString("O", System.Globalization.CultureInfo.InvariantCulture),
+                "sourceReportCount" => sourceReportCount,
+                _ => null
+            };
+        }
+
+        return cells;
+    }
+
+    private static UserRef? ResolveReportAssignee(WorkAssignment? assignment, WorkAssignmentReport report)
+        => assignment?.Assignees?.FirstOrDefault(x => x.UserId == report.AssigneeUserId)
+           ?? assignment?.Assignees?.FirstOrDefault();
+
+    private static object? ToStackCellObject(JsonElement value)
+    {
+        return value.ValueKind switch
+        {
+            JsonValueKind.Number when value.TryGetDecimal(out var number) => number,
+            JsonValueKind.String => string.IsNullOrWhiteSpace(value.GetString()) ? null : value.GetString()!.Trim(),
+            JsonValueKind.True => true,
+            JsonValueKind.False => false,
+            JsonValueKind.Array => value.EnumerateArray().Select(ToStackCellObject).Where(x => x is not null).ToList(),
+            _ => null
+        };
+    }
+
+    private static bool HasStackCellValue(JsonElement value)
+        => ToStackCellObject(value) switch
+        {
+            null => false,
+            string text => !string.IsNullOrWhiteSpace(text),
+            List<object?> list => list.Count > 0,
+            _ => true
+        };
 
     private static List<DynamicFormAggregateRowDto> BuildDynamicFormMetricRows(
         List<WorkAssignmentReport> reports,
@@ -1369,7 +1888,7 @@ public sealed class AggregateTableService : IAggregateTableService
             ? null
             : NormalizeBlockId(requestedBlockId);
         if (requestedBlock is not null &&
-            !string.Equals(blockId, requestedBlock, StringComparison.Ordinal))
+            !DynamicFormBlockMatchesRequest(block, requestedBlock))
         {
             throw DynamicFormBlockNotFound(template.Id, requestedBlockId);
         }
@@ -1446,10 +1965,7 @@ public sealed class AggregateTableService : IAggregateTableService
                 return blocks[0];
 
             return blocks.FirstOrDefault(block =>
-                string.Equals(
-                    NormalizeBlockId(block.BlockId ?? block.Id ?? "excel_block"),
-                    requested,
-                    StringComparison.Ordinal));
+                DynamicFormBlockMatchesRequest(block, requested));
         }
 
         if (string.IsNullOrWhiteSpace(template.ExcelBlockJson))
@@ -1613,10 +2129,33 @@ public sealed class AggregateTableService : IAggregateTableService
             }
         }
 
+        if (metrics.Count == 0 && tableMode is "FIXED_GRID" or "MATRIX")
+        {
+            foreach (var metric in BuildCoordinateMetricMap(block, blockId))
+                AddMetric(metric);
+        }
+
         return metrics.Values
             .OrderBy(x => x.Index)
             .ThenBy(x => x.MetricKey, StringComparer.Ordinal)
             .ToList();
+    }
+
+    private static bool DynamicFormBlockMatchesRequest(
+        DynamicFormExcelBlockJson block,
+        string requested)
+    {
+        if (string.Equals(
+                NormalizeBlockId(block.BlockId ?? block.Id ?? "excel_block"),
+                requested,
+                StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        var dynamicExcelTemplateId = NormalizeOptionalText(block.DynamicExcelTemplateId);
+        return dynamicExcelTemplateId is not null &&
+               string.Equals(dynamicExcelTemplateId, requested, StringComparison.Ordinal);
     }
 
     private static List<MetricContract> NormalizeMetricMap(
@@ -1642,6 +2181,54 @@ public sealed class AggregateTableService : IAggregateTableService
             .Select(x => x.First())
             .OrderBy(x => x.Index)
             .ToList();
+    }
+
+    private static IEnumerable<MetricContract> BuildCoordinateMetricMap(
+        DynamicFormExcelBlockJson block,
+        string blockId)
+    {
+        if (block.DataRect is null)
+            yield break;
+
+        var prefix = NormalizeCoordinateMetricPrefix(blockId);
+        var index = 0;
+        for (var r = block.DataRect.R0; r <= block.DataRect.R1; r++)
+        {
+            for (var c = block.DataRect.C0; c <= block.DataRect.C1; c++)
+            {
+                if (IsSpecialCoordinate(block.SpecialRanges, r, c))
+                    continue;
+
+                var rowKey = $"R{r + 1}";
+                var columnKey = $"C{c + 1}";
+                yield return new MetricContract(
+                    index,
+                    rowKey,
+                    columnKey,
+                    $"{prefix}.{rowKey}.{columnKey}");
+                index++;
+            }
+        }
+    }
+
+    private static bool IsSpecialCoordinate(
+        List<DynamicFormSpecialRangeJson>? specialRanges,
+        int r,
+        int c)
+        => specialRanges?.Any(range =>
+            r >= range.R0 &&
+            r <= range.R1 &&
+            c >= range.C0 &&
+            c <= range.C1) == true;
+
+    private static string NormalizeCoordinateMetricPrefix(string blockId)
+    {
+        var chars = blockId
+            .Trim()
+            .Select(ch => char.IsLetterOrDigit(ch) ? char.ToUpperInvariant(ch) : '_')
+            .ToArray();
+        var normalized = new string(chars).Trim('_');
+        return string.IsNullOrWhiteSpace(normalized) ? "EXCEL_BLOCK" : normalized;
     }
 
     private static MetricContract ParseConfiguredMetricKey(
@@ -2217,10 +2804,13 @@ public sealed class AggregateTableService : IAggregateTableService
     {
         public string? BlockId { get; set; }
         public string? Id { get; set; }
+        public string? DynamicExcelTemplateId { get; set; }
+        public string? DynamicExcelCode { get; set; }
         public string? TableMode { get; set; }
         public int? W { get; set; }
         public int? H { get; set; }
         public MetricRangeJson? DataRect { get; set; }
+        public List<DynamicFormSpecialRangeJson>? SpecialRanges { get; set; }
         public List<DynamicFormIndexMapItem>? IndexMap { get; set; }
         public List<DynamicFormMetricRuleJson>? MetricRules { get; set; }
         public List<DynamicFormMetricLabelTargetJson>? MetricLabelTargets { get; set; }
@@ -2237,6 +2827,15 @@ public sealed class AggregateTableService : IAggregateTableService
         public string? RowKey { get; set; }
         public string? ColumnKey { get; set; }
         public string? MetricKey { get; set; }
+    }
+
+    private sealed class DynamicFormSpecialRangeJson
+    {
+        public string? Role { get; set; }
+        public int R0 { get; set; }
+        public int C0 { get; set; }
+        public int R1 { get; set; }
+        public int C1 { get; set; }
     }
 
     private sealed class DynamicFormMetricRuleJson
@@ -2342,6 +2941,90 @@ public sealed class AggregateTableService : IAggregateTableService
 
             if (row.Max.HasValue)
                 Max = Max.HasValue ? Math.Max(Max.Value, row.Max.Value) : row.Max.Value;
+        }
+    }
+
+    private sealed class StackedRowAccumulator
+    {
+        private readonly Dictionary<string, StackMetricAccumulator> _metrics = new(StringComparer.Ordinal);
+
+        public StackedRowAccumulator(string key, Dictionary<string, object?> cells)
+        {
+            Key = key;
+            Cells = cells;
+        }
+
+        public string Key { get; }
+        public Dictionary<string, object?> Cells { get; }
+        public HashSet<string> SourceReportIds { get; } = new(StringComparer.Ordinal);
+        public HashSet<string> SourceAssignmentIds { get; } = new(StringComparer.Ordinal);
+
+        public void AddSource(WorkAssignmentReport report)
+        {
+            SourceReportIds.Add(report.Id);
+            SourceAssignmentIds.Add(report.WorkAssignmentId);
+            Cells["sourceReportCount"] = SourceReportIds.Count;
+        }
+
+        public void AddMetric(string metricKey, JsonElement value)
+        {
+            if (!HasStackCellValue(value))
+                return;
+
+            if (!_metrics.TryGetValue(metricKey, out var acc))
+            {
+                acc = new StackMetricAccumulator();
+                _metrics[metricKey] = acc;
+            }
+
+            acc.Add(value);
+        }
+
+        public DynamicFormStackedTableRowDto ToDto(List<MetricContract> metrics)
+        {
+            foreach (var metric in metrics)
+            {
+                Cells[metric.MetricKey] = _metrics.TryGetValue(metric.MetricKey, out var acc)
+                    ? acc.ToCell()
+                    : null;
+            }
+
+            return new DynamicFormStackedTableRowDto
+            {
+                RowKey = Key,
+                Cells = Cells,
+                SourceReportIds = SourceReportIds.OrderBy(x => x, StringComparer.Ordinal).ToList(),
+                SourceAssignmentIds = SourceAssignmentIds.OrderBy(x => x, StringComparer.Ordinal).ToList()
+            };
+        }
+    }
+
+    private sealed class StackMetricAccumulator
+    {
+        public decimal Sum { get; private set; }
+        public int NumericCount { get; private set; }
+        public int NonNumericCount { get; private set; }
+
+        public void Add(JsonElement value)
+        {
+            var number = ToNullableDecimal(value);
+            if (number.HasValue)
+            {
+                Sum += number.Value;
+                NumericCount++;
+                return;
+            }
+
+            if (HasStackCellValue(value))
+                NonNumericCount++;
+        }
+
+        public object? ToCell()
+        {
+            if (NumericCount > 0)
+                return Sum;
+
+            return NonNumericCount > 0 ? NonNumericCount : null;
         }
     }
 

@@ -33,8 +33,10 @@ using tdtd_be.Services.WorkAssignmentReports.Statistics;
 using tdtd_be.Services.WorkAssignmentReports.Payloads;
 using tdtd_be.Services.WorkAssignments;
 using tdtd_be.Services.WorkAssignments.Aggregate;
+using tdtd_be.Services.WorkAssignments.BasicSummary;
 using tdtd_be.Services.WorkAssignments.Domain;
 using tdtd_be.Services.WorkAssignments.Handover;
+using tdtd_be.Services.WorkAssignments.Internal;
 using tdtd_be.Services.WorkAssignments.Lookups;
 using tdtd_be.Services.WorkAssignments.Progress;
 using tdtd_be.Services.WorkAssignments.Queue;
@@ -62,6 +64,7 @@ if (OperatingSystem.IsWindows()
 builder.Services.Configure<MongoOptions>(builder.Configuration.GetSection("Mongo"));
 builder.Services.Configure<JwtOptions>(builder.Configuration.GetSection("Jwt"));
 builder.Services.Configure<UploadOptions>(builder.Configuration.GetSection("Uploads"));
+builder.Services.Configure<WorkAssignmentScopeOptions>(builder.Configuration.GetSection("WorkAssignmentScope"));
 builder.Services.Configure<ForwardedHeadersOptions>(opt =>
 {
     opt.ForwardedHeaders =
@@ -193,6 +196,8 @@ builder.Services.AddScoped<IDynamicExcelService, DynamicExcelService>();
 builder.Services.AddScoped<IDynamicFormService, DynamicFormService>();
 builder.Services.AddScoped<IDynamicFormCloneRequestService, DynamicFormCloneRequestService>();
 builder.Services.AddScoped<ILabelService, LabelService>();
+builder.Services.AddScoped<ILabelEnumCatalogService, LabelEnumCatalogService>();
+builder.Services.AddSingleton<WorkAssignmentTargetScopePolicy>();
 
 builder.Services.AddScoped<DocRoleReadModelProjectionService>();
 builder.Services.AddScoped<IDocRoleReadModelProjectionRetryJobService, DocRoleReadModelProjectionRetryJobService>();
@@ -235,6 +240,7 @@ builder.Services.AddScoped<IWorkReportStatisticRebuildJobService, WorkReportStat
 builder.Services.AddScoped<IWorkAssignmentProgressService, WorkAssignmentProgressService>();
 builder.Services.AddScoped<IWorkAssignmentReviewService, WorkAssignmentReviewService>();
 builder.Services.AddScoped<IAggregateTableService, AggregateTableService>();
+builder.Services.AddScoped<IWorkAssignmentBasicSummaryService, WorkAssignmentBasicSummaryService>();
 
 builder.Services.AddScoped<IWorkAssignmentRuntimeMaterializeService, WorkAssignmentRuntimeMaterializeService>();
 builder.Services.AddScoped<IWorkAssignmentQueueService, WorkAssignmentQueueService>();

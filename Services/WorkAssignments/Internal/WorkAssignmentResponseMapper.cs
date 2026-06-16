@@ -12,6 +12,7 @@ internal static class WorkAssignmentResponseMapper
         {
             Id = entity.Id!,
             WorkId = entity.WorkId,
+            Name = ResolveAssignmentName(entity),
 
             ParentAssignmentId = entity.ParentAssignmentId,
             RootAssignmentId = entity.RootAssignmentId,
@@ -82,6 +83,19 @@ internal static class WorkAssignmentResponseMapper
             WorstEvaluationLabel = entity.WorstEvaluationLabel,
             DueAtUtc = entity.DueAtUtc,
         };
+    }
+
+    private static string ResolveAssignmentName(WorkAssignment entity)
+    {
+        var name = entity.Name?.Trim();
+        if (!string.IsNullOrWhiteSpace(name))
+            return name;
+
+        return entity.DynamicFormTemplateName?.Trim()
+               ?? entity.DynamicExcelName?.Trim()
+               ?? entity.Code
+               ?? entity.Id
+               ?? string.Empty;
     }
 
     private static UserRefDTO ToUserRefDto(UserRef x) => new(

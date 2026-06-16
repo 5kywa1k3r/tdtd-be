@@ -982,7 +982,8 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
             WorkReportPeriodId = report.WorkReportPeriodId,
             AssignmentId = report.WorkAssignmentId,
             AssignmentCode = assignment?.Code,
-            AssignmentName = assignment?.DynamicFormTemplateName
+            AssignmentName = assignment?.Name
+                ?? assignment?.DynamicFormTemplateName
                 ?? assignment?.DynamicExcelName
                 ?? report.DynamicFormTemplateName
                 ?? report.DynamicExcelTemplateName,

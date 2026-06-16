@@ -20,10 +20,15 @@ namespace tdtd_be.Data
         public IMongoCollection<DynamicExcelTemplate> DynamicExcelTemplates { get; }
         public IMongoCollection<DynamicFormTemplate> DynamicFormTemplates { get; }
         public IMongoCollection<LabelCatalogItem> Labels { get; }
+        public IMongoCollection<LabelEnumCatalog> LabelEnumCatalogs { get; }
+        public IMongoCollection<LabelEnumOptionReadModel> LabelEnumOptionReadModels { get; }
         public IMongoCollection<Work> Works { get; }
         public IMongoCollection<WorkHistory> WorkHistories { get; }
         public IMongoCollection<CounterDoc> Counters { get; }
         public IMongoCollection<WorkAssignment> WorkAssignments { get; }
+        public IMongoCollection<WorkAssignmentAggregateConfig> WorkAssignmentAggregateConfigs { get; }
+        public IMongoCollection<WorkAssignmentBasicSummaryConfig> WorkAssignmentBasicSummaryConfigs { get; }
+        public IMongoCollection<WorkAssignmentBasicSummarySnapshot> WorkAssignmentBasicSummarySnapshots { get; }
         public IMongoCollection<WorkTemplateAssignee> WorkTemplateAssignees { get; }
         public IMongoCollection<DocRole> DocRoles { get; }
         public IMongoCollection<WorkListDocRole> WorkListDocRoles { get; }
@@ -71,10 +76,15 @@ namespace tdtd_be.Data
             DynamicExcelTemplates = Db.GetCollection<DynamicExcelTemplate>(o.DynamicExcelTemplateCollection);
             DynamicFormTemplates = Db.GetCollection<DynamicFormTemplate>(o.DynamicFormTemplateCollection);
             Labels = Db.GetCollection<LabelCatalogItem>(o.LabelCollection);
+            LabelEnumCatalogs = Db.GetCollection<LabelEnumCatalog>(o.LabelEnumCatalogCollection);
+            LabelEnumOptionReadModels = Db.GetCollection<LabelEnumOptionReadModel>(o.LabelEnumOptionReadModelCollection);
             Works = Db.GetCollection<Work>(o.WorkCollection);
             WorkHistories = Db.GetCollection<WorkHistory>(o.WorkHistoryCollection);
             Counters = Db.GetCollection<CounterDoc>(o.CounterCollection);
             WorkAssignments = Db.GetCollection<WorkAssignment>(o.WorkAssignmentCollection);
+            WorkAssignmentAggregateConfigs = Db.GetCollection<WorkAssignmentAggregateConfig>(o.WorkAssignmentAggregateConfigCollection);
+            WorkAssignmentBasicSummaryConfigs = Db.GetCollection<WorkAssignmentBasicSummaryConfig>(o.WorkAssignmentBasicSummaryConfigCollection);
+            WorkAssignmentBasicSummarySnapshots = Db.GetCollection<WorkAssignmentBasicSummarySnapshot>(o.WorkAssignmentBasicSummarySnapshotCollection);
             WorkTemplateAssignees = Db.GetCollection<WorkTemplateAssignee>(o.WorkTemplateAssigneeCollection);
             DocRoles = Db.GetCollection<DocRole>(o.DocRoleCollection);
             WorkListDocRoles = Db.GetCollection<WorkListDocRole>(o.WorkListDocRoleCollection);

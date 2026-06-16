@@ -12,6 +12,7 @@ public sealed class ApplyDynamicFormAggregateDraftRequest
     public string? TargetBlockId { get; set; }
     public string? ValueSelector { get; set; }
     public bool? ClearExistingValues { get; set; }
+    public string? ReportMapConfigJson { get; set; }
 
     // Backward-compatible only. Aggregation applied to reports is always APPROVED_ONLY.
     public bool? AllowSubmittedSources { get; set; }

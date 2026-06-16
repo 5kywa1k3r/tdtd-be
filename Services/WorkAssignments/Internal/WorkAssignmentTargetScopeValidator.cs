@@ -11,7 +11,8 @@ internal static class WorkAssignmentTargetScopeValidator
         Unit? actorUnit,
         IReadOnlyCollection<AppUser> targetUsers,
         IReadOnlyDictionary<string, Unit> unitById,
-        bool actorUnitHasAssignableDescendants)
+        bool actorUnitHasAssignableDescendants,
+        WorkAssignmentTargetScopePolicy? targetScopePolicy = null)
     {
         if (!IsUnitManager(actorUser))
             return;
@@ -31,7 +32,9 @@ internal static class WorkAssignmentTargetScopeValidator
             if (IsUnitManager(targetUser))
             {
                 if (targetUnit is not null &&
-                    (IsPeerUnit(actorUnit, targetUnit) || IsDescendantUnit(actorUnit, targetUnit)))
+                    (IsPeerUnit(actorUnit, targetUnit) ||
+                     IsDescendantUnit(actorUnit, targetUnit) ||
+                     targetScopePolicy?.AllowsConfiguredTarget(actorUnit, targetUnit, targetUser) == true))
                 {
                     continue;
                 }
@@ -44,6 +47,12 @@ internal static class WorkAssignmentTargetScopeValidator
                 if (!actorUnitHasAssignableDescendants &&
                     targetUnit is not null &&
                     string.Equals(actorUnit.Id, targetUnit.Id, StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                if (targetUnit is not null &&
+                    targetScopePolicy?.AllowsConfiguredTarget(actorUnit, targetUnit, targetUser) == true)
                 {
                     continue;
                 }

@@ -23,3 +23,10 @@ public sealed class UserPickRow
     public string? UnitSymbol { get; set; }
     public string? PositionCode { get; set; } // enum chức vụ
 }
+
+public sealed class CatalogPickRow
+{
+    public string Id { get; set; } = default!;
+    public string Code { get; set; } = default!;
+    public string Name { get; set; } = default!;
+}

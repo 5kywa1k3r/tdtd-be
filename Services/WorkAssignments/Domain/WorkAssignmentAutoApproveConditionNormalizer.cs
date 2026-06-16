@@ -6,6 +6,8 @@ namespace tdtd_be.Services.WorkAssignments.Domain;
 
 public static class WorkAssignmentAutoApproveConditionNormalizer
 {
+    private const string AlwaysOperator = "always";
+
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
         WriteIndented = false
@@ -31,6 +33,9 @@ public static class WorkAssignmentAutoApproveConditionNormalizer
 
             var fieldId = ReadString(root, "fieldId");
             var fieldKey = ReadString(root, "fieldKey");
+            if (IsNoFieldCondition(fieldId, fieldKey))
+                return SerializeAlwaysCondition();
+
             var field = ResolveField(fieldsJson, fieldId, fieldKey)
                         ?? throw InvalidCondition(
                             "Điều kiện tự duyệt phải chọn field hợp lệ của biểu mẫu.",
@@ -81,13 +86,12 @@ public static class WorkAssignmentAutoApproveConditionNormalizer
 
     public static bool Matches(string? conditionJson, string? fieldValuesJson)
     {
-        if (string.IsNullOrWhiteSpace(conditionJson) || string.IsNullOrWhiteSpace(fieldValuesJson))
+        if (string.IsNullOrWhiteSpace(conditionJson))
             return false;
 
         try
         {
             using var conditionDocument = JsonDocument.Parse(conditionJson);
-            using var valuesDocument = JsonDocument.Parse(fieldValuesJson);
             var condition = conditionDocument.RootElement;
             if (condition.ValueKind != JsonValueKind.Object)
                 return false;
@@ -100,10 +104,15 @@ public static class WorkAssignmentAutoApproveConditionNormalizer
 
             var fieldId = ReadString(condition, "fieldId");
             var fieldKey = ReadString(condition, "fieldKey");
+            if (IsNoFieldCondition(fieldId, fieldKey))
+                return true;
+
+            if (string.IsNullOrWhiteSpace(fieldValuesJson))
+                return false;
+
+            using var valuesDocument = JsonDocument.Parse(fieldValuesJson);
             var fieldType = NormalizeFieldType(ReadString(condition, "fieldType"));
             var op = NormalizeOperator(ReadString(condition, "operator"));
-            if (string.IsNullOrWhiteSpace(fieldId) && string.IsNullOrWhiteSpace(fieldKey))
-                return false;
 
             if (!IsSupportedFieldType(fieldType))
                 return false;
@@ -213,6 +222,21 @@ public static class WorkAssignmentAutoApproveConditionNormalizer
             _ => false
         };
 
+    private static bool IsNoFieldCondition(string? fieldId, string? fieldKey)
+        => string.IsNullOrWhiteSpace(fieldId) && string.IsNullOrWhiteSpace(fieldKey);
+
+    private static string SerializeAlwaysCondition()
+        => JsonSerializer.Serialize(new
+        {
+            version = 1,
+            enabled = true,
+            fieldId = (string?)null,
+            fieldKey = (string?)null,
+            fieldType = (string?)null,
+            @operator = AlwaysOperator,
+            value = (object?)null
+        }, JsonOptions);
+
     private static void EnsureOperatorAllowed(string fieldType, string op)
     {
         fieldType = NormalizeFieldType(fieldType);
@@ -247,6 +271,7 @@ public static class WorkAssignmentAutoApproveConditionNormalizer
             "<=" or "lessorequal" or "less_or_equal" or "lessthanorequal" => "lte",
             "contains" => "contains",
             "notempty" or "not_empty" or "isnotempty" or "is_not_empty" => "notEmpty",
+            AlwaysOperator or "all" or "no_condition" or "nocondition" => AlwaysOperator,
             "eq" or "neq" or "gt" or "gte" or "lt" or "lte" => lower,
             _ => throw InvalidCondition("Toán tử điều kiện tự duyệt không hợp lệ.", new { op = value })
         };

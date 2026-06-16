@@ -30,15 +30,18 @@ public sealed class LabelService : ILabelService
     private readonly MongoDbContext _ctx;
     private readonly MeAccessor _me;
     private readonly IWorkReportStatisticRebuildJobService _statisticRebuildJobs;
+    private readonly ILabelEnumCatalogService _enumCatalogs;
 
     public LabelService(
         MongoDbContext ctx,
         MeAccessor me,
-        IWorkReportStatisticRebuildJobService statisticRebuildJobs)
+        IWorkReportStatisticRebuildJobService statisticRebuildJobs,
+        ILabelEnumCatalogService enumCatalogs)
     {
         _ctx = ctx;
         _me = me;
         _statisticRebuildJobs = statisticRebuildJobs;
+        _enumCatalogs = enumCatalogs;
     }
 
     private static AppException LabelRequestRequired(string action)
@@ -158,6 +161,10 @@ public sealed class LabelService : ILabelService
         var scope = ResolveManagedScope(me, req.ScopeType, req.ScopeId);
         var name = NormalizeName(req.Name);
         var now = DateTime.UtcNow;
+        var valueSourceType = NormalizeValueSourceType(req.ValueSourceType, req.Usage, req.DataType);
+        var valueSourceCatalog = valueSourceType == LabelValueSourceTypes.EnumCatalog
+            ? await _enumCatalogs.EnsureVisibleActiveCatalogAsync(req.ValueSourceCatalogId ?? string.Empty, ct)
+            : null;
         var doc = new LabelCatalogItem
         {
             Code = NormalizeCode(req.Code),
@@ -168,6 +175,11 @@ public sealed class LabelService : ILabelService
             GroupCode = NormalizeOptionalCode(req.GroupCode),
             Usage = NormalizeUsage(req.Usage),
             DataType = LabelDataTypes.Normalize(req.DataType),
+            ValueSourceType = valueSourceType,
+            ValueOptions = NormalizeValueOptions(req.ValueOptions, valueSourceType),
+            ValueSourceCatalogId = valueSourceCatalog?.Id,
+            ValueSourceCatalogCode = valueSourceCatalog?.Code,
+            ValueSourceCatalogName = valueSourceCatalog?.Name,
             ScopeType = scope.scopeType,
             ScopeId = scope.scopeId,
             ManagedByUserId = me.Id,
@@ -211,6 +223,11 @@ public sealed class LabelService : ILabelService
         var name = NormalizeName(req.Name);
         var nextDataType = LabelDataTypes.Normalize(req.DataType);
         var nextUsage = NormalizeUsage(req.Usage, LabelUsages.Normalize(doc.Usage, LabelUsages.Classification));
+        var nextValueSourceType = NormalizeValueSourceType(req.ValueSourceType, nextUsage, nextDataType);
+        var nextValueOptions = NormalizeValueOptions(req.ValueOptions, nextValueSourceType);
+        var nextValueSourceCatalog = nextValueSourceType == LabelValueSourceTypes.EnumCatalog
+            ? await _enumCatalogs.EnsureVisibleActiveCatalogAsync(req.ValueSourceCatalogId ?? string.Empty, ct)
+            : null;
         var now = DateTime.UtcNow;
         var update = Builders<LabelCatalogItem>.Update
             .Set(x => x.Name, name)
@@ -220,6 +237,11 @@ public sealed class LabelService : ILabelService
             .Set(x => x.GroupCode, NormalizeOptionalCode(req.GroupCode))
             .Set(x => x.Usage, nextUsage)
             .Set(x => x.DataType, nextDataType)
+            .Set(x => x.ValueSourceType, nextValueSourceType)
+            .Set(x => x.ValueOptions, nextValueOptions)
+            .Set(x => x.ValueSourceCatalogId, nextValueSourceCatalog?.Id)
+            .Set(x => x.ValueSourceCatalogCode, nextValueSourceCatalog?.Code)
+            .Set(x => x.ValueSourceCatalogName, nextValueSourceCatalog?.Name)
             .Set(x => x.IsActive, req.IsActive)
             .Set(x => x.UpdatedAtUtc, now)
             .Set(x => x.UpdatedByUserId, me.Id);
@@ -412,6 +434,13 @@ public sealed class LabelService : ILabelService
             x.GroupCode,
             LabelUsages.Normalize(x.Usage, LabelUsages.Classification),
             LabelDataTypes.Normalize(x.DataType),
+            LabelValueSourceTypes.Normalize(x.ValueSourceType),
+            (x.ValueOptions ?? new List<LabelValueOption>())
+                .Select(option => new LabelValueOptionDto(option.Code, option.Label))
+                .ToList(),
+            x.ValueSourceCatalogId,
+            x.ValueSourceCatalogCode,
+            x.ValueSourceCatalogName,
             x.ScopeType,
             x.ScopeId,
             x.IsSystem,
@@ -503,6 +532,82 @@ public sealed class LabelService : ILabelService
                 "Mau nhan phai la ma hex dang #RRGGBB.",
                 new { color });
         return color.ToUpperInvariant();
+    }
+
+    private static string NormalizeValueSourceType(string? value, string? usage, string? dataType)
+    {
+        var sourceType = LabelValueSourceTypes.Normalize(value);
+        if (sourceType == LabelValueSourceTypes.None)
+            return sourceType;
+
+        var normalizedUsage = NormalizeUsage(usage);
+        var normalizedType = LabelDataTypes.Normalize(dataType);
+        var supportsCodeSource = normalizedType is LabelDataTypes.ShortText or LabelDataTypes.StringList;
+        if (!supportsCodeSource)
+        {
+            throw LabelValidation(
+                AppErrorCode.LABEL_USAGE_INVALID,
+                "Nguon gia tri nhan chi ap dung cho SHORT_TEXT hoac STRING_LIST.",
+                new { sourceType, dataType = normalizedType });
+        }
+
+        if (normalizedUsage != LabelUsages.TableTarget && normalizedUsage != LabelUsages.Statistic)
+        {
+            throw LabelValidation(
+                AppErrorCode.LABEL_USAGE_INVALID,
+                "Nguon gia tri nhan chi ap dung cho nhan thong ke hoac nhan vi tri bang.",
+                new { sourceType, usage = normalizedUsage });
+        }
+
+        return sourceType;
+    }
+
+    private static List<LabelValueOption> NormalizeValueOptions(
+        IReadOnlyList<LabelValueOptionDto>? value,
+        string? sourceType)
+    {
+        var normalizedSource = LabelValueSourceTypes.Normalize(sourceType);
+        if (normalizedSource != LabelValueSourceTypes.FixedEnum)
+            return new List<LabelValueOption>();
+
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var rows = new List<LabelValueOption>();
+        foreach (var option in value ?? Array.Empty<LabelValueOptionDto>())
+        {
+            var code = option.Code?.Trim();
+            var label = option.Label?.Trim();
+            if (string.IsNullOrWhiteSpace(code))
+                continue;
+            if (!CodeRegex.IsMatch(code.ToLowerInvariant()))
+                throw LabelValidation(
+                    AppErrorCode.LABEL_CODE_INVALID,
+                    "Ma gia tri enum nhan khong hop le.",
+                    new { code });
+            if (!seen.Add(code))
+                throw LabelValidation(
+                    AppErrorCode.LABEL_CODE_INVALID,
+                    "Ma gia tri enum nhan bi trung.",
+                    new { code });
+
+            rows.Add(new LabelValueOption
+            {
+                Code = code,
+                Label = string.IsNullOrWhiteSpace(label) ? code : label
+            });
+        }
+
+        if (rows.Count == 0)
+            throw LabelValidation(
+                AppErrorCode.LABEL_CODE_INVALID,
+                "Nguon FIXED_ENUM can it nhat mot gia tri.",
+                new { sourceType = normalizedSource });
+        if (rows.Count > 100)
+            throw LabelValidation(
+                AppErrorCode.LABEL_CODE_INVALID,
+                "Nguon FIXED_ENUM chi ho tro toi da 100 gia tri.",
+                new { count = rows.Count, max = 100 });
+
+        return rows;
     }
 
     private static FilterDefinition<LabelCatalogItem> BuildUsageSearchFilter(string requestedUsage)
