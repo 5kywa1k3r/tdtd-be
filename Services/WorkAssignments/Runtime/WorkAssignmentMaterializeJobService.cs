@@ -23,7 +23,7 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
     private readonly IDocRoleReadModelProjectionService _docRoleReadModelProjection;
     private readonly IWorkStatusOperationLogService _statusLog;
     private readonly ILogger<WorkAssignmentMaterializeJobService> _log;
-    private readonly int _rollingWindowDays;
+    private readonly int _rollingWindowCount;
 
     public WorkAssignmentMaterializeJobService(
         MongoDbContext ctx,
@@ -38,7 +38,12 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
         _docRoleReadModelProjection = docRoleReadModelProjection;
         _statusLog = statusLog;
         _log = log;
-        _rollingWindowDays = Math.Clamp(cfg.GetValue<int?>("WorkAssignmentMaterialize:RollingWindowDays") ?? 3, 1, 31);
+        _rollingWindowCount = Math.Clamp(
+            cfg.GetValue<int?>("WorkAssignmentMaterialize:RollingWindowCount") ??
+            cfg.GetValue<int?>("WorkAssignmentMaterialize:RollingWindowDays") ??
+            3,
+            1,
+            31);
     }
 
     public async Task EnqueueOrTouchAsync(WorkAssignment assignment, string actorUserId, CancellationToken ct = default)
@@ -148,12 +153,12 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
             if (processed > 0 || failed > 0)
             {
                 _log.LogInformation(
-                    "WorkAssignment materialize scan completed. processed={processed} failed={failed} maxJobs={maxJobs} batchSize={batchSize} rollingWindowDays={rollingWindowDays}",
+                    "WorkAssignment materialize scan completed. processed={processed} failed={failed} maxJobs={maxJobs} batchSize={batchSize} rollingWindowCount={rollingWindowCount}",
                     processed,
                     failed,
                     maxJobs,
                     batchSize,
-                    _rollingWindowDays);
+                    _rollingWindowCount);
 
                 await WriteStatusOperationLogAsync(new WorkStatusOperationLog
                 {
@@ -161,7 +166,7 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
                     Scope = "materialize-scan",
                     Result = failed == 0 ? "SUCCESS" : "PARTIAL_FAILED",
                     ActorUserId = "system",
-                    Summary = $"processed={processed};failed={failed};maxJobs={maxJobs};batchSize={batchSize};rollingWindowDays={_rollingWindowDays}",
+                    Summary = $"processed={processed};failed={failed};maxJobs={maxJobs};batchSize={batchSize};rollingWindowCount={_rollingWindowCount}",
                     StartedAtUtc = startedAtUtc
                 }, startedAtUtc, ct);
             }
@@ -172,12 +177,12 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
         {
             _log.LogError(
                 ex,
-                "WorkAssignment materialize scan failed. processed={processed} failed={failed} maxJobs={maxJobs} batchSize={batchSize} rollingWindowDays={rollingWindowDays}",
+                "WorkAssignment materialize scan failed. processed={processed} failed={failed} maxJobs={maxJobs} batchSize={batchSize} rollingWindowCount={rollingWindowCount}",
                 processed,
                 failed,
                 maxJobs,
                 batchSize,
-                _rollingWindowDays);
+                _rollingWindowCount);
 
             await WriteStatusOperationLogAsync(new WorkStatusOperationLog
             {
@@ -185,7 +190,7 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
                 Scope = "materialize-scan",
                 Result = "FAILED",
                 ActorUserId = "system",
-                Summary = $"processed={processed};failed={failed};maxJobs={maxJobs};batchSize={batchSize};rollingWindowDays={_rollingWindowDays}",
+                Summary = $"processed={processed};failed={failed};maxJobs={maxJobs};batchSize={batchSize};rollingWindowCount={_rollingWindowCount}",
                 ErrorType = ex.GetType().FullName,
                 ErrorMessage = ex.Message,
                 ErrorStackTrace = ex.ToString(),
@@ -274,227 +279,369 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
         if (dueItems.Count == 0)
         {
             if (ShouldContinueRolling(assignment, work, parent, DateTime.UtcNow))
-                await RequeueNextRollingWindowAsync(job.Id!, ct);
+                await RequeueNextRollingOccurrenceWindowAsync(job.Id!, ct);
             else
                 await CompleteJobAsync(job.Id!, ct);
 
             return;
         }
 
-        var createdOrTouched = 0;
+        var targetBatchSize = Math.Max(1, batchSize);
         var assigneeIndex = Math.Max(0, job.CursorAssigneeIndex);
         var dueIndex = Math.Max(0, job.CursorDueIndex);
         var isOnceAssignment = IsOnceAssignment(assignment);
+        var targets = new List<MaterializeTarget>(Math.Min(targetBatchSize, bindings.Count * Math.Max(1, dueItems.Count)));
 
-        while (assigneeIndex < bindings.Count && createdOrTouched < batchSize)
+        while (dueIndex < dueItems.Count && targets.Count < targetBatchSize)
         {
-            var binding = bindings[assigneeIndex];
-            var assigneeUserId = binding.AssigneeUserId;
+            var item = dueItems[dueIndex];
 
-            if (string.IsNullOrWhiteSpace(assigneeUserId) || string.IsNullOrWhiteSpace(binding.Id))
+            if (!DateTime.TryParseExact(
+                item.PeriodKey,
+                "yyyyMMdd",
+                CultureInfo.InvariantCulture,
+                DateTimeStyles.None,
+                out var periodDate))
             {
-                assigneeIndex++;
-                dueIndex = 0;
-                continue;
+                throw InvalidPeriodKey(item.PeriodKey, assignment.Id);
             }
 
-            while (dueIndex < dueItems.Count && createdOrTouched < batchSize)
+            periodDate = periodDate.Date;
+
+            var (periodStart, periodEnd) = isOnceAssignment
+                ? GetOncePeriodRange(assignment, work, parent, item.DueAtUtc)
+                : AssignmentScheduleTimeHelper.GetPeriodRange(assignment.Schedule!, periodDate);
+
+            while (assigneeIndex < bindings.Count && targets.Count < targetBatchSize)
             {
-                var item = dueItems[dueIndex];
+                var binding = bindings[assigneeIndex];
+                var assigneeUserId = binding.AssigneeUserId;
 
-                var existed = await _ctx.WorkReportPeriods
-                    .Find(x =>
-                        x.WorkAssignmentId == assignment.Id &&
-                        x.AssigneeUserId == assigneeUserId &&
-                        x.PeriodKey == item.PeriodKey &&
-                        (x.PeriodKind == null || x.PeriodKind == WorkReportPeriodKind.Scheduled) &&
-                        !x.IsDeleted)
-                    .FirstOrDefaultAsync(ct);
+                assigneeIndex++;
 
-                if (!DateTime.TryParseExact(
-                    item.PeriodKey,
-                    "yyyyMMdd",
-                    CultureInfo.InvariantCulture,
-                    DateTimeStyles.None,
-                    out var periodDate))
-                {
-                    throw InvalidPeriodKey(item.PeriodKey, assignment.Id);
-                }
+                if (string.IsNullOrWhiteSpace(assigneeUserId) || string.IsNullOrWhiteSpace(binding.Id))
+                    continue;
 
-                periodDate = periodDate.Date;
+                targets.Add(new MaterializeTarget(
+                    Binding: binding,
+                    DueItem: item,
+                    PeriodDate: periodDate,
+                    PeriodStart: periodStart,
+                    PeriodEnd: periodEnd));
+            }
 
-                var (periodStart, periodEnd) = isOnceAssignment
-                    ? GetOncePeriodRange(assignment, work, parent, item.DueAtUtc)
-                    : AssignmentScheduleTimeHelper.GetPeriodRange(assignment.Schedule!, periodDate);
-
-                var now = DateTime.UtcNow;
-
-                if (existed is null)
-                {
-                    var status = WorkReportPeriodStatusHelper.ResolveInitialStatus(item.DueAtUtc, now);
-
-                    var period = new WorkReportPeriod
-                    {
-                        WorkId = assignment.WorkId,
-                        WorkAssignmentId = assignment.Id,
-                        WorkTemplateAssigneeId = binding.Id!,
-                        DynamicExcelId = assignment.DynamicExcelId,
-                        DynamicExcelCode = assignment.DynamicExcelCode,
-                        DynamicExcelName = assignment.DynamicExcelName,
-                        DynamicFormTemplateId = assignment.DynamicFormTemplateId,
-                        DynamicFormTemplateCode = assignment.DynamicFormTemplateCode,
-                        DynamicFormTemplateName = assignment.DynamicFormTemplateName,
-                        AssigneeUserId = assigneeUserId,
-                        AssigneeUnitId = binding.AssigneeUnitId,
-                        PeriodKey = item.PeriodKey,
-                        PeriodInstanceKey = item.PeriodKey,
-                        PeriodKind = WorkReportPeriodKind.Scheduled,
-                        ReportTitle = assignment.DynamicExcelName,
-                        ReportDate = periodDate,
-                        PeriodStart = periodStart,
-                        PeriodEnd = periodEnd,
-                        DueAtUtc = item.DueAtUtc,
-                        Status = status,
-                        IsOverdue = WorkReportPeriodStatusHelper.IsOverdue(status),
-                        IsActive = true,
-                        IsDeleted = false,
-                        CreatedAtUtc = now,
-                        UpdatedAtUtc = now,
-                        CreatedByUserId = null,
-                        UpdatedByUserId = null
-                    };
-
-                    await _ctx.WorkReportPeriods.InsertOneAsync(period, cancellationToken: ct);
-
-                    await _ctx.WorkAssignmentQueueItems.UpdateOneAsync(
-                        x => x.WorkAssignmentId == period.WorkAssignmentId &&
-                             x.AssigneeUserId == period.AssigneeUserId &&
-                             x.PeriodKey == period.PeriodKey,
-                        Builders<WorkAssignmentQueueItem>.Update
-                            .SetOnInsert(x => x.Id, ObjectId.GenerateNewId().ToString())
-                            .SetOnInsert(x => x.CreatedAtUtc, now)
-                            .SetOnInsert(x => x.CreatedByUserId, null)
-                            .Set(x => x.WorkId, period.WorkId)
-                            .Set(x => x.WorkAssignmentId, period.WorkAssignmentId)
-                            .Set(x => x.AssigneeUserId, period.AssigneeUserId)
-                            .Set(x => x.PeriodKey, period.PeriodKey)
-                            .Set(x => x.DueAtUtc, period.DueAtUtc)
-                            .Set(x => x.NextScanAtUtc, period.DueAtUtc ?? now)
-                            .Set(x => x.IsActive, WorkReportPeriodStatusHelper.ShouldKeepQueueActive(period.Status))
-                            .Set(x => x.LastObservedPeriodStatus, (int)period.Status)
-                            .Set(x => x.UpdatedAtUtc, now)
-                            .Set(x => x.UpdatedByUserId, null),
-                        new UpdateOptions { IsUpsert = true },
-                        ct);
-
-                    await _docRoleReadModelProjection.RebuildReportPeriodAsync(period.Id, "system", ct);
-                    createdOrTouched++;
-                }
-                else
-                {
-                    var updatedStatus = existed.Status;
-                    var updatedIsOverdue = existed.IsOverdue;
-
-                    if (existed.Status == WorkReportPeriodStatus.Pending ||
-                        existed.Status == WorkReportPeriodStatus.OverduePending)
-                    {
-                        updatedStatus = WorkReportPeriodStatusHelper.ResolveInitialStatus(item.DueAtUtc, now);
-
-                        updatedIsOverdue = WorkReportPeriodStatusHelper.IsOverdue(updatedStatus);
-                    }
-
-                    var updatedIsActive = WorkReportPeriodStatusHelper.ShouldKeepQueueActive(updatedStatus);
-                    if (IsExistingPeriodCurrent(
-                            existed,
-                            binding.Id!,
-                            item.DueAtUtc,
-                            periodStart,
-                            periodEnd,
-                            updatedStatus,
-                            updatedIsOverdue,
-                            updatedIsActive))
-                    {
-                        dueIndex++;
-                        continue;
-                    }
-
-                    await _ctx.WorkReportPeriods.UpdateOneAsync(
-                        x => x.Id == existed.Id,
-                        Builders<WorkReportPeriod>.Update
-                            .Set(x => x.WorkTemplateAssigneeId, binding.Id!)
-                            .Set(x => x.IsActive, updatedIsActive)
-                            .Set(x => x.DueAtUtc, item.DueAtUtc)
-                            .Set(x => x.DynamicFormTemplateId, assignment.DynamicFormTemplateId)
-                            .Set(x => x.DynamicFormTemplateCode, assignment.DynamicFormTemplateCode)
-                            .Set(x => x.DynamicFormTemplateName, assignment.DynamicFormTemplateName)
-                            .Set(x => x.PeriodInstanceKey, string.IsNullOrWhiteSpace(existed.PeriodInstanceKey) ? existed.PeriodKey : existed.PeriodInstanceKey)
-                            .Set(x => x.PeriodKind, WorkReportPeriodKind.Scheduled)
-                            .Set(x => x.ReportDate, periodDate)
-                            .Set(x => x.PeriodStart, periodStart)
-                            .Set(x => x.PeriodEnd, periodEnd)
-                            .Set(x => x.Status, updatedStatus)
-                            .Set(x => x.IsOverdue, updatedIsOverdue)
-                            .Set(x => x.UpdatedAtUtc, now)
-                            .Set(x => x.UpdatedByUserId, null),
-                        cancellationToken: ct);
-
-                    await _ctx.WorkAssignmentQueueItems.UpdateOneAsync(
-                        x => x.WorkAssignmentId == existed.WorkAssignmentId &&
-                             x.AssigneeUserId == existed.AssigneeUserId &&
-                             x.PeriodKey == existed.PeriodKey,
-                        Builders<WorkAssignmentQueueItem>.Update
-                            .SetOnInsert(x => x.Id, ObjectId.GenerateNewId().ToString())
-                            .SetOnInsert(x => x.CreatedAtUtc, now)
-                            .SetOnInsert(x => x.CreatedByUserId, null)
-                            .Set(x => x.WorkId, existed.WorkId)
-                            .Set(x => x.WorkAssignmentId, existed.WorkAssignmentId)
-                            .Set(x => x.AssigneeUserId, existed.AssigneeUserId)
-                            .Set(x => x.PeriodKey, existed.PeriodKey)
-                            .Set(x => x.DueAtUtc, item.DueAtUtc)
-                            .Set(x => x.NextScanAtUtc, item.DueAtUtc)
-                            .Set(x => x.IsActive, updatedIsActive)
-                            .Set(x => x.LastObservedPeriodStatus, (int)updatedStatus)
-                            .Set(x => x.UpdatedAtUtc, now)
-                            .Set(x => x.UpdatedByUserId, null),
-                        new UpdateOptions { IsUpsert = true },
-                        ct);
-
-                    await _docRoleReadModelProjection.RebuildReportPeriodAsync(existed.Id, "system", ct);
-                    createdOrTouched++;
-                }
-
+            if (assigneeIndex >= bindings.Count)
+            {
                 dueIndex++;
-            }
-
-            if (dueIndex >= dueItems.Count)
-            {
-                assigneeIndex++;
-                dueIndex = 0;
+                assigneeIndex = 0;
             }
         }
 
-        if (assigneeIndex >= bindings.Count)
+        var changed = targets.Count == 0
+            ? new MaterializeBatchResult(0, 0, 0, 0)
+            : await ApplyMaterializeBatchAsync(assignment, targets, ct);
+
+        if (targets.Count > 0)
         {
-            if (createdOrTouched > 0)
+            _log.LogInformation(
+                "WorkAssignment materialize batch. assignmentId={assignmentId} targets={targets} created={created} updated={updated} skipped={skipped} nextAssigneeIndex={nextAssigneeIndex} nextDueIndex={nextDueIndex} batchSize={batchSize}",
+                assignment.Id,
+                targets.Count,
+                changed.CreatedCount,
+                changed.UpdatedCount,
+                changed.SkippedCount,
+                assigneeIndex,
+                dueIndex,
+                targetBatchSize);
+        }
+
+        if (dueIndex >= dueItems.Count)
+        {
+            if (changed.ChangedCount > 0)
             {
                 await _sync.SyncFromAssignmentAsync(assignment.Id, ct);
             }
 
             if (ShouldContinueRolling(assignment, work, parent, DateTime.UtcNow))
-                await RequeueNextRollingWindowAsync(job.Id!, ct);
+                await RequeueNextRollingOccurrenceWindowAsync(job.Id!, ct);
             else
                 await CompleteJobAsync(job.Id!, ct);
 
             return;
         }
 
+        if (changed.ChangedCount > 0)
+        {
+            await _sync.SyncFromAssignmentAsync(assignment.Id, ct);
+        }
+
         await RequeueQuickAsync(job.Id!, assigneeIndex, dueIndex, ct);
     }
+
+    private async Task<MaterializeBatchResult> ApplyMaterializeBatchAsync(
+        WorkAssignment assignment,
+        IReadOnlyList<MaterializeTarget> targets,
+        CancellationToken ct)
+    {
+        var now = DateTime.UtcNow;
+        var assigneeUserIds = targets
+            .Select(x => x.Binding.AssigneeUserId)
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+        var periodKeys = targets
+            .Select(x => x.DueItem.PeriodKey)
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+
+        var existingPeriods = await _ctx.WorkReportPeriods
+            .Find(x =>
+                x.WorkAssignmentId == assignment.Id &&
+                assigneeUserIds.Contains(x.AssigneeUserId) &&
+                periodKeys.Contains(x.PeriodKey) &&
+                (x.PeriodKind == null || x.PeriodKind == WorkReportPeriodKind.Scheduled) &&
+                !x.IsDeleted)
+            .ToListAsync(ct);
+
+        var existingByAssigneeAndKey = existingPeriods
+            .GroupBy(x => PeriodLookupKey(x.AssigneeUserId, x.PeriodKey), StringComparer.Ordinal)
+            .ToDictionary(
+                x => x.Key,
+                x => x.OrderByDescending(p => p.UpdatedAtUtc).First(),
+                StringComparer.Ordinal);
+
+        var periodWrites = new List<WriteModel<WorkReportPeriod>>();
+        var queueWrites = new List<WriteModel<WorkAssignmentQueueItem>>();
+        var rebuildPeriodIds = new List<string>();
+        var created = 0;
+        var updated = 0;
+        var skipped = 0;
+
+        foreach (var target in targets)
+        {
+            var binding = target.Binding;
+            var item = target.DueItem;
+            var assigneeUserId = binding.AssigneeUserId;
+
+            if (string.IsNullOrWhiteSpace(assigneeUserId) || string.IsNullOrWhiteSpace(binding.Id))
+            {
+                skipped++;
+                continue;
+            }
+
+            var lookupKey = PeriodLookupKey(assigneeUserId, item.PeriodKey);
+            var isHistoricalData = WorkAssignmentBackfillPeriodPolicy.IsBackfillHistoricalPeriod(
+                assignment,
+                target.PeriodStart,
+                target.PeriodEnd,
+                item.DueAtUtc,
+                now);
+
+            if (!existingByAssigneeAndKey.TryGetValue(lookupKey, out var existed))
+            {
+                var status = isHistoricalData
+                    ? WorkReportPeriodStatus.Pending
+                    : WorkReportPeriodStatusHelper.ResolveInitialStatus(item.DueAtUtc, now);
+                var period = new WorkReportPeriod
+                {
+                    Id = ObjectId.GenerateNewId().ToString(),
+                    WorkId = assignment.WorkId,
+                    WorkAssignmentId = assignment.Id,
+                    WorkTemplateAssigneeId = binding.Id!,
+                    DynamicExcelId = assignment.DynamicExcelId,
+                    DynamicExcelCode = assignment.DynamicExcelCode,
+                    DynamicExcelName = assignment.DynamicExcelName,
+                    DynamicFormTemplateId = assignment.DynamicFormTemplateId,
+                    DynamicFormTemplateCode = assignment.DynamicFormTemplateCode,
+                    DynamicFormTemplateName = assignment.DynamicFormTemplateName,
+                    AssigneeUserId = assigneeUserId,
+                    AssigneeUnitId = binding.AssigneeUnitId,
+                    PeriodKey = item.PeriodKey,
+                    PeriodInstanceKey = item.PeriodKey,
+                    PeriodKind = WorkReportPeriodKind.Scheduled,
+                    ReportTitle = assignment.DynamicExcelName,
+                    ReportDate = target.PeriodDate,
+                    PeriodStart = target.PeriodStart,
+                    PeriodEnd = target.PeriodEnd,
+                    DueAtUtc = item.DueAtUtc,
+                    Status = status,
+                    IsOverdue = WorkReportPeriodStatusHelper.IsOverdue(status),
+                    IsHistoricalData = isHistoricalData,
+                    IsActive = true,
+                    IsDeleted = false,
+                    CreatedAtUtc = now,
+                    UpdatedAtUtc = now,
+                    CreatedByUserId = null,
+                    UpdatedByUserId = null
+                };
+
+                periodWrites.Add(new InsertOneModel<WorkReportPeriod>(period));
+                queueWrites.Add(BuildQueueUpsert(
+                    period.WorkId,
+                    period.WorkAssignmentId,
+                    period.AssigneeUserId,
+                    period.PeriodKey,
+                    item.DueAtUtc,
+                    status,
+                    !isHistoricalData && WorkReportPeriodStatusHelper.ShouldKeepQueueActive(status),
+                    now));
+                rebuildPeriodIds.Add(period.Id);
+                created++;
+                continue;
+            }
+
+            var updatedIsHistoricalData = existed.IsHistoricalData || isHistoricalData;
+            var updatedStatus = existed.Status;
+            var updatedIsOverdue = existed.IsOverdue;
+
+            if (existed.Status == WorkReportPeriodStatus.Pending ||
+                existed.Status == WorkReportPeriodStatus.OverduePending)
+            {
+                updatedStatus = updatedIsHistoricalData
+                    ? WorkReportPeriodStatus.Pending
+                    : WorkReportPeriodStatusHelper.ResolveInitialStatus(item.DueAtUtc, now);
+                updatedIsOverdue = WorkReportPeriodStatusHelper.IsOverdue(updatedStatus);
+            }
+
+            // Period visibility is separate from queue scan activity: overdue periods must remain enterable.
+            const bool updatedPeriodIsActive = true;
+            if (IsExistingPeriodCurrent(
+                    existed,
+                    binding.Id!,
+                    item.DueAtUtc,
+                    target.PeriodStart,
+                    target.PeriodEnd,
+                    updatedStatus,
+                    updatedIsOverdue,
+                    updatedPeriodIsActive,
+                    updatedIsHistoricalData))
+            {
+                if (updatedIsHistoricalData)
+                {
+                    queueWrites.Add(BuildQueueUpsert(
+                        existed.WorkId,
+                        existed.WorkAssignmentId,
+                        existed.AssigneeUserId,
+                        existed.PeriodKey,
+                        item.DueAtUtc,
+                        updatedStatus,
+                        isActive: false,
+                        now));
+                }
+
+                skipped++;
+                continue;
+            }
+
+            periodWrites.Add(new UpdateOneModel<WorkReportPeriod>(
+                Builders<WorkReportPeriod>.Filter.Eq(x => x.Id, existed.Id),
+                Builders<WorkReportPeriod>.Update
+                    .Set(x => x.WorkTemplateAssigneeId, binding.Id!)
+                    .Set(x => x.IsActive, updatedPeriodIsActive)
+                    .Set(x => x.DueAtUtc, item.DueAtUtc)
+                    .Set(x => x.DynamicFormTemplateId, assignment.DynamicFormTemplateId)
+                    .Set(x => x.DynamicFormTemplateCode, assignment.DynamicFormTemplateCode)
+                    .Set(x => x.DynamicFormTemplateName, assignment.DynamicFormTemplateName)
+                    .Set(x => x.PeriodInstanceKey, string.IsNullOrWhiteSpace(existed.PeriodInstanceKey) ? existed.PeriodKey : existed.PeriodInstanceKey)
+                    .Set(x => x.PeriodKind, WorkReportPeriodKind.Scheduled)
+                    .Set(x => x.ReportDate, target.PeriodDate)
+                    .Set(x => x.PeriodStart, target.PeriodStart)
+                    .Set(x => x.PeriodEnd, target.PeriodEnd)
+                    .Set(x => x.Status, updatedStatus)
+                    .Set(x => x.IsOverdue, updatedIsOverdue)
+                    .Set(x => x.IsHistoricalData, updatedIsHistoricalData)
+                    .Set(x => x.UpdatedAtUtc, now)
+                    .Set(x => x.UpdatedByUserId, null)));
+
+            queueWrites.Add(BuildQueueUpsert(
+                existed.WorkId,
+                existed.WorkAssignmentId,
+                existed.AssigneeUserId,
+                existed.PeriodKey,
+                item.DueAtUtc,
+                updatedStatus,
+                !updatedIsHistoricalData && WorkReportPeriodStatusHelper.ShouldKeepQueueActive(updatedStatus),
+                now));
+            rebuildPeriodIds.Add(existed.Id);
+            updated++;
+        }
+
+        if (periodWrites.Count > 0)
+        {
+            await _ctx.WorkReportPeriods.BulkWriteAsync(
+                periodWrites,
+                new BulkWriteOptions { IsOrdered = false },
+                ct);
+        }
+
+        if (queueWrites.Count > 0)
+        {
+            await _ctx.WorkAssignmentQueueItems.BulkWriteAsync(
+                queueWrites,
+                new BulkWriteOptions { IsOrdered = false },
+                ct);
+        }
+
+        foreach (var periodId in rebuildPeriodIds.Distinct(StringComparer.Ordinal))
+            await _docRoleReadModelProjection.RebuildReportPeriodAsync(periodId, "system", ct);
+
+        return new MaterializeBatchResult(created, updated, skipped, created + updated);
+    }
+
+    private static UpdateOneModel<WorkAssignmentQueueItem> BuildQueueUpsert(
+        string workId,
+        string workAssignmentId,
+        string assigneeUserId,
+        string periodKey,
+        DateTime dueAtUtc,
+        WorkReportPeriodStatus status,
+        bool isActive,
+        DateTime now)
+    {
+        return new UpdateOneModel<WorkAssignmentQueueItem>(
+            Builders<WorkAssignmentQueueItem>.Filter.Eq(x => x.WorkAssignmentId, workAssignmentId) &
+            Builders<WorkAssignmentQueueItem>.Filter.Eq(x => x.AssigneeUserId, assigneeUserId) &
+            Builders<WorkAssignmentQueueItem>.Filter.Eq(x => x.PeriodKey, periodKey),
+            Builders<WorkAssignmentQueueItem>.Update
+                .SetOnInsert(x => x.Id, ObjectId.GenerateNewId().ToString())
+                .SetOnInsert(x => x.CreatedAtUtc, now)
+                .SetOnInsert(x => x.CreatedByUserId, null)
+                .Set(x => x.WorkId, workId)
+                .Set(x => x.WorkAssignmentId, workAssignmentId)
+                .Set(x => x.AssigneeUserId, assigneeUserId)
+                .Set(x => x.PeriodKey, periodKey)
+                .Set(x => x.DueAtUtc, dueAtUtc)
+                .Set(x => x.NextScanAtUtc, dueAtUtc)
+                .Set(x => x.IsActive, isActive)
+                .Set(x => x.LastObservedPeriodStatus, (int)status)
+                .Set(x => x.UpdatedAtUtc, now)
+                .Set(x => x.UpdatedByUserId, null))
+        {
+            IsUpsert = true
+        };
+    }
+
+    private static string PeriodLookupKey(string assigneeUserId, string periodKey)
+        => $"{assigneeUserId}|{periodKey}";
 
     private List<AssignmentScheduleDueItem> BuildDueItems(
         WorkAssignment assignment,
         Work work,
         WorkAssignment? parent)
+        => BuildDueItemsForMaterialize(
+            assignment,
+            work,
+            parent,
+            DateTime.UtcNow,
+            _rollingWindowCount);
+
+    internal static List<AssignmentScheduleDueItem> BuildDueItemsForMaterialize(
+        WorkAssignment assignment,
+        Work work,
+        WorkAssignment? parent,
+        DateTime nowUtc,
+        int rollingWindowCount)
     {
         if (IsOnceAssignment(assignment))
         {
@@ -507,27 +654,43 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
         if (assignment.Schedule is null)
             return new List<AssignmentScheduleDueItem>();
 
-        var today = DateTime.UtcNow.Date;
+        var today = nowUtc.Date;
         var start = WorkAssignmentDatePolicy.ResolveEffectiveStartDate(assignment, today);
-        if (start < today)
-            start = today;
 
         var scheduleStart = assignment.Schedule.StartDate?.Date;
         if (scheduleStart.HasValue && scheduleStart.Value > start)
             start = scheduleStart.Value;
 
-        var end = today.AddDays(_rollingWindowDays - 1);
         var effectiveCompletedDate = WorkAssignmentDatePolicy.ResolveEffectiveCompletedDate(assignment, work, parent);
-        if (effectiveCompletedDate.HasValue && effectiveCompletedDate.Value.Date < end)
-            end = effectiveCompletedDate.Value.Date;
+        var elapsedEnd = today;
+        if (effectiveCompletedDate.HasValue && effectiveCompletedDate.Value.Date < elapsedEnd)
+            elapsedEnd = effectiveCompletedDate.Value.Date;
 
-        if (end < start)
-            return new List<AssignmentScheduleDueItem>();
+        var dueItems = start <= elapsedEnd
+            ? AssignmentScheduleDueHelper.GetDueItemsInRange(assignment.Schedule, start, elapsedEnd)
+            : new List<AssignmentScheduleDueItem>();
 
-        return AssignmentScheduleDueHelper.GetDueItemsInRange(
-            assignment.Schedule,
-            start,
-            end);
+        var futureStart = today.AddDays(1);
+        if (futureStart < start)
+            futureStart = start;
+
+        if (!effectiveCompletedDate.HasValue || effectiveCompletedDate.Value.Date >= futureStart)
+        {
+            var futureItems = AssignmentScheduleDueHelper.GetDueItemsForRollingOccurrenceWindow(
+                assignment.Schedule,
+                futureStart,
+                futureStart,
+                effectiveCompletedDate,
+                Math.Max(1, rollingWindowCount));
+
+            dueItems.AddRange(futureItems);
+        }
+
+        return dueItems
+            .GroupBy(x => x.PeriodKey, StringComparer.Ordinal)
+            .Select(x => x.OrderBy(i => i.DueAtUtc).First())
+            .OrderBy(x => x.DueAtUtc)
+            .ToList();
     }
 
     private bool ShouldContinueRolling(
@@ -555,7 +718,8 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
         DateTime? periodEnd,
         WorkReportPeriodStatus status,
         bool isOverdue,
-        bool isActive)
+        bool isActive,
+        bool isHistoricalData)
     {
         return string.Equals(existed.WorkTemplateAssigneeId, bindingId, StringComparison.Ordinal) &&
                existed.DueAtUtc == dueAtUtc &&
@@ -563,7 +727,8 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
                NullableDateEquals(existed.PeriodEnd, periodEnd) &&
                existed.Status == status &&
                existed.IsOverdue == isOverdue &&
-               existed.IsActive == isActive;
+               existed.IsActive == isActive &&
+               existed.IsHistoricalData == isHistoricalData;
     }
 
     private static bool NullableDateEquals(DateTime? left, DateTime? right)
@@ -683,7 +848,6 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
         CancellationToken ct)
     {
         var now = DateTime.UtcNow;
-        var jitterSeconds = Random.Shared.Next(15, 61);
 
         await _ctx.WorkAssignmentMaterializeJobs.UpdateOneAsync(
             x => x.Id == jobId && !x.IsDeleted,
@@ -693,13 +857,13 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
                 .Set(x => x.CursorDueIndex, cursorDueIndex)
                 .Set(x => x.LeaseUntilUtc, null)
                 .Set(x => x.LastHeartbeatAtUtc, now)
-                .Set(x => x.NextRetryAtUtc, now.AddSeconds(jitterSeconds))
+                .Set(x => x.NextRetryAtUtc, now)
                 .Set(x => x.UpdatedAtUtc, now)
                 .Set(x => x.UpdatedByUserId, null),
             cancellationToken: ct);
     }
 
-    private async Task RequeueNextRollingWindowAsync(string jobId, CancellationToken ct)
+    private async Task RequeueNextRollingOccurrenceWindowAsync(string jobId, CancellationToken ct)
     {
         var now = DateTime.UtcNow;
         var jitterMinutes = Random.Shared.Next(0, 31);
@@ -814,4 +978,17 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
         => AppExceptionFactory.BadRequest(
             AppErrorCode.WORK_ASSIGNMENT_PERIOD_KEY_INVALID,
             new { assignmentId, periodKey });
+
+    private sealed record MaterializeTarget(
+        WorkTemplateAssignee Binding,
+        AssignmentScheduleDueItem DueItem,
+        DateTime PeriodDate,
+        DateTime? PeriodStart,
+        DateTime? PeriodEnd);
+
+    private sealed record MaterializeBatchResult(
+        int CreatedCount,
+        int UpdatedCount,
+        int SkippedCount,
+        int ChangedCount);
 }

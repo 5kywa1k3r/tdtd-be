@@ -13,4 +13,8 @@
     <ProjectReference Include="..\..\tdtd-be.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <Compile Remove="obj-codex\**\*.cs" />
+  </ItemGroup>
+
 </Project>

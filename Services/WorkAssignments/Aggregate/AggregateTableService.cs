@@ -1626,10 +1626,13 @@ public sealed class AggregateTableService : IAggregateTableService
             if (allowedMetrics.Count == 0)
                 continue;
 
-            var values = ResolveReportBlockValues(report, contract.BlockId, warnings);
+            using var valuesReader = ResolveReportBlockValuesReader(report.TableValuesJson, contract.BlockId);
+            var fallbackValues = valuesReader is null
+                ? ResolveLegacyReportValues(report, warnings)
+                : null;
             foreach (var metric in allowedMetrics)
             {
-                if (metric.Index < 0 || metric.Index >= values.Count)
+                if (metric.Index < 0)
                     continue;
 
                 var sourceKey = $"index:{metric.Index}";
@@ -1641,7 +1644,12 @@ public sealed class AggregateTableService : IAggregateTableService
                         sourceKey))
                     continue;
 
-                acc[metric.MetricKey].Add(values[metric.Index]);
+                var value = valuesReader is not null
+                    ? valuesReader.ReadDecimal(metric.Index)
+                    : metric.Index < (fallbackValues?.Count ?? 0)
+                        ? fallbackValues![metric.Index]
+                        : null;
+                acc[metric.MetricKey].Add(value);
             }
         }
 
@@ -1817,15 +1825,46 @@ public sealed class AggregateTableService : IAggregateTableService
             .ToList();
     }
 
-    private static List<decimal?> ResolveReportBlockValues(
+    private static Values1DCompression.Values1DReader? ResolveReportBlockValuesReader(
+        string? tableValuesJson,
+        string blockId)
+    {
+        if (string.IsNullOrWhiteSpace(tableValuesJson))
+            return null;
+
+        try
+        {
+            using var document = JsonDocument.Parse(tableValuesJson);
+            if (!document.RootElement.TryGetProperty("blocks", out var blocks) ||
+                blocks.ValueKind != JsonValueKind.Array)
+            {
+                return null;
+            }
+
+            foreach (var block in blocks.EnumerateArray())
+            {
+                var currentBlockId = block.TryGetProperty("blockId", out var blockIdElement) &&
+                                     blockIdElement.ValueKind == JsonValueKind.String
+                    ? blockIdElement.GetString()
+                    : null;
+                if (!string.Equals(NormalizeBlockId(currentBlockId), blockId, StringComparison.Ordinal))
+                    continue;
+
+                return Values1DCompression.CreateBlockReader(block);
+            }
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+
+        return null;
+    }
+
+    private static List<decimal?> ResolveLegacyReportValues(
         WorkAssignmentReport report,
-        string blockId,
         List<string> warnings)
     {
-        var block = ExtractReportTableBlock(report.TableValuesJson, blockId);
-        if (block?.Values1D is { Count: > 0 })
-            return block.Values1D.Select(ToNullableDecimal).ToList();
-
         warnings.Add("Một số báo cáo thiếu dữ liệu bảng theo block; hệ thống dùng dữ liệu ô cũ để tổng hợp.");
         return DeserializeValues1D(report.Values1DJson);
     }
@@ -1854,7 +1893,8 @@ public sealed class AggregateTableService : IAggregateTableService
 
         try
         {
-            var root = JsonSerializer.Deserialize<ReportTableValuesRoot>(tableValuesJson, JsonOptions);
+            var expandedTableValuesJson = Values1DCompression.ExpandTableValuesJson(tableValuesJson, JsonOptions) ?? tableValuesJson;
+            var root = JsonSerializer.Deserialize<ReportTableValuesRoot>(expandedTableValuesJson, JsonOptions);
             return root?.Blocks?
                 .FirstOrDefault(x => string.Equals(
                     NormalizeBlockId(x.BlockId),
@@ -2726,27 +2766,7 @@ public sealed class AggregateTableService : IAggregateTableService
     }
 
     private static List<decimal?> DeserializeValues1D(string? json)
-    {
-        if (string.IsNullOrWhiteSpace(json))
-            return new List<decimal?>();
-
-        try
-        {
-            return JsonSerializer.Deserialize<List<decimal?>>(json) ?? new List<decimal?>();
-        }
-        catch
-        {
-            try
-            {
-                var raw = JsonSerializer.Deserialize<List<JsonElement>>(json) ?? new List<JsonElement>();
-                return raw.Select(ToNullableDecimal).ToList();
-            }
-            catch
-            {
-                return new List<decimal?>();
-            }
-        }
-    }
+        => Values1DCompression.DeserializeDecimals(json, JsonOptions);
 
     private static decimal? ToNullableDecimal(JsonElement value)
     {

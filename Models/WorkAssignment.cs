@@ -69,9 +69,6 @@ public sealed class WorkAssignment : BaseEntity
     [BsonRepresentation(BsonType.ObjectId)]
     public string? CompletedByUserId { get; set; }
 
-    [BsonElement("allowUserCreatedReports")]
-    public bool AllowUserCreatedReports { get; set; } = true;
-
     [BsonElement("assignees")]
     public List<UserRef> Assignees { get; set; } = new();
 

@@ -20,6 +20,5 @@ public sealed class SaveWorkAssignmentRequest
     public string? ParentAssignmentId { get; set; }
 
     public bool? IsActive { get; set; }
-    public bool? AllowUserCreatedReports { get; set; }
     public DateTime? DueAtUtc { get; set; }
 }

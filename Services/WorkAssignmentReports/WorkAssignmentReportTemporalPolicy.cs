@@ -17,9 +17,7 @@ internal static class WorkAssignmentReportTemporalPolicy
         => !IsDataOnlyHistoricalPeriod(period);
 
     public static bool IsDataOnlyHistoricalPeriod(WorkReportPeriod period)
-        => WorkReportPeriodKind.IsUserCreated(period.PeriodKind)
-           && period.IsHistoricalData
-           && string.IsNullOrWhiteSpace(period.LinkedScheduledPeriodId);
+        => false;
 
     public static WorkReportSourceWindow ResolveSourceWindow(WorkAssignmentReport report)
     {

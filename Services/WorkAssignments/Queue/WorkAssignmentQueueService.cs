@@ -19,6 +19,7 @@ public sealed class WorkAssignmentQueueService : IWorkAssignmentQueueService
         var now = DateTime.UtcNow;
         var nextScanAt = period.DueAtUtc ?? now;
         var shouldKeepActive = period.IsActive &&
+                               !period.IsHistoricalData &&
                                WorkReportPeriodStatusHelper.ShouldKeepQueueActive(period.Status);
 
         var filter = Builders<WorkAssignmentQueueItem>.Filter.And(

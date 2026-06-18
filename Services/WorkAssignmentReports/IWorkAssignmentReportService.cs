@@ -1,5 +1,6 @@
 ﻿using tdtd_be.DTOs.Common;
 using tdtd_be.DTOs.WorkAssignmentReports;
+using tdtd_be.DTOs.DynamicExcel;
 
 namespace tdtd_be.Services.WorkAssignmentReports;
 
@@ -25,7 +26,7 @@ public interface IWorkAssignmentReportService
 
     /// <summary>
     /// Detail của 1 template report trong phạm vi 1 work:
-    /// - trả template/spec/workbook
+    /// - trả template/spec nhẹ
     /// - trả danh sách các kỳ phải báo cáo
     /// </summary>
     Task<MyReportTemplateDetailResponse> GetMyReportTemplateDetailAsync(
@@ -54,22 +55,17 @@ public interface IWorkAssignmentReportService
         string currentUserId,
         CancellationToken ct = default);
 
-    Task<WorkAssignmentReportResponse> CreateUserCreatedReportAsync(
-        string workAssignmentId,
-        CreateUserCreatedReportRequest req,
-        string currentUserId,
-        CancellationToken ct = default);
-
-    Task DeleteUserCreatedReportAsync(
-        string id,
-        string currentUserId,
-        CancellationToken ct = default);
-
     /// <summary>
     /// Lấy chi tiết một report theo id.
     /// </summary>
     Task<WorkAssignmentReportResponse> GetByIdAsync(
         string id,
+        string currentUserId,
+        CancellationToken ct = default);
+
+    Task<DynamicExcelDetail> GetReportTemplateWorkbookAsync(
+        string id,
+        string dynamicExcelTemplateId,
         string currentUserId,
         CancellationToken ct = default);
 
@@ -96,6 +92,12 @@ public interface IWorkAssignmentReportService
     Task<WorkAssignmentReportResponse> SaveDraftAsync(
         string id,
         SaveWorkAssignmentReportDraftRequest req,
+        string currentUserId,
+        CancellationToken ct = default);
+
+    Task<WorkAssignmentReportResponse> SaveDraftPatchAsync(
+        string id,
+        SaveWorkAssignmentReportDraftPatchRequest req,
         string currentUserId,
         CancellationToken ct = default);
 

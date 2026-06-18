@@ -1896,6 +1896,21 @@
             ), ct);
 
             await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_workAssignmentReports_basicSummary_sources",
+                key: new BsonDocument
+                {
+                    { "workAssignmentId", 1 },
+                    { "dynamicFormTemplateId", 1 },
+                    { "status", 1 },
+                    { "periodKey", 1 },
+                    { "isCurrent", 1 },
+                    { "isActive", 1 },
+                    { "isDeleted", 1 },
+                    { "updatedAtUtc", -1 }
+                }
+            ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
                 name: "ix_workAssignmentReports_aggregate_refresh_candidates",
                 key: new BsonDocument
                 {

@@ -43,7 +43,6 @@ public sealed class WorkAssignmentReportResponse
     public string PeriodKind { get; set; } = string.Empty;
     public string? ReportTitle { get; set; }
     public DateTime? ReportDate { get; set; }
-    public string? LinkedScheduledPeriodId { get; set; }
     public DateTime? StartedDate { get; set; }
     public DateTime? CompletedDate { get; set; }
     public bool CanEditCompletedDate { get; set; }

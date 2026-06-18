@@ -79,23 +79,6 @@ internal static class WorkAssignmentReportHistoricalDataHelper
     public static DateTime? NormalizeDate(DateTime? value)
         => value?.Date;
 
-    public static bool IsHistoricalUserCreatedData(
-        string? periodKind,
-        DateTime? reportDate,
-        DateTime? periodStart,
-        DateTime? periodEnd,
-        DateTime now)
-    {
-        if (!WorkReportPeriodKind.IsUserCreated(periodKind))
-            return false;
-
-        var anchor = periodEnd?.Date
-                     ?? reportDate?.Date
-                     ?? periodStart?.Date;
-
-        return anchor.HasValue && anchor.Value < now.Date;
-    }
-
     private static bool IsHistoricalCompletedAfterDue(DateTime? completedDate, DateTime? dueAtUtc)
         => completedDate.HasValue &&
            dueAtUtc.HasValue &&

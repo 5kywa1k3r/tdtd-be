@@ -127,7 +127,15 @@ public sealed class WorkAssignmentRuntimeMaterializeService : IWorkAssignmentRun
                 if (existed is null)
                 {
                     var now = DateTime.UtcNow;
-                    var status = WorkReportPeriodStatusHelper.ResolveInitialStatus(item.DueAtUtc, now);
+                    var isHistoricalData = WorkAssignmentBackfillPeriodPolicy.IsBackfillHistoricalPeriod(
+                        assignment,
+                        periodStart,
+                        periodEnd,
+                        item.DueAtUtc,
+                        now);
+                    var status = isHistoricalData
+                        ? WorkReportPeriodStatus.Pending
+                        : WorkReportPeriodStatusHelper.ResolveInitialStatus(item.DueAtUtc, now);
 
                     var period = new WorkReportPeriod
                     {
@@ -152,6 +160,7 @@ public sealed class WorkAssignmentRuntimeMaterializeService : IWorkAssignmentRun
                         DueAtUtc = item.DueAtUtc,
                         Status = status,
                         IsOverdue = WorkReportPeriodStatusHelper.IsOverdue(status),
+                        IsHistoricalData = isHistoricalData,
                         IsActive = true,
                         IsDeleted = false,
                         CreatedAtUtc = now,
@@ -167,6 +176,25 @@ public sealed class WorkAssignmentRuntimeMaterializeService : IWorkAssignmentRun
                 else
                 {
                     var now = DateTime.UtcNow;
+                    var isHistoricalData =
+                        existed.IsHistoricalData ||
+                        WorkAssignmentBackfillPeriodPolicy.IsBackfillHistoricalPeriod(
+                            assignment,
+                            periodStart,
+                            periodEnd,
+                            item.DueAtUtc,
+                            now);
+                    var updatedStatus = existed.Status;
+                    var updatedIsOverdue = existed.IsOverdue;
+
+                    if (existed.Status == WorkReportPeriodStatus.Pending ||
+                        existed.Status == WorkReportPeriodStatus.OverduePending)
+                    {
+                        updatedStatus = isHistoricalData
+                            ? WorkReportPeriodStatus.Pending
+                            : WorkReportPeriodStatusHelper.ResolveInitialStatus(item.DueAtUtc, now);
+                        updatedIsOverdue = WorkReportPeriodStatusHelper.IsOverdue(updatedStatus);
+                    }
 
                     await _ctx.WorkReportPeriods.UpdateOneAsync(
                         x => x.Id == existed.Id,
@@ -182,6 +210,9 @@ public sealed class WorkAssignmentRuntimeMaterializeService : IWorkAssignmentRun
                             .Set(x => x.ReportDate, periodDate)
                             .Set(x => x.PeriodStart, periodStart)
                             .Set(x => x.PeriodEnd, periodEnd)
+                            .Set(x => x.Status, updatedStatus)
+                            .Set(x => x.IsOverdue, updatedIsOverdue)
+                            .Set(x => x.IsHistoricalData, isHistoricalData)
                             .Set(x => x.UpdatedAtUtc, now)
                             .Set(x => x.UpdatedByUserId, actorUserId),
                         cancellationToken: ct);
@@ -191,6 +222,9 @@ public sealed class WorkAssignmentRuntimeMaterializeService : IWorkAssignmentRun
                     existed.DueAtUtc = item.DueAtUtc;
                     existed.PeriodStart = periodStart;
                     existed.PeriodEnd = periodEnd;
+                    existed.Status = updatedStatus;
+                    existed.IsOverdue = updatedIsOverdue;
+                    existed.IsHistoricalData = isHistoricalData;
                     existed.UpdatedAtUtc = now;
                     existed.UpdatedByUserId = actorUserId;
 

@@ -4,6 +4,7 @@ using tdtd_be.DTOs.Auth;
 using tdtd_be.DTOs.DynamicExcel;
 using tdtd_be.DTOs.WorkAssignments;
 using tdtd_be.DTOs.WorkAssignments.AggregateTable;
+using tdtd_be.DTOs.WorkAssignments.BasicSummary;
 using tdtd_be.Enum;
 using tdtd_be.Models;
 using tdtd_be.Models.Enums;
@@ -12,7 +13,9 @@ using tdtd_be.Services.WorkAssignmentReports;
 using tdtd_be.Services.WorkAssignmentReports.Payloads;
 using tdtd_be.Services.WorkAssignmentReports.Statistics;
 using tdtd_be.Services.WorkAssignments.Domain;
+using tdtd_be.Services.WorkAssignments.BasicSummary;
 using tdtd_be.Services.WorkAssignments.Internal;
+using tdtd_be.Services.WorkAssignments.Runtime;
 using tdtd_be.Services.WorkDocuments;
 using tdtd_be.Services.Works;
 using tdtd_be.Uploads;
@@ -48,15 +51,18 @@ var tests = new (string Name, Action Run)[]
     ("root missing assignment due date defaults to work due date", DefaultsRootDueDateToWorkDueDate),
     ("child missing assignment due date defaults to parent assignment due date", DefaultsChildDueDateToParentDueDate),
     ("periodic assignment date range caps occurrence validation", ValidatesPeriodicAssignmentDateRange),
+    ("materialize job backfills elapsed monthly periods before rolling future", MaterializeJobBackfillsElapsedMonthlyPeriodsBeforeRollingFuture),
+    ("materialize job limits multi-day monthly schedules to exact occurrences", MaterializeJobLimitsMonthlyMultiDayScheduleToExactOccurrences),
+    ("materialize job backfills daily periods before rolling future", MaterializeJobBackfillsDailyPeriodsBeforeRollingFuture),
+    ("materialize job backfills quarterly periods before rolling future", MaterializeJobBackfillsQuarterlyPeriodsBeforeRollingFuture),
+    ("materialize job backfills semiannual periods before rolling future", MaterializeJobBackfillsSemiAnnualPeriodsBeforeRollingFuture),
+    ("materialize job keeps separate due occurrences inside long periods", MaterializeJobKeepsSeparateDueOccurrencesInsideLongPeriods),
+    ("backfill period policy uses due occurrence before assignment creation", BackfillPeriodPolicyUsesDueOccurrenceBeforeAssignmentCreation),
     ("assignment completion blocks open materialized report periods", BlocksCompletionWithOpenMaterializedReportPeriod),
     ("assignment completion blocks future expected report periods", BlocksCompletionWithFutureExpectedReportPeriods),
     ("assignment completion allows approved periods with no future expected periods", AllowsCompletionWhenReportsAreTerminalAndNoFutureExpected),
     ("historical data approval uses completed date for due status", ResolvesHistoricalDataApprovalFromCompletedDate),
     ("historical data submission uses completed date for due status", ResolvesHistoricalSubmittedStatusFromCompletedDate),
-    ("historical user-created period is data-only for progress", TreatsHistoricalUserCreatedPeriodAsDataOnly),
-    ("user-created report period key uses ad-hoc namespace", NormalizesUserCreatedPeriodKeyAsAdHoc),
-    ("user-created report requires effective due", RequiresUserCreatedReportDue),
-    ("user-created report due cannot exceed assignment hard due", RejectsUserCreatedReportDueAfterAssignmentHardDue),
     ("historical report source window matches aggregate period filters", MatchesHistoricalReportSourceWindowForAggregation),
     ("generated unit manager can create root work", AllowsGeneratedUnitManagerWorkCreate),
     ("generated level manager can create root work", AllowsGeneratedLevelManagerWorkCreate),
@@ -84,6 +90,11 @@ var tests = new (string Name, Action Run)[]
     ("dynamic form table target labels use dynamic excel default type", ValidatesDynamicFormTableTargetDefaultDataType),
     ("dynamic form metric label targets validate range type and uniqueness", ValidatesDynamicFormMetricLabelTargets),
     ("dynamic excel numeric grid validates spec metadata", ValidatesDynamicExcelNumericGridSpecMetadata),
+    ("values1D compression round-trips null runs", CompressesValues1DNullRuns),
+    ("basic summary allows numeric methods only", BasicSummaryAllowsNumericMethodsOnly),
+    ("basic summary merges period snapshots by numeric method", BasicSummaryMergesPeriodSnapshotsByNumericMethod),
+    ("basic summary compact snapshot round-trips", BasicSummaryCompactSnapshotRoundTrips),
+    ("basic summary respects compressed table null runs", BasicSummaryRespectsCompressedTableNullRuns),
     ("legacy work basis file resolves as work document", ResolvesLegacyWorkBasisFileAsWorkDocument),
     ("assignment file resolves as assignment branch document", ResolvesAssignmentFileAsBranchDocument),
     ("assignment document path resolves ancestors only", ResolvesAssignmentDocumentAncestorsFromPath),
@@ -593,6 +604,426 @@ static void ValidatesPeriodicAssignmentDateRange()
     AssertEqual(new DateTime(2026, 5, 1), normalized.Schedule?.StartDate, "schedule start should default from assignment start date");
 }
 
+static void MaterializeJobBackfillsElapsedMonthlyPeriodsBeforeRollingFuture()
+{
+    var now = new DateTime(2026, 6, 18);
+    var work = WorkWithDateRange(
+        new DateTime(2026, 1, 1),
+        new DateTime(2026, 12, 31));
+    var assignment = new WorkAssignment
+    {
+        Id = ObjectId(70),
+        WorkId = work.Id,
+        AssignmentType = WorkAssignmentTypes.PeriodicReport,
+        StartDate = new DateTime(2026, 1, 1),
+        DueDate = new DateTime(2026, 12, 31),
+        Schedule = new AssignmentSchedule
+        {
+            CycleType = ReportCycleTypes.Monthly,
+            StartDate = new DateTime(2026, 1, 1),
+            MonthDays = new List<int> { 17 },
+            QuarterDays = Array.Empty<int>(),
+            SemiAnnualDays = Array.Empty<int>()
+        },
+        IsActive = true
+    };
+
+    var items = WorkAssignmentMaterializeJobService.BuildDueItemsForMaterialize(
+        assignment,
+        work,
+        parent: null,
+        nowUtc: now,
+        rollingWindowCount: 3);
+
+    AssertSequenceEqual(
+        new[]
+        {
+            "20260117",
+            "20260217",
+            "20260317",
+            "20260417",
+            "20260517",
+            "20260617",
+            "20260717",
+            "20260817",
+            "20260917"
+        },
+        items.Select(x => x.PeriodKey).ToList(),
+        "materialize job should process elapsed periods from assignment start before rolling future occurrences");
+}
+
+static void MaterializeJobLimitsMonthlyMultiDayScheduleToExactOccurrences()
+{
+    var now = new DateTime(2026, 6, 18);
+    var work = WorkWithDateRange(
+        new DateTime(2026, 1, 1),
+        new DateTime(2026, 12, 31));
+    var assignment = new WorkAssignment
+    {
+        Id = ObjectId(71),
+        WorkId = work.Id,
+        AssignmentType = WorkAssignmentTypes.PeriodicReport,
+        StartDate = new DateTime(2026, 6, 18),
+        DueDate = new DateTime(2026, 12, 31),
+        Schedule = new AssignmentSchedule
+        {
+            CycleType = ReportCycleTypes.Monthly,
+            StartDate = new DateTime(2026, 6, 18),
+            MonthDays = new List<int> { 5, 17, 25 },
+            QuarterDays = Array.Empty<int>(),
+            SemiAnnualDays = Array.Empty<int>()
+        },
+        IsActive = true
+    };
+
+    var items = WorkAssignmentMaterializeJobService.BuildDueItemsForMaterialize(
+        assignment,
+        work,
+        parent: null,
+        nowUtc: now,
+        rollingWindowCount: 3);
+
+    AssertSequenceEqual(
+        new[]
+        {
+            "20260625",
+            "20260705",
+            "20260717"
+        },
+        items.Select(x => x.PeriodKey).ToList(),
+        "future rolling count should mean exact due occurrences, not full cycle buckets");
+}
+
+static void MaterializeJobBackfillsDailyPeriodsBeforeRollingFuture()
+{
+    var now = new DateTime(2026, 6, 18);
+    var work = WorkWithDateRange(
+        new DateTime(2026, 6, 15),
+        new DateTime(2026, 6, 22));
+    var assignment = new WorkAssignment
+    {
+        Id = ObjectId(170),
+        WorkId = work.Id,
+        AssignmentType = WorkAssignmentTypes.PeriodicReport,
+        StartDate = new DateTime(2026, 6, 15),
+        DueDate = new DateTime(2026, 6, 22),
+        Schedule = new AssignmentSchedule
+        {
+            CycleType = ReportCycleTypes.Daily,
+            StartDate = new DateTime(2026, 6, 15),
+            QuarterDays = Array.Empty<int>(),
+            SemiAnnualDays = Array.Empty<int>()
+        },
+        IsActive = true
+    };
+
+    var items = WorkAssignmentMaterializeJobService.BuildDueItemsForMaterialize(
+        assignment,
+        work,
+        parent: null,
+        nowUtc: now,
+        rollingWindowCount: 2);
+
+    AssertSequenceEqual(
+        new[]
+        {
+            "20260615",
+            "20260616",
+            "20260617",
+            "20260618",
+            "20260619",
+            "20260620"
+        },
+        items.Select(x => x.PeriodKey).ToList(),
+        "daily materialize should process elapsed days before rolling future days");
+}
+
+static void MaterializeJobBackfillsQuarterlyPeriodsBeforeRollingFuture()
+{
+    var now = new DateTime(2026, 6, 18);
+    var work = WorkWithDateRange(
+        new DateTime(2026, 1, 1),
+        new DateTime(2026, 12, 31));
+    var assignment = new WorkAssignment
+    {
+        Id = ObjectId(171),
+        WorkId = work.Id,
+        AssignmentType = WorkAssignmentTypes.PeriodicReport,
+        StartDate = new DateTime(2026, 1, 1),
+        DueDate = new DateTime(2026, 12, 31),
+        Schedule = new AssignmentSchedule
+        {
+            CycleType = ReportCycleTypes.Quarterly,
+            StartDate = new DateTime(2026, 1, 1),
+            QuarterDays = new[] { 16 },
+            SemiAnnualDays = Array.Empty<int>()
+        },
+        IsActive = true
+    };
+
+    var items = WorkAssignmentMaterializeJobService.BuildDueItemsForMaterialize(
+        assignment,
+        work,
+        parent: null,
+        nowUtc: now,
+        rollingWindowCount: 2);
+
+    AssertSequenceEqual(
+        new[]
+        {
+            "20260116",
+            "20260416",
+            "20260716",
+            "20261016"
+        },
+        items.Select(x => x.PeriodKey).ToList(),
+        "quarterly materialize should backfill elapsed quarters before rolling future quarters");
+}
+
+static void MaterializeJobBackfillsSemiAnnualPeriodsBeforeRollingFuture()
+{
+    var now = new DateTime(2026, 6, 18);
+    var work = WorkWithDateRange(
+        new DateTime(2026, 1, 1),
+        new DateTime(2026, 12, 31));
+    var assignment = new WorkAssignment
+    {
+        Id = ObjectId(172),
+        WorkId = work.Id,
+        AssignmentType = WorkAssignmentTypes.PeriodicReport,
+        StartDate = new DateTime(2026, 1, 1),
+        DueDate = new DateTime(2026, 12, 31),
+        Schedule = new AssignmentSchedule
+        {
+            CycleType = ReportCycleTypes.SemiAnnual,
+            StartDate = new DateTime(2026, 1, 1),
+            QuarterDays = Array.Empty<int>(),
+            SemiAnnualDays = new[] { 167 }
+        },
+        IsActive = true
+    };
+
+    var items = WorkAssignmentMaterializeJobService.BuildDueItemsForMaterialize(
+        assignment,
+        work,
+        parent: null,
+        nowUtc: now,
+        rollingWindowCount: 2);
+
+    AssertSequenceEqual(
+        new[]
+        {
+            "20260616",
+            "20261214"
+        },
+        items.Select(x => x.PeriodKey).ToList(),
+        "semiannual materialize should backfill the elapsed half-year due before future half-year due");
+}
+
+static void MaterializeJobKeepsSeparateDueOccurrencesInsideLongPeriods()
+{
+    var now = new DateTime(2026, 6, 18);
+    var work = WorkWithDateRange(
+        new DateTime(2026, 6, 1),
+        new DateTime(2026, 12, 31));
+
+    var monthlyAssignment = new WorkAssignment
+    {
+        Id = ObjectId(173),
+        WorkId = work.Id,
+        AssignmentType = WorkAssignmentTypes.PeriodicReport,
+        StartDate = new DateTime(2026, 6, 1),
+        DueDate = new DateTime(2026, 12, 31),
+        Schedule = new AssignmentSchedule
+        {
+            CycleType = ReportCycleTypes.Monthly,
+            StartDate = new DateTime(2026, 6, 1),
+            MonthDays = new List<int> { 16, 25 },
+            QuarterDays = Array.Empty<int>(),
+            SemiAnnualDays = Array.Empty<int>()
+        },
+        IsActive = true
+    };
+
+    var monthlyItems = WorkAssignmentMaterializeJobService.BuildDueItemsForMaterialize(
+        monthlyAssignment,
+        work,
+        parent: null,
+        nowUtc: now,
+        rollingWindowCount: 2);
+
+    AssertSequenceEqual(
+        new[] { "20260616", "20260625", "20260716" },
+        monthlyItems.Select(x => x.PeriodKey).ToList(),
+        "monthly multi-day schedule should keep each due occurrence separate inside the same month");
+
+    var quarterlyAssignment = new WorkAssignment
+    {
+        Id = ObjectId(174),
+        WorkId = work.Id,
+        AssignmentType = WorkAssignmentTypes.PeriodicReport,
+        StartDate = new DateTime(2026, 4, 1),
+        DueDate = new DateTime(2026, 12, 31),
+        Schedule = new AssignmentSchedule
+        {
+            CycleType = ReportCycleTypes.Quarterly,
+            StartDate = new DateTime(2026, 4, 1),
+            QuarterDays = new[] { 77, 80 },
+            SemiAnnualDays = Array.Empty<int>()
+        },
+        IsActive = true
+    };
+
+    var quarterlyItems = WorkAssignmentMaterializeJobService.BuildDueItemsForMaterialize(
+        quarterlyAssignment,
+        work,
+        parent: null,
+        nowUtc: now,
+        rollingWindowCount: 2);
+
+    AssertSequenceEqual(
+        new[] { "20260616", "20260619", "20260915" },
+        quarterlyItems.Select(x => x.PeriodKey).ToList(),
+        "quarterly multi-day schedule should keep each due occurrence separate inside the same quarter");
+
+    var semiAnnualAssignment = new WorkAssignment
+    {
+        Id = ObjectId(175),
+        WorkId = work.Id,
+        AssignmentType = WorkAssignmentTypes.PeriodicReport,
+        StartDate = new DateTime(2026, 1, 1),
+        DueDate = new DateTime(2026, 12, 31),
+        Schedule = new AssignmentSchedule
+        {
+            CycleType = ReportCycleTypes.SemiAnnual,
+            StartDate = new DateTime(2026, 1, 1),
+            QuarterDays = Array.Empty<int>(),
+            SemiAnnualDays = new[] { 167, 170 }
+        },
+        IsActive = true
+    };
+
+    var semiAnnualItems = WorkAssignmentMaterializeJobService.BuildDueItemsForMaterialize(
+        semiAnnualAssignment,
+        work,
+        parent: null,
+        nowUtc: now,
+        rollingWindowCount: 2);
+
+    AssertSequenceEqual(
+        new[] { "20260616", "20260619", "20261214" },
+        semiAnnualItems.Select(x => x.PeriodKey).ToList(),
+        "semiannual multi-day schedule should keep each due occurrence separate inside the same half-year");
+}
+
+static void BackfillPeriodPolicyUsesDueOccurrenceBeforeAssignmentCreation()
+{
+    var now = new DateTime(2026, 6, 18, 9, 0, 0);
+    var assignment = new WorkAssignment
+    {
+        CreatedAtUtc = new DateTime(2026, 6, 18, 8, 0, 0),
+        StartDate = new DateTime(2026, 1, 1)
+    };
+
+    var isJanuaryBackfill = WorkAssignmentBackfillPeriodPolicy.TryResolveCompletedDateBounds(
+        assignment,
+        new DateTime(2026, 1, 1),
+        new DateTime(2026, 1, 31),
+        new DateTime(2026, 1, 17),
+        now,
+        out var minDate,
+        out var maxDate);
+
+    AssertTrue(isJanuaryBackfill, "wholly past scheduled windows before assignment creation should be historical backfill");
+    AssertEqual(new DateTime(2026, 1, 1), minDate, "backfill completed date min should start at the source window");
+    AssertEqual(new DateTime(2026, 1, 31), maxDate, "backfill completed date max should stop at the source window");
+
+    var isJuneDueBackfill = WorkAssignmentBackfillPeriodPolicy.TryResolveCompletedDateBounds(
+        assignment,
+        new DateTime(2026, 6, 1),
+        new DateTime(2026, 6, 30),
+        new DateTime(2026, 6, 16),
+        now,
+        out var juneMinDate,
+        out var juneMaxDate);
+
+    AssertTrue(isJuneDueBackfill, "mixed monthly window should be historical backfill when its due occurrence is before assignment creation");
+    AssertEqual(new DateTime(2026, 6, 1), juneMinDate, "backfill completed date min should keep the source window start");
+    AssertEqual(new DateTime(2026, 6, 18), juneMaxDate, "mixed backfill completed date max should stop at assignment creation date");
+
+    AssertFalse(
+        WorkAssignmentBackfillPeriodPolicy.IsBackfillHistoricalPeriod(
+            assignment,
+            new DateTime(2026, 6, 1),
+            new DateTime(2026, 6, 30),
+            new DateTime(2026, 6, 25),
+            now),
+        "monthly occurrence after assignment creation should stay current even when an earlier occurrence in the same month is backfill");
+
+    AssertTrue(
+        WorkAssignmentBackfillPeriodPolicy.IsBackfillHistoricalPeriod(
+            assignment,
+            new DateTime(2026, 4, 1),
+            new DateTime(2026, 6, 30),
+            new DateTime(2026, 4, 16),
+            now),
+        "quarterly window should be backfill when its due occurrence is before assignment creation");
+
+    AssertFalse(
+        WorkAssignmentBackfillPeriodPolicy.IsBackfillHistoricalPeriod(
+            assignment,
+            new DateTime(2026, 4, 1),
+            new DateTime(2026, 6, 30),
+            new DateTime(2026, 6, 19),
+            now),
+        "quarterly occurrence after assignment creation should stay current even when an earlier occurrence in the same quarter is backfill");
+
+    AssertTrue(
+        WorkAssignmentBackfillPeriodPolicy.IsBackfillHistoricalPeriod(
+            assignment,
+            new DateTime(2026, 1, 1),
+            new DateTime(2026, 6, 30),
+            new DateTime(2026, 6, 16),
+            now),
+        "semiannual window should be backfill when its due occurrence is before assignment creation");
+
+    AssertFalse(
+        WorkAssignmentBackfillPeriodPolicy.IsBackfillHistoricalPeriod(
+            assignment,
+            new DateTime(2026, 1, 1),
+            new DateTime(2026, 6, 30),
+            new DateTime(2026, 6, 19),
+            now),
+        "semiannual occurrence after assignment creation should stay current even when an earlier occurrence in the same half-year is backfill");
+
+    AssertTrue(
+        WorkAssignmentBackfillPeriodPolicy.IsBackfillHistoricalPeriod(
+            assignment,
+            new DateTime(2026, 6, 17),
+            new DateTime(2026, 6, 17),
+            new DateTime(2026, 6, 17),
+            now),
+        "daily period before assignment creation should be backfill");
+
+    AssertFalse(
+        WorkAssignmentBackfillPeriodPolicy.IsBackfillHistoricalPeriod(
+            assignment,
+            new DateTime(2026, 6, 18),
+            new DateTime(2026, 6, 18),
+            new DateTime(2026, 6, 18),
+            now),
+        "daily period on assignment creation date should use normal runtime due logic");
+
+    AssertFalse(
+        WorkAssignmentBackfillPeriodPolicy.IsBackfillHistoricalPeriod(
+            assignment,
+            new DateTime(2026, 7, 1),
+            new DateTime(2026, 7, 31),
+            new DateTime(2026, 7, 17),
+            now),
+        "future source window should use normal runtime due logic");
+}
+
 static void BlocksCompletionWithOpenMaterializedReportPeriod()
 {
     var now = new DateTime(2026, 5, 20);
@@ -733,120 +1164,12 @@ static void ResolvesHistoricalSubmittedStatusFromCompletedDate()
     AssertTrue(lateFlag, "historical late flag should turn on when completed date is after due date");
 }
 
-static void TreatsHistoricalUserCreatedPeriodAsDataOnly()
-{
-    var dataOnly = new WorkReportPeriod
-    {
-        PeriodKind = WorkReportPeriodKind.UserCreated,
-        IsHistoricalData = true
-    };
-
-    AssertFalse(
-        WorkAssignmentReportTemporalPolicy.ContributesToProgress(dataOnly),
-        "unlinked historical user-created period should not drive assignment progress");
-
-    var linked = new WorkReportPeriod
-    {
-        PeriodKind = WorkReportPeriodKind.UserCreated,
-        IsHistoricalData = true,
-        LinkedScheduledPeriodId = ObjectId(101)
-    };
-
-    AssertTrue(
-        WorkAssignmentReportTemporalPolicy.ContributesToProgress(linked),
-        "linked historical user-created period can still be treated as progress-contributing");
-}
-
-static void NormalizesUserCreatedPeriodKeyAsAdHoc()
-{
-    var reportDate = new DateTime(2026, 5, 21);
-    var generated = InvokePrivateStatic<string>(
-        typeof(WorkAssignmentReportService),
-        "NormalizeUserCreatedPeriodKey",
-        null,
-        reportDate);
-    var custom = InvokePrivateStatic<string>(
-        typeof(WorkAssignmentReportService),
-        "NormalizeUserCreatedPeriodKey",
-        "manual-1",
-        reportDate);
-    var alreadyAdHoc = InvokePrivateStatic<string>(
-        typeof(WorkAssignmentReportService),
-        "NormalizeUserCreatedPeriodKey",
-        "ADHOC:manual-2",
-        reportDate);
-
-    AssertEqual("ADHOC:20260521", generated, "generated user-created period key should be namespaced");
-    AssertEqual("ADHOC:manual-1", custom, "custom user-created period key should be namespaced");
-    AssertEqual("ADHOC:manual-2", alreadyAdHoc, "existing ad-hoc namespace should be preserved");
-}
-
-static void RequiresUserCreatedReportDue()
-{
-    AssertThrowsFromReflection(
-        AppErrorCode.WORK_ASSIGNMENT_REPORT_DUE_REQUIRED,
-        () => InvokePrivateStatic<object?>(
-            typeof(WorkAssignmentReportService),
-            "EnsureUserCreatedReportHasDueAtUtc",
-            WorkReportPeriodKind.UserCreated,
-            null,
-            new { reportId = ObjectId(201) }));
-
-    InvokePrivateStatic<object?>(
-        typeof(WorkAssignmentReportService),
-        "EnsureUserCreatedReportHasDueAtUtc",
-        WorkReportPeriodKind.UserCreated,
-        new DateTime(2026, 5, 21),
-        new { reportId = ObjectId(202) });
-}
-
-static void RejectsUserCreatedReportDueAfterAssignmentHardDue()
-{
-    var assignmentDueAtUtc = new DateTime(2026, 5, 21, 12, 0, 0, DateTimeKind.Utc);
-    var assignment = new WorkAssignment
-    {
-        DueAtUtc = assignmentDueAtUtc
-    };
-
-    var laterThanAssignmentDue = new DateTime(2026, 5, 30, 23, 59, 0, DateTimeKind.Utc);
-
-    AssertThrowsFromReflection(
-        AppErrorCode.WORK_ASSIGNMENT_REPORT_DUE_AFTER_ASSIGNMENT_DUE,
-        () => InvokePrivateStatic<object?>(
-            typeof(WorkAssignmentReportService),
-            "EnsureUserCreatedReportDueAtOrBeforeAssignmentDueAtUtc",
-            WorkReportPeriodKind.UserCreated,
-            laterThanAssignmentDue,
-            assignment,
-            new { reportId = ObjectId(203) }));
-
-    var preserved = InvokePrivateStatic<DateTime?>(
-        typeof(WorkAssignmentReportService),
-        "ResolveEffectiveReportDueAtUtc",
-        laterThanAssignmentDue,
-        assignment);
-    var stricterReportDue = InvokePrivateStatic<DateTime?>(
-        typeof(WorkAssignmentReportService),
-        "ResolveEffectiveReportDueAtUtc",
-        new DateTime(2026, 5, 20, 23, 59, 0, DateTimeKind.Utc),
-        assignment);
-    var assignmentFallback = InvokePrivateStatic<DateTime?>(
-        typeof(WorkAssignmentReportService),
-        "ResolveEffectiveReportDueAtUtc",
-        null,
-        assignment);
-
-    AssertEqual(laterThanAssignmentDue, preserved, "report due later than assignment due should not be silently capped");
-    AssertEqual(new DateTime(2026, 5, 20, 23, 59, 0, DateTimeKind.Utc), stricterReportDue, "report due earlier than assignment due should be kept");
-    AssertEqual(assignmentDueAtUtc, assignmentFallback, "missing report due should still fall back to assignment due for scheduled periods");
-}
-
 static void MatchesHistoricalReportSourceWindowForAggregation()
 {
     var report = new WorkAssignmentReport
     {
-        PeriodKind = WorkReportPeriodKind.UserCreated,
-        PeriodKey = "USER_CREATED:manual",
+        PeriodKind = WorkReportPeriodKind.Scheduled,
+        PeriodKey = "20260110",
         ReportDate = new DateTime(2026, 1, 10),
         PeriodStart = new DateTime(2026, 1, 5),
         PeriodEnd = new DateTime(2026, 1, 10),
@@ -856,7 +1179,7 @@ static void MatchesHistoricalReportSourceWindowForAggregation()
 
     AssertTrue(
         WorkAssignmentReportTemporalPolicy.MatchesPeriodScope(report, "SINGLE_PERIOD", "20260107", null, null),
-        "single-period aggregate should include a custom-key historical report when the source window overlaps");
+        "single-period aggregate should include a scheduled report when the source window overlaps");
     AssertFalse(
         WorkAssignmentReportTemporalPolicy.MatchesPeriodScope(report, "SINGLE_PERIOD", "20260111", null, null),
         "single-period aggregate should exclude dates outside the source window");
@@ -1760,6 +2083,12 @@ static void ValidatesDynamicExcelNumericGridSpecMetadata()
     AssertTrue(
         DynamicExcelRuntimePolicy.CanRunDirectTableAggregation(891),
         "large 891-cell Dynamic Excel matrix should still support direct table aggregation");
+    AssertTrue(
+        DynamicExcelRuntimePolicy.CanRunDirectTableAggregation(11000),
+        "direct table aggregation should allow the 11000-cell validation limit");
+    AssertFalse(
+        DynamicExcelRuntimePolicy.CanRunDirectTableAggregation(11001),
+        "direct table aggregation should reject tables above the 11000-cell validation limit");
 
     InvokePrivateStatic<object?>(
         serviceType,
@@ -1799,6 +2128,104 @@ static void ValidatesDynamicExcelNumericGridSpecMetadata()
         AssertEqual(3, ranges.Count, "formula/title/blank rectangular ranges should be accepted by runtime policy");
         AssertEqual(8, DynamicExcelRuntimePolicy.CountInputCells(dataRect, ranges), "formula/title/blank ranges should be skipped from input cell count");
     }
+
+    AssertThrowsFromReflection(
+        AppErrorCode.COMMON_VALIDATION_FAILED,
+        () => InvokePrivateStatic<object?>(
+            serviceType,
+            "ValidateDynamicExcelPayloadCore",
+            "Mau special range chong",
+            "FIXED_GRID",
+            workbookJson,
+            """
+            {
+              "kind": "TOP",
+              "topRows": 1,
+              "topCols": 3,
+              "dataRows": 2,
+              "specialRanges": [
+                { "role": "FORMULA", "r0": 1, "c0": 0, "r1": 1, "c1": 1 },
+                { "role": "BLANK", "r0": 1, "c0": 1, "r1": 2, "c1": 1 }
+              ]
+            }
+            """,
+            new DynamicExcelDataRectDto(1, 0, 2, 2),
+            3,
+            2));
+
+    InvokePrivateStatic<object?>(
+        serviceType,
+        "ValidateDynamicExcelPayloadCore",
+        "Mau ma tran phan vung kin",
+        "FIXED_GRID",
+        workbookJson,
+        """
+        {
+          "kind": "MATRIX",
+          "topRows": 1,
+          "topCols": 3,
+          "leftRows": 2,
+          "leftCols": 1,
+          "dataTypeOverrides": [
+            { "scope": "RANGE", "r0": 1, "c0": 1, "r1": 2, "c1": 1, "dataType": "NUMBER" },
+            { "scope": "RANGE", "r0": 1, "c0": 2, "r1": 2, "c1": 2, "dataType": "DATE" },
+            { "scope": "RANGE", "r0": 1, "c0": 3, "r1": 2, "c1": 3, "dataType": "NUMBER" }
+          ]
+        }
+        """,
+        new DynamicExcelDataRectDto(1, 1, 2, 3),
+        3,
+        2);
+
+    AssertThrowsFromReflection(
+        AppErrorCode.COMMON_VALIDATION_FAILED,
+        () => InvokePrivateStatic<object?>(
+            serviceType,
+            "ValidateDynamicExcelPayloadCore",
+            "Mau ma tran vung chong",
+            "FIXED_GRID",
+            workbookJson,
+            """
+            {
+              "kind": "MATRIX",
+              "topRows": 1,
+              "topCols": 2,
+              "leftRows": 2,
+              "leftCols": 1,
+              "dataTypeOverrides": [
+                { "scope": "RANGE", "r0": 1, "c0": 1, "r1": 2, "c1": 1, "dataType": "NUMBER" },
+                { "scope": "RANGE", "r0": 2, "c0": 1, "r1": 2, "c1": 2, "dataType": "DATE" }
+              ]
+            }
+            """,
+            new DynamicExcelDataRectDto(1, 1, 2, 2),
+            2,
+            2));
+
+    AssertThrowsFromReflection(
+        AppErrorCode.COMMON_VALIDATION_FAILED,
+        () => InvokePrivateStatic<object?>(
+            serviceType,
+            "ValidateDynamicExcelPayloadCore",
+            "Mau ma tran thieu vung",
+            "FIXED_GRID",
+            workbookJson,
+            """
+            {
+              "kind": "MATRIX",
+              "topRows": 1,
+              "topCols": 2,
+              "leftRows": 2,
+              "leftCols": 1,
+              "dataTypeOverrides": [
+                { "scope": "RANGE", "r0": 1, "c0": 1, "r1": 1, "c1": 2, "dataType": "NUMBER" },
+                { "scope": "RANGE", "r0": 2, "c0": 1, "r1": 2, "c1": 1, "dataType": "DATE" }
+              ]
+            }
+            """,
+            new DynamicExcelDataRectDto(1, 1, 2, 2),
+            2,
+            2));
 
     AssertThrowsFromReflection(
         AppErrorCode.COMMON_VALIDATION_FAILED,
@@ -2145,6 +2572,272 @@ static void ValidatesDynamicExcelNumericGridSpecMetadata()
                 new DynamicExcelDataRectDto(1, 0, 2, 2),
                 3,
                 2)));
+}
+
+static void CompressesValues1DNullRuns()
+{
+    var options = new JsonSerializerOptions(JsonSerializerDefaults.Web);
+    var smallValues = new List<object?>();
+    smallValues.AddRange(Enumerable.Repeat<object?>(null, Values1DCompression.MinValues1DCompressionLength - 1));
+    var smallJson = Values1DCompression.Serialize(smallValues, options);
+    AssertFalse(
+        smallJson.Contains("\"values1DCompressed\":true", StringComparison.Ordinal),
+        "values1D at or below compression threshold should stay dense");
+
+    var values = new List<object?> { 1, "A" };
+    values.AddRange(Enumerable.Repeat<object?>(null, 300));
+    values.Add(true);
+    values.Add(null);
+    values.Add(3);
+    var denseJson = JsonSerializer.Serialize(values, options);
+
+    var compressedJson = Values1DCompression.Serialize(values, options);
+    AssertTrue(
+        compressedJson.Contains("\"values1DCompressed\":true", StringComparison.Ordinal),
+        "top-level values1D should compress long null runs");
+    AssertEqual(
+        denseJson,
+        JsonSerializer.Serialize(Values1DCompression.DeserializeObjects(compressedJson, options), options),
+        "compressed top-level values1D should round-trip to dense values");
+
+    var tableValuesJson = JsonSerializer.Serialize(new
+    {
+        blocks = new[]
+        {
+            new
+            {
+                blockId = "b1",
+                values1D = values
+            }
+        }
+    }, options);
+    var compressedTableJson = Values1DCompression.CompressTableValuesJson(tableValuesJson, options) ?? "";
+    AssertTrue(
+        compressedTableJson.Contains("\"values1DCompressed\":true", StringComparison.Ordinal),
+        "table block values1D should store compression metadata");
+
+    using var compressedDoc = JsonDocument.Parse(compressedTableJson);
+    var block = compressedDoc.RootElement.GetProperty("blocks")[0];
+    AssertEqual(values.Count, Values1DCompression.ReadBlockValuesLength(block) ?? -1, "compressed block should report original values1D length");
+    using var reader = Values1DCompression.CreateBlockReader(block);
+    AssertTrue(reader is not null && reader.IsCompressed, "compressed block should create an indexed values1D reader");
+    AssertEqual(values.Count, reader!.Length, "indexed reader should expose original values1D length");
+    AssertEqual<decimal?>(1m, reader.ReadDecimal(0), "indexed reader should read value before compressed run");
+    AssertEqual<decimal?>(null, reader.ReadDecimal(2), "indexed reader should return null inside compressed run");
+    AssertEqual<decimal?>(3m, reader.ReadDecimal(values.Count - 1), "indexed reader should read value after compressed run");
+    AssertEqual(
+        denseJson,
+        JsonSerializer.Serialize(Values1DCompression.ReadBlockObjects(block, options), options),
+        "compressed table block values1D should expand to dense values");
+}
+
+static void BasicSummaryAllowsNumericMethodsOnly()
+{
+    var normalize = typeof(WorkAssignmentBasicSummaryService).GetMethod(
+        "NormalizeOperation",
+        BindingFlags.NonPublic | BindingFlags.Static)
+        ?? throw new MissingMethodException(nameof(WorkAssignmentBasicSummaryService), "NormalizeOperation");
+
+    var cases = new (string? Input, string Expected)[]
+    {
+        ("SUM", "SUM"),
+        ("count", "COUNT"),
+        ("average", "MEAN"),
+        ("MIN", "MIN"),
+        ("MAX", "MAX"),
+        ("JOIN", "SUM"),
+        ("MAX_DATE", "SUM"),
+        ("TRUE_COUNT", "SUM"),
+        ("BUCKET_COUNT", "SUM"),
+        (null, "SUM")
+    };
+
+    foreach (var (input, expected) in cases)
+    {
+        var actual = (string)normalize.Invoke(null, new object?[] { input })!;
+        AssertEqual(expected, actual, $"basic summary operation should normalize {input ?? "<null>"}");
+    }
+}
+
+static void BasicSummaryMergesPeriodSnapshotsByNumericMethod()
+{
+    var merge = typeof(WorkAssignmentBasicSummaryService).GetMethod(
+        "MergeNumericSummaryItems",
+        BindingFlags.NonPublic | BindingFlags.Static)
+        ?? throw new MissingMethodException(nameof(WorkAssignmentBasicSummaryService), "MergeNumericSummaryItems");
+
+    var items = new List<WorkAssignmentBasicSummaryItemDto>
+    {
+        new()
+        {
+            TargetKind = "TABLE",
+            TargetKey = "table:block_1:revenue",
+            BlockId = "block_1",
+            MetricKey = "revenue",
+            Label = "Revenue",
+            DataType = "NUMBER",
+            Operation = "MEAN",
+            ValueCount = 2,
+            ReportCount = 2,
+            Sum = 10m,
+            Min = 4m,
+            Max = 6m,
+            Mean = 5m
+        },
+        new()
+        {
+            TargetKind = "TABLE",
+            TargetKey = "table:block_1:revenue",
+            BlockId = "block_1",
+            MetricKey = "revenue",
+            Label = "Revenue",
+            DataType = "NUMBER",
+            Operation = "MEAN",
+            ValueCount = 2,
+            ReportCount = 2,
+            Sum = 20m,
+            Min = 8m,
+            Max = 12m,
+            Mean = 10m
+        }
+    };
+
+    var group = items.GroupBy(x => x.TargetKey, StringComparer.Ordinal).First();
+    var merged = (WorkAssignmentBasicSummaryItemDto)merge.Invoke(null, new object?[] { group })!;
+
+    AssertEqual(4, merged.ValueCount, "merged numeric summary should sum value counts");
+    AssertEqual(4, merged.ReportCount, "merged numeric summary should sum report counts across periods");
+    AssertEqual<decimal?>(30m, merged.Sum, "merged numeric summary should sum period sums");
+    AssertEqual<decimal?>(4m, merged.Min, "merged numeric summary should keep global min");
+    AssertEqual<decimal?>(12m, merged.Max, "merged numeric summary should keep global max");
+    AssertEqual<decimal?>(7.5m, merged.Mean, "merged numeric summary should compute weighted mean from sum/count");
+    AssertEqual(7.5m, (decimal)merged.Value!, "MEAN operation value should be the weighted mean");
+}
+
+static void BasicSummaryCompactSnapshotRoundTrips()
+{
+    var serialize = typeof(WorkAssignmentBasicSummaryService).GetMethod(
+        "SerializeSnapshotJson",
+        BindingFlags.NonPublic | BindingFlags.Static)
+        ?? throw new MissingMethodException(nameof(WorkAssignmentBasicSummaryService), "SerializeSnapshotJson");
+
+    var deserialize = typeof(WorkAssignmentBasicSummaryService).GetMethod(
+        "DeserializeSnapshot",
+        BindingFlags.NonPublic | BindingFlags.Static)
+        ?? throw new MissingMethodException(nameof(WorkAssignmentBasicSummaryService), "DeserializeSnapshot");
+
+    const string blockId = "block_1";
+    var response = new WorkAssignmentBasicSummaryResponse
+    {
+        Tables = new List<WorkAssignmentBasicSummaryItemDto>
+        {
+            new()
+            {
+                TargetKind = "TABLE",
+                TargetKey = $"table:{blockId}:table:{blockId}.row:row_1.column:col_4",
+                BlockId = blockId,
+                TableMode = "FIXED_GRID",
+                MetricKey = $"table:{blockId}.row:row_1.column:col_4",
+                RowKey = "row_1",
+                ColumnKey = "col_4",
+                Index = 3,
+                Label = $"table:{blockId}.row:row_1.column:col_4",
+                DataType = "NUMBER",
+                Operation = "SUM",
+                Value = 10m,
+                ValueCount = 1,
+                ReportCount = 1,
+                Sum = 10m,
+                Min = 10m,
+                Max = 10m,
+                Mean = 10m
+            },
+            new()
+            {
+                TargetKind = "TABLE",
+                TargetKey = $"table:{blockId}:table:{blockId}.row:row_22.column:col_7",
+                BlockId = blockId,
+                TableMode = "FIXED_GRID",
+                MetricKey = $"table:{blockId}.row:row_22.column:col_7",
+                RowKey = "row_22",
+                ColumnKey = "col_7",
+                Index = 300,
+                Label = $"table:{blockId}.row:row_22.column:col_7",
+                DataType = "NUMBER",
+                Operation = "SUM",
+                Value = 20m,
+                ValueCount = 1,
+                ReportCount = 1,
+                Sum = 20m,
+                Min = 20m,
+                Max = 20m,
+                Mean = 20m
+            }
+        },
+        Sources = new List<WorkAssignmentBasicSummarySourceDto>
+        {
+            new() { WorkAssignmentReportId = ObjectId(301), WorkAssignmentId = ObjectId(302), PeriodKey = "20260616" }
+        },
+        Warnings = new List<string> { "ok" }
+    };
+
+    var snapshotJson = (string)serialize.Invoke(null, new object?[] { response })!;
+    AssertFalse(snapshotJson.StartsWith("gzip:", StringComparison.Ordinal), "basic summary snapshot should stay readable JSON, not gzip");
+    AssertTrue(snapshotJson.Contains("\"tb\"", StringComparison.Ordinal), "basic summary snapshot should store compact table blocks");
+    AssertTrue(snapshotJson.Contains("\"values1DCompressed\":true", StringComparison.Ordinal), "sparse table vectors should reuse values1D null-run compression");
+    AssertFalse(snapshotJson.Contains("workAssignmentReportId", StringComparison.Ordinal), "basic summary snapshot should not embed source rows");
+    AssertFalse(snapshotJson.Contains($"table:{blockId}:table:{blockId}.row", StringComparison.Ordinal), "compact table snapshot should not store long target keys per cell");
+
+    var snapshot = new WorkAssignmentBasicSummarySnapshot { SnapshotJson = snapshotJson };
+    var decoded = (WorkAssignmentBasicSummaryResponse)deserialize.Invoke(
+        null,
+        new object?[] { snapshot, new List<WorkAssignment>(), new List<WorkAssignmentReport>() })!;
+
+    AssertEqual(2, decoded.Tables.Count, "compact snapshot should deserialize table cells");
+    AssertEqual(0, decoded.Sources.Count, "compact snapshot sources should hydrate from source reports, not snapshot JSON");
+    AssertEqual($"table:{blockId}:table:{blockId}.row:row_22.column:col_7", decoded.Tables[1].TargetKey, "compact snapshot should rebuild target keys from block/index");
+    AssertEqual(301, decoded.SummaryValues.Tables[0].Values1D.Count, "compact snapshot should rebuild sparse values1D shape");
+    AssertEqual(20m, (decimal)decoded.SummaryValues.Tables[0].Values1D[300]!, "compact snapshot should rebuild summary values");
+}
+
+static void BasicSummaryRespectsCompressedTableNullRuns()
+{
+    var extract = typeof(WorkAssignmentBasicSummaryService).GetMethod(
+        "ExtractTableValues",
+        BindingFlags.NonPublic | BindingFlags.Static)
+        ?? throw new MissingMethodException(nameof(WorkAssignmentBasicSummaryService), "ExtractTableValues");
+
+    var tableValuesJson = """
+        {
+          "blocks": [
+            {
+              "blockId": "block_1",
+              "tableMode": "FIXED_GRID",
+              "w": 4,
+              "h": 3,
+              "statisticsInputCellCount": 12,
+              "values1DCompressed": true,
+              "values1DCompression": "NULL_RUNS",
+              "values1DLength": 12,
+              "values1D": [null, 11, 22, 33, 44],
+              "values1DCompressedIndexes": [0],
+              "values1DCompressedCounts": [8]
+            }
+          ]
+        }
+        """;
+
+    var skipped = new HashSet<string>(StringComparer.Ordinal);
+    var rows = ((System.Collections.IEnumerable)extract.Invoke(null, new object?[] { tableValuesJson, skipped })!)
+        .Cast<object>()
+        .ToList();
+    var indexes = rows
+        .Select(row => GetReflectedProperty<int>(row, "Index"))
+        .OrderBy(x => x)
+        .ToList();
+
+    AssertEqual("8,9,10,11", string.Join(",", indexes), "basic summary should not read raw compressed values for null-run cells");
+    AssertEqual(0, skipped.Count, "compressed null-run fixture should stay below direct aggregate limit");
 }
 
 static void ResolvesLegacyWorkBasisFileAsWorkDocument()

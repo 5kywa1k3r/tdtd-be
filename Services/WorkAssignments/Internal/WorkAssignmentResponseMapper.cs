@@ -50,7 +50,6 @@ internal static class WorkAssignmentResponseMapper
 
             Description = entity.Description,
             IsActive = entity.IsActive,
-            AllowUserCreatedReports = entity.AllowUserCreatedReports,
 
             HasData = hasData,
             TemplateLocked = hasData,

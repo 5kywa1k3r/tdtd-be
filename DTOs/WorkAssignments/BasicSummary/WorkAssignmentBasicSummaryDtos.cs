@@ -5,6 +5,10 @@ public sealed class WorkAssignmentBasicSummaryRequest
     public string ScopeAssignmentId { get; set; } = default!;
     public string? DynamicFormTemplateId { get; set; }
     public List<string>? SelectedUnitIds { get; set; }
+    public string? PeriodScopeMode { get; set; }
+    public string? PeriodKey { get; set; }
+    public string? PeriodKeyFrom { get; set; }
+    public string? PeriodKeyTo { get; set; }
     public WorkAssignmentBasicSummaryDefaultMethodsDto? DefaultMethods { get; set; }
     public List<WorkAssignmentBasicSummaryRuleDto>? Rules { get; set; }
     public WorkAssignmentBasicSummarySourceViewRequestDto? SourceView { get; set; }
@@ -78,6 +82,10 @@ public sealed class WorkAssignmentBasicSummaryMetaDto
     public string? DynamicFormTemplateCode { get; set; }
     public string? DynamicFormTemplateName { get; set; }
     public List<string> SelectedUnitIds { get; set; } = new();
+    public string PeriodScopeMode { get; set; } = "ALL_PERIODS";
+    public string? PeriodKey { get; set; }
+    public string? PeriodKeyFrom { get; set; }
+    public string? PeriodKeyTo { get; set; }
     public int SourceAssignmentCount { get; set; }
     public int SourceReportCount { get; set; }
     public bool FromSnapshot { get; set; }

@@ -84,9 +84,6 @@ public sealed class WorkTemplateAssignee : BaseEntity
     [BsonElement("completedDate")]
     public DateTime? CompletedDate { get; set; }
 
-    [BsonElement("allowUserCreatedReports")]
-    public bool AllowUserCreatedReports { get; set; } = true;
-
     [BsonElement("isActive")]
     public bool IsActive { get; set; } = true;
 }

@@ -157,9 +157,6 @@ public sealed class AssignmentListDocRole : DocRoleReadModelBase
     [BsonElement("isActive")]
     public bool IsActive { get; set; }
 
-    [BsonElement("allowUserCreatedReports")]
-    public bool AllowUserCreatedReports { get; set; } = true;
-
     [BsonElement("startDate")]
     public DateTime? StartDate { get; set; }
 
@@ -381,10 +378,6 @@ public sealed class MyReportPeriodListDocRole : DocRoleReadModelBase
     [BsonElement("reportDate")]
     public DateTime? ReportDate { get; set; }
 
-    [BsonElement("linkedScheduledPeriodId")]
-    [BsonRepresentation(BsonType.ObjectId)]
-    public string? LinkedScheduledPeriodId { get; set; }
-
     [BsonElement("startedDate")]
     public DateTime? StartedDate { get; set; }
 
@@ -553,10 +546,6 @@ public sealed class ReviewReportListDocRole : DocRoleReadModelBase
 
     [BsonElement("reportDate")]
     public DateTime? ReportDate { get; set; }
-
-    [BsonElement("linkedScheduledPeriodId")]
-    [BsonRepresentation(BsonType.ObjectId)]
-    public string? LinkedScheduledPeriodId { get; set; }
 
     [BsonElement("startedDate")]
     public DateTime? StartedDate { get; set; }

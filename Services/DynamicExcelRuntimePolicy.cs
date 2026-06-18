@@ -5,7 +5,7 @@ namespace tdtd_be.Services;
 public static class DynamicExcelRuntimePolicy
 {
     public const int MaxBackgroundTableStatisticInputCells = 250;
-    public const int MaxDirectTableAggregateInputCells = 10000;
+    public const int MaxDirectTableAggregateInputCells = 11000;
     public const int MaxTableStatisticInputCells = MaxBackgroundTableStatisticInputCells;
 
     public static bool ShouldDisableBackgroundTableStatistics(int inputCellCount)
@@ -33,19 +33,50 @@ public static class DynamicExcelRuntimePolicy
         if (dataRect.R1 < dataRect.R0 || dataRect.C1 < dataRect.C0)
             return 0;
 
-        var count = 0;
-        for (var r = dataRect.R0; r <= dataRect.R1; r++)
-        {
-            for (var c = dataRect.C0; c <= dataRect.C1; c++)
-            {
-                if (specialRanges?.Any(range => Contains(range, r, c)) == true)
-                    continue;
+        var width = dataRect.C1 - dataRect.C0 + 1;
+        var height = dataRect.R1 - dataRect.R0 + 1;
+        return width * height - CountMaskedSpecialCells(dataRect, specialRanges);
+    }
 
-                count++;
+    private static int CountMaskedSpecialCells(
+        DynamicExcelRuntimeRect dataRect,
+        IReadOnlyCollection<DynamicExcelRuntimeRect>? specialRanges)
+    {
+        if (specialRanges is null || specialRanges.Count == 0)
+            return 0;
+
+        var width = dataRect.C1 - dataRect.C0 + 1;
+        var height = dataRect.R1 - dataRect.R0 + 1;
+        if (width <= 0 || height <= 0)
+            return 0;
+
+        var flags = new bool[width * height];
+        var masked = 0;
+        foreach (var range in specialRanges)
+        {
+            var r0 = Math.Max(dataRect.R0, range.R0);
+            var c0 = Math.Max(dataRect.C0, range.C0);
+            var r1 = Math.Min(dataRect.R1, range.R1);
+            var c1 = Math.Min(dataRect.C1, range.C1);
+            if (r1 < r0 || c1 < c0)
+                continue;
+
+            for (var r = r0; r <= r1; r++)
+            {
+                var offset = (r - dataRect.R0) * width + (c0 - dataRect.C0);
+                for (var c = c0; c <= c1; c++)
+                {
+                    if (!flags[offset])
+                    {
+                        flags[offset] = true;
+                        masked++;
+                    }
+                    offset++;
+                }
             }
         }
 
-        return count;
+        return masked;
     }
 
     public static IReadOnlyList<DynamicExcelRuntimeRect> ReadSpecialRanges(
@@ -81,13 +112,16 @@ public static class DynamicExcelRuntimePolicy
                 continue;
             if (!Contains(dataRect, range))
                 continue;
-            if (ranges.Any(existing => Overlaps(existing, range)))
-                continue;
 
             ranges.Add(range);
         }
 
-        return ranges;
+        return ranges
+            .OrderBy(range => range.R0)
+            .ThenBy(range => range.C0)
+            .ThenBy(range => range.R1)
+            .ThenBy(range => range.C1)
+            .ToList();
     }
 
     public static bool Contains(DynamicExcelRuntimeRect rect, int r, int c)

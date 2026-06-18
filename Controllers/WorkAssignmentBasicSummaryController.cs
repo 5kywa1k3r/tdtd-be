@@ -42,13 +42,23 @@ public sealed class WorkAssignmentBasicSummaryController : ControllerBase
         return Ok(result);
     }
 
+    [HttpPost("summary")]
+    public async Task<IActionResult> Summary(
+        [FromBody] WorkAssignmentBasicSummaryRequest req,
+        CancellationToken ct)
+    {
+        var actorUserId = GetActorUserId();
+        var result = await _service.GetSummaryAsync(req, actorUserId, ct);
+        return Ok(result);
+    }
+
     [HttpPost("once")]
     public async Task<IActionResult> Once(
         [FromBody] WorkAssignmentBasicSummaryRequest req,
         CancellationToken ct)
     {
         var actorUserId = GetActorUserId();
-        var result = await _service.GetOnceSummaryAsync(req, actorUserId, ct);
+        var result = await _service.GetSummaryAsync(req, actorUserId, ct);
         return Ok(result);
     }
 

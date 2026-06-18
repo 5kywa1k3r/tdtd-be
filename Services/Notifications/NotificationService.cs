@@ -332,7 +332,7 @@ public sealed class NotificationService : INotificationService
             ActionState = UserNotificationActionStates.Open,
             SourceEntityType = "WORK_ASSIGNMENT",
             SourceEntityId = assignment.Id,
-            ActionUrl = BuildWorkDetailUrl(assignment.WorkId, assignment.WorkType, "ASSIGN"),
+            ActionUrl = BuildWorkDetailUrl(assignment.WorkId, assignment.WorkType),
             ActorUserId = actorUserId,
             TargetUserId = userId,
             DueAtUtc = assignment.DueAtUtc,
@@ -517,7 +517,7 @@ public sealed class NotificationService : INotificationService
         return assignment.Code ?? assignment.Id;
     }
 
-    private static string? BuildWorkDetailUrl(string? workId, string? workType, string tab)
+    private static string? BuildWorkDetailUrl(string? workId, string? workType, string? tab = null)
     {
         if (string.IsNullOrWhiteSpace(workId))
             return null;
@@ -525,6 +525,9 @@ public sealed class NotificationService : INotificationService
         var prefix = string.Equals(workType, "INDICATOR", StringComparison.OrdinalIgnoreCase)
             ? "/indicators"
             : "/tasks";
+
+        if (string.IsNullOrWhiteSpace(tab))
+            return $"{prefix}/{workId}";
 
         return string.Equals(tab, "ACTIONS", StringComparison.OrdinalIgnoreCase)
             ? $"{prefix}/{workId}?tab=ASSIGN&section=ACTIONS"

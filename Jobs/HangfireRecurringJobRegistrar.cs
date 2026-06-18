@@ -67,13 +67,13 @@ public static class HangfireRecurringJobRegistrar
 
         var materializeCron = cfg["WorkAssignmentMaterialize:Cron"] ?? "*/1 * * * *";
         var materializeMaxJobs = Math.Clamp(
-            cfg.GetValue<int?>("WorkAssignmentMaterialize:MaxJobsPerRun") ?? 5,
-            1,
-            50);
-        var materializeBatchSize = Math.Clamp(
-            cfg.GetValue<int?>("WorkAssignmentMaterialize:BatchSize") ?? 20,
+            cfg.GetValue<int?>("WorkAssignmentMaterialize:MaxJobsPerRun") ?? 50,
             1,
             200);
+        var materializeBatchSize = Math.Clamp(
+            cfg.GetValue<int?>("WorkAssignmentMaterialize:BatchSize") ?? 500,
+            1,
+            1000);
 
         RecurringJob.AddOrUpdate<NonOverlappingRecurringJobRunner>(
             WorkAssignmentMaterializeJobId,

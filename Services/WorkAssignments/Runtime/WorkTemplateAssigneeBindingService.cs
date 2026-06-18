@@ -77,7 +77,6 @@ public sealed class WorkTemplateAssigneeBindingService : IWorkTemplateAssigneeBi
                 .Set(x => x.StartDate, assignment.StartDate)
                 .Set(x => x.DueDate, assignment.DueDate)
                 .Set(x => x.CompletedDate, assignment.CompletedDate)
-                .Set(x => x.AllowUserCreatedReports, true)
                 .Set(x => x.IsActive, assignment.IsActive)
                 .Set(x => x.IsDeleted, false)
                 .Set(x => x.UpdatedAtUtc, now)

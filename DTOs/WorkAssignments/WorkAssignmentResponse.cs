@@ -33,7 +33,6 @@ public class WorkAssignmentResponse
 
     public string? Description { get; set; }
     public bool IsActive { get; set; }
-    public bool AllowUserCreatedReports { get; set; }
 
     public bool HasData { get; set; }
     public bool TemplateLocked { get; set; }

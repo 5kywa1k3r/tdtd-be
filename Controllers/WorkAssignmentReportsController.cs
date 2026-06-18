@@ -55,14 +55,6 @@ public sealed class WorkAssignmentReportsController : ControllerBase
         return Ok(rs);
     }
 
-    [HttpPost("work-assignments/{workAssignmentId}/reports/user-created")]
-    public async Task<IActionResult> CreateUserCreatedReport([FromRoute] string workAssignmentId, [FromBody] CreateUserCreatedReportRequest req, CancellationToken ct)
-    {
-        var actorUserId = GetActorUserId();
-        var rs = await _service.CreateUserCreatedReportAsync(workAssignmentId, req, actorUserId, ct);
-        return Ok(rs);
-    }
-
     [HttpGet("work-assignments/{workAssignmentId}/reports")]
     public async Task<IActionResult> GetByAssignment([FromRoute] string workAssignmentId, CancellationToken ct)
     {
@@ -87,11 +79,30 @@ public sealed class WorkAssignmentReportsController : ControllerBase
         return Ok(rs);
     }
 
+    [HttpGet("work-assignment-reports/{id}/template-workbook/{dynamicExcelTemplateId}")]
+    public async Task<IActionResult> GetTemplateWorkbook(
+        [FromRoute] string id,
+        [FromRoute] string dynamicExcelTemplateId,
+        CancellationToken ct)
+    {
+        var actorUserId = GetActorUserId();
+        var rs = await _service.GetReportTemplateWorkbookAsync(id, dynamicExcelTemplateId, actorUserId, ct);
+        return Ok(rs);
+    }
+
     [HttpPut("work-assignment-reports/{id}/draft")]
     public async Task<IActionResult> SaveDraft([FromRoute] string id, [FromBody] SaveWorkAssignmentReportDraftRequest req, CancellationToken ct)
     {
         var actorUserId = GetActorUserId();
         var rs = await _service.SaveDraftAsync(id, req, actorUserId, ct);
+        return Ok(rs);
+    }
+
+    [HttpPatch("work-assignment-reports/{id}/draft/patch")]
+    public async Task<IActionResult> SaveDraftPatch([FromRoute] string id, [FromBody] SaveWorkAssignmentReportDraftPatchRequest req, CancellationToken ct)
+    {
+        var actorUserId = GetActorUserId();
+        var rs = await _service.SaveDraftPatchAsync(id, req, actorUserId, ct);
         return Ok(rs);
     }
 
@@ -125,14 +136,6 @@ public sealed class WorkAssignmentReportsController : ControllerBase
         var actorUserId = GetActorUserId();
         var rs = await _service.WithdrawSubmittedAsync(id, req, actorUserId, ct);
         return Ok(rs);
-    }
-
-    [HttpDelete("work-assignment-reports/{id}/user-created")]
-    public async Task<IActionResult> DeleteUserCreatedReport([FromRoute] string id, CancellationToken ct)
-    {
-        var actorUserId = GetActorUserId();
-        await _service.DeleteUserCreatedReportAsync(id, actorUserId, ct);
-        return NoContent();
     }
 
     [HttpGet("work-assignment-reports/{id}/logs")]

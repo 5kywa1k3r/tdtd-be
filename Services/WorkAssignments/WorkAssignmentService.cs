@@ -446,7 +446,6 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
 
             Description = normalizedReq.Description,
             IsActive = willBeActive,
-            AllowUserCreatedReports = true,
 
             ProgressStatus = 0,
             ProgressStatusUpdatedAtUtc = null,
@@ -1664,7 +1663,6 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
 
             Description = detail.Description,
             IsActive = detail.IsActive,
-            AllowUserCreatedReports = detail.AllowUserCreatedReports,
 
             ProgressStatus = entity.ProgressStatus,
             ProgressStatusUpdatedAtUtc = entity.ProgressStatusUpdatedAtUtc,
@@ -1733,7 +1731,6 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
 
             Description = entity.Description,
             IsActive = entity.IsActive,
-            AllowUserCreatedReports = entity.AllowUserCreatedReports,
 
             ProgressStatus = entity.ProgressStatus,
             ProgressStatusUpdatedAtUtc = entity.ProgressStatusUpdatedAtUtc,

@@ -76,10 +76,6 @@ public sealed class WorkReportPeriod : BaseEntity
     [BsonElement("reportDate")]
     public DateTime? ReportDate { get; set; }
 
-    [BsonElement("linkedScheduledPeriodId")]
-    [BsonRepresentation(BsonType.ObjectId)]
-    public string? LinkedScheduledPeriodId { get; set; }
-
     [BsonElement("startedDate")]
     public DateTime? StartedDate { get; set; }
 

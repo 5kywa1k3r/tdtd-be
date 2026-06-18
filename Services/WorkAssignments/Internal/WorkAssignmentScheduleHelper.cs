@@ -90,8 +90,7 @@ internal static class WorkAssignmentScheduleHelper
                 ? null
                 : req.Description.Trim(),
 
-            IsActive = req.IsActive,
-            AllowUserCreatedReports = req.AllowUserCreatedReports
+            IsActive = req.IsActive
         };
     }
 
@@ -142,8 +141,7 @@ internal static class WorkAssignmentScheduleHelper
             DynamicFormDataSourceRulesJson = req.DynamicFormDataSourceRulesJson,
             AutoApproveConditionJson = req.AutoApproveConditionJson,
             Description = req.Description,
-            IsActive = req.IsActive,
-            AllowUserCreatedReports = req.AllowUserCreatedReports
+            IsActive = req.IsActive
         };
     }
 

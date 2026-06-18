@@ -2,6 +2,8 @@ using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
+using System.Text.Json.Serialization;
 using MongoDB.Bson;
 using MongoDB.Driver;
 using tdtd_be.Common.Errors;
@@ -20,12 +22,19 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
     private const int DefaultMaxTextChars = 12000;
     private const int MaxTextCharsLimit = 100000;
     private const int MaxSourcePageSize = 200;
+    private const int MaxSourceReportsPerSummary = 1000;
+    private const int SnapshotPayloadVersion = 8;
     private const string ScopeMode = "DIRECT_CHILDREN_OR_SELF";
-    private const string FeatureVersion = "basic-summary-once-v5";
+    private const string FeatureVersion = "basic-summary-v8";
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
         PropertyNameCaseInsensitive = true
+    };
+
+    private static readonly JsonSerializerOptions SnapshotJsonOptions = new(JsonOptions)
+    {
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
     };
 
     private readonly MongoDbContext _ctx;
@@ -128,7 +137,7 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
         return MapConfig(entity);
     }
 
-    public async Task<WorkAssignmentBasicSummaryResponse> GetOnceSummaryAsync(
+    public async Task<WorkAssignmentBasicSummaryResponse> GetSummaryAsync(
         WorkAssignmentBasicSummaryRequest req,
         string actorUserId,
         CancellationToken ct)
@@ -145,18 +154,7 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
                 new { normalized.ScopeAssignmentId, actorUserId });
         }
 
-        if (!string.Equals(scope.AssignmentType, WorkAssignmentTypes.Once, StringComparison.OrdinalIgnoreCase))
-        {
-            throw AppExceptionFactory.BadRequest(
-                AppErrorCode.WORK_ASSIGNMENT_TYPE_UNSUPPORTED,
-                new
-                {
-                    scopeAssignmentId = scope.Id,
-                    scope.AssignmentType,
-                    supportedAssignmentType = WorkAssignmentTypes.Once,
-                    reason = "BASIC_SUMMARY_ONCE_ONLY"
-                });
-        }
+        ValidateSummaryScope(scope, normalized);
 
         var dynamicFormTemplateId = normalized.DynamicFormTemplateId ?? scope.DynamicFormTemplateId;
         if (string.IsNullOrWhiteSpace(dynamicFormTemplateId))
@@ -176,12 +174,50 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
             normalized.SelectedUnitIds,
             ct);
 
+        if (IsPeriodicAssignment(scope) && normalized.PeriodScopeMode == "PERIOD_RANGE")
+        {
+            var rangeResponse = await GetPeriodicRangeSummaryAsync(
+                scope,
+                template,
+                normalized,
+                sourceAssignments,
+                actorUserId,
+                ct);
+
+            ApplySourceView(rangeResponse, normalized.SourceView, normalized.IncludeSourceRows);
+            return rangeResponse;
+        }
+
         var sourceReports = await LoadSourceReportsAsync(
             sourceAssignments.Select(x => x.Id).ToList(),
             dynamicFormTemplateId,
+            normalized,
             ct);
 
-        var requestHash = BuildRequestHash(normalized, scope.Id, dynamicFormTemplateId);
+        var response = await GetOrBuildSummarySnapshotAsync(
+            scope,
+            template,
+            normalized,
+            sourceAssignments,
+            sourceReports,
+            actorUserId,
+            ct);
+
+        ApplySourceView(response, normalized.SourceView, normalized.IncludeSourceRows);
+
+        return response;
+    }
+
+    private async Task<WorkAssignmentBasicSummaryResponse> GetOrBuildSummarySnapshotAsync(
+        WorkAssignment scope,
+        DynamicFormTemplate template,
+        NormalizedRequest normalized,
+        List<WorkAssignment> sourceAssignments,
+        List<WorkAssignmentReport> sourceReports,
+        string actorUserId,
+        CancellationToken ct)
+    {
+        var requestHash = BuildRequestHash(normalized, scope.Id, template.Id);
         var sourceSignatureHash = BuildSourceSignatureHash(sourceAssignments, sourceReports);
         var snapshot = await LoadSnapshotAsync(requestHash, ct);
         var snapshotDirty = snapshot is null ||
@@ -199,13 +235,17 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
 
         if (snapshot is not null && !snapshotDirty)
         {
-            var cached = DeserializeSnapshot(snapshot);
+            var cached = DeserializeSnapshot(snapshot, sourceAssignments, sourceReports);
             PrepareMeta(
                 cached,
                 snapshot.Id,
                 scope,
                 template,
                 normalized.SelectedUnitIds,
+                normalized.PeriodScopeMode,
+                normalized.PeriodKey,
+                normalized.PeriodKeyFrom,
+                normalized.PeriodKeyTo,
                 sourceAssignments.Count,
                 sourceReports.Count,
                 fromSnapshot: true,
@@ -213,8 +253,6 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
                 snapshot.SourceSignatureHash,
                 snapshot.SnapshotDirtyAtUtc,
                 snapshot.SnapshotRefreshedAtUtc);
-
-            ApplySourceView(cached, normalized.SourceView, normalized.IncludeSourceRows);
 
             return cached;
         }
@@ -235,7 +273,7 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
             await SaveSnapshotAsync(
                 snapshotId,
                 scope,
-                dynamicFormTemplateId,
+                template.Id,
                 requestHash,
                 normalized,
                 sourceAssignments,
@@ -246,8 +284,6 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
                 snapshot is null,
                 ct);
 
-            ApplySourceView(response, normalized.SourceView, normalized.IncludeSourceRows);
-
             return response;
         }
         catch (Exception ex) when (snapshot is not null)
@@ -256,6 +292,386 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
             throw;
         }
     }
+
+    private async Task<WorkAssignmentBasicSummaryResponse> GetPeriodicRangeSummaryAsync(
+        WorkAssignment scope,
+        DynamicFormTemplate template,
+        NormalizedRequest normalized,
+        List<WorkAssignment> sourceAssignments,
+        string actorUserId,
+        CancellationToken ct)
+    {
+        var sourceAssignmentIds = sourceAssignments.Select(x => x.Id).ToList();
+        var periodKeys = await LoadPeriodKeysAsync(sourceAssignmentIds, template.Id, normalized, ct);
+        if (periodKeys.Count == 0)
+        {
+            var sourceSignatureHash = BuildSourceSignatureHash(sourceAssignments, Array.Empty<WorkAssignmentReport>());
+            var emptyResponse = await BuildSummaryAsync(
+                BuildCompositeSnapshotId(scope.Id, template.Id, normalized, Array.Empty<WorkAssignmentBasicSummaryResponse>()),
+                scope,
+                template,
+                normalized,
+                sourceAssignments,
+                new List<WorkAssignmentReport>(),
+                sourceSignatureHash,
+                ct);
+            emptyResponse.Warnings.Add("No materialized report periods were found in the selected range.");
+            return emptyResponse;
+        }
+
+        var periodResponses = new List<WorkAssignmentBasicSummaryResponse>(periodKeys.Count);
+        foreach (var periodKey in periodKeys)
+        {
+            var periodRequest = normalized with
+            {
+                PeriodScopeMode = "SINGLE_PERIOD",
+                PeriodKey = periodKey,
+                PeriodKeyFrom = null,
+                PeriodKeyTo = null,
+                IncludeSourceRows = true
+            };
+
+            var periodReports = await LoadSourceReportsAsync(
+                sourceAssignmentIds,
+                template.Id,
+                periodRequest,
+                ct);
+
+            var periodResponse = await GetOrBuildSummarySnapshotAsync(
+                scope,
+                template,
+                periodRequest,
+                sourceAssignments,
+                periodReports,
+                actorUserId,
+                ct);
+
+            periodResponses.Add(periodResponse);
+        }
+
+        return MergePeriodicSnapshotSummaries(
+            BuildCompositeSnapshotId(scope.Id, template.Id, normalized, periodResponses),
+            scope,
+            template,
+            normalized,
+            sourceAssignments,
+            periodResponses);
+    }
+
+    private async Task<List<string>> LoadPeriodKeysAsync(
+        List<string> sourceAssignmentIds,
+        string dynamicFormTemplateId,
+        NormalizedRequest req,
+        CancellationToken ct)
+    {
+        if (sourceAssignmentIds.Count == 0)
+            return new List<string>();
+
+        var fb = Builders<WorkReportPeriod>.Filter;
+        var filter = fb.In(x => x.WorkAssignmentId, sourceAssignmentIds)
+                     & fb.Eq(x => x.DynamicFormTemplateId, dynamicFormTemplateId)
+                     & fb.Eq(x => x.PeriodKind, WorkReportPeriodKind.Scheduled)
+                     & fb.Eq(x => x.IsDeleted, false)
+                     & fb.Ne(x => x.IsActive, false);
+
+        filter = AddWorkReportPeriodScopeFilter(
+            filter,
+            req.PeriodScopeMode,
+            req.PeriodKey,
+            req.PeriodKeyFrom,
+            req.PeriodKeyTo);
+
+        var periodKeys = await _ctx.WorkReportPeriods
+            .Find(filter)
+            .Project(x => x.PeriodKey)
+            .ToListAsync(ct);
+
+        if (periodKeys.Count == 0)
+            periodKeys = await LoadReportPeriodKeysAsync(sourceAssignmentIds, dynamicFormTemplateId, req, ct);
+
+        return periodKeys
+            .Select(NormalizeDayKey)
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Select(x => x!)
+            .Distinct(StringComparer.Ordinal)
+            .OrderBy(x => x, StringComparer.Ordinal)
+            .ToList();
+    }
+
+    private async Task<List<string>> LoadReportPeriodKeysAsync(
+        List<string> sourceAssignmentIds,
+        string dynamicFormTemplateId,
+        NormalizedRequest req,
+        CancellationToken ct)
+    {
+        var fb = Builders<WorkAssignmentReport>.Filter;
+        var scheduledFilter = fb.Or(
+            fb.Eq(x => x.PeriodKind, null),
+            fb.Eq(x => x.PeriodKind, WorkReportPeriodKind.Scheduled));
+
+        var filter = fb.In(x => x.WorkAssignmentId, sourceAssignmentIds)
+                     & fb.Eq(x => x.DynamicFormTemplateId, dynamicFormTemplateId)
+                     & scheduledFilter
+                     & fb.Eq(x => x.Status, WorkAssignmentReportStatus.Approved)
+                     & fb.Eq(x => x.IsDeleted, false)
+                     & fb.Eq(x => x.IsCurrent, true)
+                     & fb.Ne(x => x.IsActive, false)
+                     & fb.Ne(x => x.CumulativeContributionMode, WorkReportCumulativeContributionMode.Exclude);
+
+        filter = AddReportPeriodScopeFilter(
+            filter,
+            req.PeriodScopeMode,
+            req.PeriodKey,
+            req.PeriodKeyFrom,
+            req.PeriodKeyTo);
+
+        return await _ctx.WorkAssignmentReports
+            .Find(filter)
+            .Project(x => x.PeriodKey)
+            .ToListAsync(ct);
+    }
+
+    private static FilterDefinition<WorkReportPeriod> AddWorkReportPeriodScopeFilter(
+        FilterDefinition<WorkReportPeriod> filter,
+        string? periodScopeMode,
+        string? periodKey,
+        string? periodKeyFrom,
+        string? periodKeyTo)
+    {
+        var mode = NormalizePeriodScopeMode(periodScopeMode);
+        if (mode == "ALL_PERIODS")
+            return filter;
+
+        var fb = Builders<WorkReportPeriod>.Filter;
+
+        if (mode == "SINGLE_PERIOD")
+        {
+            var key = NormalizeDayKey(periodKey);
+            if (TryParseNormalizedDayKey(key, out var date))
+            {
+                var dayStart = date.Date;
+                var dayEndExclusive = dayStart.AddDays(1);
+                var window = fb.And(
+                    fb.Lt(x => x.PeriodStart, dayEndExclusive),
+                    fb.Gte(x => x.PeriodEnd, dayStart));
+                return filter & fb.Or(window, fb.Eq(x => x.PeriodKey, key));
+            }
+
+            return filter & fb.Eq(x => x.PeriodKey, key);
+        }
+
+        if (mode == "PERIOD_RANGE")
+        {
+            var fromKey = NormalizeDayKey(periodKeyFrom);
+            var toKey = NormalizeDayKey(periodKeyTo);
+            if (TryParseNormalizedDayKey(fromKey, out var from) &&
+                TryParseNormalizedDayKey(toKey, out var to))
+            {
+                if (to < from)
+                    (from, to) = (to, from);
+
+                var fromStart = from.Date;
+                var toEndExclusive = to.Date.AddDays(1);
+                var window = fb.And(
+                    fb.Lt(x => x.PeriodStart, toEndExclusive),
+                    fb.Gte(x => x.PeriodEnd, fromStart));
+                var keyRange = fb.And(
+                    fb.Gte(x => x.PeriodKey, fromKey),
+                    fb.Lte(x => x.PeriodKey, toKey));
+                return filter & fb.Or(window, keyRange);
+            }
+
+            return filter & fb.Gte(x => x.PeriodKey, fromKey) & fb.Lte(x => x.PeriodKey, toKey);
+        }
+
+        return filter;
+    }
+
+    private static WorkAssignmentBasicSummaryResponse MergePeriodicSnapshotSummaries(
+        string snapshotId,
+        WorkAssignment scope,
+        DynamicFormTemplate template,
+        NormalizedRequest req,
+        List<WorkAssignment> sourceAssignments,
+        List<WorkAssignmentBasicSummaryResponse> periodResponses)
+    {
+        var sources = periodResponses
+            .SelectMany(x => x.Sources ?? new List<WorkAssignmentBasicSummarySourceDto>())
+            .ToList();
+
+        var response = new WorkAssignmentBasicSummaryResponse
+        {
+            Fields = periodResponses
+                .SelectMany(x => x.Fields ?? new List<WorkAssignmentBasicSummaryItemDto>())
+                .Where(IsNumericSummaryItem)
+                .GroupBy(x => x.TargetKey, StringComparer.Ordinal)
+                .Select(MergeNumericSummaryItems)
+                .OrderBy(x => x.FieldKey ?? x.TargetKey, StringComparer.Ordinal)
+                .ToList(),
+            Tables = periodResponses
+                .SelectMany(x => x.Tables ?? new List<WorkAssignmentBasicSummaryItemDto>())
+                .Where(IsNumericSummaryItem)
+                .GroupBy(x => x.TargetKey, StringComparer.Ordinal)
+                .Select(MergeNumericSummaryItems)
+                .OrderBy(x => x.BlockId, StringComparer.Ordinal)
+                .ThenBy(x => x.Index ?? int.MaxValue)
+                .ThenBy(x => x.MetricKey, StringComparer.Ordinal)
+                .ToList(),
+            Sources = sources,
+            Warnings = periodResponses
+                .SelectMany(x => x.Warnings ?? new List<string>())
+                .Where(x => !string.IsNullOrWhiteSpace(x))
+                .Distinct(StringComparer.Ordinal)
+                .ToList()
+        };
+
+        response.SummaryValues = BuildSummaryValues(response.Fields, response.Tables);
+
+        PrepareMeta(
+            response,
+            snapshotId,
+            scope,
+            template,
+            req.SelectedUnitIds,
+            req.PeriodScopeMode,
+            req.PeriodKey,
+            req.PeriodKeyFrom,
+            req.PeriodKeyTo,
+            sourceAssignments.Count,
+            sources.Count,
+            fromSnapshot: periodResponses.Count > 0 && periodResponses.All(x => x.Meta.FromSnapshot),
+            snapshotDirty: periodResponses.Any(x => x.Meta.SnapshotDirty),
+            BuildMergedSourceSignatureHash(periodResponses),
+            periodResponses
+                .Select(x => x.Meta.SnapshotDirtyAtUtc)
+                .Where(x => x.HasValue)
+                .OrderBy(x => x)
+                .FirstOrDefault(),
+            periodResponses
+                .Select(x => x.Meta.SnapshotRefreshedAtUtc)
+                .Where(x => x.HasValue)
+                .OrderByDescending(x => x)
+                .FirstOrDefault());
+
+        return response;
+    }
+
+    private static bool IsNumericSummaryItem(WorkAssignmentBasicSummaryItemDto item)
+        => string.Equals(item.DataType, "NUMBER", StringComparison.OrdinalIgnoreCase) &&
+           IsNumericOperation(item.Operation);
+
+    private static WorkAssignmentBasicSummaryItemDto MergeNumericSummaryItems(
+        IGrouping<string, WorkAssignmentBasicSummaryItemDto> group)
+    {
+        var first = group.First();
+        var valueCount = 0;
+        var reportCount = 0;
+        var sum = 0m;
+        decimal? min = null;
+        decimal? max = null;
+
+        foreach (var item in group)
+        {
+            valueCount += item.ValueCount;
+            reportCount += item.ReportCount;
+            if (item.Sum.HasValue)
+                sum += item.Sum.Value;
+            if (item.Min.HasValue)
+                min = min.HasValue ? Math.Min(min.Value, item.Min.Value) : item.Min.Value;
+            if (item.Max.HasValue)
+                max = max.HasValue ? Math.Max(max.Value, item.Max.Value) : item.Max.Value;
+        }
+
+        var mean = valueCount > 0 ? sum / valueCount : (decimal?)null;
+        var operation = NormalizeNumericOperationOrDefault(first.Operation, "SUM");
+
+        return new WorkAssignmentBasicSummaryItemDto
+        {
+            TargetKind = first.TargetKind,
+            TargetKey = first.TargetKey,
+            FieldId = first.FieldId,
+            FieldKey = first.FieldKey,
+            BlockId = first.BlockId,
+            TableMode = first.TableMode,
+            MetricKey = first.MetricKey,
+            RowKey = first.RowKey,
+            ColumnKey = first.ColumnKey,
+            Index = first.Index,
+            Label = first.Label,
+            DataType = "NUMBER",
+            Operation = operation,
+            Value = ResolveNumericValue(operation, valueCount, sum, min, max, mean),
+            ValueCount = valueCount,
+            ReportCount = reportCount,
+            Sum = valueCount > 0 ? sum : null,
+            Min = min,
+            Max = max,
+            Mean = mean
+        };
+    }
+
+    private static object? ResolveNumericValue(
+        string operation,
+        int valueCount,
+        decimal sum,
+        decimal? min,
+        decimal? max,
+        decimal? mean)
+        => operation switch
+        {
+            "SUM" => valueCount > 0 ? sum : null,
+            "MIN" => min,
+            "MAX" => max,
+            "MEAN" => mean,
+            _ => valueCount
+        };
+
+    private static string BuildCompositeSnapshotId(
+        string scopeAssignmentId,
+        string dynamicFormTemplateId,
+        NormalizedRequest req,
+        IEnumerable<WorkAssignmentBasicSummaryResponse> periodResponses)
+    {
+        var hash = Sha256(JsonSerializer.Serialize(new
+        {
+            FeatureVersion,
+            kind = "period-range-composite",
+            scopeAssignmentId,
+            dynamicFormTemplateId,
+            req.PeriodKeyFrom,
+            req.PeriodKeyTo,
+            req.SelectedUnitIds,
+            req.DefaultMethods,
+            req.Rules,
+            periodSnapshots = periodResponses
+                .Select(x => new
+                {
+                    x.Meta.PeriodKey,
+                    x.Meta.SnapshotId,
+                    x.Meta.SourceSignatureHash,
+                    x.Meta.SnapshotRefreshedAtUtc
+                })
+                .OrderBy(x => x.PeriodKey, StringComparer.Ordinal)
+                .ToList()
+        }, JsonOptions));
+
+        return $"range:{hash[..24]}";
+    }
+
+    private static string BuildMergedSourceSignatureHash(IEnumerable<WorkAssignmentBasicSummaryResponse> periodResponses)
+        => Sha256(JsonSerializer.Serialize(
+            periodResponses
+                .Select(x => new
+                {
+                    x.Meta.PeriodKey,
+                    x.Meta.SnapshotId,
+                    x.Meta.SourceSignatureHash,
+                    x.Meta.SourceReportCount,
+                    x.Meta.SnapshotRefreshedAtUtc
+                })
+                .OrderBy(x => x.PeriodKey, StringComparer.Ordinal)
+                .ToList(),
+            JsonOptions));
 
     private async Task<NormalizedRequest> NormalizeRequestAsync(
         WorkAssignmentBasicSummaryRequest req,
@@ -284,6 +700,10 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
             defaultMethods,
             rules,
             sourceView,
+            NormalizePeriodScopeMode(req.PeriodScopeMode),
+            NormalizeDayKey(req.PeriodKey),
+            NormalizeDayKey(req.PeriodKeyFrom),
+            NormalizeDayKey(req.PeriodKeyTo),
             req.ForceRefresh,
             req.IncludeSourceRows,
             Math.Clamp(req.MaxTextChars <= 0 ? DefaultMaxTextChars : req.MaxTextChars, 1000, MaxTextCharsLimit));
@@ -304,10 +724,11 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
         CancellationToken ct)
     {
         var fb = Builders<WorkAssignment>.Filter;
+        var sourceAssignmentTypes = ResolveSourceAssignmentTypes(scope.AssignmentType);
         var filter = fb.Eq(x => x.WorkId, scope.WorkId)
                      & fb.Eq(x => x.ParentAssignmentId, scope.Id)
                      & fb.Eq(x => x.DynamicFormTemplateId, dynamicFormTemplateId)
-                     & fb.Eq(x => x.AssignmentType, WorkAssignmentTypes.Once)
+                     & fb.In(x => x.AssignmentType, sourceAssignmentTypes)
                      & fb.Eq(x => x.IsDeleted, false)
                      & fb.Eq(x => x.IsActive, true);
 
@@ -323,7 +744,7 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
         if (directChildren.Count > 0)
             return directChildren;
 
-        if (IsActiveOnceAssignmentForTemplate(scope, dynamicFormTemplateId) &&
+        if (IsActiveAssignmentForTemplate(scope, dynamicFormTemplateId, sourceAssignmentTypes) &&
             AssignmentMatchesSelectedUnits(scope, selectedUnitIds))
         {
             return new List<WorkAssignment> { scope };
@@ -332,12 +753,13 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
         return directChildren;
     }
 
-    private static bool IsActiveOnceAssignmentForTemplate(
+    private static bool IsActiveAssignmentForTemplate(
         WorkAssignment assignment,
-        string dynamicFormTemplateId)
+        string dynamicFormTemplateId,
+        string[] supportedAssignmentTypes)
         => assignment.IsActive &&
            !assignment.IsDeleted &&
-           string.Equals(assignment.AssignmentType, WorkAssignmentTypes.Once, StringComparison.OrdinalIgnoreCase) &&
+           supportedAssignmentTypes.Contains(assignment.AssignmentType, StringComparer.OrdinalIgnoreCase) &&
            string.Equals(assignment.DynamicFormTemplateId?.Trim(), dynamicFormTemplateId, StringComparison.Ordinal);
 
     private static bool AssignmentMatchesSelectedUnits(
@@ -348,9 +770,18 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
                !string.IsNullOrWhiteSpace(a.UnitId) &&
                selectedUnitIds.Contains(a.UnitId));
 
+    private static string[] ResolveSourceAssignmentTypes(string? scopeAssignmentType)
+        => string.Equals(scopeAssignmentType, WorkAssignmentTypes.PeriodicReport, StringComparison.OrdinalIgnoreCase)
+            ? new[] { WorkAssignmentTypes.PeriodicReport }
+            : new[] { WorkAssignmentTypes.Once };
+
+    private static bool IsPeriodicAssignment(WorkAssignment assignment)
+        => string.Equals(assignment.AssignmentType, WorkAssignmentTypes.PeriodicReport, StringComparison.OrdinalIgnoreCase);
+
     private async Task<List<WorkAssignmentReport>> LoadSourceReportsAsync(
         List<string> sourceAssignmentIds,
         string dynamicFormTemplateId,
+        NormalizedRequest req,
         CancellationToken ct)
     {
         if (sourceAssignmentIds.Count == 0)
@@ -370,12 +801,94 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
                      & fb.Ne(x => x.IsActive, false)
                      & fb.Ne(x => x.CumulativeContributionMode, WorkReportCumulativeContributionMode.Exclude);
 
-        return await _ctx.WorkAssignmentReports
+        filter = AddReportPeriodScopeFilter(
+            filter,
+            req.PeriodScopeMode,
+            req.PeriodKey,
+            req.PeriodKeyFrom,
+            req.PeriodKeyTo);
+
+        var reports = await _ctx.WorkAssignmentReports
             .Find(filter)
             .SortBy(x => x.WorkAssignmentId)
             .ThenBy(x => x.AssigneeUserId)
             .ThenBy(x => x.PeriodKey)
+            .Limit(MaxSourceReportsPerSummary + 1)
             .ToListAsync(ct);
+
+        if (reports.Count > MaxSourceReportsPerSummary)
+        {
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_AGGREGATE_PERIOD_SCOPE_INVALID,
+                new
+                {
+                    req.PeriodScopeMode,
+                    req.PeriodKey,
+                    req.PeriodKeyFrom,
+                    req.PeriodKeyTo,
+                    maxSourceReports = MaxSourceReportsPerSummary,
+                    reason = "BASIC_SUMMARY_SOURCE_REPORT_LIMIT_EXCEEDED"
+                },
+                $"Basic summary source report limit exceeded ({MaxSourceReportsPerSummary}). Please narrow the period window or unit filter.");
+        }
+
+        return reports;
+    }
+
+    private static FilterDefinition<WorkAssignmentReport> AddReportPeriodScopeFilter(
+        FilterDefinition<WorkAssignmentReport> filter,
+        string? periodScopeMode,
+        string? periodKey,
+        string? periodKeyFrom,
+        string? periodKeyTo)
+    {
+        var mode = NormalizePeriodScopeMode(periodScopeMode);
+        if (mode == "ALL_PERIODS")
+            return filter;
+
+        var fb = Builders<WorkAssignmentReport>.Filter;
+
+        if (mode == "SINGLE_PERIOD")
+        {
+            var key = NormalizeDayKey(periodKey);
+            if (TryParseNormalizedDayKey(key, out var date))
+            {
+                var dayStart = date.Date;
+                var dayEndExclusive = dayStart.AddDays(1);
+                var window = fb.And(
+                    fb.Lt(x => x.PeriodStart, dayEndExclusive),
+                    fb.Gte(x => x.PeriodEnd, dayStart));
+                return filter & fb.Or(window, fb.Eq(x => x.PeriodKey, key));
+            }
+
+            return filter & fb.Eq(x => x.PeriodKey, key);
+        }
+
+        if (mode == "PERIOD_RANGE")
+        {
+            var fromKey = NormalizeDayKey(periodKeyFrom);
+            var toKey = NormalizeDayKey(periodKeyTo);
+            if (TryParseNormalizedDayKey(fromKey, out var from) &&
+                TryParseNormalizedDayKey(toKey, out var to))
+            {
+                if (to < from)
+                    (from, to) = (to, from);
+
+                var fromStart = from.Date;
+                var toEndExclusive = to.Date.AddDays(1);
+                var window = fb.And(
+                    fb.Lt(x => x.PeriodStart, toEndExclusive),
+                    fb.Gte(x => x.PeriodEnd, fromStart));
+                var keyRange = fb.And(
+                    fb.Gte(x => x.PeriodKey, fromKey),
+                    fb.Lte(x => x.PeriodKey, toKey));
+                return filter & fb.Or(window, keyRange);
+            }
+
+            return filter & fb.Gte(x => x.PeriodKey, fromKey) & fb.Lte(x => x.PeriodKey, toKey);
+        }
+
+        return filter;
     }
 
     private async Task<WorkAssignmentBasicSummaryResponse> BuildSummaryAsync(
@@ -388,7 +901,9 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
         string sourceSignatureHash,
         CancellationToken ct)
     {
-        var fields = ExtractFieldDefinitions(template.FieldsJson);
+        var fields = ExtractFieldDefinitions(template.FieldsJson)
+            .Where(x => x.FieldType == "number")
+            .ToList();
         var fieldAccumulators = fields
             .Select(field =>
             {
@@ -478,6 +993,10 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
             scope,
             template,
             req.SelectedUnitIds,
+            req.PeriodScopeMode,
+            req.PeriodKey,
+            req.PeriodKeyFrom,
+            req.PeriodKeyTo,
             sourceAssignments.Count,
             sourceReports.Count,
             fromSnapshot: false,
@@ -495,31 +1014,7 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
         string reportId)
     {
         if (value.NumericValue.HasValue)
-        {
             accumulator.AddNumber(value.NumericValue.Value, reportId);
-            return;
-        }
-
-        if (value.BooleanValue.HasValue)
-        {
-            accumulator.AddBoolean(value.BooleanValue.Value, reportId);
-            return;
-        }
-
-        if (value.DateValueUtc.HasValue)
-        {
-            accumulator.AddDate(value.DateValueUtc.Value, reportId);
-            return;
-        }
-
-        if (!string.IsNullOrWhiteSpace(value.BucketKey))
-        {
-            accumulator.AddBucket(value.BucketKey!, value.BucketLabel ?? value.BucketKey!, reportId);
-            return;
-        }
-
-        if (!string.IsNullOrWhiteSpace(value.TextValue))
-            accumulator.AddText(value.TextValue!, reportId);
     }
 
     private static WorkAssignmentBasicSummarySourceDto MapSource(
@@ -561,7 +1056,7 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
     {
         var warnings = new List<string>();
         if (sourceAssignments.Count == 0)
-            warnings.Add("No active ONCE source assignments were found for this dynamic form template.");
+            warnings.Add("No active source assignments were found for this dynamic form template.");
 
         var reportedAssignmentIds = sourceReports
             .Select(x => x.WorkAssignmentId)
@@ -570,9 +1065,6 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
         var missingApproved = sourceAssignments.Count(x => !reportedAssignmentIds.Contains(x.Id));
         if (missingApproved > 0)
             warnings.Add($"{missingApproved} source assignments do not have an approved scheduled report yet.");
-
-        if (!string.Equals(scope.AssignmentType, WorkAssignmentTypes.Once, StringComparison.OrdinalIgnoreCase))
-            warnings.Add("Basic summary is intended for ONCE assignments only.");
 
         return warnings;
     }
@@ -586,9 +1078,60 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
             .ThenByDescending(x => x.UpdatedAtUtc)
             .FirstOrDefaultAsync(ct);
 
-    private static WorkAssignmentBasicSummaryResponse DeserializeSnapshot(WorkAssignmentBasicSummarySnapshot snapshot)
-        => JsonSerializer.Deserialize<WorkAssignmentBasicSummaryResponse>(snapshot.SnapshotJson, JsonOptions)
-           ?? new WorkAssignmentBasicSummaryResponse();
+    private static WorkAssignmentBasicSummaryResponse DeserializeSnapshot(
+        WorkAssignmentBasicSummarySnapshot snapshot,
+        List<WorkAssignment> sourceAssignments,
+        List<WorkAssignmentReport> sourceReports)
+    {
+        var response = DeserializeCompactSnapshot(snapshot.SnapshotJson) ??
+                       DeserializeLegacySnapshot(snapshot.SnapshotJson) ??
+                       new WorkAssignmentBasicSummaryResponse();
+
+        var assignmentById = sourceAssignments.ToDictionary(x => x.Id, StringComparer.Ordinal);
+        response.Sources = sourceReports.Select(report => MapSource(report, assignmentById)).ToList();
+        response.SummaryValues = BuildSummaryValues(response.Fields, response.Tables);
+        response.SourcesPage ??= new WorkAssignmentBasicSummarySourcePageDto();
+        response.Warnings ??= new List<string>();
+        return response;
+    }
+
+    private static WorkAssignmentBasicSummaryResponse? DeserializeLegacySnapshot(string snapshotJson)
+    {
+        try
+        {
+            return JsonSerializer.Deserialize<WorkAssignmentBasicSummaryResponse>(snapshotJson, JsonOptions);
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
+    private static WorkAssignmentBasicSummaryResponse? DeserializeCompactSnapshot(string snapshotJson)
+    {
+        BasicSummarySnapshotPayload? payload;
+        try
+        {
+            payload = JsonSerializer.Deserialize<BasicSummarySnapshotPayload>(snapshotJson, JsonOptions);
+            if (payload is null || payload.Version != SnapshotPayloadVersion)
+                return null;
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+
+        return new WorkAssignmentBasicSummaryResponse
+        {
+            Meta = payload.Meta ?? new WorkAssignmentBasicSummaryMetaDto(),
+            Fields = payload.Fields ?? new List<WorkAssignmentBasicSummaryItemDto>(),
+            Tables = InflateCompactTableBlocks(payload.TableBlocks ?? new List<CompactTableBlockSnapshot>()),
+            Warnings = payload.Warnings ?? new List<string>()
+        };
+    }
+
+    private static string SerializeSnapshotJson(WorkAssignmentBasicSummaryResponse response)
+        => JsonSerializer.Serialize(CreateSnapshotPayload(response), SnapshotJsonOptions);
 
     private async Task SaveSnapshotAsync(
         string snapshotId,
@@ -610,6 +1153,10 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
             FeatureVersion,
             scopeAssignmentId = scope.Id,
             dynamicFormTemplateId,
+            periodScopeMode = req.PeriodScopeMode,
+            periodKey = req.PeriodKey,
+            periodKeyFrom = req.PeriodKeyFrom,
+            periodKeyTo = req.PeriodKeyTo,
             selectedUnitIds = req.SelectedUnitIds,
             defaultMethods = req.DefaultMethods,
             rules = req.Rules,
@@ -628,7 +1175,7 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
             .Set(x => x.SourceAssignmentIds, sourceAssignments.Select(x => x.Id).ToList())
             .Set(x => x.SourceReportIds, sourceReports.Select(x => x.Id).ToList())
             .Set(x => x.SourceSignatureHash, sourceSignatureHash)
-            .Set(x => x.SnapshotJson, JsonSerializer.Serialize(response, JsonOptions))
+            .Set(x => x.SnapshotJson, SerializeSnapshotJson(response))
             .Set(x => x.SnapshotDirty, false)
             .Set(x => x.SnapshotDirtyAtUtc, (DateTime?)null)
             .Set(x => x.SnapshotRefreshedAtUtc, now)
@@ -643,6 +1190,293 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
             new UpdateOptions { IsUpsert = isNew },
             ct);
     }
+
+    private static BasicSummarySnapshotPayload CreateSnapshotPayload(
+        WorkAssignmentBasicSummaryResponse response)
+        => new()
+        {
+            Version = SnapshotPayloadVersion,
+            Meta = response.Meta,
+            Fields = response.Fields.Select(CloneSnapshotItem).ToList(),
+            TableBlocks = BuildCompactTableBlocks(response.Tables),
+            Warnings = response.Warnings
+        };
+
+    private static List<CompactTableBlockSnapshot> BuildCompactTableBlocks(
+        List<WorkAssignmentBasicSummaryItemDto> tables)
+        => tables
+            .Where(x => !string.IsNullOrWhiteSpace(x.BlockId))
+            .GroupBy(x => $"{x.BlockId!}\u001F{(string.IsNullOrWhiteSpace(x.TableMode) ? "FIXED_GRID" : x.TableMode!)}", StringComparer.Ordinal)
+            .Select(group =>
+            {
+                var parts = group.Key.Split('\u001F');
+                return BuildCompactTableBlock(parts[0], parts.Length > 1 ? parts[1] : "FIXED_GRID", group.ToList());
+            })
+            .ToList();
+
+    private static CompactTableBlockSnapshot BuildCompactTableBlock(
+        string blockId,
+        string tableMode,
+        List<WorkAssignmentBasicSummaryItemDto> items)
+    {
+        var indexedItems = items
+            .Where(x => IsNumericSummaryItem(x) && x.Index.HasValue && x.Index.Value >= 0)
+            .ToList();
+        var canVectorize = indexedItems.Count == items.Count &&
+                           indexedItems.Select(x => x.Index!.Value).Distinct().Count() == indexedItems.Count;
+
+        if (!canVectorize || indexedItems.Count == 0)
+        {
+            return new CompactTableBlockSnapshot
+            {
+                BlockId = blockId,
+                TableMode = tableMode,
+                Items = items.Select(CloneSnapshotItem).ToList()
+            };
+        }
+
+        var length = indexedItems.Max(x => x.Index!.Value) + 1;
+        var width = InferTableBlockWidth(blockId, indexedItems);
+        var defaultOperation = indexedItems
+            .Select(x => NormalizeNumericOperationOrDefault(x.Operation, "SUM"))
+            .GroupBy(x => x, StringComparer.Ordinal)
+            .OrderByDescending(x => x.Count())
+            .ThenBy(x => x.Key, StringComparer.Ordinal)
+            .First()
+            .Key;
+
+        var valueCounts = CreateDecimalVector(length);
+        var reportCounts = CreateDecimalVector(length);
+        var sums = CreateDecimalVector(length);
+        var mins = CreateDecimalVector(length);
+        var maxes = CreateDecimalVector(length);
+        var overrides = new List<CompactTableMetricOverride>();
+
+        foreach (var item in indexedItems)
+        {
+            var index = item.Index!.Value;
+            valueCounts[index] = item.ValueCount > 0 ? item.ValueCount : null;
+            reportCounts[index] = item.ReportCount > 0 ? item.ReportCount : null;
+            sums[index] = item.Sum;
+            mins[index] = item.Min;
+            maxes[index] = item.Max;
+
+            var defaults = BuildDefaultTableMetric(blockId, index, width);
+            var operation = NormalizeNumericOperationOrDefault(item.Operation, defaultOperation);
+            var metricDiffers =
+                !string.Equals(item.MetricKey, defaults.MetricKey, StringComparison.Ordinal) ||
+                !string.Equals(item.RowKey, defaults.RowKey, StringComparison.Ordinal) ||
+                !string.Equals(item.ColumnKey, defaults.ColumnKey, StringComparison.Ordinal);
+            var operationDiffers = !string.Equals(operation, defaultOperation, StringComparison.Ordinal);
+            var labelDiffers = !string.IsNullOrWhiteSpace(item.Label) &&
+                               !string.Equals(item.Label, item.MetricKey, StringComparison.Ordinal);
+
+            if (!metricDiffers && !operationDiffers && !labelDiffers)
+                continue;
+
+            overrides.Add(new CompactTableMetricOverride
+            {
+                Index = index,
+                MetricKey = metricDiffers ? item.MetricKey : null,
+                RowKey = metricDiffers ? item.RowKey : null,
+                ColumnKey = metricDiffers ? item.ColumnKey : null,
+                Operation = operationDiffers ? operation : null,
+                Label = labelDiffers ? item.Label : null
+            });
+        }
+
+        return new CompactTableBlockSnapshot
+        {
+            BlockId = blockId,
+            TableMode = tableMode,
+            Width = width,
+            Length = length,
+            Operation = defaultOperation,
+            ValueCounts = SerializeDecimalVector(valueCounts),
+            ReportCounts = SerializeDecimalVector(reportCounts),
+            Sums = SerializeDecimalVector(sums),
+            Mins = SerializeDecimalVector(mins),
+            Maxes = SerializeDecimalVector(maxes),
+            Overrides = overrides.Count == 0 ? null : overrides
+        };
+    }
+
+    private static List<WorkAssignmentBasicSummaryItemDto> InflateCompactTableBlocks(
+        List<CompactTableBlockSnapshot> blocks)
+    {
+        var tables = new List<WorkAssignmentBasicSummaryItemDto>();
+        foreach (var block in blocks)
+        {
+            if (block.Items is { Count: > 0 })
+            {
+                tables.AddRange(block.Items.Select(CloneSnapshotItem));
+                continue;
+            }
+
+            var valueCounts = DeserializeDecimalVector(block.ValueCounts);
+            var reportCounts = DeserializeDecimalVector(block.ReportCounts);
+            var sums = DeserializeDecimalVector(block.Sums);
+            var mins = DeserializeDecimalVector(block.Mins);
+            var maxes = DeserializeDecimalVector(block.Maxes);
+            var length = new[] { block.Length, valueCounts.Count, reportCounts.Count, sums.Count, mins.Count, maxes.Count }.Max();
+            var width = Math.Max(1, block.Width);
+            var defaultOperation = NormalizeNumericOperationOrDefault(block.Operation, "SUM");
+            var overrides = (block.Overrides ?? new List<CompactTableMetricOverride>())
+                .GroupBy(x => x.Index)
+                .ToDictionary(x => x.Key, x => x.First());
+
+            for (var index = 0; index < length; index++)
+            {
+                var valueCount = DecimalVectorIntAt(valueCounts, index);
+                var reportCount = DecimalVectorIntAt(reportCounts, index);
+                var sum = DecimalVectorAt(sums, index);
+                var min = DecimalVectorAt(mins, index);
+                var max = DecimalVectorAt(maxes, index);
+                if (valueCount <= 0 && reportCount <= 0 && !sum.HasValue && !min.HasValue && !max.HasValue)
+                    continue;
+
+                var defaults = BuildDefaultTableMetric(block.BlockId, index, width);
+                overrides.TryGetValue(index, out var metricOverride);
+                var metricKey = NormalizeMetricPart(metricOverride?.MetricKey, defaults.MetricKey);
+                var rowKey = NormalizeMetricPart(metricOverride?.RowKey, defaults.RowKey);
+                var columnKey = NormalizeMetricPart(metricOverride?.ColumnKey, defaults.ColumnKey);
+                var operation = NormalizeNumericOperationOrDefault(metricOverride?.Operation, defaultOperation);
+                var mean = valueCount > 0 && sum.HasValue ? sum.Value / valueCount : (decimal?)null;
+
+                tables.Add(new WorkAssignmentBasicSummaryItemDto
+                {
+                    TargetKind = "TABLE",
+                    TargetKey = $"table:{block.BlockId}:{metricKey}",
+                    BlockId = block.BlockId,
+                    TableMode = string.IsNullOrWhiteSpace(block.TableMode) ? "FIXED_GRID" : block.TableMode,
+                    MetricKey = metricKey,
+                    RowKey = rowKey,
+                    ColumnKey = columnKey,
+                    Index = index,
+                    Label = NormalizeMetricPart(metricOverride?.Label, metricKey),
+                    DataType = "NUMBER",
+                    Operation = operation,
+                    Value = ResolveNumericValue(operation, valueCount, sum ?? 0m, min, max, mean),
+                    ValueCount = Math.Max(0, valueCount),
+                    ReportCount = Math.Max(0, reportCount),
+                    Sum = valueCount > 0 ? sum : null,
+                    Min = min,
+                    Max = max,
+                    Mean = mean
+                });
+            }
+        }
+
+        return tables
+            .OrderBy(x => x.BlockId, StringComparer.Ordinal)
+            .ThenBy(x => x.Index ?? int.MaxValue)
+            .ThenBy(x => x.MetricKey, StringComparer.Ordinal)
+            .ToList();
+    }
+
+    private static List<decimal?> CreateDecimalVector(int length)
+        => Enumerable.Repeat<decimal?>(null, Math.Max(0, length)).ToList();
+
+    private static JsonNode? SerializeDecimalVector(IReadOnlyList<decimal?> values)
+    {
+        if (!values.Any(x => x.HasValue))
+            return null;
+
+        return JsonNode.Parse(Values1DCompression.SerializeDecimals(values, SnapshotJsonOptions));
+    }
+
+    private static List<decimal?> DeserializeDecimalVector(JsonNode? node)
+        => node is null
+            ? new List<decimal?>()
+            : Values1DCompression.DeserializeDecimals(node.ToJsonString(SnapshotJsonOptions), SnapshotJsonOptions);
+
+    private static decimal? DecimalVectorAt(IReadOnlyList<decimal?> values, int index)
+        => index >= 0 && index < values.Count ? values[index] : null;
+
+    private static int DecimalVectorIntAt(IReadOnlyList<decimal?> values, int index)
+        => DecimalVectorAt(values, index) is { } value ? Math.Max(0, decimal.ToInt32(decimal.Truncate(value))) : 0;
+
+    private static int InferTableBlockWidth(
+        string blockId,
+        IReadOnlyList<WorkAssignmentBasicSummaryItemDto> items)
+    {
+        var candidates = new List<int>();
+        var maxColumn = 0;
+        foreach (var item in items)
+        {
+            if (!item.Index.HasValue)
+                continue;
+
+            var rowIndex = ParseOrdinalIndex(item.RowKey ?? string.Empty, "row_");
+            var columnIndex = ParseOrdinalIndex(item.ColumnKey ?? string.Empty, "col_");
+            if (columnIndex.HasValue)
+                maxColumn = Math.Max(maxColumn, columnIndex.Value + 1);
+
+            if (!rowIndex.HasValue || !columnIndex.HasValue || rowIndex.Value <= 0)
+                continue;
+
+            var numerator = item.Index.Value - columnIndex.Value;
+            if (numerator <= 0 || numerator % rowIndex.Value != 0)
+                continue;
+
+            var width = numerator / rowIndex.Value;
+            if (width > columnIndex.Value)
+                candidates.Add(width);
+        }
+
+        if (candidates.Count > 0)
+        {
+            return candidates
+                .GroupBy(x => x)
+                .OrderByDescending(x => x.Count())
+                .ThenBy(x => x.Key)
+                .First()
+                .Key;
+        }
+
+        return Math.Max(1, maxColumn);
+    }
+
+    private static CompactTableMetricParts BuildDefaultTableMetric(string blockId, int index, int width)
+    {
+        var safeWidth = Math.Max(1, width);
+        var rowKey = $"row_{(index / safeWidth) + 1}";
+        var columnKey = $"col_{(index % safeWidth) + 1}";
+        return new CompactTableMetricParts(rowKey, columnKey, BuildMetricKey(blockId, rowKey, columnKey));
+    }
+
+    private static WorkAssignmentBasicSummaryItemDto CloneSnapshotItem(WorkAssignmentBasicSummaryItemDto item)
+        => new()
+        {
+            TargetKind = item.TargetKind,
+            TargetKey = item.TargetKey,
+            FieldId = item.FieldId,
+            FieldKey = item.FieldKey,
+            BlockId = item.BlockId,
+            TableMode = item.TableMode,
+            MetricKey = item.MetricKey,
+            RowKey = item.RowKey,
+            ColumnKey = item.ColumnKey,
+            Index = item.Index,
+            Label = item.Label,
+            DataType = item.DataType,
+            Operation = item.Operation,
+            Value = item.Value,
+            ValueCount = item.ValueCount,
+            ReportCount = item.ReportCount,
+            Sum = item.Sum,
+            Min = item.Min,
+            Max = item.Max,
+            Mean = item.Mean,
+            TrueCount = item.TrueCount == 0 ? null : item.TrueCount,
+            FalseCount = item.FalseCount == 0 ? null : item.FalseCount,
+            MinDateUtc = item.MinDateUtc,
+            MaxDateUtc = item.MaxDateUtc,
+            Text = item.Text,
+            TextCharCount = item.TextCharCount == 0 ? null : item.TextCharCount,
+            TextTruncated = item.TextTruncated,
+            Buckets = item.Buckets is { Count: > 0 } ? item.Buckets : new List<WorkAssignmentBasicSummaryBucketDto>()
+        };
 
     private async Task MarkSnapshotDirtyAsync(string snapshotId, CancellationToken ct)
     {
@@ -672,6 +1506,10 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
         WorkAssignment scope,
         DynamicFormTemplate template,
         List<string> selectedUnitIds,
+        string periodScopeMode,
+        string? periodKey,
+        string? periodKeyFrom,
+        string? periodKeyTo,
         int sourceAssignmentCount,
         int sourceReportCount,
         bool fromSnapshot,
@@ -690,6 +1528,10 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
             DynamicFormTemplateCode = template.Code,
             DynamicFormTemplateName = template.Name,
             SelectedUnitIds = selectedUnitIds,
+            PeriodScopeMode = periodScopeMode,
+            PeriodKey = periodKey,
+            PeriodKeyFrom = periodKeyFrom,
+            PeriodKeyTo = periodKeyTo,
             SourceAssignmentCount = sourceAssignmentCount,
             SourceReportCount = sourceReportCount,
             FromSnapshot = fromSnapshot,
@@ -883,6 +1725,10 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
             scopeAssignmentId,
             dynamicFormTemplateId,
             scopeMode = ScopeMode,
+            periodScopeMode = req.PeriodScopeMode,
+            periodKey = req.PeriodKey,
+            periodKeyFrom = req.PeriodKeyFrom,
+            periodKeyTo = req.PeriodKeyTo,
             selectedUnitIds = req.SelectedUnitIds,
             defaultMethods = req.DefaultMethods,
             rules = req.Rules,
@@ -925,6 +1771,10 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
                     x.PeriodKey,
                     x.PeriodInstanceKey,
                     x.PeriodKind,
+                    x.PeriodStart,
+                    x.PeriodEnd,
+                    x.DynamicFormTemplateId,
+                    x.CumulativeContributionMode,
                     x.PayloadRevision,
                     x.PayloadHash,
                     x.PayloadUpdatedAtUtc,
@@ -960,6 +1810,82 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
             throw AppExceptionFactory.Unauthorized();
     }
 
+    private static void ValidateSummaryScope(WorkAssignment scope, NormalizedRequest req)
+    {
+        if (!WorkAssignmentTypes.All.Contains(scope.AssignmentType, StringComparer.OrdinalIgnoreCase))
+        {
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_TYPE_UNSUPPORTED,
+                new
+                {
+                    scopeAssignmentId = scope.Id,
+                    scope.AssignmentType,
+                    supportedAssignmentTypes = WorkAssignmentTypes.All,
+                    reason = "BASIC_SUMMARY_ASSIGNMENT_TYPE_UNSUPPORTED"
+                });
+        }
+
+        if (req.PeriodScopeMode == "CUMULATIVE_TO_PERIOD")
+        {
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_AGGREGATE_PERIOD_SCOPE_INVALID,
+                new { req.PeriodScopeMode, reason = "BASIC_SUMMARY_CUMULATIVE_DISABLED" },
+                "Basic summary does not support cumulative period scope.");
+        }
+
+        if (req.PeriodScopeMode == "SINGLE_PERIOD")
+        {
+            if (string.IsNullOrWhiteSpace(req.PeriodKey))
+                throw MissingPeriodKey("PeriodKey", req.PeriodScopeMode);
+            return;
+        }
+
+        if (req.PeriodScopeMode == "PERIOD_RANGE")
+        {
+            if (string.IsNullOrWhiteSpace(req.PeriodKeyFrom))
+                throw MissingPeriodKey("PeriodKeyFrom", req.PeriodScopeMode);
+
+            if (string.IsNullOrWhiteSpace(req.PeriodKeyTo))
+                throw MissingPeriodKey("PeriodKeyTo", req.PeriodScopeMode);
+
+            return;
+        }
+
+        if (req.PeriodScopeMode == "ALL_PERIODS")
+        {
+            if (string.Equals(scope.AssignmentType, WorkAssignmentTypes.PeriodicReport, StringComparison.OrdinalIgnoreCase))
+            {
+                throw AppExceptionFactory.BadRequest(
+                    AppErrorCode.WORK_ASSIGNMENT_AGGREGATE_PERIOD_SCOPE_INVALID,
+                    new
+                    {
+                        req.PeriodScopeMode,
+                        scope.AssignmentType,
+                        reason = "BASIC_SUMMARY_PERIODIC_WINDOW_REQUIRED"
+                    },
+                    "Periodic basic summary requires a single period or period range.");
+            }
+
+            return;
+        }
+
+        throw AppExceptionFactory.BadRequest(
+            AppErrorCode.WORK_ASSIGNMENT_AGGREGATE_PERIOD_SCOPE_INVALID,
+            new { req.PeriodScopeMode });
+    }
+
+    private static AppException MissingPeriodKey(string field, string? periodScopeMode)
+    {
+        var code = field switch
+        {
+            "PeriodKeyFrom" => AppErrorCode.WORK_ASSIGNMENT_AGGREGATE_PERIOD_KEY_FROM_REQUIRED,
+            "PeriodKeyTo" => AppErrorCode.WORK_ASSIGNMENT_AGGREGATE_PERIOD_KEY_TO_REQUIRED,
+            _ => AppErrorCode.WORK_ASSIGNMENT_AGGREGATE_PERIOD_KEY_REQUIRED
+        };
+
+        return AppExceptionFactory.BadRequest(code, new { field, periodScopeMode });
+    }
+
     private static List<string> NormalizeStringList(IEnumerable<string>? values)
         => (values ?? Array.Empty<string>())
             .Where(x => !string.IsNullOrWhiteSpace(x))
@@ -967,6 +1893,32 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
             .Distinct(StringComparer.Ordinal)
             .OrderBy(x => x, StringComparer.Ordinal)
             .ToList();
+
+    private static string NormalizePeriodScopeMode(string? value)
+    {
+        var normalized = (value ?? "ALL_PERIODS").Trim().ToUpperInvariant();
+        return normalized == "ALL_APPROVED_IN_SCOPE" ? "ALL_PERIODS" : normalized;
+    }
+
+    private static string? NormalizeDayKey(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return null;
+
+        var digits = new string(value.Where(char.IsDigit).ToArray());
+        if (digits.Length == 8)
+            return digits;
+
+        return value.Trim();
+    }
+
+    private static bool TryParseNormalizedDayKey(string? value, out DateTime date)
+        => DateTime.TryParseExact(
+            NormalizeDayKey(value),
+            "yyyyMMdd",
+            CultureInfo.InvariantCulture,
+            DateTimeStyles.None,
+            out date);
 
     private async Task<string> NormalizeExistingTemplateIdAsync(string? dynamicFormTemplateId, CancellationToken ct)
     {
@@ -1044,12 +1996,15 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
             .ToList();
 
     private static NormalizedDefaultMethods NormalizeDefaultMethods(WorkAssignmentBasicSummaryDefaultMethodsDto? value)
-        => new(
-            Number: NormalizeOperationOrDefault(value?.Number, "SUM"),
-            Date: NormalizeOperationOrDefault(value?.Date, "MAX_DATE"),
-            Boolean: NormalizeOperationOrDefault(value?.Boolean, "TRUE_COUNT"),
-            Text: NormalizeOperationOrDefault(value?.Text, "JOIN"),
-            Selection: NormalizeOperationOrDefault(value?.Selection, "BUCKET_COUNT"));
+    {
+        var number = NormalizeNumericOperationOrDefault(value?.Number, "SUM");
+        return new(
+            Number: number,
+            Date: number,
+            Boolean: number,
+            Text: number,
+            Selection: number);
+    }
 
     private static NormalizedSourceView NormalizeSourceView(WorkAssignmentBasicSummarySourceViewRequestDto? value)
     {
@@ -1068,15 +2023,7 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
         => string.IsNullOrWhiteSpace(value) ? null : value.Trim();
 
     private static string NormalizeOperationOrDefault(string? value, string fallback)
-    {
-        if (string.IsNullOrWhiteSpace(value))
-            return fallback;
-
-        var normalized = NormalizeOperation(value);
-        return normalized == "COUNT" && !string.Equals(value.Trim(), "COUNT", StringComparison.OrdinalIgnoreCase)
-            ? fallback
-            : normalized;
-    }
+        => NormalizeNumericOperationOrDefault(value, fallback);
 
     private static string ResolveOperation(
         List<WorkAssignmentBasicSummaryRuleDto> rules,
@@ -1119,6 +2066,9 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
     }
 
     private static string NormalizeOperation(string? value)
+        => NormalizeNumericOperationOrDefault(value, "SUM");
+
+    private static string NormalizeNumericOperationOrDefault(string? value, string fallback)
     {
         var op = value?.Trim().ToUpperInvariant();
         return op switch
@@ -1128,35 +2078,21 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
             "MAX" => "MAX",
             "MEAN" or "AVG" or "AVERAGE" => "MEAN",
             "COUNT" => "COUNT",
-            "JOIN" or "CONCAT" or "TEXT_JOIN" => "JOIN",
-            "MIN_DATE" or "EARLIEST" => "MIN_DATE",
-            "MAX_DATE" or "LATEST" => "MAX_DATE",
-            "TRUE_COUNT" => "TRUE_COUNT",
-            "FALSE_COUNT" => "FALSE_COUNT",
-            "BUCKET_COUNT" or "GROUP_COUNT" => "BUCKET_COUNT",
-            _ => "COUNT"
+            _ => fallback
         };
     }
 
+    private static bool IsNumericOperation(string? value)
+    {
+        var op = value?.Trim().ToUpperInvariant();
+        return op is "SUM" or "MIN" or "MAX" or "MEAN" or "AVG" or "AVERAGE" or "COUNT";
+    }
+
     private static string DefaultFieldOperation(FieldDefinition field, NormalizedDefaultMethods defaults)
-        => field.FieldType switch
-        {
-            "number" => defaults.Number,
-            "date" => defaults.Date,
-            "boolean" => defaults.Boolean,
-            "singleSelect" or "multiSelect" or "shortText" => defaults.Selection,
-            _ => defaults.Text
-        };
+        => defaults.Number;
 
     private static string DefaultTableOperation(ParsedTableValue value, NormalizedDefaultMethods defaults)
-        => value.DataType switch
-        {
-            "NUMBER" => defaults.Number,
-            "DATE" or "FULL_DATE" => defaults.Date,
-            "BOOLEAN" => defaults.Boolean,
-            "SHORT_TEXT" or "MULTI_SELECT" => defaults.Selection,
-            _ => defaults.Text
-        };
+        => defaults.Number;
 
     private static string FieldTypeToSummaryDataType(string fieldType)
         => fieldType switch
@@ -1327,66 +2263,74 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
         string? tableValuesJson,
         ISet<string>? skippedDirectAggregateBlocks = null)
     {
+        var output = new List<ParsedTableValue>();
         if (string.IsNullOrWhiteSpace(tableValuesJson))
-            yield break;
+            return output;
 
-        TableValuesRoot? root;
         try
         {
-            root = JsonSerializer.Deserialize<TableValuesRoot>(tableValuesJson, JsonOptions);
+            using var document = JsonDocument.Parse(tableValuesJson);
+            if (!document.RootElement.TryGetProperty("blocks", out var blocks) ||
+                blocks.ValueKind != JsonValueKind.Array ||
+                blocks.GetArrayLength() == 0)
+            {
+                return output;
+            }
+
+            foreach (var blockElement in blocks.EnumerateArray())
+            {
+                var block = JsonSerializer.Deserialize<TableValuesBlock>(blockElement.GetRawText(), JsonOptions);
+                if (block is null)
+                    continue;
+
+                using var valuesReader = Values1DCompression.CreateBlockReader(blockElement);
+                var blockId = NormalizeMetricPart(block.BlockId, "excel_block");
+                var directInputCellCount = ResolveDirectAggregateInputCellCount(block, valuesReader);
+                if (!DynamicExcelRuntimePolicy.CanRunDirectTableAggregation(directInputCellCount))
+                {
+                    skippedDirectAggregateBlocks?.Add($"{blockId} ({directInputCellCount})");
+                    continue;
+                }
+
+                // statisticsDisabled only disables background projections; basic summary reads saved values directly.
+                var tableMode = NormalizeTableMode(block.TableMode);
+                var metrics = NormalizeMetricDefinitions(block.MetricDefinitions, blockId, tableMode);
+
+                if (tableMode == "APPEND_ROWS")
+                {
+                    output.AddRange(ExtractAppendRows(block, blockId, metrics));
+                    continue;
+                }
+
+                if (tableMode == "APPEND_COLUMNS")
+                {
+                    output.AddRange(ExtractAppendColumns(block, blockId, metrics));
+                    continue;
+                }
+
+                if (tableMode == "MATRIX")
+                {
+                    output.AddRange(ExtractMatrix(block, blockId, metrics));
+                    continue;
+                }
+
+                output.AddRange(ExtractFixedGrid(block, blockId, metrics, valuesReader));
+            }
         }
         catch (JsonException)
         {
-            yield break;
+            return output;
         }
 
-        if (root?.Blocks is null || root.Blocks.Count == 0)
-            yield break;
-
-        foreach (var block in root.Blocks)
-        {
-            var blockId = NormalizeMetricPart(block.BlockId, "excel_block");
-            var directInputCellCount = ResolveDirectAggregateInputCellCount(block);
-            if (!DynamicExcelRuntimePolicy.CanRunDirectTableAggregation(directInputCellCount))
-            {
-                skippedDirectAggregateBlocks?.Add($"{blockId} ({directInputCellCount})");
-                continue;
-            }
-
-            // statisticsDisabled only disables background projections; basic summary reads saved values directly.
-            var tableMode = NormalizeTableMode(block.TableMode);
-            var metrics = NormalizeMetricDefinitions(block.MetricDefinitions, blockId, tableMode);
-
-            if (tableMode == "APPEND_ROWS")
-            {
-                foreach (var row in ExtractAppendRows(block, blockId, metrics))
-                    yield return row;
-                continue;
-            }
-
-            if (tableMode == "APPEND_COLUMNS")
-            {
-                foreach (var row in ExtractAppendColumns(block, blockId, metrics))
-                    yield return row;
-                continue;
-            }
-
-            if (tableMode == "MATRIX")
-            {
-                foreach (var row in ExtractMatrix(block, blockId, metrics))
-                    yield return row;
-                continue;
-            }
-
-            foreach (var row in ExtractFixedGrid(block, blockId, metrics))
-                yield return row;
-        }
+        return output;
     }
 
-    private static int ResolveDirectAggregateInputCellCount(TableValuesBlock block)
+    private static int ResolveDirectAggregateInputCellCount(
+        TableValuesBlock block,
+        Values1DCompression.Values1DReader? valuesReader)
     {
         var metadataInputCellCount = block.StatisticsInputCellCount.GetValueOrDefault();
-        var valuesInputCellCount = block.Values1D?.Count ?? 0;
+        var valuesInputCellCount = valuesReader?.Length ?? block.Values1D?.Count ?? 0;
         if (metadataInputCellCount > 0)
             return Math.Max(metadataInputCellCount, valuesInputCellCount);
         if (valuesInputCellCount > 0)
@@ -1400,9 +2344,11 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
     private static IEnumerable<ParsedTableValue> ExtractFixedGrid(
         TableValuesBlock block,
         string blockId,
-        List<MetricContract> metricDefinitions)
+        List<MetricContract> metricDefinitions,
+        Values1DCompression.Values1DReader? valuesReader)
     {
-        if (block.Values1D is not { Count: > 0 })
+        var valueCount = valuesReader?.Length ?? block.Values1D?.Count ?? 0;
+        if (valueCount <= 0)
             yield break;
 
         var metrics = metricDefinitions.Count > 0
@@ -1410,14 +2356,22 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
             : NormalizeIndexMap(block.IndexMap, blockId);
 
         if (metrics.Count == 0)
-            metrics = BuildFallbackMetricMap(blockId, block.W, block.H, block.Values1D.Count);
+            metrics = BuildFallbackMetricMap(blockId, block.W, block.H, valueCount);
 
         foreach (var metric in metrics)
         {
-            if (metric.Index < 0 || metric.Index >= block.Values1D.Count)
+            if (metric.Index < 0 || metric.Index >= valueCount)
                 continue;
 
-            foreach (var row in ParseTableCell(block.Values1D[metric.Index], blockId, "FIXED_GRID", metric))
+            var metricValue = valuesReader is not null
+                ? valuesReader.GetElement(metric.Index)
+                : block.Values1D is not null && metric.Index < block.Values1D.Count
+                    ? block.Values1D[metric.Index]
+                    : (JsonElement?)null;
+            if (!metricValue.HasValue)
+                continue;
+
+            foreach (var row in ParseTableCell(metricValue.Value, blockId, "FIXED_GRID", metric))
                 yield return row;
         }
     }
@@ -1501,65 +2455,12 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
         if (IsBlankJsonElement(value) || metric.DataType == "IGNORE")
             yield break;
 
-        if (metric.DataType == "NUMBER")
-        {
-            var number = ToNullableDecimal(value);
-            if (number.HasValue)
-                yield return ParsedTableValue.Number(blockId, tableMode, metric, number.Value);
-            yield break;
-        }
-
-        if (metric.DataType == "BOOLEAN")
-        {
-            if (TryReadBoolean(value, out var boolean))
-                yield return ParsedTableValue.Boolean(blockId, tableMode, metric, boolean);
-            yield break;
-        }
-
-        if (metric.DataType is "DATE" or "FULL_DATE")
-        {
-            var date = ReadDateValue(value, requireFullDate: metric.DataType == "FULL_DATE");
-            if (date.HasValue)
-                yield return ParsedTableValue.Date(blockId, tableMode, metric, date.Value);
-            yield break;
-        }
-
-        if (metric.DataType == "MULTI_SELECT")
-        {
-            foreach (var item in ReadStringListValues(value).Distinct(StringComparer.Ordinal))
-            {
-                var option = ResolveMetricOption(metric.Options, item);
-                if (metric.Options.Length > 0 && option is null)
-                    continue;
-
-                yield return ParsedTableValue.Bucket(
-                    blockId,
-                    tableMode,
-                    metric,
-                    option?.Code ?? item,
-                    option?.Label ?? item);
-            }
-
-            yield break;
-        }
-
-        var text = ToNullableString(value)?.Trim();
-        if (string.IsNullOrWhiteSpace(text))
+        if (metric.DataType != "NUMBER")
             yield break;
 
-        var shortTextOption = ResolveMetricOption(metric.Options, text);
-        if (metric.DataType == "SHORT_TEXT" && (metric.Options.Length > 0 || shortTextOption is not null))
-        {
-            yield return ParsedTableValue.Bucket(
-                blockId,
-                tableMode,
-                metric,
-                shortTextOption?.Code ?? text,
-                shortTextOption?.Label ?? text);
-            yield break;
-        }
-
-        yield return ParsedTableValue.Text(blockId, tableMode, metric, text);
+        var number = ToNullableDecimal(value);
+        if (number.HasValue)
+            yield return ParsedTableValue.Number(blockId, tableMode, metric, number.Value);
     }
 
     private static List<MetricContract> NormalizeMetricDefinitions(
@@ -1907,6 +2808,89 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
         }
     }
 
+    private sealed class BasicSummarySnapshotPayload
+    {
+        [JsonPropertyName("v")]
+        public int Version { get; set; }
+
+        [JsonPropertyName("meta")]
+        public WorkAssignmentBasicSummaryMetaDto? Meta { get; set; }
+
+        [JsonPropertyName("fields")]
+        public List<WorkAssignmentBasicSummaryItemDto>? Fields { get; set; }
+
+        [JsonPropertyName("tb")]
+        public List<CompactTableBlockSnapshot>? TableBlocks { get; set; }
+
+        [JsonPropertyName("warnings")]
+        public List<string>? Warnings { get; set; }
+    }
+
+    private sealed class CompactTableBlockSnapshot
+    {
+        [JsonPropertyName("b")]
+        public string BlockId { get; set; } = default!;
+
+        [JsonPropertyName("m")]
+        public string TableMode { get; set; } = "FIXED_GRID";
+
+        [JsonPropertyName("w")]
+        public int Width { get; set; } = 1;
+
+        [JsonPropertyName("n")]
+        public int Length { get; set; }
+
+        [JsonPropertyName("op")]
+        public string Operation { get; set; } = "SUM";
+
+        [JsonPropertyName("vc")]
+        public JsonNode? ValueCounts { get; set; }
+
+        [JsonPropertyName("rc")]
+        public JsonNode? ReportCounts { get; set; }
+
+        [JsonPropertyName("s")]
+        public JsonNode? Sums { get; set; }
+
+        [JsonPropertyName("mi")]
+        public JsonNode? Mins { get; set; }
+
+        [JsonPropertyName("ma")]
+        public JsonNode? Maxes { get; set; }
+
+        [JsonPropertyName("ov")]
+        public List<CompactTableMetricOverride>? Overrides { get; set; }
+
+        [JsonPropertyName("items")]
+        public List<WorkAssignmentBasicSummaryItemDto>? Items { get; set; }
+    }
+
+    private sealed class CompactTableMetricOverride
+    {
+        [JsonPropertyName("i")]
+        public int Index { get; set; }
+
+        [JsonPropertyName("mk")]
+        public string? MetricKey { get; set; }
+
+        [JsonPropertyName("rk")]
+        public string? RowKey { get; set; }
+
+        [JsonPropertyName("ck")]
+        public string? ColumnKey { get; set; }
+
+        [JsonPropertyName("op")]
+        public string? Operation { get; set; }
+
+        [JsonPropertyName("l")]
+        public string? Label { get; set; }
+    }
+
+    private sealed record CompactTableMetricParts(
+        string RowKey,
+        string ColumnKey,
+        string MetricKey);
+
     private sealed record NormalizedRequest(
         string ScopeAssignmentId,
         string? DynamicFormTemplateId,
@@ -1914,6 +2898,10 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
         NormalizedDefaultMethods DefaultMethods,
         List<WorkAssignmentBasicSummaryRuleDto> Rules,
         NormalizedSourceView SourceView,
+        string PeriodScopeMode,
+        string? PeriodKey,
+        string? PeriodKeyFrom,
+        string? PeriodKeyTo,
         bool ForceRefresh,
         bool IncludeSourceRows,
         int MaxTextChars);

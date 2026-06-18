@@ -34,7 +34,8 @@ public sealed class MyReportTemplateDetailResponse
     public string SpecJson { get; set; } = string.Empty;
 
     /// <summary>
-    /// Workbook gốc của template để FE render sheet ngay.
+    /// Snapshot nhẹ của template, không bao gồm workbook JSON nặng.
+    /// Workbook được tải riêng khi người dùng mở bảng.
     /// </summary>
     public string TemplateSnapshotJson { get; set; } = string.Empty;
 
@@ -44,8 +45,7 @@ public sealed class MyReportTemplateDetailResponse
     public List<WorkReportPeriodRow> Periods { get; set; } = new();
 
     /// <summary>
-    /// Danh sách phân công/binding mà user hiện tại có thể tạo báo cáo chủ động.
-    /// Cần cho trường hợp cùng một biểu mẫu được giao nhiều lần nhưng chưa có kỳ/report nào.
+    /// Danh sách phân công/binding hiện hành của user cho biểu mẫu này.
     /// </summary>
     public List<MyReportTemplateAssignmentOption> AssignmentOptions { get; set; } = new();
 }
@@ -64,5 +64,4 @@ public sealed class MyReportTemplateAssignmentOption
     public DateTime? DueAtUtc { get; set; }
 
     public bool IsActive { get; set; } = true;
-    public bool AllowUserCreatedReports { get; set; } = true;
 }

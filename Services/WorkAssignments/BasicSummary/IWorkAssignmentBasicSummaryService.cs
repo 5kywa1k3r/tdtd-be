@@ -17,7 +17,7 @@ public interface IWorkAssignmentBasicSummaryService
         string actorUserId,
         CancellationToken ct);
 
-    Task<WorkAssignmentBasicSummaryResponse> GetOnceSummaryAsync(
+    Task<WorkAssignmentBasicSummaryResponse> GetSummaryAsync(
         WorkAssignmentBasicSummaryRequest req,
         string actorUserId,
         CancellationToken ct);

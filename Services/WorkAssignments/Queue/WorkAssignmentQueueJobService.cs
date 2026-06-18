@@ -5,6 +5,7 @@ using tdtd_be.Enum;
 using tdtd_be.Models;
 using tdtd_be.Models.Enums;
 using tdtd_be.Services.Common;
+using tdtd_be.Services.WorkAssignments.Internal;
 using tdtd_be.Services.WorkAssignments.Queue;
 
 namespace tdtd_be.Services.WorkAssignments.Runtime;
@@ -128,6 +129,50 @@ public sealed class WorkAssignmentQueueJobService : IWorkAssignmentQueueJobServi
                 {
                     await DisableQueueItemAsync(item.Id!, now, ct);
                     missingPeriod++;
+                    disabled++;
+                    continue;
+                }
+
+                var isHistoricalBackfill =
+                    period.IsHistoricalData ||
+                    WorkAssignmentBackfillPeriodPolicy.IsBackfillHistoricalPeriod(
+                        assignment,
+                        period.PeriodStart,
+                        period.PeriodEnd,
+                        period.DueAtUtc ?? period.ReportDate,
+                        now);
+
+                if (isHistoricalBackfill)
+                {
+                    var healedStatus = period.Status;
+                    var healedIsOverdue = period.IsOverdue;
+                    if (period.Status == WorkReportPeriodStatus.Pending ||
+                        period.Status == WorkReportPeriodStatus.OverduePending)
+                    {
+                        healedStatus = WorkReportPeriodStatus.Pending;
+                        healedIsOverdue = false;
+                    }
+
+                    if (!period.IsHistoricalData ||
+                        period.Status != healedStatus ||
+                        period.IsOverdue != healedIsOverdue)
+                    {
+                        await _ctx.WorkReportPeriods.UpdateOneAsync(
+                            x => x.Id == period.Id,
+                            Builders<WorkReportPeriod>.Update
+                                .Set(x => x.IsHistoricalData, true)
+                                .Set(x => x.Status, healedStatus)
+                                .Set(x => x.IsOverdue, healedIsOverdue)
+                                .Set(x => x.UpdatedAtUtc, now)
+                                .Set(x => x.UpdatedByUserId, null),
+                            cancellationToken: ct);
+
+                        await _sync.SyncFromAssignmentAsync(period.WorkAssignmentId, ct);
+                        await _docRoleReadModelProjection.RebuildReportPeriodAsync(period.Id, "system", ct);
+                        changed++;
+                    }
+
+                    await DisableQueueItemAsync(item.Id!, now, ct);
                     disabled++;
                     continue;
                 }

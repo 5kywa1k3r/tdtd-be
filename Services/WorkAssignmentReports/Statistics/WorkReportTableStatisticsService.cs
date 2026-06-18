@@ -798,14 +798,23 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
 
         try
         {
-            var root = JsonSerializer.Deserialize<TableValuesRoot>(tableValuesJson, JsonOptions);
-            if (root?.Blocks is null || root.Blocks.Count == 0)
+            using var document = JsonDocument.Parse(tableValuesJson);
+            if (!document.RootElement.TryGetProperty("blocks", out var blocks) ||
+                blocks.ValueKind != JsonValueKind.Array ||
+                blocks.GetArrayLength() == 0)
+            {
                 return new List<ParsedMetricValue>();
+            }
 
             var rows = new List<ParsedMetricValue>();
-            foreach (var block in root.Blocks)
+            foreach (var blockElement in blocks.EnumerateArray())
             {
-                if (ShouldDisableRuntimeBlockTableStatistics(block))
+                var block = JsonSerializer.Deserialize<TableValuesBlock>(blockElement.GetRawText(), JsonOptions);
+                if (block is null)
+                    continue;
+
+                using var valuesReader = Values1DCompression.CreateBlockReader(blockElement);
+                if (ShouldDisableRuntimeBlockTableStatistics(block, valuesReader))
                     continue;
 
                 var blockId = NormalizeBlockId(block.BlockId);
@@ -831,7 +840,7 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
                 }
 
                 if (tableMode == "FIXED_GRID")
-                    rows.AddRange(ExtractFixedGrid(block, blockId, dynamicExcelTemplateId, metricTargets));
+                    rows.AddRange(ExtractFixedGrid(block, blockId, dynamicExcelTemplateId, valuesReader, metricTargets));
             }
 
             return rows;
@@ -846,9 +855,11 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
         TableValuesBlock block,
         string blockId,
         string? dynamicExcelTemplateId,
+        Values1DCompression.Values1DReader? valuesReader,
         MetricTargetMap metricTargets)
     {
-        if (block.Values1D is not { Count: > 0 })
+        var valueCount = valuesReader?.Length ?? block.Values1D?.Count ?? 0;
+        if (valueCount <= 0)
             yield break;
 
         var metrics = NormalizeMetricDefinitions(block.MetricDefinitions, blockId, "FIXED_GRID");
@@ -857,18 +868,25 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
         if (metrics.Count == 0 && block.HasSpecialRanges)
             yield break;
         if (metrics.Count == 0)
-            metrics = BuildFallbackMetricMap(blockId, block.W, block.H, block.Values1D.Count, metricTargets);
+            metrics = BuildFallbackMetricMap(blockId, block.W, block.H, valueCount, metricTargets);
 
         foreach (var metric in metrics)
         {
             if (!metricTargets.Contains(blockId, metric.MetricKey))
                 continue;
 
-            if (metric.Index < 0 || metric.Index >= block.Values1D.Count)
+            if (metric.Index < 0 || metric.Index >= valueCount)
+                continue;
+
+            var metricValue = valuesReader?.GetElement(metric.Index) ??
+                              (block.Values1D is not null && metric.Index < block.Values1D.Count
+                                  ? block.Values1D[metric.Index]
+                                  : (JsonElement?)null);
+            if (!metricValue.HasValue)
                 continue;
 
             foreach (var value in ParseTypedMetricValue(
-                         block.Values1D[metric.Index],
+                         metricValue.Value,
                          metric,
                          blockId,
                          "FIXED_GRID",
@@ -1630,13 +1648,15 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
         return w > 0 && h > 0 ? w * h : 0;
     }
 
-    private static bool ShouldDisableRuntimeBlockTableStatistics(TableValuesBlock block)
+    private static bool ShouldDisableRuntimeBlockTableStatistics(
+        TableValuesBlock block,
+        Values1DCompression.Values1DReader? valuesReader)
     {
         if (block.StatisticsDisabled == true)
             return true;
 
         var metadataInputCellCount = block.StatisticsInputCellCount.GetValueOrDefault();
-        var valuesInputCellCount = block.Values1D?.Count ?? 0;
+        var valuesInputCellCount = valuesReader?.Length ?? block.Values1D?.Count ?? 0;
         var inputCellCount = Math.Max(metadataInputCellCount, valuesInputCellCount);
         if (inputCellCount <= 0)
         {

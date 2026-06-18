@@ -1,7 +1,7 @@
 ﻿namespace tdtd_be.DTOs.WorkAssignmentReports;
 
 /// <summary>
-/// Snapshot tối thiểu của template tại thời điểm khởi tạo report.
+/// Snapshot nhẹ của template tại thời điểm khởi tạo report.
 /// DTO này chủ yếu dùng nội bộ service để serialize sang TemplateSnapshotJson.
 /// </summary>
 public sealed class TemplateSnapshotDTO
@@ -25,12 +25,6 @@ public sealed class TemplateSnapshotDTO
     /// Spec JSON của template.
     /// </summary>
     public string SpecJson { get; set; } = string.Empty;
-
-    /// <summary>
-    /// Workbook JSON gốc của template.
-    /// Đây là bản dùng để clone ra report draft.
-    /// </summary>
-    public string RawWorkbookDataJson { get; set; } = string.Empty;
 
     /// <summary>
     /// Hàng bắt đầu của dataRect.

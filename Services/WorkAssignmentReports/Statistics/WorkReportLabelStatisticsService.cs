@@ -526,7 +526,8 @@ public sealed class WorkReportLabelStatisticsService : IWorkReportLabelStatistic
 
         try
         {
-            var root = JsonSerializer.Deserialize<TableValuesRoot>(tableValuesJson, JsonOptions);
+            var expandedTableValuesJson = Values1DCompression.ExpandTableValuesJson(tableValuesJson, JsonOptions) ?? tableValuesJson;
+            var root = JsonSerializer.Deserialize<TableValuesRoot>(expandedTableValuesJson, JsonOptions);
             if (root?.Blocks is null || root.Blocks.Count == 0)
                 return new List<ParsedRowLabel>();
 

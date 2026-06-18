@@ -315,7 +315,19 @@ public sealed class DynamicExcelService : IDynamicExcelService
             IsDeleted = false
         };
 
-        await _ctx.DynamicExcelTemplates.InsertOneAsync(doc, cancellationToken: ct);
+        try
+        {
+            await _ctx.DynamicExcelTemplates.InsertOneAsync(doc, cancellationToken: ct);
+        }
+        catch (MongoWriteException ex) when (ex.WriteError?.Category == ServerErrorCategory.DuplicateKey)
+        {
+            throw DynamicExcelCodeDuplicate(code!);
+        }
+        catch (MongoBulkWriteException<DynamicExcelTemplate> ex) when (
+            ex.WriteErrors.Any(error => error.Category == ServerErrorCategory.DuplicateKey))
+        {
+            throw DynamicExcelCodeDuplicate(code!);
+        }
 
         return await GetByIdAsync(doc.Id, ct);
     }
@@ -837,6 +849,8 @@ public sealed class DynamicExcelService : IDynamicExcelService
         if (firstSheet.ValueKind != JsonValueKind.Object)
             return;
 
+        var specialMask = BuildDynamicExcelSpecialCellMask(dataRect, specialRanges);
+
         if (firstSheet.TryGetProperty("data", out var data) && data.ValueKind == JsonValueKind.Array)
         {
             var rowIndex = 0;
@@ -847,7 +861,7 @@ public sealed class DynamicExcelService : IDynamicExcelService
                     var colIndex = 0;
                     foreach (var cell in row.EnumerateArray())
                     {
-                        ValidateDynamicExcelTemplateInputCell(cell, rowIndex, colIndex, dataRect, specialRanges, "data");
+                        ValidateDynamicExcelTemplateInputCell(cell, rowIndex, colIndex, dataRect, specialMask, "data");
                         colIndex++;
                     }
                 }
@@ -870,7 +884,7 @@ public sealed class DynamicExcelService : IDynamicExcelService
                 continue;
 
             var cell = item.TryGetProperty("v", out var value) ? value : item;
-            ValidateDynamicExcelTemplateInputCell(cell, r.Value, c.Value, dataRect, specialRanges, "celldata");
+            ValidateDynamicExcelTemplateInputCell(cell, r.Value, c.Value, dataRect, specialMask, "celldata");
         }
     }
 
@@ -879,10 +893,10 @@ public sealed class DynamicExcelService : IDynamicExcelService
         int r,
         int c,
         DynamicExcelDataRectDto dataRect,
-        IReadOnlyCollection<DynamicExcelSpecialRange> specialRanges,
+        DynamicExcelSpecialCellMask? specialMask,
         string source)
     {
-        if (!IsDynamicExcelInputCell(dataRect, specialRanges, r, c))
+        if (!IsDynamicExcelInputCell(dataRect, specialMask, r, c))
             return;
 
         if (!HasMeaningfulDynamicExcelTemplateCellValue(cell))
@@ -895,14 +909,14 @@ public sealed class DynamicExcelService : IDynamicExcelService
 
     private static bool IsDynamicExcelInputCell(
         DynamicExcelDataRectDto dataRect,
-        IReadOnlyCollection<DynamicExcelSpecialRange> specialRanges,
+        DynamicExcelSpecialCellMask? specialMask,
         int r,
         int c)
     {
         if (r < dataRect.R0 || r > dataRect.R1 || c < dataRect.C0 || c > dataRect.C1)
             return false;
 
-        return !specialRanges.Any(range => DynamicExcelRangeContains(range, r, c));
+        return !IsDynamicExcelMaskedSpecialCell(specialMask, r, c);
     }
 
     private static bool HasMeaningfulDynamicExcelTemplateCellValue(JsonElement cell)
@@ -1178,18 +1192,64 @@ public sealed class DynamicExcelService : IDynamicExcelService
         DynamicExcelDataRectDto dataRect,
         IReadOnlyCollection<DynamicExcelSpecialRange> specialRanges)
     {
-        var count = 0;
-        for (var r = dataRect.R0; r <= dataRect.R1; r++)
+        if (dataRect.R1 < dataRect.R0 || dataRect.C1 < dataRect.C0)
+            return 0;
+
+        var width = dataRect.C1 - dataRect.C0 + 1;
+        var height = dataRect.R1 - dataRect.R0 + 1;
+        var specialMask = BuildDynamicExcelSpecialCellMask(dataRect, specialRanges);
+        return width * height - (specialMask?.MaskedCount ?? 0);
+    }
+
+    private static DynamicExcelSpecialCellMask? BuildDynamicExcelSpecialCellMask(
+        DynamicExcelDataRectDto dataRect,
+        IReadOnlyCollection<DynamicExcelSpecialRange> specialRanges)
+    {
+        if (specialRanges.Count == 0)
+            return null;
+
+        var width = dataRect.C1 - dataRect.C0 + 1;
+        var height = dataRect.R1 - dataRect.R0 + 1;
+        if (width <= 0 || height <= 0)
+            return null;
+
+        var flags = new bool[width * height];
+        var masked = 0;
+        foreach (var range in specialRanges)
         {
-            for (var c = dataRect.C0; c <= dataRect.C1; c++)
+            var r0 = Math.Max(dataRect.R0, range.R0);
+            var c0 = Math.Max(dataRect.C0, range.C0);
+            var r1 = Math.Min(dataRect.R1, range.R1);
+            var c1 = Math.Min(dataRect.C1, range.C1);
+            if (r1 < r0 || c1 < c0)
+                continue;
+
+            for (var r = r0; r <= r1; r++)
             {
-                if (specialRanges.Any(range => DynamicExcelRangeContains(range, r, c)))
-                    continue;
-                count++;
+                var offset = (r - dataRect.R0) * width + (c0 - dataRect.C0);
+                for (var c = c0; c <= c1; c++)
+                {
+                    if (!flags[offset])
+                    {
+                        flags[offset] = true;
+                        masked++;
+                    }
+                    offset++;
+                }
             }
         }
 
-        return count;
+        return new DynamicExcelSpecialCellMask(dataRect, width, flags, masked);
+    }
+
+    private static bool IsDynamicExcelMaskedSpecialCell(DynamicExcelSpecialCellMask? mask, int r, int c)
+    {
+        if (mask is null)
+            return false;
+        if (r < mask.DataRect.R0 || r > mask.DataRect.R1 || c < mask.DataRect.C0 || c > mask.DataRect.C1)
+            return false;
+
+        return mask.Flags[(r - mask.DataRect.R0) * mask.Width + (c - mask.DataRect.C0)];
     }
 
     private static string? NormalizeDynamicExcelSpecialRole(string? value)
@@ -1203,9 +1263,6 @@ public sealed class DynamicExcelService : IDynamicExcelService
             role = "BLANK";
         return role is "FORMULA" or "TITLE" or "BLANK" ? role : null;
     }
-
-    private static bool DynamicExcelRangeContains(DynamicExcelSpecialRange range, int r, int c)
-        => r >= range.R0 && r <= range.R1 && c >= range.C0 && c <= range.C1;
 
     private static bool DynamicExcelRangesOverlap(DynamicExcelSpecialRange a, DynamicExcelSpecialRange b)
         => a.R0 <= b.R1 && a.R1 >= b.R0 && a.C0 <= b.C1 && a.C1 >= b.C0;
@@ -1761,6 +1818,11 @@ public sealed class DynamicExcelService : IDynamicExcelService
 
     private sealed record DynamicExcelRange(int R0, int C0, int R1, int C1);
     private sealed record DynamicExcelSpecialRange(int R0, int C0, int R1, int C1, string Role);
+    private sealed record DynamicExcelSpecialCellMask(
+        DynamicExcelDataRectDto DataRect,
+        int Width,
+        bool[] Flags,
+        int MaskedCount);
 
     private static AppException DynamicExcelValidation(string message, object? details = null)
         => AppExceptionFactory.BadRequest(
@@ -1777,6 +1839,11 @@ public sealed class DynamicExcelService : IDynamicExcelService
         => AppExceptionFactory.NotFound(
             AppErrorCode.DYNAMIC_EXCEL_TEMPLATE_NOT_FOUND,
             new { dynamicExcelTemplateId });
+
+    private static AppException DynamicExcelCodeDuplicate(string code)
+        => AppExceptionFactory.Create(
+            AppErrorCode.DYNAMIC_EXCEL_CODE_DUPLICATE,
+            new { code });
 
     private static AppException DynamicExcelInUse(AppErrorCode code, string dynamicExcelTemplateId)
         => AppExceptionFactory.Create(

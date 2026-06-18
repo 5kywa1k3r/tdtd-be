@@ -2500,7 +2500,7 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
         var result = new DashboardMindMapCoverageDto
         {
             ScheduledPeriodCount = scheduledPeriods.Count,
-            AdHocCount = periodRows.Count(x => WorkReportPeriodKind.IsUserCreated(x.PeriodKind)),
+            AdHocCount = 0,
             ReportedCount = scheduledPeriods.Count(HasCurrentReport),
             SubmittedCount = scheduledPeriods.Count(x =>
                 x.Status is WorkReportPeriodStatus.Submitted or WorkReportPeriodStatus.OverdueSubmitted),
@@ -2651,9 +2651,7 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
         => string.Equals(assignment.AssignmentType, WorkAssignmentTypes.Once, StringComparison.OrdinalIgnoreCase);
 
     private static string NormalizePeriodKind(string? value)
-        => WorkReportPeriodKind.IsUserCreated(value)
-            ? WorkReportPeriodKind.UserCreated
-            : WorkReportPeriodKind.Scheduled;
+        => WorkReportPeriodKind.Scheduled;
 
     private static DashboardMindMapTemplateUserDto MapTemplateUser(
         string assignmentId,

@@ -30,7 +30,6 @@ public sealed class WorkAssignmentListResponse
 
     public string? Description { get; set; }
     public bool IsActive { get; set; }
-    public bool AllowUserCreatedReports { get; set; }
 
     public int ProgressStatus { get; set; }
     public DateTime? ProgressStatusUpdatedAtUtc { get; set; }

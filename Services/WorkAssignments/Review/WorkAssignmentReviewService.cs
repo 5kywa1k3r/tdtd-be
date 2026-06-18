@@ -769,7 +769,6 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
         if (period is not null && wasCurrent)
         {
             var nextPeriodStatus = WorkReportPeriodStatusHelper.ResolveInitialStatus(period.DueAtUtc, now);
-            var deactivatePeriod = WorkReportPeriodKind.IsUserCreated(period.PeriodKind);
             var update = Builders<WorkReportPeriod>.Update
                 .Set(x => x.CurrentReportId, (string?)null)
                 .Set(x => x.Status, nextPeriodStatus)
@@ -782,9 +781,6 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
                 .Set(x => x.ReturnReason, null)
                 .Set(x => x.UpdatedAtUtc, now)
                 .Set(x => x.UpdatedByUserId, me.Id);
-
-            if (deactivatePeriod)
-                update = update.Set(x => x.IsActive, false);
 
             await _ctx.WorkReportPeriods.UpdateOneAsync(
                 x => x.Id == period.Id && !x.IsDeleted,
@@ -800,7 +796,6 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
             period.LateReason = null;
             period.ReviewerComment = null;
             period.ReturnReason = null;
-            period.IsActive = !deactivatePeriod;
             period.UpdatedAtUtc = now;
             period.UpdatedByUserId = me.Id;
         }
@@ -1700,20 +1695,11 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
     }
 
     private static DateTime ResolvePeriodOrder(WorkReportPeriod period)
-    {
-        if (WorkReportPeriodKind.IsUserCreated(period.PeriodKind))
-            return period.ReportDate
-                   ?? period.PeriodStart
-                   ?? period.PeriodEnd
-                   ?? period.DueAtUtc
-                   ?? period.CreatedAtUtc;
-
-        return period.PeriodStart
-               ?? period.ReportDate
-               ?? period.PeriodEnd
-               ?? period.DueAtUtc
-               ?? period.CreatedAtUtc;
-    }
+        => period.PeriodStart
+           ?? period.ReportDate
+           ?? period.PeriodEnd
+           ?? period.DueAtUtc
+           ?? period.CreatedAtUtc;
 
     private static bool MatchUserTypeFilter(string? username, string? filter)
     {
