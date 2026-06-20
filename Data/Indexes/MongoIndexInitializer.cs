@@ -121,6 +121,27 @@
             var workAssignmentAdvancedSummaryConfigs = db.GetCollection<WorkAssignmentAdvancedSummaryConfig>(opt.WorkAssignmentAdvancedSummaryConfigCollection);
             await EnsureWorkAssignmentAdvancedSummaryConfigsAsync(workAssignmentAdvancedSummaryConfigs, ct);
 
+            var workAssignmentAdvancedSummaryDayNodes = db.GetCollection<WorkAssignmentAdvancedSummaryDayNode>(opt.WorkAssignmentAdvancedSummaryDayNodeCollection);
+            await EnsureWorkAssignmentAdvancedSummaryHierarchyNodesAsync(
+                workAssignmentAdvancedSummaryDayNodes,
+                "Day",
+                "dayKey",
+                ct);
+
+            var workAssignmentAdvancedSummaryMonthNodes = db.GetCollection<WorkAssignmentAdvancedSummaryMonthNode>(opt.WorkAssignmentAdvancedSummaryMonthNodeCollection);
+            await EnsureWorkAssignmentAdvancedSummaryHierarchyNodesAsync(
+                workAssignmentAdvancedSummaryMonthNodes,
+                "Month",
+                "monthKey",
+                ct);
+
+            var workAssignmentAdvancedSummaryYearNodes = db.GetCollection<WorkAssignmentAdvancedSummaryYearNode>(opt.WorkAssignmentAdvancedSummaryYearNodeCollection);
+            await EnsureWorkAssignmentAdvancedSummaryHierarchyNodesAsync(
+                workAssignmentAdvancedSummaryYearNodes,
+                "Year",
+                "yearKey",
+                ct);
+
             // WORK TEMPLATE ASSIGNEES
             var workTemplateAssignees = db.GetCollection<WorkTemplateAssignee>(opt.WorkTemplateAssigneeCollection);
             await EnsureWorkTemplateAssigneesAsync(workTemplateAssignees, ct);
@@ -1813,6 +1834,61 @@
                 key: new BsonDocument
                 {
                     { "previewCorrelationId", 1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
+        }
+
+        private static async Task EnsureWorkAssignmentAdvancedSummaryHierarchyNodesAsync<T>(
+            IMongoCollection<T> col,
+            string collectionLabel,
+            string grainKeyField,
+            CancellationToken ct)
+            where T : WorkAssignmentAdvancedSummaryHierarchyNodeBase
+        {
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: $"ux_workAssignmentAdvancedSummary{collectionLabel}Nodes_scope_grain",
+                key: new BsonDocument
+                {
+                    { "assignmentId", 1 },
+                    { "dynamicFormTemplateId", 1 },
+                    { "sectionId", 1 },
+                    { "configHash", 1 },
+                    { grainKeyField, 1 }
+                },
+                unique: true,
+                partial: new BsonDocument("isDeleted", false)
+            ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: $"ix_workAssignmentAdvancedSummary{collectionLabel}Nodes_scope_range",
+                key: new BsonDocument
+                {
+                    { "assignmentId", 1 },
+                    { "dynamicFormTemplateId", 1 },
+                    { "sectionId", 1 },
+                    { "configHash", 1 },
+                    { grainKeyField, 1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: $"ix_workAssignmentAdvancedSummary{collectionLabel}Nodes_status_dirty",
+                key: new BsonDocument
+                {
+                    { "status", 1 },
+                    { "isDirty", 1 },
+                    { "updatedAtUtc", -1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: $"ix_workAssignmentAdvancedSummary{collectionLabel}Nodes_correlation",
+                key: new BsonDocument
+                {
+                    { "buildCorrelationId", 1 },
                     { "isDeleted", 1 }
                 }
             ), ct);

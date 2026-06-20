@@ -105,6 +105,7 @@ var tests = new (string Name, Action Run)[]
     ("advanced summary config normalizes object json", AdvancedSummaryConfigNormalizesObjectJson),
     ("advanced summary preview blocks unsupported range condition", AdvancedSummaryPreviewBlocksUnsupportedRangeCondition),
     ("advanced summary field gate enforces section limits", AdvancedSummaryFieldGateEnforcesSectionLimits),
+    ("advanced summary hierarchy keys roll up day month year", AdvancedSummaryHierarchyKeysRollUpDayMonthYear),
     ("legacy work basis file resolves as work document", ResolvesLegacyWorkBasisFileAsWorkDocument),
     ("assignment file resolves as assignment branch document", ResolvesAssignmentFileAsBranchDocument),
     ("assignment document path resolves ancestors only", ResolvesAssignmentDocumentAncestorsFromPath),
@@ -3316,6 +3317,23 @@ static void AdvancedSummaryFieldGateEnforcesSectionLimits()
         1);
     AssertEqual("BLOCKED", GetReflectedProperty<string>(cumulativeBlocked, "Status"), "250 cumulative section fields should be blocked");
     AssertEqual(true, GetReflectedProperty<bool>(cumulativeBlocked, "IsCumulative"), "cumulative period scope should be detected");
+}
+
+static void AdvancedSummaryHierarchyKeysRollUpDayMonthYear()
+{
+    var date = new DateTime(2026, 6, 20, 13, 45, 0, DateTimeKind.Utc);
+
+    AssertEqual("2026-06-20", AdvancedSummaryHierarchyKeyHelper.ToDayKey(date), "day key should be yyyy-MM-dd");
+    AssertEqual("2026-06", AdvancedSummaryHierarchyKeyHelper.ToMonthKey("2026-06-20"), "day should roll up to month key");
+    AssertEqual("2026", AdvancedSummaryHierarchyKeyHelper.ToYearKeyFromMonth("2026-06"), "month should roll up to year key");
+
+    var month = AdvancedSummaryHierarchyKeyHelper.GetMonthBoundsUtc("2026-02");
+    AssertEqual(new DateTime(2026, 2, 1, 0, 0, 0, DateTimeKind.Utc), month.StartUtc, "month start should be utc first day");
+    AssertEqual(new DateTime(2026, 3, 1, 0, 0, 0, DateTimeKind.Utc), month.EndExclusiveUtc, "month end should be exclusive next month");
+
+    var year = AdvancedSummaryHierarchyKeyHelper.GetYearBoundsUtc("2024");
+    AssertEqual(new DateTime(2024, 1, 1, 0, 0, 0, DateTimeKind.Utc), year.StartUtc, "year start should be utc Jan 1");
+    AssertEqual(new DateTime(2025, 1, 1, 0, 0, 0, DateTimeKind.Utc), year.EndExclusiveUtc, "year end should be exclusive next year");
 }
 
 static void ResolvesLegacyWorkBasisFileAsWorkDocument()
