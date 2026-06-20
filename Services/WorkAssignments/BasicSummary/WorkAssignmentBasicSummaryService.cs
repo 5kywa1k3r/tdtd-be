@@ -23,11 +23,11 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
     private const int MaxTextCharsLimit = 100000;
     private const int MaxSourcePageSize = 200;
     private const int MaxSourceReportsPerSummary = 1000;
-    private const int SnapshotPayloadVersion = 8;
+    private const int SnapshotPayloadVersion = 9;
     private const string ScopeMode = "DIRECT_CHILDREN_OR_SELF";
-    private const string FeatureVersion = "basic-summary-v8";
+    private const string FeatureVersion = "basic-summary-v9";
     private const string SummaryType = "BASIC";
-    private const string ContractVersion = "basic-fixed-scope-v1";
+    private const string ContractVersion = "basic-fixed-scope-v2";
     private const string SnapshotPayloadKind = "COMPACT_VALUES1D_OPTIMIZED";
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
@@ -1103,7 +1103,7 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
                         targetKey,
                         label: tableValue.MetricKey,
                         dataType: tableValue.DataType,
-                        operation: ResolveTableOperation(req.Rules, tableValue, targetKey, DefaultTableOperation(tableValue, req.DefaultMethods)),
+                        operation: DefaultTableOperation(tableValue, req.DefaultMethods),
                         maxTextChars: req.MaxTextChars)
                     {
                         BlockId = tableValue.BlockId,
@@ -2130,7 +2130,7 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
             AssignmentId = config.AssignmentId,
             DynamicFormTemplateId = config.DynamicFormTemplateId,
             DefaultMethods = ParseAndNormalizeDefaultMethods(config.DefaultMethodsJson),
-            Rules = NormalizeRules(ParseConfigJson<List<WorkAssignmentBasicSummaryRuleDto>>(config.RulesJson, new())),
+            Rules = NormalizeStoredRules(ParseConfigJson<List<WorkAssignmentBasicSummaryRuleDto>>(config.RulesJson, new())),
             VersionNo = config.VersionNo,
             IsActive = config.IsActive
         };
@@ -2166,21 +2166,61 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
 
     private static List<WorkAssignmentBasicSummaryRuleDto> NormalizeRules(
         IEnumerable<WorkAssignmentBasicSummaryRuleDto>? rules)
-        => (rules ?? Array.Empty<WorkAssignmentBasicSummaryRuleDto>())
-            .Where(x => !string.IsNullOrWhiteSpace(x.TargetKey) && !string.IsNullOrWhiteSpace(x.Operation))
-            .Select(x => new WorkAssignmentBasicSummaryRuleDto
+        => NormalizeRulesCore(rules, rejectUnsupportedTargets: true);
+
+    private static List<WorkAssignmentBasicSummaryRuleDto> NormalizeStoredRules(
+        IEnumerable<WorkAssignmentBasicSummaryRuleDto>? rules)
+        => NormalizeRulesCore(rules, rejectUnsupportedTargets: false);
+
+    private static List<WorkAssignmentBasicSummaryRuleDto> NormalizeRulesCore(
+        IEnumerable<WorkAssignmentBasicSummaryRuleDto>? rules,
+        bool rejectUnsupportedTargets)
+    {
+        var normalizedRules = new List<WorkAssignmentBasicSummaryRuleDto>();
+
+        foreach (var rule in rules ?? Array.Empty<WorkAssignmentBasicSummaryRuleDto>())
+        {
+            if (string.IsNullOrWhiteSpace(rule.TargetKey) || string.IsNullOrWhiteSpace(rule.Operation))
+                continue;
+
+            var targetKind = string.IsNullOrWhiteSpace(rule.TargetKind)
+                ? "FIELD"
+                : rule.TargetKind.Trim().ToUpperInvariant();
+
+            if (!string.Equals(targetKind, "FIELD", StringComparison.Ordinal))
             {
-                TargetKind = string.IsNullOrWhiteSpace(x.TargetKind)
-                    ? "FIELD"
-                    : x.TargetKind.Trim().ToUpperInvariant(),
-                TargetKey = x.TargetKey.Trim(),
-                Operation = NormalizeOperation(x.Operation)
-            })
+                if (rejectUnsupportedTargets)
+                {
+                    throw AppExceptionFactory.BadRequest(
+                        AppErrorCode.WORK_ASSIGNMENT_AGGREGATE_MODE_INVALID,
+                        new
+                        {
+                            summaryType = SummaryType,
+                            contractVersion = ContractVersion,
+                            targetKind,
+                            reason = "BASIC_SUMMARY_RULE_TARGET_KIND_UNSUPPORTED"
+                        },
+                        "Basic summary only supports field-level method overrides. Data-range/table rules belong to Advanced summary.");
+                }
+
+                continue;
+            }
+
+            normalizedRules.Add(new WorkAssignmentBasicSummaryRuleDto
+            {
+                TargetKind = "FIELD",
+                TargetKey = rule.TargetKey.Trim(),
+                Operation = NormalizeOperation(rule.Operation)
+            });
+        }
+
+        return normalizedRules
             .GroupBy(x => $"{x.TargetKind}:{x.TargetKey}", StringComparer.OrdinalIgnoreCase)
             .Select(x => x.First())
             .OrderBy(x => x.TargetKind, StringComparer.Ordinal)
             .ThenBy(x => x.TargetKey, StringComparer.Ordinal)
             .ToList();
+    }
 
     private static NormalizedDefaultMethods NormalizeDefaultMethods(WorkAssignmentBasicSummaryDefaultMethodsDto? value)
     {
@@ -2237,9 +2277,6 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
     private static string? NormalizeOptionalText(string? value)
         => string.IsNullOrWhiteSpace(value) ? null : value.Trim();
 
-    private static string NormalizeOperationOrDefault(string? value, string fallback)
-        => NormalizeBasicOperationOrDefault(value, fallback);
-
     private static string ResolveOperation(
         List<WorkAssignmentBasicSummaryRuleDto> rules,
         string targetKind,
@@ -2254,31 +2291,6 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
              string.Equals(x.TargetKey, alternateKey, StringComparison.OrdinalIgnoreCase)));
 
         return rule is null ? fallback : NormalizeOperationForDataType(rule.Operation, dataType, fallback);
-    }
-
-    private static string ResolveTableOperation(
-        List<WorkAssignmentBasicSummaryRuleDto> rules,
-        ParsedTableValue value,
-        string targetKey,
-        string fallback)
-    {
-        var candidateKeys = new List<string>
-        {
-            targetKey,
-            value.MetricKey
-        };
-
-        if (value.Index >= 0)
-        {
-            candidateKeys.Add($"table:{value.BlockId}:index:{value.Index}");
-            candidateKeys.Add($"index:{value.Index}");
-        }
-
-        var rule = rules.FirstOrDefault(x =>
-            string.Equals(x.TargetKind, "TABLE", StringComparison.OrdinalIgnoreCase) &&
-            candidateKeys.Any(key => string.Equals(x.TargetKey, key, StringComparison.OrdinalIgnoreCase)));
-
-        return rule is null ? fallback : NormalizeOperationForDataType(rule.Operation, value.DataType, fallback);
     }
 
     private static string NormalizeOperation(string? value)

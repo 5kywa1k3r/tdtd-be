@@ -94,6 +94,7 @@ var tests = new (string Name, Action Run)[]
     ("values1D compression round-trips null and zero runs", CompressesValues1DBlankRuns),
     ("basic summary normalizes typed methods", BasicSummaryNormalizesTypedMethods),
     ("basic summary supports typed default methods", BasicSummarySupportsTypedDefaultMethods),
+    ("basic summary rejects table method rules", BasicSummaryRejectsTableMethodRules),
     ("basic summary extracts typed table values", BasicSummaryExtractsTypedTableValues),
     ("basic summary merges period snapshots by typed method", BasicSummaryMergesPeriodSnapshotsByTypedMethod),
     ("basic summary compact snapshot round-trips", BasicSummaryCompactSnapshotRoundTrips),
@@ -2802,6 +2803,46 @@ static void BasicSummarySupportsTypedDefaultMethods()
         "JOIN",
         (string)normalizeForDataType.Invoke(null, new object?[] { "sample", "SHORT_TEXT", "COUNT" })!,
         "basic summary rule should keep a typed text method");
+}
+
+static void BasicSummaryRejectsTableMethodRules()
+{
+    var normalizeRules = typeof(WorkAssignmentBasicSummaryService).GetMethod(
+        "NormalizeRules",
+        BindingFlags.NonPublic | BindingFlags.Static)
+        ?? throw new MissingMethodException(nameof(WorkAssignmentBasicSummaryService), "NormalizeRules");
+
+    var fieldRules = (List<WorkAssignmentBasicSummaryRuleDto>)normalizeRules.Invoke(null, new object?[]
+    {
+        new List<WorkAssignmentBasicSummaryRuleDto>
+        {
+            new()
+            {
+                TargetKind = "FIELD",
+                TargetKey = "field:score",
+                Operation = "average"
+            }
+        }
+    })!;
+
+    AssertEqual(1, fieldRules.Count, "basic summary should still allow field-level method overrides");
+    AssertEqual("FIELD", fieldRules[0].TargetKind, "basic summary field rule should normalize target kind");
+    AssertEqual("MEAN", fieldRules[0].Operation, "basic summary field rule should normalize operation");
+
+    AssertThrowsFromReflection(
+        AppErrorCode.WORK_ASSIGNMENT_AGGREGATE_MODE_INVALID,
+        () => normalizeRules.Invoke(null, new object?[]
+        {
+            new List<WorkAssignmentBasicSummaryRuleDto>
+            {
+                new()
+                {
+                    TargetKind = "TABLE",
+                    TargetKey = "table:block_1:index:0",
+                    Operation = "SUM"
+                }
+            }
+        }));
 }
 
 static void BasicSummaryExtractsTypedTableValues()
