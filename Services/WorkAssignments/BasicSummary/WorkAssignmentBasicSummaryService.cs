@@ -14,6 +14,7 @@ using tdtd_be.Enum;
 using tdtd_be.Models;
 using tdtd_be.Models.Enums;
 using tdtd_be.Services;
+using tdtd_be.Services.Notifications;
 using tdtd_be.Services.WorkAssignmentReports.Payloads;
 
 namespace tdtd_be.Services.WorkAssignments.BasicSummary;
@@ -45,17 +46,20 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
     private readonly IWorkReportPayloadReader _payloadReader;
     private readonly IUnitSelectionService _unitSelection;
     private readonly IBackgroundJobClient _backgroundJobs;
+    private readonly INotificationService _notifications;
 
     public WorkAssignmentBasicSummaryService(
         MongoDbContext ctx,
         IWorkReportPayloadReader payloadReader,
         IUnitSelectionService unitSelection,
-        IBackgroundJobClient backgroundJobs)
+        IBackgroundJobClient backgroundJobs,
+        INotificationService notifications)
     {
         _ctx = ctx;
         _payloadReader = payloadReader;
         _unitSelection = unitSelection;
         _backgroundJobs = backgroundJobs;
+        _notifications = notifications;
     }
 
     public async Task<WorkAssignmentBasicSummaryConfigDto?> GetConfigAsync(
@@ -226,10 +230,18 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
         if (string.IsNullOrWhiteSpace(snapshotId))
             throw new ArgumentException("Snapshot id is required.", nameof(snapshotId));
 
+        WorkAssignment? notifyScope = null;
+        DynamicFormTemplate? notifyTemplate = null;
+        string? correlationId = null;
+
         try
         {
+            var refreshSnapshot = await LoadSnapshotByIdAsync(snapshotId, ct);
+            correlationId = refreshSnapshot?.RefreshCorrelationId;
+
             var normalized = await NormalizeRequestAsync(req, ct);
             var scope = await LoadScopeAssignmentAsync(normalized.ScopeAssignmentId, ct);
+            notifyScope = scope;
 
             if (!CanReadAssignment(scope, actorUserId))
             {
@@ -254,6 +266,7 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
                 ?? throw AppExceptionFactory.NotFound(
                     AppErrorCode.DYNAMIC_FORM_TEMPLATE_NOT_FOUND,
                     new { dynamicFormTemplateId });
+            notifyTemplate = template;
 
             var sourceAssignments = await LoadSourceAssignmentsAsync(
                 scope,
@@ -277,12 +290,83 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
                 sourceReports,
                 actorUserId,
                 ct);
+
+            await NotifyBasicSummaryRefreshCompletedAsync(
+                snapshotId,
+                actorUserId,
+                notifyScope,
+                notifyTemplate,
+                correlationId,
+                ct);
         }
         catch (Exception ex)
         {
-            await MarkSnapshotRefreshErrorAsync(snapshotId, BuildRefreshErrorMessage(ex), ct);
+            var error = BuildRefreshErrorMessage(ex);
+            await MarkSnapshotRefreshErrorAsync(snapshotId, error, ct);
+            await NotifyBasicSummaryRefreshFailedAsync(
+                snapshotId,
+                actorUserId,
+                notifyScope,
+                notifyTemplate,
+                correlationId,
+                error,
+                ct);
             throw;
         }
+    }
+
+    public async Task<WorkAssignmentBasicSummaryJobResetResultDto> ResetSnapshotJobAsync(
+        string snapshotId,
+        string actorUserId,
+        CancellationToken ct)
+    {
+        EnsureActor(actorUserId);
+
+        snapshotId = snapshotId?.Trim() ?? string.Empty;
+        if (string.IsNullOrWhiteSpace(snapshotId))
+            throw AppExceptionFactory.BadRequest(AppErrorCode.COMMON_ARGUMENT_REQUIRED, new { field = "snapshotId" });
+
+        var snapshot = await LoadSnapshotByIdAsync(snapshotId, ct)
+                       ?? throw AppExceptionFactory.NotFound(AppErrorCode.COMMON_NOT_FOUND, new { snapshotId });
+
+        var req = BuildBasicSummaryRequestFromSnapshotJson(snapshot.RequestJson);
+        req.ForceRefresh = true;
+        req.IncludeSourceRows = true;
+
+        var correlationId = ObjectId.GenerateNewId().ToString();
+        var jobId = _backgroundJobs.Enqueue<IWorkAssignmentBasicSummaryService>(
+            svc => svc.RefreshSnapshotJobAsync(snapshot.Id, req, actorUserId, CancellationToken.None));
+        var queuedAtUtc = DateTime.UtcNow;
+
+        await _ctx.WorkAssignmentBasicSummarySnapshots.UpdateOneAsync(
+            x => x.Id == snapshot.Id && !x.IsDeleted,
+            Builders<WorkAssignmentBasicSummarySnapshot>.Update
+                .Set(x => x.RefreshStatus, WorkAssignmentBasicSummaryRefreshStatuses.Queued)
+                .Set(x => x.RefreshJobId, jobId)
+                .Set(x => x.RefreshCorrelationId, correlationId)
+                .Set(x => x.RefreshRequestedByUserId, actorUserId)
+                .Set(x => x.RefreshResetByUserId, actorUserId)
+                .Set(x => x.RefreshQueuedAtUtc, queuedAtUtc)
+                .Set(x => x.RefreshStartedAtUtc, (DateTime?)null)
+                .Set(x => x.RefreshFinishedAtUtc, (DateTime?)null)
+                .Set(x => x.RefreshResetAtUtc, queuedAtUtc)
+                .Set(x => x.RefreshError, (string?)null)
+                .Set(x => x.SnapshotDirty, true)
+                .Set(x => x.SnapshotDirtyAtUtc, queuedAtUtc)
+                .Set(x => x.UpdatedAtUtc, queuedAtUtc)
+                .Set(x => x.UpdatedByUserId, actorUserId),
+            cancellationToken: ct);
+
+        await NotifyBasicSummaryRefreshResetAsync(snapshot, actorUserId, correlationId, ct);
+
+        return new WorkAssignmentBasicSummaryJobResetResultDto
+        {
+            SnapshotId = snapshot.Id,
+            JobId = jobId,
+            CorrelationId = correlationId,
+            Status = WorkAssignmentBasicSummaryRefreshStatuses.Queued,
+            QueuedAtUtc = queuedAtUtc
+        };
     }
 
     private async Task<WorkAssignmentBasicSummaryResponse> GetOrBuildSummarySnapshotAsync(
@@ -332,6 +416,7 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
                 snapshot.SnapshotRefreshedAtUtc,
                 snapshot.RefreshStatus,
                 snapshot.RefreshJobId,
+                snapshot.RefreshCorrelationId,
                 snapshot.RefreshQueuedAtUtc,
                 snapshot.RefreshStartedAtUtc,
                 snapshot.RefreshFinishedAtUtc,
@@ -465,12 +550,14 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
         if (!ShouldEnqueueSnapshotRefresh(snapshot.RefreshStatus, req.ForceRefresh))
             return;
 
+        var correlationId = ObjectId.GenerateNewId().ToString();
         var jobId = _backgroundJobs.Enqueue<IWorkAssignmentBasicSummaryService>(
             svc => svc.RefreshSnapshotJobAsync(snapshot.Id, req, actorUserId, CancellationToken.None));
 
-        await MarkSnapshotRefreshQueuedAsync(snapshot.Id, jobId, actorUserId, ct);
+        await MarkSnapshotRefreshQueuedAsync(snapshot.Id, jobId, correlationId, actorUserId, ct);
         snapshot.RefreshStatus = WorkAssignmentBasicSummaryRefreshStatuses.Queued;
         snapshot.RefreshJobId = jobId;
+        snapshot.RefreshCorrelationId = correlationId;
         snapshot.RefreshRequestedByUserId = actorUserId;
         snapshot.RefreshQueuedAtUtc = DateTime.UtcNow;
         snapshot.RefreshError = null;
@@ -531,6 +618,7 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
             staleSnapshot?.SnapshotRefreshedAtUtc ?? queuedSnapshot.SnapshotRefreshedAtUtc,
             queuedSnapshot.RefreshStatus,
             queuedSnapshot.RefreshJobId,
+            queuedSnapshot.RefreshCorrelationId,
             queuedSnapshot.RefreshQueuedAtUtc,
             queuedSnapshot.RefreshStartedAtUtc,
             queuedSnapshot.RefreshFinishedAtUtc,
@@ -798,6 +886,7 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
                 .FirstOrDefault(),
             MergeRefreshStatus(periodResponses),
             periodResponses.Select(x => x.Meta.CalculationJobId).FirstOrDefault(x => !string.IsNullOrWhiteSpace(x)),
+            periodResponses.Select(x => x.Meta.CalculationCorrelationId).FirstOrDefault(x => !string.IsNullOrWhiteSpace(x)),
             periodResponses
                 .Select(x => x.Meta.CalculationQueuedAtUtc)
                 .Where(x => x.HasValue)
@@ -1538,6 +1627,13 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
             .ThenByDescending(x => x.UpdatedAtUtc)
             .FirstOrDefaultAsync(ct);
 
+    private async Task<WorkAssignmentBasicSummarySnapshot?> LoadSnapshotByIdAsync(
+        string snapshotId,
+        CancellationToken ct)
+        => await _ctx.WorkAssignmentBasicSummarySnapshots
+            .Find(x => x.Id == snapshotId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct);
+
     private static WorkAssignmentBasicSummaryResponse DeserializeSnapshot(
         WorkAssignmentBasicSummarySnapshot snapshot,
         List<WorkAssignment> sourceAssignments,
@@ -1658,6 +1754,38 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
             rules = req.Rules,
             maxTextChars = req.MaxTextChars
         }, JsonOptions);
+
+    private static WorkAssignmentBasicSummaryRequest BuildBasicSummaryRequestFromSnapshotJson(string? requestJson)
+    {
+        var stored = ParseConfigJson<BasicSummarySnapshotRequestJson>(requestJson, new BasicSummarySnapshotRequestJson());
+        if (string.IsNullOrWhiteSpace(stored.ScopeAssignmentId))
+        {
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.COMMON_VALIDATION_FAILED,
+                new { field = "requestJson.scopeAssignmentId", reason = "BASIC_SUMMARY_SNAPSHOT_REQUEST_INVALID" });
+        }
+
+        return new WorkAssignmentBasicSummaryRequest
+        {
+            ScopeAssignmentId = stored.ScopeAssignmentId.Trim(),
+            DynamicFormTemplateId = string.IsNullOrWhiteSpace(stored.DynamicFormTemplateId)
+                ? null
+                : stored.DynamicFormTemplateId.Trim(),
+            SelectedUnitIds = stored.SelectedUnitIds,
+            PeriodScopeMode = stored.PeriodScopeMode,
+            PeriodKey = stored.PeriodKey,
+            PeriodKeyFrom = stored.PeriodKeyFrom,
+            PeriodKeyTo = stored.PeriodKeyTo,
+            DefaultMethods = stored.DefaultMethods,
+            Rules = stored.Rules,
+            ForceRefresh = true,
+            IncludeSourceRows = true,
+            MaxTextChars = Math.Clamp(
+                stored.MaxTextChars.GetValueOrDefault(DefaultMaxTextChars),
+                1000,
+                MaxTextCharsLimit)
+        };
+    }
 
     private static BasicSummarySnapshotPayload CreateSnapshotPayload(
         WorkAssignmentBasicSummaryResponse response)
@@ -1961,6 +2089,7 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
     private async Task MarkSnapshotRefreshQueuedAsync(
         string snapshotId,
         string jobId,
+        string correlationId,
         string actorUserId,
         CancellationToken ct)
     {
@@ -1970,8 +2099,10 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
             Builders<WorkAssignmentBasicSummarySnapshot>.Update
                 .Set(x => x.RefreshStatus, WorkAssignmentBasicSummaryRefreshStatuses.Queued)
                 .Set(x => x.RefreshJobId, jobId)
+                .Set(x => x.RefreshCorrelationId, correlationId)
                 .Set(x => x.RefreshRequestedByUserId, actorUserId)
                 .Set(x => x.RefreshQueuedAtUtc, now)
+                .Set(x => x.RefreshStartedAtUtc, (DateTime?)null)
                 .Set(x => x.RefreshFinishedAtUtc, (DateTime?)null)
                 .Set(x => x.RefreshError, (string?)null)
                 .Set(x => x.UpdatedAtUtc, now)
@@ -2025,6 +2156,7 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
         DateTime? snapshotRefreshedAtUtc,
         string? calculationStatus = null,
         string? calculationJobId = null,
+        string? calculationCorrelationId = null,
         DateTime? calculationQueuedAtUtc = null,
         DateTime? calculationStartedAtUtc = null,
         DateTime? calculationFinishedAtUtc = null,
@@ -2058,6 +2190,7 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
             IsCalculating = IsActiveRefreshStatus(calculationStatus),
             CalculationStatus = calculationStatus,
             CalculationJobId = calculationJobId,
+            CalculationCorrelationId = calculationCorrelationId,
             CalculationQueuedAtUtc = calculationQueuedAtUtc,
             CalculationStartedAtUtc = calculationStartedAtUtc,
             CalculationFinishedAtUtc = calculationFinishedAtUtc,
@@ -2096,6 +2229,143 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
 
         message = message.Trim();
         return message.Length <= 2000 ? message : message[..2000];
+    }
+
+    private Task NotifyBasicSummaryRefreshCompletedAsync(
+        string snapshotId,
+        string actorUserId,
+        WorkAssignment? scope,
+        DynamicFormTemplate? template,
+        string? correlationId,
+        CancellationToken ct)
+        => NotifyBasicSummaryRefreshAsync(
+            snapshotId,
+            actorUserId,
+            scope,
+            template,
+            correlationId,
+            eventStatus: "done",
+            title: "Tổng hợp cơ bản đã tính xong",
+            stateText: "đã hoàn tất tính nền",
+            severity: UserNotificationSeverities.Info,
+            requiresAction: false,
+            error: null,
+            ct);
+
+    private Task NotifyBasicSummaryRefreshFailedAsync(
+        string snapshotId,
+        string actorUserId,
+        WorkAssignment? scope,
+        DynamicFormTemplate? template,
+        string? correlationId,
+        string error,
+        CancellationToken ct)
+        => NotifyBasicSummaryRefreshAsync(
+            snapshotId,
+            actorUserId,
+            scope,
+            template,
+            correlationId,
+            eventStatus: "failed",
+            title: "Tổng hợp cơ bản tính nền bị lỗi",
+            stateText: "tính nền thất bại",
+            severity: UserNotificationSeverities.Warning,
+            requiresAction: true,
+            error,
+            ct);
+
+    private async Task NotifyBasicSummaryRefreshResetAsync(
+        WorkAssignmentBasicSummarySnapshot snapshot,
+        string actorUserId,
+        string correlationId,
+        CancellationToken ct)
+    {
+        var scope = await _ctx.WorkAssignments
+            .Find(x => x.Id == snapshot.ScopeAssignmentId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct);
+        var template = await _ctx.DynamicFormTemplates
+            .Find(x => x.Id == snapshot.DynamicFormTemplateId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct);
+
+        await NotifyBasicSummaryRefreshAsync(
+            snapshot.Id,
+            actorUserId,
+            scope,
+            template,
+            correlationId,
+            eventStatus: "reset",
+            title: "Tổng hợp cơ bản đã được reset",
+            stateText: "đã được đưa lại vào hàng đợi tính nền",
+            severity: UserNotificationSeverities.Info,
+            requiresAction: false,
+            error: null,
+            ct);
+    }
+
+    private Task NotifyBasicSummaryRefreshAsync(
+        string snapshotId,
+        string actorUserId,
+        WorkAssignment? scope,
+        DynamicFormTemplate? template,
+        string? correlationId,
+        string eventStatus,
+        string title,
+        string stateText,
+        string severity,
+        bool requiresAction,
+        string? error,
+        CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(actorUserId))
+            return Task.CompletedTask;
+
+        var eventCorrelation = string.IsNullOrWhiteSpace(correlationId) ? snapshotId : correlationId.Trim();
+        return _notifications.CreateManyAsync(new[]
+        {
+            new NotificationCommand
+            {
+                RecipientUserId = actorUserId,
+                Type = UserNotificationTypes.BasicSummaryRefresh,
+                Severity = severity,
+                Title = title,
+                Body = BuildBasicSummaryRefreshNotificationBody(stateText, scope, template, eventCorrelation, error),
+                WorkId = scope?.WorkId,
+                WorkAssignmentId = scope?.Id,
+                AssignmentCode = scope?.Code,
+                Category = UserNotificationCategories.Status,
+                RequiresAction = requiresAction,
+                ActionState = requiresAction
+                    ? UserNotificationActionStates.Open
+                    : UserNotificationActionStates.Resolved,
+                SourceEntityType = "WORK_ASSIGNMENT_BASIC_SUMMARY_SNAPSHOT",
+                SourceEntityId = snapshotId,
+                RequestId = ObjectId.TryParse(eventCorrelation, out _) ? eventCorrelation : null,
+                ActorUserId = actorUserId,
+                TargetUserId = actorUserId,
+                OccurredAtUtc = DateTime.UtcNow,
+                EventKey = $"basic-summary-refresh:{eventStatus}:{snapshotId}:{eventCorrelation}"
+            }
+        }, ct);
+    }
+
+    private static string BuildBasicSummaryRefreshNotificationBody(
+        string stateText,
+        WorkAssignment? scope,
+        DynamicFormTemplate? template,
+        string correlationId,
+        string? error)
+    {
+        var templateLabel = new[] { template?.Code, template?.Name, template?.Id }
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .FirstOrDefault() ?? "-";
+        var scopeLabel = new[] { scope?.Code, scope?.Name, scope?.Id }
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .FirstOrDefault() ?? "-";
+        var body = $"Biểu mẫu {templateLabel}, công việc {scopeLabel}: {stateText}. Mã theo dõi: {correlationId}.";
+        if (!string.IsNullOrWhiteSpace(error))
+            body += $" Lỗi: {error.Trim()}";
+
+        return body.Length <= 1800 ? body : body[..1800];
     }
 
     private static void ApplySourceView(
@@ -3643,6 +3913,20 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
 
         [JsonPropertyName("l")]
         public string? Label { get; set; }
+    }
+
+    private sealed class BasicSummarySnapshotRequestJson
+    {
+        public string? ScopeAssignmentId { get; set; }
+        public string? DynamicFormTemplateId { get; set; }
+        public string? PeriodScopeMode { get; set; }
+        public string? PeriodKey { get; set; }
+        public string? PeriodKeyFrom { get; set; }
+        public string? PeriodKeyTo { get; set; }
+        public List<string>? SelectedUnitIds { get; set; }
+        public WorkAssignmentBasicSummaryDefaultMethodsDto? DefaultMethods { get; set; }
+        public List<WorkAssignmentBasicSummaryRuleDto>? Rules { get; set; }
+        public int? MaxTextChars { get; set; }
     }
 
     private sealed record CompactTableMetricParts(

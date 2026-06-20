@@ -89,3 +89,41 @@ public sealed class StatisticRebuildJobRow
     public DateTime CreatedAtUtc { get; init; }
     public DateTime UpdatedAtUtc { get; init; }
 }
+
+public sealed class BasicSummaryJobRow
+{
+    public string Id { get; init; } = string.Empty;
+    public string WorkId { get; init; } = string.Empty;
+    public string ScopeAssignmentId { get; init; } = string.Empty;
+    public string DynamicFormTemplateId { get; init; } = string.Empty;
+    public string RequestHash { get; init; } = string.Empty;
+    public string? SourceSignatureHash { get; init; }
+    public int SourceAssignmentCount { get; init; }
+    public int SourceReportCount { get; init; }
+    public bool SnapshotDirty { get; init; }
+    public DateTime? SnapshotDirtyAtUtc { get; init; }
+    public DateTime? SnapshotRefreshedAtUtc { get; init; }
+    public string? RefreshStatus { get; init; }
+    public string? RefreshJobId { get; init; }
+    public string? RefreshCorrelationId { get; init; }
+    public string? RefreshRequestedByUserId { get; init; }
+    public string? RefreshResetByUserId { get; init; }
+    public DateTime? RefreshQueuedAtUtc { get; init; }
+    public DateTime? RefreshStartedAtUtc { get; init; }
+    public DateTime? RefreshFinishedAtUtc { get; init; }
+    public DateTime? RefreshResetAtUtc { get; init; }
+    public string? RefreshError { get; init; }
+    public bool IsDeleted { get; init; }
+    public DateTime CreatedAtUtc { get; init; }
+    public DateTime UpdatedAtUtc { get; init; }
+}
+
+public sealed class BasicSummaryJobResetResponse
+{
+    public bool Ok { get; init; }
+    public BasicSummaryJobRow? Job { get; init; }
+    public string SnapshotId { get; init; } = string.Empty;
+    public string JobId { get; init; } = string.Empty;
+    public string CorrelationId { get; init; } = string.Empty;
+    public DateTime QueuedAtUtc { get; init; }
+}

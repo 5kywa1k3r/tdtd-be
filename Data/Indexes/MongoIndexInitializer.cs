@@ -1691,6 +1691,25 @@
                     { "isDeleted", 1 }
                 }
             ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_workAssignmentBasicSummarySnapshots_refresh_status",
+                key: new BsonDocument
+                {
+                    { "refreshStatus", 1 },
+                    { "refreshQueuedAtUtc", -1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_workAssignmentBasicSummarySnapshots_refresh_correlation",
+                key: new BsonDocument
+                {
+                    { "refreshCorrelationId", 1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
         }
 
         private static async Task EnsureWorkAssignmentBasicSummaryConfigsAsync(

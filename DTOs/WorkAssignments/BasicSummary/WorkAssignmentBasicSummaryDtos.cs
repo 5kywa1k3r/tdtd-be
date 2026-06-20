@@ -72,6 +72,15 @@ public sealed class SaveWorkAssignmentBasicSummaryConfigRequest
     public List<WorkAssignmentBasicSummaryRuleDto>? Rules { get; set; }
 }
 
+public sealed class WorkAssignmentBasicSummaryJobResetResultDto
+{
+    public string SnapshotId { get; set; } = string.Empty;
+    public string JobId { get; set; } = string.Empty;
+    public string CorrelationId { get; set; } = string.Empty;
+    public string Status { get; set; } = "QUEUED";
+    public DateTime QueuedAtUtc { get; set; }
+}
+
 public sealed class WorkAssignmentBasicSummaryMetaDto
 {
     public string SummaryType { get; set; } = "BASIC";
@@ -99,6 +108,7 @@ public sealed class WorkAssignmentBasicSummaryMetaDto
     public bool IsCalculating { get; set; }
     public string? CalculationStatus { get; set; }
     public string? CalculationJobId { get; set; }
+    public string? CalculationCorrelationId { get; set; }
     public DateTime? CalculationQueuedAtUtc { get; set; }
     public DateTime? CalculationStartedAtUtc { get; set; }
     public DateTime? CalculationFinishedAtUtc { get; set; }

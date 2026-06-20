@@ -61,9 +61,16 @@ public sealed class WorkAssignmentBasicSummarySnapshot : BaseEntity
     [BsonElement("refreshJobId")]
     public string? RefreshJobId { get; set; }
 
+    [BsonElement("refreshCorrelationId")]
+    public string? RefreshCorrelationId { get; set; }
+
     [BsonElement("refreshRequestedByUserId")]
     [BsonRepresentation(BsonType.ObjectId)]
     public string? RefreshRequestedByUserId { get; set; }
+
+    [BsonElement("refreshResetByUserId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? RefreshResetByUserId { get; set; }
 
     [BsonElement("refreshQueuedAtUtc")]
     [BsonDateTimeOptions(Kind = DateTimeKind.Utc)]
@@ -76,6 +83,10 @@ public sealed class WorkAssignmentBasicSummarySnapshot : BaseEntity
     [BsonElement("refreshFinishedAtUtc")]
     [BsonDateTimeOptions(Kind = DateTimeKind.Utc)]
     public DateTime? RefreshFinishedAtUtc { get; set; }
+
+    [BsonElement("refreshResetAtUtc")]
+    [BsonDateTimeOptions(Kind = DateTimeKind.Utc)]
+    public DateTime? RefreshResetAtUtc { get; set; }
 
     [BsonElement("refreshError")]
     public string? RefreshError { get; set; }

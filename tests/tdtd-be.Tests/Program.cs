@@ -96,6 +96,7 @@ var tests = new (string Name, Action Run)[]
     ("basic summary supports typed default methods", BasicSummarySupportsTypedDefaultMethods),
     ("basic summary rejects table method rules", BasicSummaryRejectsTableMethodRules),
     ("basic summary refresh status controls enqueue", BasicSummaryRefreshStatusControlsEnqueue),
+    ("basic summary reset request rebuilds from snapshot json", BasicSummaryResetRequestRebuildsFromSnapshotJson),
     ("basic summary extracts typed table values", BasicSummaryExtractsTypedTableValues),
     ("basic summary merges period snapshots by typed method", BasicSummaryMergesPeriodSnapshotsByTypedMethod),
     ("basic summary compact snapshot round-trips", BasicSummaryCompactSnapshotRoundTrips),
@@ -2862,6 +2863,41 @@ static void BasicSummaryRefreshStatusControlsEnqueue()
     AssertFalse(Invoke("RUNNING", true), "running snapshot should not enqueue duplicate refresh jobs even on force refresh");
     AssertFalse(Invoke("FAILED", false), "failed snapshot should wait for explicit reset/force refresh");
     AssertTrue(Invoke("FAILED", true), "force refresh should reset a failed basic summary job");
+}
+
+static void BasicSummaryResetRequestRebuildsFromSnapshotJson()
+{
+    var requestJson = JsonSerializer.Serialize(new
+    {
+        scopeAssignmentId = ObjectId(1),
+        dynamicFormTemplateId = ObjectId(2),
+        periodScopeMode = "SINGLE_PERIOD",
+        periodKey = "20260601",
+        selectedUnitIds = new[] { ObjectId(3) },
+        defaultMethods = new { number = "AVG", text = "LIST" },
+        rules = new[]
+        {
+            new { targetKind = "FIELD", targetKey = "field:score", operation = "COUNT" }
+        },
+        maxTextChars = 500000
+    });
+
+    var req = InvokePrivateStatic<WorkAssignmentBasicSummaryRequest>(
+        typeof(WorkAssignmentBasicSummaryService),
+        "BuildBasicSummaryRequestFromSnapshotJson",
+        requestJson);
+
+    AssertEqual(ObjectId(1), req.ScopeAssignmentId, "reset request should keep scope assignment");
+    AssertEqual(ObjectId(2), req.DynamicFormTemplateId, "reset request should keep dynamic form template");
+    AssertEqual("SINGLE_PERIOD", req.PeriodScopeMode, "reset request should keep period scope mode");
+    AssertEqual("20260601", req.PeriodKey, "reset request should keep period key");
+    AssertEqual(ObjectId(3), req.SelectedUnitIds?.Single(), "reset request should keep selected units");
+    AssertEqual("AVG", req.DefaultMethods?.Number, "reset request should keep typed number method");
+    AssertEqual("LIST", req.DefaultMethods?.Text, "reset request should keep typed text method");
+    AssertEqual("field:score", req.Rules?.Single().TargetKey, "reset request should keep field rule");
+    AssertTrue(req.ForceRefresh, "reset request should force refresh");
+    AssertTrue(req.IncludeSourceRows, "reset request should include source rows for rebuild");
+    AssertEqual(100000, req.MaxTextChars, "reset request should clamp max text chars");
 }
 
 static void BasicSummaryExtractsTypedTableValues()

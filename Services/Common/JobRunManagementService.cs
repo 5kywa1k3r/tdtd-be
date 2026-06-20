@@ -8,6 +8,7 @@ using tdtd_be.Models;
 using tdtd_be.Models.Statistics;
 using tdtd_be.Services.Notifications;
 using tdtd_be.Services.WorkAssignmentReports.Statistics;
+using tdtd_be.Services.WorkAssignments.BasicSummary;
 using tdtd_be.Services.WorkAssignments.Queue;
 using tdtd_be.Services.WorkAssignments.Runtime;
 
@@ -23,6 +24,13 @@ public interface IJobRunManagementService
         CancellationToken ct = default);
     Task<PagedResult<StatisticRebuildJobRow>> SearchStatisticRebuildJobsAsync(
         JobRunSearchRequest request,
+        CancellationToken ct = default);
+    Task<PagedResult<BasicSummaryJobRow>> SearchBasicSummaryJobsAsync(
+        JobRunSearchRequest request,
+        CancellationToken ct = default);
+    Task<BasicSummaryJobResetResponse> ResetBasicSummaryJobAsync(
+        string snapshotId,
+        string actorUserId,
         CancellationToken ct = default);
     Task<int> ProcessMaterializeJobsAsync(int maxJobs, int batchSize, CancellationToken ct = default);
     Task ProcessWorkAssignmentQueueScanAsync(CancellationToken ct = default);
@@ -41,6 +49,7 @@ public sealed class JobRunManagementService : IJobRunManagementService
     private readonly IDocRoleReadModelProjectionRetryJobService _projectionRetry;
     private readonly IUserActionLogService _userActionLog;
     private readonly IWorkReportStatisticRebuildJobService _statisticRebuildJobs;
+    private readonly IWorkAssignmentBasicSummaryService _basicSummary;
 
     public JobRunManagementService(
         MongoDbContext ctx,
@@ -49,7 +58,8 @@ public sealed class JobRunManagementService : IJobRunManagementService
         INotificationDueScanJobService notificationDueScan,
         IDocRoleReadModelProjectionRetryJobService projectionRetry,
         IUserActionLogService userActionLog,
-        IWorkReportStatisticRebuildJobService statisticRebuildJobs)
+        IWorkReportStatisticRebuildJobService statisticRebuildJobs,
+        IWorkAssignmentBasicSummaryService basicSummary)
     {
         _ctx = ctx;
         _materializeJobs = materializeJobs;
@@ -58,6 +68,7 @@ public sealed class JobRunManagementService : IJobRunManagementService
         _projectionRetry = projectionRetry;
         _userActionLog = userActionLog;
         _statisticRebuildJobs = statisticRebuildJobs;
+        _basicSummary = basicSummary;
     }
 
     public async Task<PagedResult<MaterializeJobRow>> SearchMaterializeJobsAsync(
@@ -227,6 +238,85 @@ public sealed class JobRunManagementService : IJobRunManagementService
             Math.Clamp(batchSize, 1, 100),
             ct);
 
+    public async Task<PagedResult<BasicSummaryJobRow>> SearchBasicSummaryJobsAsync(
+        JobRunSearchRequest request,
+        CancellationToken ct = default)
+    {
+        request ??= new JobRunSearchRequest();
+
+        var page = Math.Max(0, request.Page);
+        var pageSize = Math.Clamp(request.PageSize <= 0 ? 50 : request.PageSize, 1, 100);
+        var fb = Builders<WorkAssignmentBasicSummarySnapshot>.Filter;
+        var filter = request.IncludeInactive
+            ? FilterDefinition<WorkAssignmentBasicSummarySnapshot>.Empty
+            : fb.Eq(x => x.IsDeleted, false);
+
+        filter &= EqIfNotBlank(fb, x => x.RefreshStatus, request.Status);
+        filter &= EqIfNotBlank(fb, x => x.WorkId, request.WorkId);
+        filter &= EqIfNotBlank(fb, x => x.ScopeAssignmentId, request.WorkAssignmentId);
+        filter &= EqIfNotBlank(fb, x => x.DynamicFormTemplateId, request.DynamicFormTemplateId);
+
+        var userId = NullIfWhiteSpace(request.UserId);
+        if (userId is not null)
+        {
+            filter &= fb.Or(
+                fb.Eq(x => x.RefreshRequestedByUserId, userId),
+                fb.Eq(x => x.RefreshResetByUserId, userId),
+                fb.Eq(x => x.CreatedByUserId, userId),
+                fb.Eq(x => x.UpdatedByUserId, userId));
+        }
+
+        var query = NullIfWhiteSpace(request.Query);
+        if (query is not null)
+        {
+            var regex = new BsonRegularExpression(Regex.Escape(query), "i");
+            filter &= fb.Or(
+                fb.Regex(x => x.RefreshStatus, regex),
+                fb.Regex(x => x.RefreshJobId, regex),
+                fb.Regex(x => x.RefreshCorrelationId, regex),
+                fb.Regex(x => x.RefreshError, regex),
+                fb.Regex(x => x.RequestHash, regex),
+                fb.Regex(x => x.SourceSignatureHash, regex));
+        }
+
+        var total = await _ctx.WorkAssignmentBasicSummarySnapshots.CountDocumentsAsync(filter, cancellationToken: ct);
+        var rows = await _ctx.WorkAssignmentBasicSummarySnapshots
+            .Find(filter)
+            .Sort(Builders<WorkAssignmentBasicSummarySnapshot>.Sort
+                .Descending(x => x.RefreshQueuedAtUtc)
+                .Descending(x => x.UpdatedAtUtc))
+            .Skip(page * pageSize)
+            .Limit(pageSize)
+            .ToListAsync(ct);
+
+        return new PagedResult<BasicSummaryJobRow>(
+            rows.Select(ToBasicSummaryJobRow).ToList(),
+            total,
+            page,
+            pageSize);
+    }
+
+    public async Task<BasicSummaryJobResetResponse> ResetBasicSummaryJobAsync(
+        string snapshotId,
+        string actorUserId,
+        CancellationToken ct = default)
+    {
+        var reset = await _basicSummary.ResetSnapshotJobAsync(snapshotId, actorUserId, ct);
+        var snapshot = await _ctx.WorkAssignmentBasicSummarySnapshots
+            .Find(x => x.Id == reset.SnapshotId)
+            .FirstOrDefaultAsync(ct);
+
+        return new BasicSummaryJobResetResponse
+        {
+            Ok = true,
+            Job = snapshot is null ? null : ToBasicSummaryJobRow(snapshot),
+            SnapshotId = reset.SnapshotId,
+            JobId = reset.JobId,
+            CorrelationId = reset.CorrelationId,
+            QueuedAtUtc = reset.QueuedAtUtc
+        };
+    }
+
     private static MaterializeJobRow ToMaterializeRow(WorkAssignmentMaterializeJobs x)
         => new()
         {
@@ -301,6 +391,35 @@ public sealed class JobRunManagementService : IJobRunManagementService
             LastError = x.LastError,
             LastErrorAtUtc = x.LastErrorAtUtc,
             IsActive = x.IsActive,
+            CreatedAtUtc = x.CreatedAtUtc,
+            UpdatedAtUtc = x.UpdatedAtUtc
+        };
+
+    private static BasicSummaryJobRow ToBasicSummaryJobRow(WorkAssignmentBasicSummarySnapshot x)
+        => new()
+        {
+            Id = x.Id,
+            WorkId = x.WorkId,
+            ScopeAssignmentId = x.ScopeAssignmentId,
+            DynamicFormTemplateId = x.DynamicFormTemplateId,
+            RequestHash = x.RequestHash,
+            SourceSignatureHash = x.SourceSignatureHash,
+            SourceAssignmentCount = x.SourceAssignmentIds?.Count ?? 0,
+            SourceReportCount = x.SourceReportIds?.Count ?? 0,
+            SnapshotDirty = x.SnapshotDirty,
+            SnapshotDirtyAtUtc = x.SnapshotDirtyAtUtc,
+            SnapshotRefreshedAtUtc = x.SnapshotRefreshedAtUtc,
+            RefreshStatus = x.RefreshStatus,
+            RefreshJobId = x.RefreshJobId,
+            RefreshCorrelationId = x.RefreshCorrelationId,
+            RefreshRequestedByUserId = x.RefreshRequestedByUserId,
+            RefreshResetByUserId = x.RefreshResetByUserId,
+            RefreshQueuedAtUtc = x.RefreshQueuedAtUtc,
+            RefreshStartedAtUtc = x.RefreshStartedAtUtc,
+            RefreshFinishedAtUtc = x.RefreshFinishedAtUtc,
+            RefreshResetAtUtc = x.RefreshResetAtUtc,
+            RefreshError = x.RefreshError,
+            IsDeleted = x.IsDeleted,
             CreatedAtUtc = x.CreatedAtUtc,
             UpdatedAtUtc = x.UpdatedAtUtc
         };

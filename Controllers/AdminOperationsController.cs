@@ -320,6 +320,46 @@ public sealed class AdminOperationsController : ControllerBase
         });
     }
 
+    [HttpGet("job-runs/basic-summary-jobs")]
+    public async Task<IActionResult> SearchBasicSummaryJobs(
+        [FromQuery] string? status = null,
+        [FromQuery] string? workId = null,
+        [FromQuery] string? workAssignmentId = null,
+        [FromQuery] string? dynamicFormTemplateId = null,
+        [FromQuery] string? userId = null,
+        [FromQuery] string? q = null,
+        [FromQuery] bool includeInactive = false,
+        [FromQuery] int page = 0,
+        [FromQuery] int pageSize = 50,
+        CancellationToken ct = default)
+    {
+        RequireSystemAdmin();
+
+        return Ok(await _jobRuns.SearchBasicSummaryJobsAsync(new JobRunSearchRequest
+        {
+            Status = status,
+            WorkId = workId,
+            WorkAssignmentId = workAssignmentId,
+            DynamicFormTemplateId = dynamicFormTemplateId,
+            UserId = userId,
+            Query = q,
+            IncludeInactive = includeInactive,
+            Page = page,
+            PageSize = pageSize
+        }, ct));
+    }
+
+    [HttpPost("job-runs/basic-summary-jobs/{snapshotId}/reset")]
+    public async Task<IActionResult> ResetBasicSummaryJob(
+        string snapshotId,
+        CancellationToken ct = default)
+    {
+        var me = _me.RequireMe();
+        RoleGuard.RequireSystemAdmin(me);
+
+        return Ok(await _jobRuns.ResetBasicSummaryJobAsync(snapshotId, me.Id, ct));
+    }
+
     [HttpGet("report-payloads/diagnostics")]
     public async Task<IActionResult> CheckReportPayloadDiagnostics(
         [FromQuery] string? workId = null,

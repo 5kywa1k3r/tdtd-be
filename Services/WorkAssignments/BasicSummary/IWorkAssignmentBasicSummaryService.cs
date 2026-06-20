@@ -27,4 +27,9 @@ public interface IWorkAssignmentBasicSummaryService
         WorkAssignmentBasicSummaryRequest req,
         string actorUserId,
         CancellationToken ct);
+
+    Task<WorkAssignmentBasicSummaryJobResetResultDto> ResetSnapshotJobAsync(
+        string snapshotId,
+        string actorUserId,
+        CancellationToken ct);
 }
