@@ -66,6 +66,9 @@ var tests = new (string Name, Action Run)[]
     ("historical data approval uses completed date for due status", ResolvesHistoricalDataApprovalFromCompletedDate),
     ("historical data submission uses completed date for due status", ResolvesHistoricalSubmittedStatusFromCompletedDate),
     ("historical report source window matches aggregate period filters", MatchesHistoricalReportSourceWindowForAggregation),
+    ("historical mutation policy allows recent approved changes", HistoricalMutationPolicyAllowsRecentApprovedChanges),
+    ("historical mutation policy requires management for extended window", HistoricalMutationPolicyRequiresManagementForExtendedWindow),
+    ("historical mutation policy requires admin beyond extended window", HistoricalMutationPolicyRequiresAdminBeyondExtendedWindow),
     ("generated unit manager can create root work", AllowsGeneratedUnitManagerWorkCreate),
     ("generated level manager can create root work", AllowsGeneratedLevelManagerWorkCreate),
     ("management account usernames use unit symbol", ManagementAccountUsernamesUseUnitSymbol),
@@ -1257,6 +1260,58 @@ static void MatchesHistoricalReportSourceWindowForAggregation()
     AssertFalse(
         WorkAssignmentReportTemporalPolicy.MatchesPeriodScope(report, "CUMULATIVE_TO_PERIOD", null, null, "20260104"),
         "cumulative aggregate should exclude reports whose source window starts after the cutoff");
+}
+
+static void HistoricalMutationPolicyAllowsRecentApprovedChanges()
+{
+    var now = new DateTime(2026, 6, 20, 10, 0, 0, DateTimeKind.Utc);
+    var report = ApprovedHistoricalMutationReport(new DateTime(2026, 6, 1));
+    var actor = Me("reviewer", "NORMAL_USER", new List<string>());
+
+    var decision = WorkAssignmentHistoricalMutationPolicy.EvaluateApprovedMutation(report, null, actor, now);
+
+    AssertTrue(decision.IsAllowed, "recent approved historical mutation should be allowed for normal review flow");
+    AssertEqual("RECENT_WINDOW", decision.Required, "recent mutation should not require elevated role");
+    WorkAssignmentHistoricalMutationPolicy.EnsureApprovedMutationAllowed(report, null, actor, "TEST_RECENT", now);
+}
+
+static void HistoricalMutationPolicyRequiresManagementForExtendedWindow()
+{
+    var now = new DateTime(2026, 6, 20, 10, 0, 0, DateTimeKind.Utc);
+    var report = ApprovedHistoricalMutationReport(new DateTime(2026, 4, 20));
+    var normalActor = Me("reviewer", "NORMAL_USER", new List<string>());
+    var unitManager = Me(
+        username: "mu_pv01",
+        accountKind: "UNIT_MANAGER",
+        roles: new List<string> { Roles.ManagerUnit(ObjectId(9)) });
+
+    var normalDecision = WorkAssignmentHistoricalMutationPolicy.EvaluateApprovedMutation(report, null, normalActor, now);
+    var managerDecision = WorkAssignmentHistoricalMutationPolicy.EvaluateApprovedMutation(report, null, unitManager, now);
+
+    AssertFalse(normalDecision.IsAllowed, "older than one month should not be allowed for normal reviewer");
+    AssertEqual("MANAGEMENT_OR_ADMIN", normalDecision.Required, "extended window should require management role");
+    AssertTrue(managerDecision.IsAllowed, "generated management account should be allowed up to three months");
+    AssertThrows(
+        AppErrorCode.WORK_ASSIGNMENT_REPORT_HISTORICAL_MUTATION_WINDOW_FORBIDDEN,
+        () => WorkAssignmentHistoricalMutationPolicy.EnsureApprovedMutationAllowed(report, null, normalActor, "TEST_EXTENDED", now));
+}
+
+static void HistoricalMutationPolicyRequiresAdminBeyondExtendedWindow()
+{
+    var now = new DateTime(2026, 6, 20, 10, 0, 0, DateTimeKind.Utc);
+    var report = ApprovedHistoricalMutationReport(new DateTime(2026, 2, 20));
+    var unitManager = Me(
+        username: "mu_pv01",
+        accountKind: "UNIT_MANAGER",
+        roles: new List<string> { Roles.ManagerUnit(ObjectId(9)) });
+    var admin = Me("admin", "NORMAL_USER", new List<string> { Roles.ADMIN });
+
+    var managerDecision = WorkAssignmentHistoricalMutationPolicy.EvaluateApprovedMutation(report, null, unitManager, now);
+    var adminDecision = WorkAssignmentHistoricalMutationPolicy.EvaluateApprovedMutation(report, null, admin, now);
+
+    AssertFalse(managerDecision.IsAllowed, "older than three months should not be allowed for management account");
+    AssertEqual("ADMIN_OR_SYSTEM_ADMIN", managerDecision.Required, "old mutation should require admin");
+    AssertTrue(adminDecision.IsAllowed, "admin should be allowed beyond the extended historical mutation window");
 }
 
 static void AllowsGeneratedUnitManagerWorkCreate()
@@ -3850,6 +3905,23 @@ static WorkAssignmentAdvancedSummaryDayNode TestAdvancedSummaryDayNode(
         CreatedAtUtc = AdvancedSummaryHierarchyKeyHelper.ParseDayKey(dayKey),
         UpdatedAtUtc = AdvancedSummaryHierarchyKeyHelper.ParseDayKey(dayKey).AddHours(2),
         IsDeleted = false
+    };
+
+static WorkAssignmentReport ApprovedHistoricalMutationReport(DateTime sourceDate)
+    => new()
+    {
+        Id = ObjectId(120),
+        WorkId = ObjectId(121),
+        WorkAssignmentId = ObjectId(122),
+        WorkReportPeriodId = ObjectId(123),
+        AssigneeUserId = UserId(4),
+        Status = WorkAssignmentReportStatus.Approved,
+        CompletedDate = sourceDate.Date,
+        PeriodKey = sourceDate.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture),
+        IsHistoricalData = true,
+        HistoricalDataApproved = true,
+        ApprovedAtUtc = sourceDate.Date.AddHours(9),
+        UpdatedAtUtc = sourceDate.Date.AddHours(10)
     };
 
 static object GetRollupField(object rollup, string fieldId)

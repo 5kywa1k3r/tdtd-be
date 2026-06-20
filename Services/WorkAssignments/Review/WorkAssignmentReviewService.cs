@@ -643,6 +643,13 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
         await EnsureNoLaterApprovedReportsAsync(period, ct);
 
         var now = DateTime.UtcNow;
+        WorkAssignmentHistoricalMutationPolicy.EnsureApprovedMutationAllowed(
+            report,
+            period,
+            me,
+            "REVIEW_RECALL_APPROVED",
+            now);
+
         await _ctx.WorkAssignmentReports.UpdateOneAsync(
             x => x.Id == report.Id,
             Builders<WorkAssignmentReport>.Update
@@ -747,6 +754,16 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
             await EnsureNoLaterApprovedReportsAsync(period, ct);
 
         var now = DateTime.UtcNow;
+        if (report.Status == WorkAssignmentReportStatus.Approved)
+        {
+            WorkAssignmentHistoricalMutationPolicy.EnsureApprovedMutationAllowed(
+                report,
+                period,
+                me,
+                "REVIEW_DEACTIVATE_REPORT",
+                now);
+        }
+
         var comment = NormalizeOptionalText(req.Comment);
         var wasCurrent = report.IsCurrent || string.Equals(period?.CurrentReportId, report.Id, StringComparison.Ordinal);
 
@@ -904,6 +921,16 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
                 ReportDetails(report));
 
         var now = DateTime.UtcNow;
+        if (report.Status == WorkAssignmentReportStatus.Approved)
+        {
+            WorkAssignmentHistoricalMutationPolicy.EnsureApprovedMutationAllowed(
+                report,
+                period,
+                me,
+                "REVIEW_REACTIVATE_REPORT",
+                now);
+        }
+
         var comment = NormalizeOptionalText(req.Comment);
         var nextPeriodStatus = ResolvePeriodStatusFromReport(period, report, now);
 
