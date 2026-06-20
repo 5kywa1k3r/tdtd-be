@@ -48,4 +48,10 @@ public interface IWorkAssignmentAdvancedSummaryHierarchyService
         string actorUserId,
         string correlationId,
         CancellationToken ct);
+
+    Task<WorkAssignmentAdvancedSummaryHierarchyQueryResponse> QueryHierarchyAsync(
+        string configId,
+        QueryWorkAssignmentAdvancedSummaryHierarchyRequest req,
+        string actorUserId,
+        CancellationToken ct);
 }

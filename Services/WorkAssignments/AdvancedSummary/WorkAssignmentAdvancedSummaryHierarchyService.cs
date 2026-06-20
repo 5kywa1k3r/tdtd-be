@@ -24,6 +24,7 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
     private const string DayNodeValueKind = "ADVANCED_SUMMARY_DAY_NODE_V1";
     private const string MonthNodeValueKind = "ADVANCED_SUMMARY_MONTH_NODE_V1";
     private const string YearNodeValueKind = "ADVANCED_SUMMARY_YEAR_NODE_V1";
+    private const string QueryNodeValueKind = "ADVANCED_SUMMARY_QUERY_RESULT_V1";
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
@@ -472,6 +473,99 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
                 ct);
             throw;
         }
+    }
+
+    public async Task<WorkAssignmentAdvancedSummaryHierarchyQueryResponse> QueryHierarchyAsync(
+        string configId,
+        QueryWorkAssignmentAdvancedSummaryHierarchyRequest req,
+        string actorUserId,
+        CancellationToken ct)
+    {
+        EnsureActor(actorUserId);
+        var startDayKey = NormalizeQueryDayKey(req.StartDayKey, "startDayKey");
+        var endDayKey = NormalizeQueryDayKey(string.IsNullOrWhiteSpace(req.EndDayKey) ? req.StartDayKey : req.EndDayKey, "endDayKey");
+        var startUtc = AdvancedSummaryHierarchyKeyHelper.ParseDayKey(startDayKey);
+        var endExclusiveUtc = AdvancedSummaryHierarchyKeyHelper.ParseDayKey(endDayKey).AddDays(1);
+        if (endExclusiveUtc <= startUtc)
+        {
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.COMMON_VALIDATION_FAILED,
+                new { startDayKey, endDayKey, reason = "ADVANCED_SUMMARY_QUERY_RANGE_INVALID" },
+                "Advanced summary query end day must be on or after start day.");
+        }
+
+        var config = await LoadLockedConfigAsync(configId, ct);
+        await LoadContextAsync(config, actorUserId, ct);
+
+        var allDayKeys = EnumerateDayKeys(startUtc, endExclusiveUtc).ToList();
+        var queryState = new HierarchyQueryState(
+            await LoadQueryDayNodesAsync(config, allDayKeys, ct),
+            await LoadQueryMonthNodesAsync(config, startUtc, endExclusiveUtc, ct),
+            await LoadQueryYearNodesAsync(config, startUtc, endExclusiveUtc, ct));
+
+        foreach (var span in PlanHierarchyQuerySpans(startUtc, endExclusiveUtc))
+            ResolveQuerySpan(span, queryState);
+
+        if (req.EnqueueMissing)
+            await EnqueueQueryBuildsAsync(config, queryState, actorUserId, ct);
+
+        var resultJson = default(string);
+        var resultHash = default(string);
+        if (queryState.Gaps.Count == 0)
+        {
+            var selected = queryState.SelectedNodes
+                .OrderBy(x => x.WindowStartUtc)
+                .ThenBy(x => x.Grain, StringComparer.Ordinal)
+                .ToList();
+            var result = BuildRollupValue(
+                QueryNodeValueKind,
+                "QUERY",
+                $"{startDayKey}..{endDayKey}",
+                monthKey: null,
+                yearKey: string.Empty,
+                startUtc,
+                endExclusiveUtc,
+                selected,
+                x => $"{x.Grain}:{x.GrainKey}");
+            resultJson = JsonSerializer.Serialize(result, ValueJsonOptions);
+            resultHash = Sha256(resultJson);
+        }
+
+        return new WorkAssignmentAdvancedSummaryHierarchyQueryResponse
+        {
+            ConfigId = config.Id,
+            ConfigHash = config.ConfigHash,
+            WorkId = config.WorkId,
+            AssignmentId = config.AssignmentId,
+            DynamicFormTemplateId = config.DynamicFormTemplateId,
+            SectionId = config.SectionId,
+            StartDayKey = startDayKey,
+            EndDayKey = endDayKey,
+            WindowStartUtc = startUtc,
+            WindowEndExclusiveUtc = endExclusiveUtc,
+            Status = ResolveQueryStatus(queryState),
+            ResultJson = resultJson,
+            ResultHash = resultHash,
+            SelectedNodes = queryState.SelectedNodes
+                .OrderBy(x => x.WindowStartUtc)
+                .ThenBy(x => x.Grain, StringComparer.Ordinal)
+                .Select(MapQueryNode)
+                .ToList(),
+            MissingNodes = queryState.Gaps
+                .Where(x => x.Node is null)
+                .Select(MapQueryGap)
+                .ToList(),
+            DirtyNodes = queryState.Gaps
+                .Where(x => x.Node is not null &&
+                            !string.Equals(x.Node.Status, WorkAssignmentAdvancedSummaryHierarchyNodeStatuses.Building, StringComparison.Ordinal))
+                .Select(MapQueryGap)
+                .ToList(),
+            BuildingNodes = queryState.Gaps
+                .Where(x => string.Equals(x.Node?.Status, WorkAssignmentAdvancedSummaryHierarchyNodeStatuses.Building, StringComparison.Ordinal))
+                .Select(MapQueryGap)
+                .ToList(),
+            EnqueuedNodes = queryState.EnqueuedNodes.ToList()
+        };
     }
 
     private async Task<WorkAssignmentAdvancedSummaryDayNode> BuildDayNodeAsync(
@@ -971,6 +1065,367 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
     {
         for (var cursor = startUtc.Date; cursor < endExclusiveUtc.Date; cursor = cursor.AddDays(1))
             yield return AdvancedSummaryHierarchyKeyHelper.ToDayKey(cursor);
+    }
+
+    private async Task<Dictionary<string, WorkAssignmentAdvancedSummaryDayNode>> LoadQueryDayNodesAsync(
+        WorkAssignmentAdvancedSummaryConfig config,
+        IReadOnlyCollection<string> dayKeys,
+        CancellationToken ct)
+    {
+        if (dayKeys.Count == 0)
+            return new Dictionary<string, WorkAssignmentAdvancedSummaryDayNode>(StringComparer.Ordinal);
+
+        var fb = Builders<WorkAssignmentAdvancedSummaryDayNode>.Filter;
+        var filter = fb.Eq(x => x.AssignmentId, config.AssignmentId)
+                     & fb.Eq(x => x.DynamicFormTemplateId, config.DynamicFormTemplateId)
+                     & fb.Eq(x => x.SectionId, config.SectionId)
+                     & fb.Eq(x => x.ConfigHash, config.ConfigHash)
+                     & fb.Eq(x => x.IsDeleted, false)
+                     & fb.In(x => x.DayKey, dayKeys);
+
+        return (await _ctx.WorkAssignmentAdvancedSummaryDayNodes.Find(filter).ToListAsync(ct))
+            .GroupBy(x => x.DayKey, StringComparer.Ordinal)
+            .ToDictionary(x => x.Key, x => x.First(), StringComparer.Ordinal);
+    }
+
+    private async Task<Dictionary<string, WorkAssignmentAdvancedSummaryMonthNode>> LoadQueryMonthNodesAsync(
+        WorkAssignmentAdvancedSummaryConfig config,
+        DateTime startUtc,
+        DateTime endExclusiveUtc,
+        CancellationToken ct)
+    {
+        var monthKeys = EnumerateMonthKeys(startUtc, endExclusiveUtc).ToList();
+        if (monthKeys.Count == 0)
+            return new Dictionary<string, WorkAssignmentAdvancedSummaryMonthNode>(StringComparer.Ordinal);
+
+        var fb = Builders<WorkAssignmentAdvancedSummaryMonthNode>.Filter;
+        var filter = fb.Eq(x => x.AssignmentId, config.AssignmentId)
+                     & fb.Eq(x => x.DynamicFormTemplateId, config.DynamicFormTemplateId)
+                     & fb.Eq(x => x.SectionId, config.SectionId)
+                     & fb.Eq(x => x.ConfigHash, config.ConfigHash)
+                     & fb.Eq(x => x.IsDeleted, false)
+                     & fb.In(x => x.MonthKey, monthKeys);
+
+        return (await _ctx.WorkAssignmentAdvancedSummaryMonthNodes.Find(filter).ToListAsync(ct))
+            .GroupBy(x => x.MonthKey, StringComparer.Ordinal)
+            .ToDictionary(x => x.Key, x => x.First(), StringComparer.Ordinal);
+    }
+
+    private async Task<Dictionary<string, WorkAssignmentAdvancedSummaryYearNode>> LoadQueryYearNodesAsync(
+        WorkAssignmentAdvancedSummaryConfig config,
+        DateTime startUtc,
+        DateTime endExclusiveUtc,
+        CancellationToken ct)
+    {
+        var yearKeys = EnumerateYearKeys(startUtc, endExclusiveUtc).ToList();
+        if (yearKeys.Count == 0)
+            return new Dictionary<string, WorkAssignmentAdvancedSummaryYearNode>(StringComparer.Ordinal);
+
+        var fb = Builders<WorkAssignmentAdvancedSummaryYearNode>.Filter;
+        var filter = fb.Eq(x => x.AssignmentId, config.AssignmentId)
+                     & fb.Eq(x => x.DynamicFormTemplateId, config.DynamicFormTemplateId)
+                     & fb.Eq(x => x.SectionId, config.SectionId)
+                     & fb.Eq(x => x.ConfigHash, config.ConfigHash)
+                     & fb.Eq(x => x.IsDeleted, false)
+                     & fb.In(x => x.YearKey, yearKeys);
+
+        return (await _ctx.WorkAssignmentAdvancedSummaryYearNodes.Find(filter).ToListAsync(ct))
+            .GroupBy(x => x.YearKey, StringComparer.Ordinal)
+            .ToDictionary(x => x.Key, x => x.First(), StringComparer.Ordinal);
+    }
+
+    private static List<HierarchyQuerySpan> PlanHierarchyQuerySpans(DateTime startUtc, DateTime endExclusiveUtc)
+    {
+        var spans = new List<HierarchyQuerySpan>();
+        for (var cursor = startUtc.Date; cursor < endExclusiveUtc.Date;)
+        {
+            if (cursor.Month == 1 && cursor.Day == 1 && cursor.AddYears(1) <= endExclusiveUtc.Date)
+            {
+                spans.Add(new HierarchyQuerySpan(
+                    WorkAssignmentAdvancedSummaryHierarchyGrains.Year,
+                    AdvancedSummaryHierarchyKeyHelper.ToYearKey(cursor),
+                    cursor,
+                    cursor.AddYears(1)));
+                cursor = cursor.AddYears(1);
+                continue;
+            }
+
+            if (cursor.Day == 1 && cursor.AddMonths(1) <= endExclusiveUtc.Date)
+            {
+                spans.Add(new HierarchyQuerySpan(
+                    WorkAssignmentAdvancedSummaryHierarchyGrains.Month,
+                    AdvancedSummaryHierarchyKeyHelper.ToMonthKey(cursor),
+                    cursor,
+                    cursor.AddMonths(1)));
+                cursor = cursor.AddMonths(1);
+                continue;
+            }
+
+            spans.Add(new HierarchyQuerySpan(
+                WorkAssignmentAdvancedSummaryHierarchyGrains.Day,
+                AdvancedSummaryHierarchyKeyHelper.ToDayKey(cursor),
+                cursor,
+                cursor.AddDays(1)));
+            cursor = cursor.AddDays(1);
+        }
+
+        return spans;
+    }
+
+    private static bool ResolveQuerySpan(HierarchyQuerySpan span, HierarchyQueryState state)
+        => span.Grain switch
+        {
+            WorkAssignmentAdvancedSummaryHierarchyGrains.Year => ResolveQueryYearSpan(span, state),
+            WorkAssignmentAdvancedSummaryHierarchyGrains.Month => ResolveQueryMonthSpan(span, state),
+            _ => ResolveQueryDaySpan(span, state)
+        };
+
+    private static bool ResolveQueryYearSpan(HierarchyQuerySpan span, HierarchyQueryState state)
+    {
+        state.YearNodes.TryGetValue(span.GrainKey, out var yearNode);
+        if (yearNode is not null && IsCleanHierarchyNode(yearNode))
+        {
+            state.AddSelected(yearNode);
+            return true;
+        }
+
+        var before = state.Gaps.Count;
+        foreach (var monthKey in EnumerateMonthKeys(span.StartUtc, span.EndExclusiveUtc))
+        {
+            var monthStart = AdvancedSummaryHierarchyKeyHelper.ParseMonthKey(monthKey);
+            ResolveQueryMonthSpan(new HierarchyQuerySpan(
+                WorkAssignmentAdvancedSummaryHierarchyGrains.Month,
+                monthKey,
+                monthStart,
+                monthStart.AddMonths(1)), state);
+        }
+
+        var coveredByChildren = state.Gaps.Count == before;
+        if (coveredByChildren)
+        {
+            state.AddWarmSpan(span, yearNode);
+            return true;
+        }
+
+        if (yearNode is not null)
+            state.AddGap(span, yearNode);
+        return false;
+    }
+
+    private static bool ResolveQueryMonthSpan(HierarchyQuerySpan span, HierarchyQueryState state)
+    {
+        state.MonthNodes.TryGetValue(span.GrainKey, out var monthNode);
+        if (monthNode is not null && IsCleanHierarchyNode(monthNode))
+        {
+            state.AddSelected(monthNode);
+            return true;
+        }
+
+        var before = state.Gaps.Count;
+        foreach (var dayKey in EnumerateDayKeys(span.StartUtc, span.EndExclusiveUtc))
+        {
+            var dayStart = AdvancedSummaryHierarchyKeyHelper.ParseDayKey(dayKey);
+            ResolveQueryDaySpan(new HierarchyQuerySpan(
+                WorkAssignmentAdvancedSummaryHierarchyGrains.Day,
+                dayKey,
+                dayStart,
+                dayStart.AddDays(1)), state);
+        }
+
+        var coveredByChildren = state.Gaps.Count == before;
+        if (coveredByChildren)
+        {
+            state.AddWarmSpan(span, monthNode);
+            return true;
+        }
+
+        if (monthNode is not null)
+            state.AddGap(span, monthNode);
+        return false;
+    }
+
+    private static bool ResolveQueryDaySpan(HierarchyQuerySpan span, HierarchyQueryState state)
+    {
+        state.DayNodes.TryGetValue(span.GrainKey, out var dayNode);
+        if (dayNode is not null && IsCleanHierarchyNode(dayNode))
+        {
+            state.AddSelected(dayNode);
+            return true;
+        }
+
+        state.AddGap(span, dayNode);
+        return false;
+    }
+
+    private async Task EnqueueQueryBuildsAsync(
+        WorkAssignmentAdvancedSummaryConfig config,
+        HierarchyQueryState state,
+        string actorUserId,
+        CancellationToken ct)
+    {
+        foreach (var gap in state.Gaps)
+        {
+            if (gap.Span.Grain != WorkAssignmentAdvancedSummaryHierarchyGrains.Day ||
+                !CanAutoEnqueueNode(gap.Node))
+            {
+                continue;
+            }
+
+            var dto = await RequestDayNodeBuildAsync(
+                config.Id,
+                gap.Span.GrainKey,
+                new BuildWorkAssignmentAdvancedSummaryDayNodeRequest { ForceRefresh = gap.Node is not null },
+                actorUserId,
+                ct);
+            state.AddEnqueued(MapQueryNode(dto));
+        }
+
+        foreach (var warm in state.WarmSpans)
+        {
+            if (!CanAutoEnqueueNode(warm.Node))
+                continue;
+
+            if (warm.Span.Grain == WorkAssignmentAdvancedSummaryHierarchyGrains.Month)
+            {
+                var dto = await RequestMonthNodeBuildAsync(
+                    config.Id,
+                    warm.Span.GrainKey,
+                    new BuildWorkAssignmentAdvancedSummaryMonthNodeRequest { ForceRefresh = warm.Node is not null },
+                    actorUserId,
+                    ct);
+                state.AddEnqueued(MapQueryNode(dto));
+            }
+            else if (warm.Span.Grain == WorkAssignmentAdvancedSummaryHierarchyGrains.Year)
+            {
+                var dto = await RequestYearNodeBuildAsync(
+                    config.Id,
+                    warm.Span.GrainKey,
+                    new BuildWorkAssignmentAdvancedSummaryYearNodeRequest { ForceRefresh = warm.Node is not null },
+                    actorUserId,
+                    ct);
+                state.AddEnqueued(MapQueryNode(dto));
+            }
+        }
+    }
+
+    private static string ResolveQueryStatus(HierarchyQueryState state)
+    {
+        if (state.Gaps.Count == 0)
+            return "READY";
+        if (state.EnqueuedNodes.Count > 0 ||
+            state.Gaps.Any(x => string.Equals(x.Node?.Status, WorkAssignmentAdvancedSummaryHierarchyNodeStatuses.Building, StringComparison.Ordinal)))
+        {
+            return "BUILDING";
+        }
+        if (state.Gaps.Any(x => x.Node is not null))
+            return "DIRTY";
+        return "MISSING";
+    }
+
+    private static bool IsCleanHierarchyNode(WorkAssignmentAdvancedSummaryHierarchyNodeBase? node)
+        => node is not null &&
+           string.Equals(node.Status, WorkAssignmentAdvancedSummaryHierarchyNodeStatuses.Clean, StringComparison.Ordinal) &&
+           !node.IsDirty &&
+           !string.IsNullOrWhiteSpace(node.ValueHash);
+
+    private static bool CanAutoEnqueueNode(WorkAssignmentAdvancedSummaryHierarchyNodeBase? node)
+        => node is null ||
+           (!string.Equals(node.Status, WorkAssignmentAdvancedSummaryHierarchyNodeStatuses.Building, StringComparison.Ordinal) &&
+            !string.Equals(node.Status, WorkAssignmentAdvancedSummaryHierarchyNodeStatuses.Failed, StringComparison.Ordinal));
+
+    private static WorkAssignmentAdvancedSummaryHierarchyQueryNodeDto MapQueryGap(HierarchyQueryGap gap)
+        => gap.Node is null
+            ? new WorkAssignmentAdvancedSummaryHierarchyQueryNodeDto
+            {
+                Grain = gap.Span.Grain,
+                GrainKey = gap.Span.GrainKey,
+                Status = "MISSING",
+                IsDirty = true
+            }
+            : MapQueryNode(gap.Node);
+
+    private static WorkAssignmentAdvancedSummaryHierarchyQueryNodeDto MapQueryNode(
+        WorkAssignmentAdvancedSummaryHierarchyNodeBase node)
+        => new()
+        {
+            Grain = node.Grain,
+            GrainKey = node.GrainKey,
+            Status = node.Status,
+            IsDirty = node.IsDirty,
+            BuildJobId = node.BuildJobId,
+            BuildCorrelationId = node.BuildCorrelationId,
+            BuildError = node.BuildError,
+            ValueHash = node.ValueHash,
+            SourceReportCount = node.SourceReportCount
+        };
+
+    private static WorkAssignmentAdvancedSummaryHierarchyQueryNodeDto MapQueryNode(
+        WorkAssignmentAdvancedSummaryDayNodeDto node)
+        => new()
+        {
+            Grain = node.Grain,
+            GrainKey = node.GrainKey,
+            Status = node.Status,
+            IsDirty = node.IsDirty,
+            BuildJobId = node.BuildJobId,
+            BuildCorrelationId = node.BuildCorrelationId,
+            BuildError = node.BuildError,
+            ValueHash = node.ValueHash,
+            SourceReportCount = node.SourceReportCount
+        };
+
+    private static WorkAssignmentAdvancedSummaryHierarchyQueryNodeDto MapQueryNode(
+        WorkAssignmentAdvancedSummaryMonthNodeDto node)
+        => new()
+        {
+            Grain = node.Grain,
+            GrainKey = node.GrainKey,
+            Status = node.Status,
+            IsDirty = node.IsDirty,
+            BuildJobId = node.BuildJobId,
+            BuildCorrelationId = node.BuildCorrelationId,
+            BuildError = node.BuildError,
+            ValueHash = node.ValueHash,
+            SourceReportCount = node.SourceReportCount
+        };
+
+    private static WorkAssignmentAdvancedSummaryHierarchyQueryNodeDto MapQueryNode(
+        WorkAssignmentAdvancedSummaryYearNodeDto node)
+        => new()
+        {
+            Grain = node.Grain,
+            GrainKey = node.GrainKey,
+            Status = node.Status,
+            IsDirty = node.IsDirty,
+            BuildJobId = node.BuildJobId,
+            BuildCorrelationId = node.BuildCorrelationId,
+            BuildError = node.BuildError,
+            ValueHash = node.ValueHash,
+            SourceReportCount = node.SourceReportCount
+        };
+
+    private static IEnumerable<string> EnumerateMonthKeys(DateTime startUtc, DateTime endExclusiveUtc)
+    {
+        var cursor = new DateTime(startUtc.Year, startUtc.Month, 1, 0, 0, 0, DateTimeKind.Utc);
+        var end = endExclusiveUtc.Date.AddDays(-1);
+        var endMonth = new DateTime(end.Year, end.Month, 1, 0, 0, 0, DateTimeKind.Utc);
+        while (cursor <= endMonth)
+        {
+            yield return AdvancedSummaryHierarchyKeyHelper.ToMonthKey(cursor);
+            cursor = cursor.AddMonths(1);
+        }
+    }
+
+    private static IEnumerable<string> EnumerateYearKeys(DateTime startUtc, DateTime endExclusiveUtc)
+    {
+        var cursor = new DateTime(startUtc.Year, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        var end = endExclusiveUtc.Date.AddDays(-1);
+        var endYear = new DateTime(end.Year, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        while (cursor <= endYear)
+        {
+            yield return AdvancedSummaryHierarchyKeyHelper.ToYearKey(cursor);
+            cursor = cursor.AddYears(1);
+        }
     }
 
     private async Task<List<WorkAssignmentReport>> LoadDaySourceReportsAsync(
@@ -2137,6 +2592,21 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
     private static string NormalizeDayKey(string dayKey)
         => AdvancedSummaryHierarchyKeyHelper.ToDayKey(AdvancedSummaryHierarchyKeyHelper.ParseDayKey(dayKey));
 
+    private static string NormalizeQueryDayKey(string dayKey, string field)
+    {
+        try
+        {
+            return NormalizeDayKey(dayKey);
+        }
+        catch (ArgumentException)
+        {
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.COMMON_VALIDATION_FAILED,
+                new { field, reason = "ADVANCED_SUMMARY_QUERY_DAY_KEY_INVALID" },
+                "Advanced summary query day key must use yyyy-MM-dd.");
+        }
+    }
+
     private static string NormalizeMonthKey(string monthKey)
         => AdvancedSummaryHierarchyKeyHelper.ToMonthKey(AdvancedSummaryHierarchyKeyHelper.ParseMonthKey(monthKey));
 
@@ -2198,6 +2668,72 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
     private sealed record AdvancedSummaryBuildContext(
         WorkAssignment Scope,
         DynamicFormTemplate Template);
+
+    private sealed record HierarchyQuerySpan(
+        string Grain,
+        string GrainKey,
+        DateTime StartUtc,
+        DateTime EndExclusiveUtc);
+
+    private sealed record HierarchyQueryGap(
+        HierarchyQuerySpan Span,
+        WorkAssignmentAdvancedSummaryHierarchyNodeBase? Node);
+
+    private sealed record HierarchyQueryWarmSpan(
+        HierarchyQuerySpan Span,
+        WorkAssignmentAdvancedSummaryHierarchyNodeBase? Node);
+
+    private sealed class HierarchyQueryState
+    {
+        private readonly HashSet<string> _selectedKeys = new(StringComparer.Ordinal);
+        private readonly HashSet<string> _gapKeys = new(StringComparer.Ordinal);
+        private readonly HashSet<string> _warmKeys = new(StringComparer.Ordinal);
+        private readonly HashSet<string> _enqueuedKeys = new(StringComparer.Ordinal);
+
+        public HierarchyQueryState(
+            Dictionary<string, WorkAssignmentAdvancedSummaryDayNode> dayNodes,
+            Dictionary<string, WorkAssignmentAdvancedSummaryMonthNode> monthNodes,
+            Dictionary<string, WorkAssignmentAdvancedSummaryYearNode> yearNodes)
+        {
+            DayNodes = dayNodes;
+            MonthNodes = monthNodes;
+            YearNodes = yearNodes;
+        }
+
+        public Dictionary<string, WorkAssignmentAdvancedSummaryDayNode> DayNodes { get; }
+        public Dictionary<string, WorkAssignmentAdvancedSummaryMonthNode> MonthNodes { get; }
+        public Dictionary<string, WorkAssignmentAdvancedSummaryYearNode> YearNodes { get; }
+        public List<WorkAssignmentAdvancedSummaryHierarchyNodeBase> SelectedNodes { get; } = new();
+        public List<HierarchyQueryGap> Gaps { get; } = new();
+        public List<HierarchyQueryWarmSpan> WarmSpans { get; } = new();
+        public List<WorkAssignmentAdvancedSummaryHierarchyQueryNodeDto> EnqueuedNodes { get; } = new();
+
+        public void AddSelected(WorkAssignmentAdvancedSummaryHierarchyNodeBase node)
+        {
+            if (_selectedKeys.Add(NodeKey(node.Grain, node.GrainKey)))
+                SelectedNodes.Add(node);
+        }
+
+        public void AddGap(HierarchyQuerySpan span, WorkAssignmentAdvancedSummaryHierarchyNodeBase? node)
+        {
+            if (_gapKeys.Add(NodeKey(span.Grain, span.GrainKey)))
+                Gaps.Add(new HierarchyQueryGap(span, node));
+        }
+
+        public void AddWarmSpan(HierarchyQuerySpan span, WorkAssignmentAdvancedSummaryHierarchyNodeBase? node)
+        {
+            if (_warmKeys.Add(NodeKey(span.Grain, span.GrainKey)))
+                WarmSpans.Add(new HierarchyQueryWarmSpan(span, node));
+        }
+
+        public void AddEnqueued(WorkAssignmentAdvancedSummaryHierarchyQueryNodeDto node)
+        {
+            if (_enqueuedKeys.Add(NodeKey(node.Grain, node.GrainKey)))
+                EnqueuedNodes.Add(node);
+        }
+
+        private static string NodeKey(string grain, string key) => $"{grain}:{key}";
+    }
 
     private sealed record SimpleConfigAnalysis(
         List<TargetSpec> Targets,

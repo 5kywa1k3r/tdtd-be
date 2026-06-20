@@ -68,6 +68,48 @@ public sealed class BuildWorkAssignmentAdvancedSummaryYearNodeRequest
     public bool ForceRefresh { get; set; }
 }
 
+public sealed class QueryWorkAssignmentAdvancedSummaryHierarchyRequest
+{
+    public string StartDayKey { get; set; } = string.Empty;
+    public string EndDayKey { get; set; } = string.Empty;
+    public bool EnqueueMissing { get; set; } = true;
+}
+
+public sealed class WorkAssignmentAdvancedSummaryHierarchyQueryResponse
+{
+    public string ConfigId { get; set; } = string.Empty;
+    public string ConfigHash { get; set; } = string.Empty;
+    public string WorkId { get; set; } = string.Empty;
+    public string AssignmentId { get; set; } = string.Empty;
+    public string DynamicFormTemplateId { get; set; } = string.Empty;
+    public string SectionId { get; set; } = string.Empty;
+    public string StartDayKey { get; set; } = string.Empty;
+    public string EndDayKey { get; set; } = string.Empty;
+    public DateTime WindowStartUtc { get; set; }
+    public DateTime WindowEndExclusiveUtc { get; set; }
+    public string Status { get; set; } = "MISSING";
+    public string? ResultJson { get; set; }
+    public string? ResultHash { get; set; }
+    public List<WorkAssignmentAdvancedSummaryHierarchyQueryNodeDto> SelectedNodes { get; set; } = new();
+    public List<WorkAssignmentAdvancedSummaryHierarchyQueryNodeDto> MissingNodes { get; set; } = new();
+    public List<WorkAssignmentAdvancedSummaryHierarchyQueryNodeDto> DirtyNodes { get; set; } = new();
+    public List<WorkAssignmentAdvancedSummaryHierarchyQueryNodeDto> BuildingNodes { get; set; } = new();
+    public List<WorkAssignmentAdvancedSummaryHierarchyQueryNodeDto> EnqueuedNodes { get; set; } = new();
+}
+
+public sealed class WorkAssignmentAdvancedSummaryHierarchyQueryNodeDto
+{
+    public string Grain { get; set; } = string.Empty;
+    public string GrainKey { get; set; } = string.Empty;
+    public string Status { get; set; } = string.Empty;
+    public bool IsDirty { get; set; }
+    public string? BuildJobId { get; set; }
+    public string? BuildCorrelationId { get; set; }
+    public string? BuildError { get; set; }
+    public string? ValueHash { get; set; }
+    public long SourceReportCount { get; set; }
+}
+
 public sealed class WorkAssignmentAdvancedSummaryDayNodeDto
 {
     public string Id { get; set; } = string.Empty;

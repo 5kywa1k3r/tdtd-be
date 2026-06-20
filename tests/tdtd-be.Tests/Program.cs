@@ -109,6 +109,7 @@ var tests = new (string Name, Action Run)[]
     ("advanced summary day node source day uses completed date first", AdvancedSummaryDayNodeSourceDayUsesCompletedDateFirst),
     ("advanced summary hierarchy rollup merges child fields", AdvancedSummaryHierarchyRollupMergesChildFields),
     ("advanced summary hierarchy rollup requires clean children", AdvancedSummaryHierarchyRollupRequiresCleanChildren),
+    ("advanced summary hierarchy query plans largest grains", AdvancedSummaryHierarchyQueryPlansLargestGrains),
     ("legacy work basis file resolves as work document", ResolvesLegacyWorkBasisFileAsWorkDocument),
     ("assignment file resolves as assignment branch document", ResolvesAssignmentFileAsBranchDocument),
     ("assignment document path resolves ancestors only", ResolvesAssignmentDocumentAncestorsFromPath),
@@ -3455,6 +3456,33 @@ static void AdvancedSummaryHierarchyRollupRequiresCleanChildren()
             new List<string> { "2026-01-01", "2026-01-02" },
             childNodes,
             new Func<WorkAssignmentAdvancedSummaryDayNode, string>(x => x.DayKey)));
+}
+
+static void AdvancedSummaryHierarchyQueryPlansLargestGrains()
+{
+    var spans = InvokePrivateStatic<object>(
+        typeof(WorkAssignmentAdvancedSummaryHierarchyService),
+        "PlanHierarchyQuerySpans",
+        new DateTime(2025, 12, 31, 0, 0, 0, DateTimeKind.Utc),
+        new DateTime(2027, 2, 3, 0, 0, 0, DateTimeKind.Utc)) as System.Collections.IEnumerable
+        ?? throw new InvalidOperationException("query spans should be enumerable");
+
+    var keys = spans
+        .Cast<object>()
+        .Select(x => $"{GetReflectedProperty<string>(x, "Grain")}:{GetReflectedProperty<string>(x, "GrainKey")}")
+        .ToList();
+
+    AssertSequenceEqual(
+        new[]
+        {
+            "DAY:2025-12-31",
+            "YEAR:2026",
+            "MONTH:2027-01",
+            "DAY:2027-02-01",
+            "DAY:2027-02-02"
+        },
+        keys,
+        "query planner should use the largest exact day/month/year spans");
 }
 
 static void ResolvesLegacyWorkBasisFileAsWorkDocument()

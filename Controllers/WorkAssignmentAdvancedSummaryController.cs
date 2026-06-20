@@ -106,6 +106,17 @@ public sealed class WorkAssignmentAdvancedSummaryController : ControllerBase
         return Ok(result);
     }
 
+    [HttpPost("configs/{configId}/hierarchy/query")]
+    public async Task<IActionResult> QueryHierarchy(
+        [FromRoute] string configId,
+        [FromBody] QueryWorkAssignmentAdvancedSummaryHierarchyRequest req,
+        CancellationToken ct)
+    {
+        var actorUserId = GetActorUserId();
+        var result = await _hierarchy.QueryHierarchyAsync(configId, req ?? new QueryWorkAssignmentAdvancedSummaryHierarchyRequest(), actorUserId, ct);
+        return Ok(result);
+    }
+
     private string GetActorUserId()
         => User.FindFirstValue("sub") ?? throw AppExceptionFactory.Unauthorized();
 }
