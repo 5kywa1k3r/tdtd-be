@@ -2,6 +2,7 @@ using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using tdtd_be.Common.Auth;
 using tdtd_be.DTOs.Operations;
+using tdtd_be.DTOs.WorkAssignments.AdvancedSummary;
 using tdtd_be.Models;
 using tdtd_be.Services.Common;
 using tdtd_be.Services.WorkAssignmentReports.Payloads;
@@ -428,6 +429,23 @@ public sealed class AdminOperationsController : ControllerBase
             await WriteAdvancedSummaryNodeCleanupLogAsync(request, result: null, startedAtUtc, me.Id, ex, ct);
             throw;
         }
+    }
+
+    [HttpPost("job-runs/advanced-summary-nodes/diagnostics/day")]
+    public async Task<IActionResult> DiagnoseAdvancedSummaryDayNode(
+        [FromBody] DiagnoseWorkAssignmentAdvancedSummaryDayNodeRequest? request,
+        CancellationToken ct = default)
+    {
+        var me = _me.RequireMe();
+        RoleGuard.RequireSystemAdmin(me);
+        request ??= new DiagnoseWorkAssignmentAdvancedSummaryDayNodeRequest();
+
+        return Ok(await _jobRuns.DiagnoseAdvancedSummaryDayNodeAsync(
+            request.ConfigId,
+            request.DayKey,
+            request,
+            me.Id,
+            ct));
     }
 
     [HttpGet("report-payloads/diagnostics")]

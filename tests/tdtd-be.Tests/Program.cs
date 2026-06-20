@@ -133,6 +133,7 @@ var tests = new (string Name, Action Run)[]
     ("advanced summary operations reset actor uses original requester", AdvancedSummaryOperationsResetActorUsesOriginalRequester),
     ("advanced summary operations cleanup limit is bounded", AdvancedSummaryOperationsCleanupLimitIsBounded),
     ("advanced summary operations cleanup requires scope selector", AdvancedSummaryOperationsCleanupRequiresScopeSelector),
+    ("advanced summary diagnostics comparable hash ignores generated time", AdvancedSummaryDiagnosticsComparableHashIgnoresGeneratedTime),
 };
 
 var failures = new List<string>();
@@ -527,6 +528,55 @@ static void AdvancedSummaryOperationsCleanupRequiresScopeSelector()
             SourceSignatureHash = "source-sig"
         }),
         "advanced cleanup should allow section/source-signature scoped cleanup");
+}
+
+static void AdvancedSummaryDiagnosticsComparableHashIgnoresGeneratedTime()
+{
+    var first = @"{
+        ""schemaVersion"": 1,
+        ""kind"": ""ADVANCED_SUMMARY_DAY_NODE_V1"",
+        ""generatedAtUtc"": ""2026-06-20T01:00:00Z"",
+        ""configId"": ""cfg"",
+        ""configHash"": ""hash"",
+        ""grain"": ""DAY"",
+        ""grainKey"": ""2026-06-01"",
+        ""dayKey"": ""2026-06-01"",
+        ""monthKey"": ""2026-06"",
+        ""yearKey"": ""2026"",
+        ""windowStartUtc"": ""2026-06-01T00:00:00Z"",
+        ""windowEndExclusiveUtc"": ""2026-06-02T00:00:00Z"",
+        ""sourceAssignmentCount"": 1,
+        ""sourceReportCount"": 2,
+        ""sectionReportCount"": 2,
+        ""sectionFieldCount"": 1,
+        ""targetFieldCount"": 1,
+        ""inputNodeCount"": 0,
+        ""warnings"": [],
+        ""fields"": [
+            {
+                ""fieldId"": ""f1"",
+                ""fieldKey"": ""field_1"",
+                ""label"": ""Field 1"",
+                ""dataType"": ""number"",
+                ""method"": ""SUM"",
+                ""valueCount"": 2,
+                ""sourceReportCount"": 2,
+                ""result"": 10,
+                ""sampleValues"": []
+            }
+        ]
+    }";
+    var second = first.Replace("2026-06-20T01:00:00Z", "2026-06-20T02:00:00Z");
+    var changedResult = first.Replace(@"""result"": 10", @"""result"": 11");
+
+    var firstHash = WorkAssignmentAdvancedSummaryHierarchyService.BuildAdvancedSummaryComparableValueHash(first);
+    var secondHash = WorkAssignmentAdvancedSummaryHierarchyService.BuildAdvancedSummaryComparableValueHash(second);
+    var changedHash = WorkAssignmentAdvancedSummaryHierarchyService.BuildAdvancedSummaryComparableValueHash(changedResult);
+
+    AssertEqual(firstHash, secondHash, "diagnostics comparable hash should ignore generatedAtUtc");
+    AssertFalse(
+        string.Equals(firstHash, changedHash, StringComparison.Ordinal),
+        "diagnostics comparable hash should still change when statistic values change");
 }
 
 static void BlocksOnceDueBeforeAssignmentStart()

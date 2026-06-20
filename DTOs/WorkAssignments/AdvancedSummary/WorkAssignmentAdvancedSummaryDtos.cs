@@ -75,6 +75,46 @@ public sealed class QueryWorkAssignmentAdvancedSummaryHierarchyRequest
     public bool EnqueueMissing { get; set; } = true;
 }
 
+public sealed class DiagnoseWorkAssignmentAdvancedSummaryDayNodeRequest
+{
+    public string ConfigId { get; set; } = string.Empty;
+    public string DayKey { get; set; } = string.Empty;
+    public bool IncludeValueJson { get; set; }
+}
+
+public sealed class WorkAssignmentAdvancedSummaryDayNodeDiagnosticsResponse
+{
+    public string ConfigId { get; set; } = string.Empty;
+    public string ConfigHash { get; set; } = string.Empty;
+    public string DayKey { get; set; } = string.Empty;
+    public string Status { get; set; } = string.Empty;
+    public bool Matches { get; set; }
+    public string DiagnosticActorUserId { get; set; } = string.Empty;
+    public DateTime CheckedAtUtc { get; set; }
+    public List<string> Differences { get; set; } = new();
+    public WorkAssignmentAdvancedSummaryDayNodeDiagnosticSnapshot? Cache { get; set; }
+    public WorkAssignmentAdvancedSummaryDayNodeDiagnosticSnapshot Direct { get; set; } = new();
+}
+
+public sealed class WorkAssignmentAdvancedSummaryDayNodeDiagnosticSnapshot
+{
+    public string? NodeId { get; set; }
+    public string Status { get; set; } = string.Empty;
+    public bool IsDirty { get; set; }
+    public long SourceReportCount { get; set; }
+    public string? SourceSignatureHash { get; set; }
+    public string? ValueHash { get; set; }
+    public string? ComparableValueHash { get; set; }
+    public string? ComparableValueError { get; set; }
+    public DateTime? BuiltAtUtc { get; set; }
+    public string? BuildJobId { get; set; }
+    public string? BuildCorrelationId { get; set; }
+    public string? BuildError { get; set; }
+    public DateTime WindowStartUtc { get; set; }
+    public DateTime WindowEndExclusiveUtc { get; set; }
+    public string? ValueJson { get; set; }
+}
+
 public sealed class WorkAssignmentAdvancedSummaryHierarchyQueryResponse
 {
     public string ConfigId { get; set; } = string.Empty;

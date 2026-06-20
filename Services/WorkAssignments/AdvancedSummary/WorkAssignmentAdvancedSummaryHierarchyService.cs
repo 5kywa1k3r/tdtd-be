@@ -568,6 +568,45 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
         };
     }
 
+    public async Task<WorkAssignmentAdvancedSummaryDayNodeDiagnosticsResponse> DiagnoseDayNodeAsync(
+        string configId,
+        string dayKey,
+        DiagnoseWorkAssignmentAdvancedSummaryDayNodeRequest req,
+        string actorUserId,
+        CancellationToken ct)
+    {
+        EnsureActor(actorUserId);
+        req ??= new DiagnoseWorkAssignmentAdvancedSummaryDayNodeRequest();
+        var normalizedDayKey = NormalizeDayKey(string.IsNullOrWhiteSpace(dayKey) ? req.DayKey : dayKey);
+        var config = await LoadLockedConfigAsync(configId, ct);
+        var cacheNode = await LoadDayNodeAsync(config, normalizedDayKey, ct);
+        var diagnosticActorUserId = ResolveDiagnosticsActor(config, cacheNode, actorUserId);
+        var context = await LoadContextAsync(config, diagnosticActorUserId, ct);
+        var directNode = await BuildDayNodeAsync(
+            config,
+            context,
+            normalizedDayKey,
+            diagnosticActorUserId,
+            $"diagnostics:{ObjectId.GenerateNewId()}",
+            ct);
+
+        var includeValueJson = req?.IncludeValueJson == true;
+        var differences = CompareDayNodeDiagnostics(cacheNode, directNode);
+        return new WorkAssignmentAdvancedSummaryDayNodeDiagnosticsResponse
+        {
+            ConfigId = config.Id,
+            ConfigHash = config.ConfigHash,
+            DayKey = normalizedDayKey,
+            Status = ResolveDayNodeDiagnosticsStatus(cacheNode, differences),
+            Matches = cacheNode is not null && differences.Count == 0,
+            DiagnosticActorUserId = diagnosticActorUserId,
+            CheckedAtUtc = DateTime.UtcNow,
+            Differences = differences,
+            Cache = cacheNode is null ? null : ToDayNodeDiagnosticSnapshot(cacheNode, includeValueJson),
+            Direct = ToDayNodeDiagnosticSnapshot(directNode, includeValueJson)
+        };
+    }
+
     private async Task<WorkAssignmentAdvancedSummaryDayNode> BuildDayNodeAsync(
         WorkAssignmentAdvancedSummaryConfig config,
         AdvancedSummaryBuildContext context,
@@ -1863,6 +1902,176 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
             UpdatedAtUtc = x.UpdatedAtUtc
         };
 
+    private static WorkAssignmentAdvancedSummaryDayNodeDiagnosticSnapshot ToDayNodeDiagnosticSnapshot(
+        WorkAssignmentAdvancedSummaryDayNode x,
+        bool includeValueJson)
+    {
+        var comparableValueHash = TryBuildAdvancedSummaryComparableValueHash(
+            x.ValueJson,
+            out var valueHash,
+            out var valueError)
+            ? valueHash
+            : null;
+
+        return new WorkAssignmentAdvancedSummaryDayNodeDiagnosticSnapshot
+        {
+            NodeId = x.Id,
+            Status = x.Status,
+            IsDirty = x.IsDirty,
+            SourceReportCount = x.SourceReportCount,
+            SourceSignatureHash = x.SourceSignatureHash,
+            ValueHash = x.ValueHash,
+            ComparableValueHash = comparableValueHash,
+            ComparableValueError = valueError,
+            BuiltAtUtc = x.BuiltAtUtc,
+            BuildJobId = x.BuildJobId,
+            BuildCorrelationId = x.BuildCorrelationId,
+            BuildError = x.BuildError,
+            WindowStartUtc = x.WindowStartUtc,
+            WindowEndExclusiveUtc = x.WindowEndExclusiveUtc,
+            ValueJson = includeValueJson ? x.ValueJson : null
+        };
+    }
+
+    private static List<string> CompareDayNodeDiagnostics(
+        WorkAssignmentAdvancedSummaryDayNode? cacheNode,
+        WorkAssignmentAdvancedSummaryDayNode directNode)
+    {
+        var differences = new List<string>();
+        if (cacheNode is null)
+        {
+            differences.Add("CACHE_MISSING");
+            return differences;
+        }
+
+        if (cacheNode.IsDirty)
+            differences.Add("CACHE_DIRTY");
+        if (!string.Equals(cacheNode.Status, WorkAssignmentAdvancedSummaryHierarchyNodeStatuses.Clean, StringComparison.Ordinal))
+            differences.Add($"CACHE_STATUS_{cacheNode.Status}");
+        if (cacheNode.SourceReportCount != directNode.SourceReportCount)
+            differences.Add("SOURCE_REPORT_COUNT");
+        if (!string.Equals(cacheNode.SourceSignatureHash, directNode.SourceSignatureHash, StringComparison.Ordinal))
+            differences.Add("SOURCE_SIGNATURE_HASH");
+        if (!cacheNode.SourceReportIds.OrderBy(x => x, StringComparer.Ordinal).SequenceEqual(
+                directNode.SourceReportIds.OrderBy(x => x, StringComparer.Ordinal),
+                StringComparer.Ordinal))
+            differences.Add("SOURCE_REPORT_IDS");
+
+        var cacheComparableOk = TryBuildAdvancedSummaryComparableValueHash(
+            cacheNode.ValueJson,
+            out var cacheComparableHash,
+            out _);
+        var directComparableOk = TryBuildAdvancedSummaryComparableValueHash(
+            directNode.ValueJson,
+            out var directComparableHash,
+            out _);
+        if (!cacheComparableOk)
+            differences.Add("CACHE_VALUE_JSON_INVALID");
+        if (!directComparableOk)
+            differences.Add("DIRECT_VALUE_JSON_INVALID");
+        if (cacheComparableOk &&
+            directComparableOk &&
+            !string.Equals(cacheComparableHash, directComparableHash, StringComparison.Ordinal))
+        {
+            differences.Add("COMPARABLE_VALUE_HASH");
+        }
+
+        return differences;
+    }
+
+    private static string ResolveDayNodeDiagnosticsStatus(
+        WorkAssignmentAdvancedSummaryDayNode? cacheNode,
+        IReadOnlyCollection<string> differences)
+    {
+        if (cacheNode is null)
+            return "CACHE_MISSING";
+        if (string.Equals(cacheNode.Status, WorkAssignmentAdvancedSummaryHierarchyNodeStatuses.Building, StringComparison.Ordinal))
+            return "CACHE_BUILDING";
+        if (string.Equals(cacheNode.Status, WorkAssignmentAdvancedSummaryHierarchyNodeStatuses.Failed, StringComparison.Ordinal))
+            return "CACHE_FAILED";
+        if (cacheNode.IsDirty ||
+            string.Equals(cacheNode.Status, WorkAssignmentAdvancedSummaryHierarchyNodeStatuses.Dirty, StringComparison.Ordinal))
+        {
+            return "CACHE_DIRTY";
+        }
+
+        return differences.Count == 0 ? "MATCH" : "MISMATCH";
+    }
+
+    private static string ResolveDiagnosticsActor(
+        WorkAssignmentAdvancedSummaryConfig config,
+        WorkAssignmentAdvancedSummaryDayNode? cacheNode,
+        string fallbackUserId)
+    {
+        if (!string.IsNullOrWhiteSpace(cacheNode?.UpdatedByUserId))
+            return cacheNode.UpdatedByUserId;
+        if (!string.IsNullOrWhiteSpace(cacheNode?.CreatedByUserId))
+            return cacheNode.CreatedByUserId;
+        if (!string.IsNullOrWhiteSpace(config.LockedByUserId))
+            return config.LockedByUserId;
+        if (!string.IsNullOrWhiteSpace(config.UpdatedByUserId))
+            return config.UpdatedByUserId;
+        if (!string.IsNullOrWhiteSpace(config.CreatedByUserId))
+            return config.CreatedByUserId;
+
+        return fallbackUserId;
+    }
+
+    private static bool TryBuildAdvancedSummaryComparableValueHash(
+        string? valueJson,
+        out string? hash,
+        out string? error)
+    {
+        hash = null;
+        error = null;
+        try
+        {
+            hash = BuildAdvancedSummaryComparableValueHash(valueJson);
+            return true;
+        }
+        catch (Exception ex) when (ex is JsonException or AppException)
+        {
+            error = BuildErrorMessage(ex);
+            return false;
+        }
+    }
+
+    internal static string BuildAdvancedSummaryComparableValueHash(string? valueJson)
+    {
+        if (string.IsNullOrWhiteSpace(valueJson))
+            throw new JsonException("Advanced summary value JSON is empty.");
+
+        var value = JsonSerializer.Deserialize<AdvancedSummaryHierarchyNodeValue>(valueJson, JsonOptions)
+                    ?? throw new JsonException("Advanced summary value JSON is empty.");
+        var comparable = new AdvancedSummaryComparableNodeValue
+        {
+            SchemaVersion = value.SchemaVersion,
+            Kind = value.Kind,
+            ConfigId = value.ConfigId,
+            ConfigHash = value.ConfigHash,
+            Grain = value.Grain,
+            GrainKey = value.GrainKey,
+            DayKey = value.DayKey,
+            MonthKey = value.MonthKey,
+            YearKey = value.YearKey,
+            WindowStartUtc = value.WindowStartUtc,
+            WindowEndExclusiveUtc = value.WindowEndExclusiveUtc,
+            SourceAssignmentCount = value.SourceAssignmentCount,
+            SourceReportCount = value.SourceReportCount,
+            SectionReportCount = value.SectionReportCount,
+            SectionFieldCount = value.SectionFieldCount,
+            TargetFieldCount = value.TargetFieldCount,
+            InputNodeCount = value.InputNodeCount,
+            Warnings = value.Warnings.OrderBy(x => x, StringComparer.Ordinal).ToList(),
+            Fields = value.Fields
+                .OrderBy(x => x.FieldKey, StringComparer.Ordinal)
+                .ThenBy(x => x.FieldId, StringComparer.Ordinal)
+                .ToList()
+        };
+
+        return Sha256(JsonSerializer.Serialize(comparable, ValueJsonOptions));
+    }
+
     private Task NotifyDayNodeBuildAsync(
         WorkAssignmentAdvancedSummaryDayNode? node,
         string actorUserId,
@@ -3019,6 +3228,29 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
         public int SchemaVersion { get; set; }
         public string Kind { get; set; } = DayNodeValueKind;
         public DateTime GeneratedAtUtc { get; set; }
+        public string ConfigId { get; set; } = string.Empty;
+        public string ConfigHash { get; set; } = string.Empty;
+        public string Grain { get; set; } = string.Empty;
+        public string GrainKey { get; set; } = string.Empty;
+        public string DayKey { get; set; } = string.Empty;
+        public string? MonthKey { get; set; }
+        public string? YearKey { get; set; }
+        public DateTime WindowStartUtc { get; set; }
+        public DateTime WindowEndExclusiveUtc { get; set; }
+        public int SourceAssignmentCount { get; set; }
+        public long SourceReportCount { get; set; }
+        public long SectionReportCount { get; set; }
+        public int SectionFieldCount { get; set; }
+        public int TargetFieldCount { get; set; }
+        public int InputNodeCount { get; set; }
+        public List<string> Warnings { get; set; } = new();
+        public List<AdvancedSummaryDayNodeFieldDto> Fields { get; set; } = new();
+    }
+
+    private sealed class AdvancedSummaryComparableNodeValue
+    {
+        public int SchemaVersion { get; set; }
+        public string Kind { get; set; } = string.Empty;
         public string ConfigId { get; set; } = string.Empty;
         public string ConfigHash { get; set; } = string.Empty;
         public string Grain { get; set; } = string.Empty;

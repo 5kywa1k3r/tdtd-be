@@ -54,4 +54,11 @@ public interface IWorkAssignmentAdvancedSummaryHierarchyService
         QueryWorkAssignmentAdvancedSummaryHierarchyRequest req,
         string actorUserId,
         CancellationToken ct);
+
+    Task<WorkAssignmentAdvancedSummaryDayNodeDiagnosticsResponse> DiagnoseDayNodeAsync(
+        string configId,
+        string dayKey,
+        DiagnoseWorkAssignmentAdvancedSummaryDayNodeRequest req,
+        string actorUserId,
+        CancellationToken ct);
 }

@@ -47,6 +47,12 @@ public interface IJobRunManagementService
         AdvancedSummaryNodeCleanupRequest request,
         string actorUserId,
         CancellationToken ct = default);
+    Task<WorkAssignmentAdvancedSummaryDayNodeDiagnosticsResponse> DiagnoseAdvancedSummaryDayNodeAsync(
+        string configId,
+        string dayKey,
+        DiagnoseWorkAssignmentAdvancedSummaryDayNodeRequest request,
+        string actorUserId,
+        CancellationToken ct = default);
     Task<int> ProcessMaterializeJobsAsync(int maxJobs, int batchSize, CancellationToken ct = default);
     Task ProcessWorkAssignmentQueueScanAsync(CancellationToken ct = default);
     Task ProcessNotificationDueScanAsync(CancellationToken ct = default);
@@ -515,6 +521,14 @@ public sealed class JobRunManagementService : IJobRunManagementService
             SampleRows = selectedRows
         };
     }
+
+    public Task<WorkAssignmentAdvancedSummaryDayNodeDiagnosticsResponse> DiagnoseAdvancedSummaryDayNodeAsync(
+        string configId,
+        string dayKey,
+        DiagnoseWorkAssignmentAdvancedSummaryDayNodeRequest request,
+        string actorUserId,
+        CancellationToken ct = default)
+        => _advancedSummary.DiagnoseDayNodeAsync(configId, dayKey, request, actorUserId, ct);
 
     private async Task<(List<AdvancedSummaryNodeRow> Rows, long Total)> SearchAdvancedSummaryNodesByGrainAsync<T>(
         IMongoCollection<T> col,
