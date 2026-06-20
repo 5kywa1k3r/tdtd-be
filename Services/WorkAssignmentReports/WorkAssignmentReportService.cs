@@ -23,6 +23,7 @@ using tdtd_be.Services.Common.Time;
 using tdtd_be.Services;
 using tdtd_be.Services.WorkAssignments.Domain;
 using tdtd_be.Services.WorkAssignments.Internal;
+using tdtd_be.Services.WorkAssignments.AdvancedSummary;
 using tdtd_be.Services.WorkAssignments.Aggregate;
 using tdtd_be.Services.WorkAssignments.Queue;
 using tdtd_be.Services.WorkAssignments.Runtime;
@@ -62,6 +63,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
     private readonly IWorkReportFieldStatisticsService _fieldStatistics;
     private readonly IAggregateTableService _aggregateTableService;
     private readonly ILabelEnumCatalogService _enumCatalogs;
+    private readonly IWorkAssignmentAdvancedSummaryDirtyService _advancedSummaryDirty;
     private readonly ILogger<WorkAssignmentReportService> _log;
 
     private static readonly JsonSerializerOptions _jsonOptions = new(JsonSerializerDefaults.Web)
@@ -104,6 +106,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         IWorkReportFieldStatisticsService fieldStatistics,
         IAggregateTableService aggregateTableService,
         ILabelEnumCatalogService enumCatalogs,
+        IWorkAssignmentAdvancedSummaryDirtyService advancedSummaryDirty,
         ILogger<WorkAssignmentReportService> log)
     {
         _ctx = ctx;
@@ -121,6 +124,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         _fieldStatistics = fieldStatistics;
         _aggregateTableService = aggregateTableService;
         _enumCatalogs = enumCatalogs;
+        _advancedSummaryDirty = advancedSummaryDirty;
         _log = log;
     }
 
@@ -5143,6 +5147,14 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                     ct);
             }
 
+            await _advancedSummaryDirty.MarkReportStatusMutationDirtyAsync(
+                report,
+                operation,
+                fromStatus,
+                toStatus,
+                actorUserId,
+                ct);
+
             _log.LogInformation(
                 "WorkAssignment report status operation completed. operation={operation} reportId={reportId} periodId={periodId} assignmentId={assignmentId} workId={workId} fromStatus={fromStatus} toStatus={toStatus}",
                 operation,
@@ -5907,6 +5919,11 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             await _labelStatistics.RebuildForReportAsync(report.Id, actorUserId, ct);
             await _tableStatistics.RebuildForReportAsync(report.Id, actorUserId, ct);
             await _fieldStatistics.RebuildForReportAsync(report.Id, actorUserId, ct);
+            await _advancedSummaryDirty.MarkApprovedReportPayloadDirtyAsync(
+                report,
+                "AUTO_REFRESH_AGGREGATE",
+                actorUserId,
+                ct);
         }
 
         if (!string.IsNullOrWhiteSpace(report.WorkReportPeriodId))

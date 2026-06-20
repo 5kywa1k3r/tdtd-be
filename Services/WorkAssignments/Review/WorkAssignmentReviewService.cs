@@ -15,6 +15,7 @@ using tdtd_be.Services.Common;
 using tdtd_be.Services.WorkAssignmentReports;
 using tdtd_be.Services.WorkAssignmentReports.Payloads;
 using tdtd_be.Services.WorkAssignmentReports.Statistics;
+using tdtd_be.Services.WorkAssignments.AdvancedSummary;
 using tdtd_be.Services.WorkAssignments.Domain;
 using tdtd_be.Services.WorkAssignments.Internal;
 using tdtd_be.Services.WorkAssignments.Queue;
@@ -34,6 +35,7 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
     private readonly IWorkReportTableStatisticsService _tableStatistics;
     private readonly IWorkReportFieldStatisticsService _fieldStatistics;
     private readonly IWorkAssignmentReportService _reportService;
+    private readonly IWorkAssignmentAdvancedSummaryDirtyService _advancedSummaryDirty;
     private readonly MeAccessor _me;
     private readonly ILogger<WorkAssignmentReviewService> _log;
 
@@ -48,6 +50,7 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
         IWorkReportTableStatisticsService tableStatistics,
         IWorkReportFieldStatisticsService fieldStatistics,
         IWorkAssignmentReportService reportService,
+        IWorkAssignmentAdvancedSummaryDirtyService advancedSummaryDirty,
         MeAccessor me,
         ILogger<WorkAssignmentReviewService> log)
     {
@@ -61,6 +64,7 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
         _tableStatistics = tableStatistics;
         _fieldStatistics = fieldStatistics;
         _reportService = reportService;
+        _advancedSummaryDirty = advancedSummaryDirty;
         _me = me;
         _log = log;
     }
@@ -2075,6 +2079,14 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
 
                 await RebuildReportStatisticsAsync(report, actorUserId, ct);
             }
+
+            await _advancedSummaryDirty.MarkReportStatusMutationDirtyAsync(
+                report,
+                operation,
+                fromStatus,
+                toStatus,
+                actorUserId,
+                ct);
 
             _log.LogInformation(
                 "WorkAssignment review report status operation completed. operation={operation} reportId={reportId} periodId={periodId} assignmentId={assignmentId} workId={workId} fromStatus={fromStatus} toStatus={toStatus}",

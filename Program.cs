@@ -245,6 +245,7 @@ builder.Services.AddScoped<IAggregateTableService, AggregateTableService>();
 builder.Services.AddScoped<IWorkAssignmentBasicSummaryService, WorkAssignmentBasicSummaryService>();
 builder.Services.AddScoped<IWorkAssignmentAdvancedSummaryConfigService, WorkAssignmentAdvancedSummaryConfigService>();
 builder.Services.AddScoped<IWorkAssignmentAdvancedSummaryHierarchyService, WorkAssignmentAdvancedSummaryHierarchyService>();
+builder.Services.AddScoped<IWorkAssignmentAdvancedSummaryDirtyService, WorkAssignmentAdvancedSummaryDirtyService>();
 
 builder.Services.AddScoped<IWorkAssignmentRuntimeMaterializeService, WorkAssignmentRuntimeMaterializeService>();
 builder.Services.AddScoped<IWorkAssignmentQueueService, WorkAssignmentQueueService>();

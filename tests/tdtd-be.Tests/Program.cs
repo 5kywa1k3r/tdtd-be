@@ -107,6 +107,8 @@ var tests = new (string Name, Action Run)[]
     ("advanced summary field gate enforces section limits", AdvancedSummaryFieldGateEnforcesSectionLimits),
     ("advanced summary hierarchy keys roll up day month year", AdvancedSummaryHierarchyKeysRollUpDayMonthYear),
     ("advanced summary day node source day uses completed date first", AdvancedSummaryDayNodeSourceDayUsesCompletedDateFirst),
+    ("advanced summary dirty scopes include self and parent assignments", AdvancedSummaryDirtyScopesIncludeSelfAndParentAssignments),
+    ("advanced summary dirty status mutation rules cover approved and active changes", AdvancedSummaryDirtyStatusMutationRulesCoverApprovedAndActiveChanges),
     ("advanced summary hierarchy rollup merges child fields", AdvancedSummaryHierarchyRollupMergesChildFields),
     ("advanced summary hierarchy rollup requires clean children", AdvancedSummaryHierarchyRollupRequiresCleanChildren),
     ("advanced summary hierarchy query plans largest grains", AdvancedSummaryHierarchyQueryPlansLargestGrains),
@@ -3358,6 +3360,10 @@ static void AdvancedSummaryDayNodeSourceDayUsesCompletedDateFirst()
         "ResolveReportSourceDayKey",
         report);
     AssertEqual("2026-01-05", completedDay, "completed date should define source day before period metadata");
+    AssertEqual(
+        completedDay,
+        AdvancedSummaryReportSourceDayResolver.Resolve(report),
+        "day builder and dirty marker should share the same source-day resolver");
 
     report.CompletedDate = null;
     var periodDay = InvokePrivateStatic<string>(
@@ -3365,6 +3371,60 @@ static void AdvancedSummaryDayNodeSourceDayUsesCompletedDateFirst()
         "ResolveReportSourceDayKey",
         report);
     AssertEqual("2026-01-07", periodDay, "period key should define source day when completed date is missing");
+}
+
+static void AdvancedSummaryDirtyScopesIncludeSelfAndParentAssignments()
+{
+    var ids = InvokePrivateStatic<List<string>>(
+        typeof(WorkAssignmentAdvancedSummaryDirtyService),
+        "BuildCandidateScopeAssignmentIds",
+        " child ",
+        " parent ");
+
+    AssertSequenceEqual(
+        new[] { "child", "parent" },
+        ids,
+        "dirty marker should touch configs on the source assignment and its direct parent scope");
+
+    var selfOnly = InvokePrivateStatic<List<string>>(
+        typeof(WorkAssignmentAdvancedSummaryDirtyService),
+        "BuildCandidateScopeAssignmentIds",
+        "child",
+        " child ");
+
+    AssertSequenceEqual(
+        new[] { "child" },
+        selfOnly,
+        "dirty scope should not duplicate the same assignment id");
+}
+
+static void AdvancedSummaryDirtyStatusMutationRulesCoverApprovedAndActiveChanges()
+{
+    var submittedReport = new WorkAssignmentReport { Status = WorkAssignmentReportStatus.Submitted };
+    var approveMutation = InvokePrivateStatic<bool>(
+        typeof(WorkAssignmentAdvancedSummaryDirtyService),
+        "ShouldDirtyForStatusMutation",
+        submittedReport,
+        WorkAssignmentReportStatus.Submitted.ToString(),
+        WorkAssignmentReportStatus.Approved.ToString());
+    AssertTrue(approveMutation, "moving into approved status should dirty advanced summary nodes");
+
+    var approvedReport = new WorkAssignmentReport { Status = WorkAssignmentReportStatus.Approved };
+    var deactivateMutation = InvokePrivateStatic<bool>(
+        typeof(WorkAssignmentAdvancedSummaryDirtyService),
+        "ShouldDirtyForStatusMutation",
+        approvedReport,
+        "ACTIVE",
+        "INACTIVE");
+    AssertTrue(deactivateMutation, "deactivating an approved report should dirty advanced summary nodes");
+
+    var draftMutation = InvokePrivateStatic<bool>(
+        typeof(WorkAssignmentAdvancedSummaryDirtyService),
+        "ShouldDirtyForStatusMutation",
+        submittedReport,
+        WorkAssignmentReportStatus.Draft.ToString(),
+        WorkAssignmentReportStatus.Submitted.ToString());
+    AssertFalse(draftMutation, "draft to submitted should not dirty advanced summary nodes before approval");
 }
 
 static void AdvancedSummaryHierarchyRollupMergesChildFields()

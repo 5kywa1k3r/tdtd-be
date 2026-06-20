@@ -1493,30 +1493,7 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
     }
 
     private static string ResolveReportSourceDayKey(WorkAssignmentReport report)
-    {
-        if (report.CompletedDate.HasValue)
-            return AdvancedSummaryHierarchyKeyHelper.ToDayKey(report.CompletedDate.Value);
-
-        if (!string.IsNullOrWhiteSpace(report.PeriodKey))
-        {
-            try { return AdvancedSummaryHierarchyKeyHelper.ToDayKey(AdvancedSummaryHierarchyKeyHelper.ParseDayKey(report.PeriodKey)); }
-            catch (ArgumentException) { }
-        }
-
-        if (report.PeriodStart.HasValue)
-            return AdvancedSummaryHierarchyKeyHelper.ToDayKey(report.PeriodStart.Value);
-
-        if (report.ReportDate.HasValue)
-            return AdvancedSummaryHierarchyKeyHelper.ToDayKey(report.ReportDate.Value);
-
-        if (report.ApprovedAtUtc.HasValue)
-            return AdvancedSummaryHierarchyKeyHelper.ToDayKey(report.ApprovedAtUtc.Value);
-
-        throw AppExceptionFactory.BadRequest(
-            AppErrorCode.COMMON_VALIDATION_FAILED,
-            new { reportId = report.Id, reason = "ADVANCED_SUMMARY_SOURCE_DAY_UNRESOLVABLE" },
-            "Cannot resolve source day for approved report.");
-    }
+        => AdvancedSummaryReportSourceDayResolver.Resolve(report);
 
     private async Task<AdvancedSummaryBuildContext> LoadContextAsync(
         WorkAssignmentAdvancedSummaryConfig config,
