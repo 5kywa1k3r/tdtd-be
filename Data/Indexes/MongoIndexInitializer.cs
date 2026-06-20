@@ -118,6 +118,9 @@
             var workAssignmentBasicSummarySnapshots = db.GetCollection<WorkAssignmentBasicSummarySnapshot>(opt.WorkAssignmentBasicSummarySnapshotCollection);
             await EnsureWorkAssignmentBasicSummarySnapshotsAsync(workAssignmentBasicSummarySnapshots, ct);
 
+            var workAssignmentAdvancedSummaryConfigs = db.GetCollection<WorkAssignmentAdvancedSummaryConfig>(opt.WorkAssignmentAdvancedSummaryConfigCollection);
+            await EnsureWorkAssignmentAdvancedSummaryConfigsAsync(workAssignmentAdvancedSummaryConfigs, ct);
+
             // WORK TEMPLATE ASSIGNEES
             var workTemplateAssignees = db.GetCollection<WorkTemplateAssignee>(opt.WorkTemplateAssigneeCollection);
             await EnsureWorkTemplateAssigneesAsync(workTemplateAssignees, ct);
@@ -1740,6 +1743,58 @@
                     { "dynamicFormTemplateId", 1 },
                     { "isDeleted", 1 },
                     { "updatedAtUtc", -1 }
+                }
+            ), ct);
+        }
+
+        private static async Task EnsureWorkAssignmentAdvancedSummaryConfigsAsync(
+            IMongoCollection<WorkAssignmentAdvancedSummaryConfig> col,
+            CancellationToken ct)
+        {
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ux_workAssignmentAdvancedSummaryConfigs_draft_scope",
+                key: new BsonDocument
+                {
+                    { "assignmentId", 1 },
+                    { "dynamicFormTemplateId", 1 },
+                    { "sectionId", 1 },
+                    { "status", 1 }
+                },
+                unique: true,
+                partial: new BsonDocument
+                {
+                    { "isDeleted", false },
+                    { "status", WorkAssignmentAdvancedSummaryConfigStatuses.Draft }
+                }
+            ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ux_workAssignmentAdvancedSummaryConfigs_locked_version",
+                key: new BsonDocument
+                {
+                    { "assignmentId", 1 },
+                    { "dynamicFormTemplateId", 1 },
+                    { "sectionId", 1 },
+                    { "versionNo", 1 }
+                },
+                unique: true,
+                partial: new BsonDocument
+                {
+                    { "isDeleted", false },
+                    { "status", WorkAssignmentAdvancedSummaryConfigStatuses.Locked }
+                }
+            ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_workAssignmentAdvancedSummaryConfigs_scope_status",
+                key: new BsonDocument
+                {
+                    { "assignmentId", 1 },
+                    { "dynamicFormTemplateId", 1 },
+                    { "sectionId", 1 },
+                    { "status", 1 },
+                    { "updatedAtUtc", -1 },
+                    { "isDeleted", 1 }
                 }
             ), ct);
         }

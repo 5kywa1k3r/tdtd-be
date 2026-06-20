@@ -25,6 +25,7 @@
         public string WorkAssignmentAggregateConfigCollection { get; set; } = "work_assignment_aggregate_configs";
         public string WorkAssignmentBasicSummaryConfigCollection { get; set; } = "work_assignment_basic_summary_configs";
         public string WorkAssignmentBasicSummarySnapshotCollection { get; set; } = "work_assignment_basic_summary_snapshots";
+        public string WorkAssignmentAdvancedSummaryConfigCollection { get; set; } = "work_assignment_advanced_summary_configs";
         public string WorkTemplateAssigneeCollection { get; set; } = "work_template_assignees";
         public string DocRoleCollection { get; set; } = "doc_roles";
         public string WorkListDocRoleCollection { get; set; } = "work_list_doc_roles";

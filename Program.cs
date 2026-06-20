@@ -33,6 +33,7 @@ using tdtd_be.Services.WorkAssignmentReports;
 using tdtd_be.Services.WorkAssignmentReports.Statistics;
 using tdtd_be.Services.WorkAssignmentReports.Payloads;
 using tdtd_be.Services.WorkAssignments;
+using tdtd_be.Services.WorkAssignments.AdvancedSummary;
 using tdtd_be.Services.WorkAssignments.Aggregate;
 using tdtd_be.Services.WorkAssignments.BasicSummary;
 using tdtd_be.Services.WorkAssignments.Domain;
@@ -242,6 +243,7 @@ builder.Services.AddScoped<IWorkAssignmentProgressService, WorkAssignmentProgres
 builder.Services.AddScoped<IWorkAssignmentReviewService, WorkAssignmentReviewService>();
 builder.Services.AddScoped<IAggregateTableService, AggregateTableService>();
 builder.Services.AddScoped<IWorkAssignmentBasicSummaryService, WorkAssignmentBasicSummaryService>();
+builder.Services.AddScoped<IWorkAssignmentAdvancedSummaryConfigService, WorkAssignmentAdvancedSummaryConfigService>();
 
 builder.Services.AddScoped<IWorkAssignmentRuntimeMaterializeService, WorkAssignmentRuntimeMaterializeService>();
 builder.Services.AddScoped<IWorkAssignmentQueueService, WorkAssignmentQueueService>();

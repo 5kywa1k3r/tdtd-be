@@ -13,6 +13,7 @@ using tdtd_be.Services.WorkAssignmentReports;
 using tdtd_be.Services.WorkAssignmentReports.Payloads;
 using tdtd_be.Services.WorkAssignmentReports.Statistics;
 using tdtd_be.Services.WorkAssignments.Domain;
+using tdtd_be.Services.WorkAssignments.AdvancedSummary;
 using tdtd_be.Services.WorkAssignments.BasicSummary;
 using tdtd_be.Services.WorkAssignments.Internal;
 using tdtd_be.Services.WorkAssignments.Runtime;
@@ -101,6 +102,7 @@ var tests = new (string Name, Action Run)[]
     ("basic summary merges period snapshots by typed method", BasicSummaryMergesPeriodSnapshotsByTypedMethod),
     ("basic summary compact snapshot round-trips", BasicSummaryCompactSnapshotRoundTrips),
     ("basic summary respects compressed table null runs", BasicSummaryRespectsCompressedTableNullRuns),
+    ("advanced summary config normalizes object json", AdvancedSummaryConfigNormalizesObjectJson),
     ("legacy work basis file resolves as work document", ResolvesLegacyWorkBasisFileAsWorkDocument),
     ("assignment file resolves as assignment branch document", ResolvesAssignmentFileAsBranchDocument),
     ("assignment document path resolves ancestors only", ResolvesAssignmentDocumentAncestorsFromPath),
@@ -3237,6 +3239,26 @@ static void BasicSummaryRespectsCompressedTableNullRuns()
 
     AssertEqual("8,9,10,11", string.Join(",", indexes), "basic summary should not read raw compressed values for null-run cells");
     AssertEqual(0, skipped.Count, "compressed null-run fixture should stay below direct aggregate limit");
+}
+
+static void AdvancedSummaryConfigNormalizesObjectJson()
+{
+    var normalized = InvokePrivateStatic<string>(
+        typeof(WorkAssignmentAdvancedSummaryConfigService),
+        "NormalizeConfigJson",
+        "{ \"method\": \"SUM\", \"condition\": { \"field\": \"score\" } }");
+
+    AssertEqual(
+        "{\"method\":\"SUM\",\"condition\":{\"field\":\"score\"}}",
+        normalized,
+        "advanced summary config should normalize object json");
+
+    AssertThrowsFromReflection(
+        AppErrorCode.COMMON_VALIDATION_FAILED,
+        () => InvokePrivateStatic<string>(
+            typeof(WorkAssignmentAdvancedSummaryConfigService),
+            "NormalizeConfigJson",
+            "[]"));
 }
 
 static void ResolvesLegacyWorkBasisFileAsWorkDocument()

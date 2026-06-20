@@ -30,6 +30,7 @@ namespace tdtd_be.Data
         public IMongoCollection<WorkAssignmentAggregateConfig> WorkAssignmentAggregateConfigs { get; }
         public IMongoCollection<WorkAssignmentBasicSummaryConfig> WorkAssignmentBasicSummaryConfigs { get; }
         public IMongoCollection<WorkAssignmentBasicSummarySnapshot> WorkAssignmentBasicSummarySnapshots { get; }
+        public IMongoCollection<WorkAssignmentAdvancedSummaryConfig> WorkAssignmentAdvancedSummaryConfigs { get; }
         public IMongoCollection<WorkTemplateAssignee> WorkTemplateAssignees { get; }
         public IMongoCollection<DocRole> DocRoles { get; }
         public IMongoCollection<WorkListDocRole> WorkListDocRoles { get; }
@@ -88,6 +89,7 @@ namespace tdtd_be.Data
             WorkAssignmentAggregateConfigs = Db.GetCollection<WorkAssignmentAggregateConfig>(o.WorkAssignmentAggregateConfigCollection);
             WorkAssignmentBasicSummaryConfigs = Db.GetCollection<WorkAssignmentBasicSummaryConfig>(o.WorkAssignmentBasicSummaryConfigCollection);
             WorkAssignmentBasicSummarySnapshots = Db.GetCollection<WorkAssignmentBasicSummarySnapshot>(o.WorkAssignmentBasicSummarySnapshotCollection);
+            WorkAssignmentAdvancedSummaryConfigs = Db.GetCollection<WorkAssignmentAdvancedSummaryConfig>(o.WorkAssignmentAdvancedSummaryConfigCollection);
             WorkTemplateAssignees = Db.GetCollection<WorkTemplateAssignee>(o.WorkTemplateAssigneeCollection);
             DocRoles = Db.GetCollection<DocRole>(o.DocRoleCollection);
             WorkListDocRoles = Db.GetCollection<WorkListDocRole>(o.WorkListDocRoleCollection);
