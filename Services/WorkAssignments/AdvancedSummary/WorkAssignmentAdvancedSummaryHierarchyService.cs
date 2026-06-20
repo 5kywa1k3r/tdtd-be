@@ -22,6 +22,8 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
     private const int DayNodeSampleTextLimit = 160;
     private const int DayNodeSampleLimit = 5;
     private const string DayNodeValueKind = "ADVANCED_SUMMARY_DAY_NODE_V1";
+    private const string MonthNodeValueKind = "ADVANCED_SUMMARY_MONTH_NODE_V1";
+    private const string YearNodeValueKind = "ADVANCED_SUMMARY_YEAR_NODE_V1";
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
@@ -192,6 +194,286 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
         }
     }
 
+    public async Task<WorkAssignmentAdvancedSummaryMonthNodeDto> RequestMonthNodeBuildAsync(
+        string configId,
+        string monthKey,
+        BuildWorkAssignmentAdvancedSummaryMonthNodeRequest req,
+        string actorUserId,
+        CancellationToken ct)
+    {
+        EnsureActor(actorUserId);
+        var normalizedMonthKey = NormalizeMonthKey(monthKey);
+        var config = await LoadLockedConfigAsync(configId, ct);
+        await LoadContextAsync(config, actorUserId, ct);
+        var (startUtc, endExclusiveUtc) = AdvancedSummaryHierarchyKeyHelper.GetMonthBoundsUtc(normalizedMonthKey);
+        var yearKey = AdvancedSummaryHierarchyKeyHelper.ToYearKeyFromMonth(normalizedMonthKey);
+
+        var existing = await LoadMonthNodeAsync(config, normalizedMonthKey, ct);
+        if (existing is not null &&
+            req?.ForceRefresh != true &&
+            string.Equals(existing.Status, WorkAssignmentAdvancedSummaryHierarchyNodeStatuses.Building, StringComparison.Ordinal))
+        {
+            return MapMonthNode(existing);
+        }
+
+        var correlationId = ObjectId.GenerateNewId().ToString();
+        var jobId = _backgroundJobs.Enqueue<IWorkAssignmentAdvancedSummaryHierarchyService>(
+            svc => svc.BuildMonthNodeJobAsync(config.Id, normalizedMonthKey, config.ConfigHash, actorUserId, correlationId, CancellationToken.None));
+        var now = DateTime.UtcNow;
+
+        var node = existing ?? new WorkAssignmentAdvancedSummaryMonthNode
+        {
+            Id = ObjectId.GenerateNewId().ToString(),
+            CreatedAtUtc = now,
+            CreatedByUserId = actorUserId,
+            IsDeleted = false
+        };
+
+        node.WorkId = config.WorkId;
+        node.AssignmentId = config.AssignmentId;
+        node.DynamicFormTemplateId = config.DynamicFormTemplateId;
+        node.SectionId = config.SectionId;
+        node.ConfigId = config.Id;
+        node.ConfigVersionNo = config.VersionNo;
+        node.ConfigHash = config.ConfigHash;
+        node.Grain = WorkAssignmentAdvancedSummaryHierarchyGrains.Month;
+        node.GrainKey = normalizedMonthKey;
+        node.MonthKey = normalizedMonthKey;
+        node.YearKey = yearKey;
+        node.WindowStartUtc = startUtc;
+        node.WindowEndExclusiveUtc = endExclusiveUtc;
+        node.Status = WorkAssignmentAdvancedSummaryHierarchyNodeStatuses.Building;
+        node.IsDirty = true;
+        node.DirtyReason = req?.ForceRefresh == true ? "FORCE_REFRESH" : "BUILD_REQUESTED";
+        node.BuildJobId = jobId;
+        node.BuildCorrelationId = correlationId;
+        node.BuildError = null;
+        node.UpdatedAtUtc = now;
+        node.UpdatedByUserId = actorUserId;
+        node.IsDeleted = false;
+
+        await _ctx.WorkAssignmentAdvancedSummaryMonthNodes.ReplaceOneAsync(
+            MonthNodeIdentityFilter(config, normalizedMonthKey),
+            node,
+            new ReplaceOptions { IsUpsert = true },
+            ct);
+
+        return MapMonthNode(node);
+    }
+
+    public async Task BuildMonthNodeJobAsync(
+        string configId,
+        string monthKey,
+        string expectedConfigHash,
+        string actorUserId,
+        string correlationId,
+        CancellationToken ct)
+    {
+        EnsureActor(actorUserId);
+        var normalizedMonthKey = NormalizeMonthKey(monthKey);
+        var config = await LoadLockedConfigAsync(configId, ct);
+        if (!string.Equals(config.ConfigHash, expectedConfigHash, StringComparison.Ordinal))
+            return;
+
+        WorkAssignment? notifyScope = null;
+        DynamicFormTemplate? notifyTemplate = null;
+        try
+        {
+            var context = await LoadContextAsync(config, actorUserId, ct);
+            notifyScope = context.Scope;
+            notifyTemplate = context.Template;
+
+            await MarkNodeBuildingAsync(
+                _ctx.WorkAssignmentAdvancedSummaryMonthNodes,
+                CurrentMonthNodeBuildFilter(config, normalizedMonthKey, expectedConfigHash, correlationId),
+                actorUserId,
+                ct);
+
+            var built = await BuildMonthNodeAsync(config, normalizedMonthKey, actorUserId, correlationId, ct);
+
+            await _ctx.WorkAssignmentAdvancedSummaryMonthNodes.ReplaceOneAsync(
+                CurrentMonthNodeBuildFilter(config, normalizedMonthKey, expectedConfigHash, correlationId),
+                built,
+                new ReplaceOptions { IsUpsert = false },
+                ct);
+
+            await NotifyHierarchyNodeBuildAsync(
+                built,
+                actorUserId,
+                notifyScope,
+                notifyTemplate,
+                eventStatus: "done",
+                title: "Advanced summary month node built",
+                stateText: "month hierarchy node built",
+                severity: UserNotificationSeverities.Info,
+                requiresAction: false,
+                error: null,
+                ct);
+        }
+        catch (Exception ex)
+        {
+            var error = BuildErrorMessage(ex);
+            await MarkNodeFailedAsync(
+                _ctx.WorkAssignmentAdvancedSummaryMonthNodes,
+                CurrentMonthNodeBuildFilter(config, normalizedMonthKey, expectedConfigHash, correlationId),
+                actorUserId,
+                error,
+                ct);
+            await NotifyHierarchyNodeBuildAsync(
+                await LoadMonthNodeAsync(config, normalizedMonthKey, ct),
+                actorUserId,
+                notifyScope,
+                notifyTemplate,
+                eventStatus: "failed",
+                title: "Advanced summary month node failed",
+                stateText: "month hierarchy node build failed",
+                severity: UserNotificationSeverities.Warning,
+                requiresAction: true,
+                error,
+                ct);
+            throw;
+        }
+    }
+
+    public async Task<WorkAssignmentAdvancedSummaryYearNodeDto> RequestYearNodeBuildAsync(
+        string configId,
+        string yearKey,
+        BuildWorkAssignmentAdvancedSummaryYearNodeRequest req,
+        string actorUserId,
+        CancellationToken ct)
+    {
+        EnsureActor(actorUserId);
+        var normalizedYearKey = NormalizeYearKey(yearKey);
+        var config = await LoadLockedConfigAsync(configId, ct);
+        await LoadContextAsync(config, actorUserId, ct);
+        var (startUtc, endExclusiveUtc) = AdvancedSummaryHierarchyKeyHelper.GetYearBoundsUtc(normalizedYearKey);
+
+        var existing = await LoadYearNodeAsync(config, normalizedYearKey, ct);
+        if (existing is not null &&
+            req?.ForceRefresh != true &&
+            string.Equals(existing.Status, WorkAssignmentAdvancedSummaryHierarchyNodeStatuses.Building, StringComparison.Ordinal))
+        {
+            return MapYearNode(existing);
+        }
+
+        var correlationId = ObjectId.GenerateNewId().ToString();
+        var jobId = _backgroundJobs.Enqueue<IWorkAssignmentAdvancedSummaryHierarchyService>(
+            svc => svc.BuildYearNodeJobAsync(config.Id, normalizedYearKey, config.ConfigHash, actorUserId, correlationId, CancellationToken.None));
+        var now = DateTime.UtcNow;
+
+        var node = existing ?? new WorkAssignmentAdvancedSummaryYearNode
+        {
+            Id = ObjectId.GenerateNewId().ToString(),
+            CreatedAtUtc = now,
+            CreatedByUserId = actorUserId,
+            IsDeleted = false
+        };
+
+        node.WorkId = config.WorkId;
+        node.AssignmentId = config.AssignmentId;
+        node.DynamicFormTemplateId = config.DynamicFormTemplateId;
+        node.SectionId = config.SectionId;
+        node.ConfigId = config.Id;
+        node.ConfigVersionNo = config.VersionNo;
+        node.ConfigHash = config.ConfigHash;
+        node.Grain = WorkAssignmentAdvancedSummaryHierarchyGrains.Year;
+        node.GrainKey = normalizedYearKey;
+        node.YearKey = normalizedYearKey;
+        node.WindowStartUtc = startUtc;
+        node.WindowEndExclusiveUtc = endExclusiveUtc;
+        node.Status = WorkAssignmentAdvancedSummaryHierarchyNodeStatuses.Building;
+        node.IsDirty = true;
+        node.DirtyReason = req?.ForceRefresh == true ? "FORCE_REFRESH" : "BUILD_REQUESTED";
+        node.BuildJobId = jobId;
+        node.BuildCorrelationId = correlationId;
+        node.BuildError = null;
+        node.UpdatedAtUtc = now;
+        node.UpdatedByUserId = actorUserId;
+        node.IsDeleted = false;
+
+        await _ctx.WorkAssignmentAdvancedSummaryYearNodes.ReplaceOneAsync(
+            YearNodeIdentityFilter(config, normalizedYearKey),
+            node,
+            new ReplaceOptions { IsUpsert = true },
+            ct);
+
+        return MapYearNode(node);
+    }
+
+    public async Task BuildYearNodeJobAsync(
+        string configId,
+        string yearKey,
+        string expectedConfigHash,
+        string actorUserId,
+        string correlationId,
+        CancellationToken ct)
+    {
+        EnsureActor(actorUserId);
+        var normalizedYearKey = NormalizeYearKey(yearKey);
+        var config = await LoadLockedConfigAsync(configId, ct);
+        if (!string.Equals(config.ConfigHash, expectedConfigHash, StringComparison.Ordinal))
+            return;
+
+        WorkAssignment? notifyScope = null;
+        DynamicFormTemplate? notifyTemplate = null;
+        try
+        {
+            var context = await LoadContextAsync(config, actorUserId, ct);
+            notifyScope = context.Scope;
+            notifyTemplate = context.Template;
+
+            await MarkNodeBuildingAsync(
+                _ctx.WorkAssignmentAdvancedSummaryYearNodes,
+                CurrentYearNodeBuildFilter(config, normalizedYearKey, expectedConfigHash, correlationId),
+                actorUserId,
+                ct);
+
+            var built = await BuildYearNodeAsync(config, normalizedYearKey, actorUserId, correlationId, ct);
+
+            await _ctx.WorkAssignmentAdvancedSummaryYearNodes.ReplaceOneAsync(
+                CurrentYearNodeBuildFilter(config, normalizedYearKey, expectedConfigHash, correlationId),
+                built,
+                new ReplaceOptions { IsUpsert = false },
+                ct);
+
+            await NotifyHierarchyNodeBuildAsync(
+                built,
+                actorUserId,
+                notifyScope,
+                notifyTemplate,
+                eventStatus: "done",
+                title: "Advanced summary year node built",
+                stateText: "year hierarchy node built",
+                severity: UserNotificationSeverities.Info,
+                requiresAction: false,
+                error: null,
+                ct);
+        }
+        catch (Exception ex)
+        {
+            var error = BuildErrorMessage(ex);
+            await MarkNodeFailedAsync(
+                _ctx.WorkAssignmentAdvancedSummaryYearNodes,
+                CurrentYearNodeBuildFilter(config, normalizedYearKey, expectedConfigHash, correlationId),
+                actorUserId,
+                error,
+                ct);
+            await NotifyHierarchyNodeBuildAsync(
+                await LoadYearNodeAsync(config, normalizedYearKey, ct),
+                actorUserId,
+                notifyScope,
+                notifyTemplate,
+                eventStatus: "failed",
+                title: "Advanced summary year node failed",
+                stateText: "year hierarchy node build failed",
+                severity: UserNotificationSeverities.Warning,
+                requiresAction: true,
+                error,
+                ct);
+            throw;
+        }
+    }
+
     private async Task<WorkAssignmentAdvancedSummaryDayNode> BuildDayNodeAsync(
         WorkAssignmentAdvancedSummaryConfig config,
         AdvancedSummaryBuildContext context,
@@ -274,14 +556,18 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
         if (targetFields.Count == 0)
             warnings.Add("No field target was available for this day node.");
 
-        var value = new AdvancedSummaryDayNodeValue
+        var value = new AdvancedSummaryHierarchyNodeValue
         {
             SchemaVersion = 1,
             Kind = DayNodeValueKind,
             GeneratedAtUtc = DateTime.UtcNow,
             ConfigId = config.Id,
             ConfigHash = config.ConfigHash,
+            Grain = WorkAssignmentAdvancedSummaryHierarchyGrains.Day,
+            GrainKey = dayKey,
             DayKey = dayKey,
+            MonthKey = AdvancedSummaryHierarchyKeyHelper.ToMonthKey(dayKey),
+            YearKey = AdvancedSummaryHierarchyKeyHelper.ToYearKeyFromDay(dayKey),
             WindowStartUtc = startUtc,
             WindowEndExclusiveUtc = endExclusiveUtc,
             SourceAssignmentCount = sourceAssignments.Count,
@@ -333,6 +619,358 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
             UpdatedByUserId = actorUserId,
             IsDeleted = false
         };
+    }
+
+    private async Task<WorkAssignmentAdvancedSummaryMonthNode> BuildMonthNodeAsync(
+        WorkAssignmentAdvancedSummaryConfig config,
+        string monthKey,
+        string actorUserId,
+        string correlationId,
+        CancellationToken ct)
+    {
+        EnsureSimpleConfigSupported(config.ConfigJson);
+        var (startUtc, endExclusiveUtc) = AdvancedSummaryHierarchyKeyHelper.GetMonthBoundsUtc(monthKey);
+        var expectedDayKeys = EnumerateDayKeys(startUtc, endExclusiveUtc).ToList();
+        var childNodes = await LoadCleanDayNodesForMonthAsync(config, monthKey, expectedDayKeys, ct);
+        ValidateCleanChildNodes(
+            WorkAssignmentAdvancedSummaryHierarchyGrains.Month,
+            monthKey,
+            WorkAssignmentAdvancedSummaryHierarchyGrains.Day,
+            expectedDayKeys,
+            childNodes,
+            x => x.DayKey);
+
+        var rollup = BuildRollupValue(
+            MonthNodeValueKind,
+            WorkAssignmentAdvancedSummaryHierarchyGrains.Month,
+            monthKey,
+            monthKey,
+            AdvancedSummaryHierarchyKeyHelper.ToYearKeyFromMonth(monthKey),
+            startUtc,
+            endExclusiveUtc,
+            childNodes,
+            x => x.DayKey);
+        var valueJson = JsonSerializer.Serialize(rollup, ValueJsonOptions);
+        var now = DateTime.UtcNow;
+        var existingNode = await LoadMonthNodeAsync(config, monthKey, ct);
+
+        return new WorkAssignmentAdvancedSummaryMonthNode
+        {
+            Id = existingNode?.Id ?? ObjectId.GenerateNewId().ToString(),
+            WorkId = config.WorkId,
+            AssignmentId = config.AssignmentId,
+            DynamicFormTemplateId = config.DynamicFormTemplateId,
+            SectionId = config.SectionId,
+            ConfigId = config.Id,
+            ConfigVersionNo = config.VersionNo,
+            ConfigHash = config.ConfigHash,
+            Grain = WorkAssignmentAdvancedSummaryHierarchyGrains.Month,
+            GrainKey = monthKey,
+            MonthKey = monthKey,
+            YearKey = AdvancedSummaryHierarchyKeyHelper.ToYearKeyFromMonth(monthKey),
+            WindowStartUtc = startUtc,
+            WindowEndExclusiveUtc = endExclusiveUtc,
+            Status = WorkAssignmentAdvancedSummaryHierarchyNodeStatuses.Clean,
+            IsDirty = false,
+            DirtyReason = null,
+            SourceSignatureHash = BuildInputNodeSignature(childNodes),
+            SourceReportCount = childNodes.Sum(x => x.SourceReportCount),
+            SourceReportIds = new List<string>(),
+            InputNodeKeys = childNodes.Select(x => x.DayKey).OrderBy(x => x, StringComparer.Ordinal).ToList(),
+            ValueJson = valueJson,
+            ValueHash = Sha256(valueJson),
+            BuiltAtUtc = now,
+            BuildJobId = existingNode?.BuildJobId,
+            BuildCorrelationId = correlationId,
+            BuildError = null,
+            CreatedAtUtc = existingNode?.CreatedAtUtc ?? now,
+            CreatedByUserId = existingNode?.CreatedByUserId ?? actorUserId,
+            UpdatedAtUtc = now,
+            UpdatedByUserId = actorUserId,
+            IsDeleted = false
+        };
+    }
+
+    private async Task<WorkAssignmentAdvancedSummaryYearNode> BuildYearNodeAsync(
+        WorkAssignmentAdvancedSummaryConfig config,
+        string yearKey,
+        string actorUserId,
+        string correlationId,
+        CancellationToken ct)
+    {
+        EnsureSimpleConfigSupported(config.ConfigJson);
+        var (startUtc, endExclusiveUtc) = AdvancedSummaryHierarchyKeyHelper.GetYearBoundsUtc(yearKey);
+        var expectedMonthKeys = Enumerable.Range(1, 12)
+            .Select(month => $"{yearKey}-{month:00}")
+            .ToList();
+        var childNodes = await LoadCleanMonthNodesForYearAsync(config, yearKey, expectedMonthKeys, ct);
+        ValidateCleanChildNodes(
+            WorkAssignmentAdvancedSummaryHierarchyGrains.Year,
+            yearKey,
+            WorkAssignmentAdvancedSummaryHierarchyGrains.Month,
+            expectedMonthKeys,
+            childNodes,
+            x => x.MonthKey);
+
+        var rollup = BuildRollupValue(
+            YearNodeValueKind,
+            WorkAssignmentAdvancedSummaryHierarchyGrains.Year,
+            yearKey,
+            monthKey: null,
+            yearKey,
+            startUtc,
+            endExclusiveUtc,
+            childNodes,
+            x => x.MonthKey);
+        var valueJson = JsonSerializer.Serialize(rollup, ValueJsonOptions);
+        var now = DateTime.UtcNow;
+        var existingNode = await LoadYearNodeAsync(config, yearKey, ct);
+
+        return new WorkAssignmentAdvancedSummaryYearNode
+        {
+            Id = existingNode?.Id ?? ObjectId.GenerateNewId().ToString(),
+            WorkId = config.WorkId,
+            AssignmentId = config.AssignmentId,
+            DynamicFormTemplateId = config.DynamicFormTemplateId,
+            SectionId = config.SectionId,
+            ConfigId = config.Id,
+            ConfigVersionNo = config.VersionNo,
+            ConfigHash = config.ConfigHash,
+            Grain = WorkAssignmentAdvancedSummaryHierarchyGrains.Year,
+            GrainKey = yearKey,
+            YearKey = yearKey,
+            WindowStartUtc = startUtc,
+            WindowEndExclusiveUtc = endExclusiveUtc,
+            Status = WorkAssignmentAdvancedSummaryHierarchyNodeStatuses.Clean,
+            IsDirty = false,
+            DirtyReason = null,
+            SourceSignatureHash = BuildInputNodeSignature(childNodes),
+            SourceReportCount = childNodes.Sum(x => x.SourceReportCount),
+            SourceReportIds = new List<string>(),
+            InputNodeKeys = childNodes.Select(x => x.MonthKey).OrderBy(x => x, StringComparer.Ordinal).ToList(),
+            ValueJson = valueJson,
+            ValueHash = Sha256(valueJson),
+            BuiltAtUtc = now,
+            BuildJobId = existingNode?.BuildJobId,
+            BuildCorrelationId = correlationId,
+            BuildError = null,
+            CreatedAtUtc = existingNode?.CreatedAtUtc ?? now,
+            CreatedByUserId = existingNode?.CreatedByUserId ?? actorUserId,
+            UpdatedAtUtc = now,
+            UpdatedByUserId = actorUserId,
+            IsDeleted = false
+        };
+    }
+
+    private async Task<List<WorkAssignmentAdvancedSummaryDayNode>> LoadCleanDayNodesForMonthAsync(
+        WorkAssignmentAdvancedSummaryConfig config,
+        string monthKey,
+        IReadOnlyCollection<string> expectedDayKeys,
+        CancellationToken ct)
+    {
+        var fb = Builders<WorkAssignmentAdvancedSummaryDayNode>.Filter;
+        var filter = fb.Eq(x => x.AssignmentId, config.AssignmentId)
+                     & fb.Eq(x => x.DynamicFormTemplateId, config.DynamicFormTemplateId)
+                     & fb.Eq(x => x.SectionId, config.SectionId)
+                     & fb.Eq(x => x.ConfigHash, config.ConfigHash)
+                     & fb.Eq(x => x.IsDeleted, false)
+                     & fb.In(x => x.DayKey, expectedDayKeys);
+
+        return await _ctx.WorkAssignmentAdvancedSummaryDayNodes
+            .Find(filter)
+            .Sort(Builders<WorkAssignmentAdvancedSummaryDayNode>.Sort.Ascending(x => x.DayKey))
+            .ToListAsync(ct);
+    }
+
+    private async Task<List<WorkAssignmentAdvancedSummaryMonthNode>> LoadCleanMonthNodesForYearAsync(
+        WorkAssignmentAdvancedSummaryConfig config,
+        string yearKey,
+        IReadOnlyCollection<string> expectedMonthKeys,
+        CancellationToken ct)
+    {
+        var fb = Builders<WorkAssignmentAdvancedSummaryMonthNode>.Filter;
+        var filter = fb.Eq(x => x.AssignmentId, config.AssignmentId)
+                     & fb.Eq(x => x.DynamicFormTemplateId, config.DynamicFormTemplateId)
+                     & fb.Eq(x => x.SectionId, config.SectionId)
+                     & fb.Eq(x => x.ConfigHash, config.ConfigHash)
+                     & fb.Eq(x => x.YearKey, yearKey)
+                     & fb.Eq(x => x.IsDeleted, false)
+                     & fb.In(x => x.MonthKey, expectedMonthKeys);
+
+        return await _ctx.WorkAssignmentAdvancedSummaryMonthNodes
+            .Find(filter)
+            .Sort(Builders<WorkAssignmentAdvancedSummaryMonthNode>.Sort.Ascending(x => x.MonthKey))
+            .ToListAsync(ct);
+    }
+
+    private static void ValidateCleanChildNodes<T>(
+        string parentGrain,
+        string parentKey,
+        string childGrain,
+        IReadOnlyCollection<string> expectedChildKeys,
+        IReadOnlyCollection<T> childNodes,
+        Func<T, string> keySelector)
+        where T : WorkAssignmentAdvancedSummaryHierarchyNodeBase
+    {
+        var nodesByKey = childNodes
+            .GroupBy(keySelector, StringComparer.Ordinal)
+            .ToDictionary(x => x.Key, x => x.First(), StringComparer.Ordinal);
+        var missing = expectedChildKeys
+            .Where(x => !nodesByKey.ContainsKey(x))
+            .Take(40)
+            .ToList();
+        var dirty = childNodes
+            .Where(x => !string.Equals(x.Status, WorkAssignmentAdvancedSummaryHierarchyNodeStatuses.Clean, StringComparison.Ordinal) ||
+                        x.IsDirty ||
+                        string.IsNullOrWhiteSpace(x.ValueHash))
+            .Select(x => new
+            {
+                key = keySelector(x),
+                x.Status,
+                x.IsDirty,
+                hasValueHash = !string.IsNullOrWhiteSpace(x.ValueHash)
+            })
+            .Take(40)
+            .ToList();
+
+        if (missing.Count == 0 && dirty.Count == 0)
+            return;
+
+        throw AppExceptionFactory.BadRequest(
+            AppErrorCode.COMMON_VALIDATION_FAILED,
+            new
+            {
+                parentGrain,
+                parentKey,
+                childGrain,
+                missingChildKeys = missing,
+                dirtyChildNodes = dirty,
+                reason = "ADVANCED_SUMMARY_CHILD_NODE_MISSING_OR_DIRTY"
+            },
+            $"Advanced summary {parentGrain.ToLowerInvariant()} node requires all {childGrain.ToLowerInvariant()} child nodes to be clean before rollup.");
+    }
+
+    private static AdvancedSummaryHierarchyNodeValue BuildRollupValue<T>(
+        string kind,
+        string grain,
+        string grainKey,
+        string? monthKey,
+        string yearKey,
+        DateTime windowStartUtc,
+        DateTime windowEndExclusiveUtc,
+        IReadOnlyCollection<T> childNodes,
+        Func<T, string> keySelector)
+        where T : WorkAssignmentAdvancedSummaryHierarchyNodeBase
+    {
+        var orderedChildren = childNodes
+            .OrderBy(keySelector, StringComparer.Ordinal)
+            .ToList();
+        var childValues = orderedChildren
+            .Select(ParseHierarchyNodeValue)
+            .ToList();
+        var fields = RollUpFields(childValues.SelectMany(x => x.Fields));
+        var warnings = childValues
+            .SelectMany(x => x.Warnings)
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Distinct(StringComparer.Ordinal)
+            .Take(40)
+            .ToList();
+
+        if (orderedChildren.Count == 0)
+            warnings.Add("No child nodes were available for rollup.");
+        if (warnings.Count > 0)
+            warnings.Insert(0, $"Rolled up from {orderedChildren.Count} {orderedChildren.FirstOrDefault()?.Grain ?? "child"} node(s).");
+
+        return new AdvancedSummaryHierarchyNodeValue
+        {
+            SchemaVersion = 1,
+            Kind = kind,
+            GeneratedAtUtc = DateTime.UtcNow,
+            ConfigId = orderedChildren.FirstOrDefault()?.ConfigId ?? string.Empty,
+            ConfigHash = orderedChildren.FirstOrDefault()?.ConfigHash ?? string.Empty,
+            Grain = grain,
+            GrainKey = grainKey,
+            MonthKey = monthKey,
+            YearKey = yearKey,
+            WindowStartUtc = windowStartUtc,
+            WindowEndExclusiveUtc = windowEndExclusiveUtc,
+            SourceAssignmentCount = childValues.Count == 0 ? 0 : childValues.Max(x => x.SourceAssignmentCount),
+            SourceReportCount = orderedChildren.Sum(x => x.SourceReportCount),
+            SectionReportCount = childValues.Sum(x => x.SectionReportCount),
+            SectionFieldCount = childValues.Count == 0 ? 0 : childValues.Max(x => x.SectionFieldCount),
+            TargetFieldCount = fields.Count,
+            InputNodeCount = orderedChildren.Count,
+            Warnings = warnings,
+            Fields = fields
+        };
+    }
+
+    private static List<AdvancedSummaryDayNodeFieldDto> RollUpFields(IEnumerable<AdvancedSummaryDayNodeFieldDto> childFields)
+    {
+        var accumulators = new Dictionary<string, HierarchyFieldRollupAccumulator>(StringComparer.Ordinal);
+        foreach (var field in childFields)
+        {
+            if (string.IsNullOrWhiteSpace(field.FieldId))
+                continue;
+
+            if (!accumulators.TryGetValue(field.FieldId, out var accumulator))
+            {
+                accumulator = new HierarchyFieldRollupAccumulator(field);
+                accumulators[field.FieldId] = accumulator;
+            }
+
+            accumulator.Add(field);
+        }
+
+        return accumulators.Values
+            .OrderBy(x => x.FieldKey, StringComparer.Ordinal)
+            .Select(x => x.ToDto())
+            .ToList();
+    }
+
+    private static AdvancedSummaryHierarchyNodeValue ParseHierarchyNodeValue(
+        WorkAssignmentAdvancedSummaryHierarchyNodeBase node)
+    {
+        try
+        {
+            return JsonSerializer.Deserialize<AdvancedSummaryHierarchyNodeValue>(node.ValueJson, JsonOptions)
+                   ?? new AdvancedSummaryHierarchyNodeValue();
+        }
+        catch (JsonException ex)
+        {
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.COMMON_VALIDATION_FAILED,
+                new
+                {
+                    nodeId = node.Id,
+                    node.Grain,
+                    node.GrainKey,
+                    reason = "ADVANCED_SUMMARY_CHILD_NODE_VALUE_JSON_INVALID",
+                    ex.Message
+                },
+                "Advanced summary child node value JSON is invalid.");
+        }
+    }
+
+    private static string BuildInputNodeSignature<T>(IEnumerable<T> childNodes)
+        where T : WorkAssignmentAdvancedSummaryHierarchyNodeBase
+        => Sha256(string.Join(
+            "\n",
+            childNodes
+                .OrderBy(x => x.GrainKey, StringComparer.Ordinal)
+                .Select(x => string.Join(
+                    "|",
+                    x.Grain,
+                    x.GrainKey,
+                    x.ValueHash ?? string.Empty,
+                    x.SourceSignatureHash ?? string.Empty,
+                    x.BuiltAtUtc?.ToString("O", System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty,
+                    x.UpdatedAtUtc.ToString("O", System.Globalization.CultureInfo.InvariantCulture)))));
+
+    private static IEnumerable<string> EnumerateDayKeys(DateTime startUtc, DateTime endExclusiveUtc)
+    {
+        for (var cursor = startUtc.Date; cursor < endExclusiveUtc.Date; cursor = cursor.AddDays(1))
+            yield return AdvancedSummaryHierarchyKeyHelper.ToDayKey(cursor);
     }
 
     private async Task<List<WorkAssignmentReport>> LoadDaySourceReportsAsync(
@@ -528,6 +1166,22 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
             .Find(DayNodeIdentityFilter(config, dayKey))
             .FirstOrDefaultAsync(ct);
 
+    private async Task<WorkAssignmentAdvancedSummaryMonthNode?> LoadMonthNodeAsync(
+        WorkAssignmentAdvancedSummaryConfig config,
+        string monthKey,
+        CancellationToken ct)
+        => await _ctx.WorkAssignmentAdvancedSummaryMonthNodes
+            .Find(MonthNodeIdentityFilter(config, monthKey))
+            .FirstOrDefaultAsync(ct);
+
+    private async Task<WorkAssignmentAdvancedSummaryYearNode?> LoadYearNodeAsync(
+        WorkAssignmentAdvancedSummaryConfig config,
+        string yearKey,
+        CancellationToken ct)
+        => await _ctx.WorkAssignmentAdvancedSummaryYearNodes
+            .Find(YearNodeIdentityFilter(config, yearKey))
+            .FirstOrDefaultAsync(ct);
+
     private async Task MarkDayNodeBuildingAsync(
         WorkAssignmentAdvancedSummaryConfig config,
         string dayKey,
@@ -543,6 +1197,45 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
                 .Set(x => x.Status, WorkAssignmentAdvancedSummaryHierarchyNodeStatuses.Building)
                 .Set(x => x.IsDirty, true)
                 .Set(x => x.BuildError, (string?)null)
+                .Set(x => x.UpdatedAtUtc, now)
+                .Set(x => x.UpdatedByUserId, actorUserId),
+            cancellationToken: ct);
+    }
+
+    private static async Task MarkNodeBuildingAsync<T>(
+        IMongoCollection<T> collection,
+        FilterDefinition<T> filter,
+        string actorUserId,
+        CancellationToken ct)
+        where T : WorkAssignmentAdvancedSummaryHierarchyNodeBase
+    {
+        var now = DateTime.UtcNow;
+        await collection.UpdateOneAsync(
+            filter,
+            Builders<T>.Update
+                .Set(x => x.Status, WorkAssignmentAdvancedSummaryHierarchyNodeStatuses.Building)
+                .Set(x => x.IsDirty, true)
+                .Set(x => x.BuildError, (string?)null)
+                .Set(x => x.UpdatedAtUtc, now)
+                .Set(x => x.UpdatedByUserId, actorUserId),
+            cancellationToken: ct);
+    }
+
+    private static async Task MarkNodeFailedAsync<T>(
+        IMongoCollection<T> collection,
+        FilterDefinition<T> filter,
+        string actorUserId,
+        string error,
+        CancellationToken ct)
+        where T : WorkAssignmentAdvancedSummaryHierarchyNodeBase
+    {
+        var now = DateTime.UtcNow;
+        await collection.UpdateOneAsync(
+            filter,
+            Builders<T>.Update
+                .Set(x => x.Status, WorkAssignmentAdvancedSummaryHierarchyNodeStatuses.Failed)
+                .Set(x => x.IsDirty, true)
+                .Set(x => x.BuildError, error)
                 .Set(x => x.UpdatedAtUtc, now)
                 .Set(x => x.UpdatedByUserId, actorUserId),
             cancellationToken: ct);
@@ -582,6 +1275,32 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
                & fb.Eq(x => x.IsDeleted, false);
     }
 
+    private static FilterDefinition<WorkAssignmentAdvancedSummaryMonthNode> MonthNodeIdentityFilter(
+        WorkAssignmentAdvancedSummaryConfig config,
+        string monthKey)
+    {
+        var fb = Builders<WorkAssignmentAdvancedSummaryMonthNode>.Filter;
+        return fb.Eq(x => x.AssignmentId, config.AssignmentId)
+               & fb.Eq(x => x.DynamicFormTemplateId, config.DynamicFormTemplateId)
+               & fb.Eq(x => x.SectionId, config.SectionId)
+               & fb.Eq(x => x.ConfigHash, config.ConfigHash)
+               & fb.Eq(x => x.MonthKey, monthKey)
+               & fb.Eq(x => x.IsDeleted, false);
+    }
+
+    private static FilterDefinition<WorkAssignmentAdvancedSummaryYearNode> YearNodeIdentityFilter(
+        WorkAssignmentAdvancedSummaryConfig config,
+        string yearKey)
+    {
+        var fb = Builders<WorkAssignmentAdvancedSummaryYearNode>.Filter;
+        return fb.Eq(x => x.AssignmentId, config.AssignmentId)
+               & fb.Eq(x => x.DynamicFormTemplateId, config.DynamicFormTemplateId)
+               & fb.Eq(x => x.SectionId, config.SectionId)
+               & fb.Eq(x => x.ConfigHash, config.ConfigHash)
+               & fb.Eq(x => x.YearKey, yearKey)
+               & fb.Eq(x => x.IsDeleted, false);
+    }
+
     private static FilterDefinition<WorkAssignmentAdvancedSummaryDayNode> CurrentDayNodeBuildFilter(
         WorkAssignmentAdvancedSummaryConfig config,
         string dayKey,
@@ -590,6 +1309,30 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
     {
         var fb = Builders<WorkAssignmentAdvancedSummaryDayNode>.Filter;
         return DayNodeIdentityFilter(config, dayKey)
+               & fb.Eq(x => x.ConfigHash, expectedConfigHash)
+               & fb.Eq(x => x.BuildCorrelationId, correlationId);
+    }
+
+    private static FilterDefinition<WorkAssignmentAdvancedSummaryMonthNode> CurrentMonthNodeBuildFilter(
+        WorkAssignmentAdvancedSummaryConfig config,
+        string monthKey,
+        string expectedConfigHash,
+        string correlationId)
+    {
+        var fb = Builders<WorkAssignmentAdvancedSummaryMonthNode>.Filter;
+        return MonthNodeIdentityFilter(config, monthKey)
+               & fb.Eq(x => x.ConfigHash, expectedConfigHash)
+               & fb.Eq(x => x.BuildCorrelationId, correlationId);
+    }
+
+    private static FilterDefinition<WorkAssignmentAdvancedSummaryYearNode> CurrentYearNodeBuildFilter(
+        WorkAssignmentAdvancedSummaryConfig config,
+        string yearKey,
+        string expectedConfigHash,
+        string correlationId)
+    {
+        var fb = Builders<WorkAssignmentAdvancedSummaryYearNode>.Filter;
+        return YearNodeIdentityFilter(config, yearKey)
                & fb.Eq(x => x.ConfigHash, expectedConfigHash)
                & fb.Eq(x => x.BuildCorrelationId, correlationId);
     }
@@ -608,6 +1351,69 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
             Grain = x.Grain,
             GrainKey = x.GrainKey,
             DayKey = x.DayKey,
+            Status = x.Status,
+            IsDirty = x.IsDirty,
+            DirtyReason = x.DirtyReason,
+            SourceReportCount = x.SourceReportCount,
+            SourceSignatureHash = x.SourceSignatureHash,
+            ValueJson = x.ValueJson,
+            ValueHash = x.ValueHash,
+            BuiltAtUtc = x.BuiltAtUtc,
+            BuildJobId = x.BuildJobId,
+            BuildCorrelationId = x.BuildCorrelationId,
+            BuildError = x.BuildError,
+            WindowStartUtc = x.WindowStartUtc,
+            WindowEndExclusiveUtc = x.WindowEndExclusiveUtc,
+            CreatedAtUtc = x.CreatedAtUtc,
+            UpdatedAtUtc = x.UpdatedAtUtc
+        };
+
+    private static WorkAssignmentAdvancedSummaryMonthNodeDto MapMonthNode(WorkAssignmentAdvancedSummaryMonthNode x)
+        => new()
+        {
+            Id = x.Id,
+            WorkId = x.WorkId,
+            AssignmentId = x.AssignmentId,
+            DynamicFormTemplateId = x.DynamicFormTemplateId,
+            SectionId = x.SectionId,
+            ConfigId = x.ConfigId,
+            ConfigVersionNo = x.ConfigVersionNo,
+            ConfigHash = x.ConfigHash,
+            Grain = x.Grain,
+            GrainKey = x.GrainKey,
+            MonthKey = x.MonthKey,
+            YearKey = x.YearKey,
+            Status = x.Status,
+            IsDirty = x.IsDirty,
+            DirtyReason = x.DirtyReason,
+            SourceReportCount = x.SourceReportCount,
+            SourceSignatureHash = x.SourceSignatureHash,
+            ValueJson = x.ValueJson,
+            ValueHash = x.ValueHash,
+            BuiltAtUtc = x.BuiltAtUtc,
+            BuildJobId = x.BuildJobId,
+            BuildCorrelationId = x.BuildCorrelationId,
+            BuildError = x.BuildError,
+            WindowStartUtc = x.WindowStartUtc,
+            WindowEndExclusiveUtc = x.WindowEndExclusiveUtc,
+            CreatedAtUtc = x.CreatedAtUtc,
+            UpdatedAtUtc = x.UpdatedAtUtc
+        };
+
+    private static WorkAssignmentAdvancedSummaryYearNodeDto MapYearNode(WorkAssignmentAdvancedSummaryYearNode x)
+        => new()
+        {
+            Id = x.Id,
+            WorkId = x.WorkId,
+            AssignmentId = x.AssignmentId,
+            DynamicFormTemplateId = x.DynamicFormTemplateId,
+            SectionId = x.SectionId,
+            ConfigId = x.ConfigId,
+            ConfigVersionNo = x.ConfigVersionNo,
+            ConfigHash = x.ConfigHash,
+            Grain = x.Grain,
+            GrainKey = x.GrainKey,
+            YearKey = x.YearKey,
             Status = x.Status,
             IsDirty = x.IsDirty,
             DirtyReason = x.DirtyReason,
@@ -681,6 +1487,70 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
         var templateLabel = PickNonBlank(template?.Code, template?.Name, template?.Id, node.DynamicFormTemplateId) ?? "-";
         var scopeLabel = PickNonBlank(scope?.Code, scope?.Name, scope?.Id, node.AssignmentId) ?? "-";
         var body = $"Template {templateLabel}, assignment {scopeLabel}, day {node.DayKey}: {stateText}. Correlation: {correlationId}.";
+        if (!string.IsNullOrWhiteSpace(error))
+            body += $" Error: {error.Trim()}";
+
+        return body.Length <= 1800 ? body : body[..1800];
+    }
+
+    private Task NotifyHierarchyNodeBuildAsync(
+        WorkAssignmentAdvancedSummaryHierarchyNodeBase? node,
+        string actorUserId,
+        WorkAssignment? scope,
+        DynamicFormTemplate? template,
+        string eventStatus,
+        string title,
+        string stateText,
+        string severity,
+        bool requiresAction,
+        string? error,
+        CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(actorUserId) || node is null)
+            return Task.CompletedTask;
+
+        var grain = string.IsNullOrWhiteSpace(node.Grain) ? "NODE" : node.Grain;
+        var correlationId = string.IsNullOrWhiteSpace(node.BuildCorrelationId) ? node.Id : node.BuildCorrelationId;
+        return _notifications.CreateManyAsync(new[]
+        {
+            new NotificationCommand
+            {
+                RecipientUserId = actorUserId,
+                Type = UserNotificationTypes.AdvancedSummaryHierarchyBuild,
+                Severity = severity,
+                Title = title,
+                Body = BuildHierarchyNodeNotificationBody(stateText, node, scope, template, correlationId, error),
+                WorkId = node.WorkId,
+                WorkAssignmentId = node.AssignmentId,
+                AssignmentCode = scope?.Code,
+                Category = UserNotificationCategories.Status,
+                RequiresAction = requiresAction,
+                ActionState = requiresAction
+                    ? UserNotificationActionStates.Open
+                    : UserNotificationActionStates.Resolved,
+                SourceEntityType = $"WORK_ASSIGNMENT_ADVANCED_SUMMARY_{grain}_NODE",
+                SourceEntityId = node.Id,
+                RequestId = ObjectId.TryParse(correlationId, out _) ? correlationId : null,
+                ActorUserId = actorUserId,
+                TargetUserId = actorUserId,
+                OccurredAtUtc = DateTime.UtcNow,
+                EventKey = $"advanced-summary-{grain.ToLowerInvariant()}-node:{eventStatus}:{node.Id}:{correlationId}"
+            }
+        }, ct);
+    }
+
+    private static string BuildHierarchyNodeNotificationBody(
+        string stateText,
+        WorkAssignmentAdvancedSummaryHierarchyNodeBase node,
+        WorkAssignment? scope,
+        DynamicFormTemplate? template,
+        string correlationId,
+        string? error)
+    {
+        var templateLabel = PickNonBlank(template?.Code, template?.Name, template?.Id, node.DynamicFormTemplateId) ?? "-";
+        var scopeLabel = PickNonBlank(scope?.Code, scope?.Name, scope?.Id, node.AssignmentId) ?? "-";
+        var grainLabel = string.IsNullOrWhiteSpace(node.Grain) ? "node" : node.Grain.ToLowerInvariant();
+        var body = $"Template {templateLabel}, assignment {scopeLabel}, {grainLabel} {node.GrainKey}: {stateText}. Correlation: {correlationId}.";
         if (!string.IsNullOrWhiteSpace(error))
             body += $" Error: {error.Trim()}";
 
@@ -1162,6 +2032,98 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
         return null;
     }
 
+    private static decimal? ToNullableDecimalResult(object? value)
+        => value switch
+        {
+            null => null,
+            JsonElement element => ToNullableDecimal(element),
+            decimal d => d,
+            double d => (decimal)d,
+            float f => (decimal)f,
+            int i => i,
+            long l => l,
+            short s => s,
+            byte b => b,
+            string text when decimal.TryParse(
+                text,
+                System.Globalization.NumberStyles.Number,
+                System.Globalization.CultureInfo.InvariantCulture,
+                out var parsed) => parsed,
+            _ => null
+        };
+
+    private static long? ToNullableLongResult(object? value)
+    {
+        var number = ToNullableDecimalResult(value);
+        return number.HasValue ? (long)number.Value : null;
+    }
+
+    private static DateTime? ToNullableDateResult(object? value)
+    {
+        if (value is JsonElement element)
+            return ReadDateValue(element);
+
+        if (value is DateTime date)
+            return date;
+
+        if (value is string text &&
+            DateTime.TryParse(
+                text,
+                System.Globalization.CultureInfo.InvariantCulture,
+                System.Globalization.DateTimeStyles.AssumeUniversal | System.Globalization.DateTimeStyles.AdjustToUniversal,
+                out var parsed))
+        {
+            return parsed;
+        }
+
+        return null;
+    }
+
+    private static Dictionary<string, long> ReadBucketCountsResult(object? value)
+    {
+        var output = new Dictionary<string, long>(StringComparer.Ordinal);
+        if (value is JsonElement element)
+        {
+            if (element.ValueKind != JsonValueKind.Object)
+                return output;
+
+            foreach (var prop in element.EnumerateObject())
+            {
+                var count = ToNullableLongResult(prop.Value);
+                if (count.HasValue)
+                    output[prop.Name] = count.Value;
+            }
+
+            return output;
+        }
+
+        if (value is IDictionary<string, int> intDict)
+        {
+            foreach (var item in intDict)
+                output[item.Key] = item.Value;
+            return output;
+        }
+
+        if (value is IDictionary<string, long> longDict)
+        {
+            foreach (var item in longDict)
+                output[item.Key] = item.Value;
+            return output;
+        }
+
+        if (value is IDictionary<string, object?> objectDict)
+        {
+            foreach (var item in objectDict)
+            {
+                var count = ToNullableLongResult(item.Value);
+                if (count.HasValue)
+                    output[item.Key] = count.Value;
+            }
+        }
+
+        return output;
+    }
+
     private static string BuildSourceSignaturePart(WorkAssignmentReport report, string? sectionPayloadHash)
         => string.Join(
             "|",
@@ -1174,6 +2136,12 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
 
     private static string NormalizeDayKey(string dayKey)
         => AdvancedSummaryHierarchyKeyHelper.ToDayKey(AdvancedSummaryHierarchyKeyHelper.ParseDayKey(dayKey));
+
+    private static string NormalizeMonthKey(string monthKey)
+        => AdvancedSummaryHierarchyKeyHelper.ToMonthKey(AdvancedSummaryHierarchyKeyHelper.ParseMonthKey(monthKey));
+
+    private static string NormalizeYearKey(string yearKey)
+        => AdvancedSummaryHierarchyKeyHelper.ToYearKey(AdvancedSummaryHierarchyKeyHelper.ParseYearKey(yearKey));
 
     private static string NormalizeFieldType(string? value)
         => string.IsNullOrWhiteSpace(value) ? "text" : value.Trim();
@@ -1383,21 +2351,176 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
         }
     }
 
-    private sealed class AdvancedSummaryDayNodeValue
+    private sealed class HierarchyFieldRollupAccumulator
+    {
+        private readonly List<string> _samples = new();
+        private readonly Dictionary<string, long> _bucketCounts = new(StringComparer.Ordinal);
+        private decimal _sum;
+        private decimal? _min;
+        private decimal? _max;
+        private decimal _weightedMeanSum;
+        private long _meanWeight;
+        private DateTime? _minDate;
+        private DateTime? _maxDate;
+        private long _trueCount;
+        private long _falseCount;
+
+        public HierarchyFieldRollupAccumulator(AdvancedSummaryDayNodeFieldDto seed)
+        {
+            FieldId = seed.FieldId;
+            FieldKey = seed.FieldKey;
+            Label = seed.Label;
+            DataType = seed.DataType;
+            Method = seed.Method;
+        }
+
+        public string FieldId { get; }
+        public string FieldKey { get; }
+        public string Label { get; }
+        public string DataType { get; }
+        public string Method { get; }
+        public long ValueCount { get; private set; }
+        public long SourceReportCount { get; private set; }
+
+        public void Add(AdvancedSummaryDayNodeFieldDto field)
+        {
+            ValueCount += field.ValueCount;
+            SourceReportCount += field.SourceReportCount;
+            foreach (var sample in field.SampleValues)
+                AddSample(sample);
+
+            switch (Method)
+            {
+                case "SUM":
+                    _sum += ToNullableDecimalResult(field.Result) ?? 0m;
+                    break;
+                case "MEAN":
+                    var mean = ToNullableDecimalResult(field.Result);
+                    if (mean.HasValue && field.ValueCount > 0)
+                    {
+                        _weightedMeanSum += mean.Value * field.ValueCount;
+                        _meanWeight += field.ValueCount;
+                    }
+                    break;
+                case "MIN":
+                    AddMin(ToNullableDecimalResult(field.Result));
+                    break;
+                case "MAX":
+                    AddMax(ToNullableDecimalResult(field.Result));
+                    break;
+                case "MIN_DATE":
+                    AddMinDate(ToNullableDateResult(field.Result));
+                    break;
+                case "MAX_DATE":
+                    AddMaxDate(ToNullableDateResult(field.Result));
+                    break;
+                case "TRUE_COUNT":
+                    _trueCount += ToNullableLongResult(field.Result) ?? 0;
+                    break;
+                case "FALSE_COUNT":
+                    _falseCount += ToNullableLongResult(field.Result) ?? 0;
+                    break;
+                case "BUCKET_COUNT":
+                    foreach (var item in ReadBucketCountsResult(field.Result))
+                        _bucketCounts[item.Key] = _bucketCounts.TryGetValue(item.Key, out var count) ? count + item.Value : item.Value;
+                    break;
+            }
+        }
+
+        public AdvancedSummaryDayNodeFieldDto ToDto()
+            => new()
+            {
+                FieldId = FieldId,
+                FieldKey = FieldKey,
+                Label = Label,
+                DataType = DataType,
+                Method = Method,
+                ValueCount = ValueCount > int.MaxValue ? int.MaxValue : (int)ValueCount,
+                SourceReportCount = SourceReportCount > int.MaxValue ? int.MaxValue : (int)SourceReportCount,
+                Result = BuildResult(),
+                SampleValues = _samples.ToList()
+            };
+
+        private object? BuildResult()
+            => Method switch
+            {
+                "SUM" => _sum,
+                "COUNT" => ValueCount,
+                "MEAN" => _meanWeight == 0 ? null : _weightedMeanSum / _meanWeight,
+                "MIN" => _min,
+                "MAX" => _max,
+                "MIN_DATE" => _minDate?.ToString("O", System.Globalization.CultureInfo.InvariantCulture),
+                "MAX_DATE" => _maxDate?.ToString("O", System.Globalization.CultureInfo.InvariantCulture),
+                "TRUE_COUNT" => _trueCount,
+                "FALSE_COUNT" => _falseCount,
+                "BUCKET_COUNT" => _bucketCounts
+                    .OrderBy(x => x.Key, StringComparer.Ordinal)
+                    .ToDictionary(x => x.Key, x => x.Value, StringComparer.Ordinal),
+                "JOIN" => string.Join(", ", _samples),
+                _ => ValueCount
+            };
+
+        private void AddMin(decimal? value)
+        {
+            if (!value.HasValue)
+                return;
+            _min = !_min.HasValue || value.Value < _min.Value ? value.Value : _min;
+        }
+
+        private void AddMax(decimal? value)
+        {
+            if (!value.HasValue)
+                return;
+            _max = !_max.HasValue || value.Value > _max.Value ? value.Value : _max;
+        }
+
+        private void AddMinDate(DateTime? value)
+        {
+            if (!value.HasValue)
+                return;
+            _minDate = !_minDate.HasValue || value.Value < _minDate.Value ? value.Value : _minDate;
+        }
+
+        private void AddMaxDate(DateTime? value)
+        {
+            if (!value.HasValue)
+                return;
+            _maxDate = !_maxDate.HasValue || value.Value > _maxDate.Value ? value.Value : _maxDate;
+        }
+
+        private void AddSample(string value)
+        {
+            value = value.Trim();
+            if (string.IsNullOrWhiteSpace(value) || _samples.Count >= DayNodeSampleLimit)
+                return;
+
+            if (value.Length > DayNodeSampleTextLimit)
+                value = value[..DayNodeSampleTextLimit];
+            if (!_samples.Contains(value, StringComparer.Ordinal))
+                _samples.Add(value);
+        }
+    }
+
+    private sealed class AdvancedSummaryHierarchyNodeValue
     {
         public int SchemaVersion { get; set; }
         public string Kind { get; set; } = DayNodeValueKind;
         public DateTime GeneratedAtUtc { get; set; }
         public string ConfigId { get; set; } = string.Empty;
         public string ConfigHash { get; set; } = string.Empty;
+        public string Grain { get; set; } = string.Empty;
+        public string GrainKey { get; set; } = string.Empty;
         public string DayKey { get; set; } = string.Empty;
+        public string? MonthKey { get; set; }
+        public string? YearKey { get; set; }
         public DateTime WindowStartUtc { get; set; }
         public DateTime WindowEndExclusiveUtc { get; set; }
         public int SourceAssignmentCount { get; set; }
-        public int SourceReportCount { get; set; }
-        public int SectionReportCount { get; set; }
+        public long SourceReportCount { get; set; }
+        public long SectionReportCount { get; set; }
         public int SectionFieldCount { get; set; }
         public int TargetFieldCount { get; set; }
+        public int InputNodeCount { get; set; }
         public List<string> Warnings { get; set; } = new();
         public List<AdvancedSummaryDayNodeFieldDto> Fields { get; set; } = new();
     }

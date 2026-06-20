@@ -107,6 +107,8 @@ var tests = new (string Name, Action Run)[]
     ("advanced summary field gate enforces section limits", AdvancedSummaryFieldGateEnforcesSectionLimits),
     ("advanced summary hierarchy keys roll up day month year", AdvancedSummaryHierarchyKeysRollUpDayMonthYear),
     ("advanced summary day node source day uses completed date first", AdvancedSummaryDayNodeSourceDayUsesCompletedDateFirst),
+    ("advanced summary hierarchy rollup merges child fields", AdvancedSummaryHierarchyRollupMergesChildFields),
+    ("advanced summary hierarchy rollup requires clean children", AdvancedSummaryHierarchyRollupRequiresCleanChildren),
     ("legacy work basis file resolves as work document", ResolvesLegacyWorkBasisFileAsWorkDocument),
     ("assignment file resolves as assignment branch document", ResolvesAssignmentFileAsBranchDocument),
     ("assignment document path resolves ancestors only", ResolvesAssignmentDocumentAncestorsFromPath),
@@ -3364,6 +3366,97 @@ static void AdvancedSummaryDayNodeSourceDayUsesCompletedDateFirst()
     AssertEqual("2026-01-07", periodDay, "period key should define source day when completed date is missing");
 }
 
+static void AdvancedSummaryHierarchyRollupMergesChildFields()
+{
+    var childNodes = new List<WorkAssignmentAdvancedSummaryDayNode>
+    {
+        TestAdvancedSummaryDayNode(
+            "2026-01-01",
+            2,
+            """
+            {
+              "schemaVersion": 1,
+              "kind": "ADVANCED_SUMMARY_DAY_NODE_V1",
+              "configId": "cfg",
+              "configHash": "hash",
+              "warnings": [],
+              "fields": [
+                { "fieldId": "num", "fieldKey": "num", "label": "Number", "dataType": "NUMBER", "method": "SUM", "valueCount": 2, "sourceReportCount": 2, "result": 10, "sampleValues": ["4", "6"] },
+                { "fieldId": "avg", "fieldKey": "avg", "label": "Average", "dataType": "NUMBER", "method": "MEAN", "valueCount": 2, "sourceReportCount": 2, "result": 5, "sampleValues": ["5"] },
+                { "fieldId": "choice", "fieldKey": "choice", "label": "Choice", "dataType": "SINGLE_SELECT", "method": "BUCKET_COUNT", "valueCount": 1, "sourceReportCount": 1, "result": { "A": 1 }, "sampleValues": ["A"] }
+              ]
+            }
+            """),
+        TestAdvancedSummaryDayNode(
+            "2026-01-02",
+            3,
+            """
+            {
+              "schemaVersion": 1,
+              "kind": "ADVANCED_SUMMARY_DAY_NODE_V1",
+              "configId": "cfg",
+              "configHash": "hash",
+              "warnings": [],
+              "fields": [
+                { "fieldId": "num", "fieldKey": "num", "label": "Number", "dataType": "NUMBER", "method": "SUM", "valueCount": 1, "sourceReportCount": 1, "result": 7, "sampleValues": ["7"] },
+                { "fieldId": "avg", "fieldKey": "avg", "label": "Average", "dataType": "NUMBER", "method": "MEAN", "valueCount": 1, "sourceReportCount": 1, "result": 11, "sampleValues": ["11"] },
+                { "fieldId": "choice", "fieldKey": "choice", "label": "Choice", "dataType": "SINGLE_SELECT", "method": "BUCKET_COUNT", "valueCount": 3, "sourceReportCount": 3, "result": { "A": 2, "B": 1 }, "sampleValues": ["A", "B"] }
+              ]
+            }
+            """)
+    };
+
+    var rollup = InvokePrivateStaticGeneric<object>(
+        typeof(WorkAssignmentAdvancedSummaryHierarchyService),
+        "BuildRollupValue",
+        new[] { typeof(WorkAssignmentAdvancedSummaryDayNode) },
+        "ADVANCED_SUMMARY_MONTH_NODE_V1",
+        "MONTH",
+        "2026-01",
+        "2026-01",
+        "2026",
+        new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc),
+        new DateTime(2026, 2, 1, 0, 0, 0, DateTimeKind.Utc),
+        childNodes,
+        new Func<WorkAssignmentAdvancedSummaryDayNode, string>(x => x.DayKey));
+
+    AssertEqual("MONTH", GetReflectedProperty<string>(rollup, "Grain"), "rollup grain should be month");
+    AssertEqual(5L, GetReflectedProperty<long>(rollup, "SourceReportCount"), "source report count should sum child nodes");
+
+    var sumField = GetRollupField(rollup, "num");
+    AssertEqual(17m, ToDecimalResult(sumField), "sum rollup should add child sums");
+
+    var meanField = GetRollupField(rollup, "avg");
+    AssertEqual(7m, ToDecimalResult(meanField), "mean rollup should weight by child value count");
+
+    var choiceField = GetRollupField(rollup, "choice");
+    var buckets = GetReflectedProperty<object>(choiceField, "Result") as System.Collections.IDictionary
+        ?? throw new InvalidOperationException("bucket result should be a dictionary");
+    AssertEqual(3L, Convert.ToInt64(buckets["A"], System.Globalization.CultureInfo.InvariantCulture), "bucket A should merge child counts");
+    AssertEqual(1L, Convert.ToInt64(buckets["B"], System.Globalization.CultureInfo.InvariantCulture), "bucket B should merge child counts");
+}
+
+static void AdvancedSummaryHierarchyRollupRequiresCleanChildren()
+{
+    var childNodes = new List<WorkAssignmentAdvancedSummaryDayNode>
+    {
+        TestAdvancedSummaryDayNode("2026-01-01", 1, """{ "fields": [] }""", WorkAssignmentAdvancedSummaryHierarchyNodeStatuses.Dirty, isDirty: true)
+    };
+
+    AssertThrowsFromReflection(
+        AppErrorCode.COMMON_VALIDATION_FAILED,
+        () => InvokePrivateStaticGeneric<object?>(
+            typeof(WorkAssignmentAdvancedSummaryHierarchyService),
+            "ValidateCleanChildNodes",
+            new[] { typeof(WorkAssignmentAdvancedSummaryDayNode) },
+            "MONTH",
+            "2026-01",
+            "DAY",
+            new List<string> { "2026-01-01", "2026-01-02" },
+            childNodes,
+            new Func<WorkAssignmentAdvancedSummaryDayNode, string>(x => x.DayKey)));
+}
+
 static void ResolvesLegacyWorkBasisFileAsWorkDocument()
 {
     var workId = ObjectId(7);
@@ -3638,6 +3731,56 @@ static Unit TestUnit(
     FullName = $"Unit {seed}"
 };
 
+static WorkAssignmentAdvancedSummaryDayNode TestAdvancedSummaryDayNode(
+    string dayKey,
+    long sourceReportCount,
+    string valueJson,
+    string status = WorkAssignmentAdvancedSummaryHierarchyNodeStatuses.Clean,
+    bool isDirty = false)
+    => new()
+    {
+        Id = ObjectId(Math.Abs(dayKey.GetHashCode()) % 100000 + 1000),
+        WorkId = ObjectId(90),
+        AssignmentId = ObjectId(91),
+        DynamicFormTemplateId = ObjectId(92),
+        SectionId = "section",
+        ConfigId = ObjectId(93),
+        ConfigVersionNo = 1,
+        ConfigHash = "hash",
+        Grain = WorkAssignmentAdvancedSummaryHierarchyGrains.Day,
+        GrainKey = dayKey,
+        DayKey = dayKey,
+        WindowStartUtc = AdvancedSummaryHierarchyKeyHelper.ParseDayKey(dayKey),
+        WindowEndExclusiveUtc = AdvancedSummaryHierarchyKeyHelper.ParseDayKey(dayKey).AddDays(1),
+        Status = status,
+        IsDirty = isDirty,
+        SourceSignatureHash = $"sig-{dayKey}",
+        SourceReportCount = sourceReportCount,
+        ValueJson = valueJson,
+        ValueHash = $"value-{dayKey}",
+        BuiltAtUtc = AdvancedSummaryHierarchyKeyHelper.ParseDayKey(dayKey).AddHours(1),
+        CreatedAtUtc = AdvancedSummaryHierarchyKeyHelper.ParseDayKey(dayKey),
+        UpdatedAtUtc = AdvancedSummaryHierarchyKeyHelper.ParseDayKey(dayKey).AddHours(2),
+        IsDeleted = false
+    };
+
+static object GetRollupField(object rollup, string fieldId)
+{
+    var fields = GetReflectedProperty<object>(rollup, "Fields") as System.Collections.IEnumerable
+        ?? throw new InvalidOperationException("rollup fields should be enumerable");
+
+    return fields
+        .Cast<object>()
+        .Single(x => string.Equals(GetReflectedProperty<string>(x, "FieldId"), fieldId, StringComparison.Ordinal));
+}
+
+static decimal ToDecimalResult(object field)
+{
+    var result = GetReflectedProperty<object>(field, "Result")
+        ?? throw new InvalidOperationException("field result should not be null");
+    return Convert.ToDecimal(result, System.Globalization.CultureInfo.InvariantCulture);
+}
+
 static AppUser TestUser(int seed, string username, string accountKind, string unitId) => new()
 {
     Id = UserId(seed),
@@ -3692,6 +3835,17 @@ static T InvokePrivateStatic<T>(Type type, string name, params object?[] args)
         ?? throw new InvalidOperationException($"{type.Name}.{name} helper method was not found.");
 
     var result = method.Invoke(null, args);
+    return result is null ? default! : (T)result;
+}
+
+static T InvokePrivateStaticGeneric<T>(Type type, string name, Type[] genericTypes, params object?[] args)
+{
+    var method = type
+        .GetMethods(BindingFlags.Static | BindingFlags.NonPublic)
+        .SingleOrDefault(x => x.Name == name && x.IsGenericMethodDefinition && x.GetGenericArguments().Length == genericTypes.Length)
+        ?? throw new InvalidOperationException($"{type.Name}.{name} generic helper method was not found.");
+
+    var result = method.MakeGenericMethod(genericTypes).Invoke(null, args);
     return result is null ? default! : (T)result;
 }
 

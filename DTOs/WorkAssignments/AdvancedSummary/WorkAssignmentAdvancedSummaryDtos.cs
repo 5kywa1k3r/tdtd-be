@@ -58,6 +58,16 @@ public sealed class BuildWorkAssignmentAdvancedSummaryDayNodeRequest
     public bool ForceRefresh { get; set; }
 }
 
+public sealed class BuildWorkAssignmentAdvancedSummaryMonthNodeRequest
+{
+    public bool ForceRefresh { get; set; }
+}
+
+public sealed class BuildWorkAssignmentAdvancedSummaryYearNodeRequest
+{
+    public bool ForceRefresh { get; set; }
+}
+
 public sealed class WorkAssignmentAdvancedSummaryDayNodeDto
 {
     public string Id { get; set; } = string.Empty;
@@ -71,6 +81,67 @@ public sealed class WorkAssignmentAdvancedSummaryDayNodeDto
     public string Grain { get; set; } = "DAY";
     public string GrainKey { get; set; } = string.Empty;
     public string DayKey { get; set; } = string.Empty;
+    public string Status { get; set; } = string.Empty;
+    public bool IsDirty { get; set; }
+    public string? DirtyReason { get; set; }
+    public long SourceReportCount { get; set; }
+    public string? SourceSignatureHash { get; set; }
+    public string ValueJson { get; set; } = "{}";
+    public string? ValueHash { get; set; }
+    public DateTime? BuiltAtUtc { get; set; }
+    public string? BuildJobId { get; set; }
+    public string? BuildCorrelationId { get; set; }
+    public string? BuildError { get; set; }
+    public DateTime WindowStartUtc { get; set; }
+    public DateTime WindowEndExclusiveUtc { get; set; }
+    public DateTime CreatedAtUtc { get; set; }
+    public DateTime UpdatedAtUtc { get; set; }
+}
+
+public sealed class WorkAssignmentAdvancedSummaryMonthNodeDto
+{
+    public string Id { get; set; } = string.Empty;
+    public string WorkId { get; set; } = string.Empty;
+    public string AssignmentId { get; set; } = string.Empty;
+    public string DynamicFormTemplateId { get; set; } = string.Empty;
+    public string SectionId { get; set; } = string.Empty;
+    public string ConfigId { get; set; } = string.Empty;
+    public int ConfigVersionNo { get; set; }
+    public string ConfigHash { get; set; } = string.Empty;
+    public string Grain { get; set; } = "MONTH";
+    public string GrainKey { get; set; } = string.Empty;
+    public string MonthKey { get; set; } = string.Empty;
+    public string YearKey { get; set; } = string.Empty;
+    public string Status { get; set; } = string.Empty;
+    public bool IsDirty { get; set; }
+    public string? DirtyReason { get; set; }
+    public long SourceReportCount { get; set; }
+    public string? SourceSignatureHash { get; set; }
+    public string ValueJson { get; set; } = "{}";
+    public string? ValueHash { get; set; }
+    public DateTime? BuiltAtUtc { get; set; }
+    public string? BuildJobId { get; set; }
+    public string? BuildCorrelationId { get; set; }
+    public string? BuildError { get; set; }
+    public DateTime WindowStartUtc { get; set; }
+    public DateTime WindowEndExclusiveUtc { get; set; }
+    public DateTime CreatedAtUtc { get; set; }
+    public DateTime UpdatedAtUtc { get; set; }
+}
+
+public sealed class WorkAssignmentAdvancedSummaryYearNodeDto
+{
+    public string Id { get; set; } = string.Empty;
+    public string WorkId { get; set; } = string.Empty;
+    public string AssignmentId { get; set; } = string.Empty;
+    public string DynamicFormTemplateId { get; set; } = string.Empty;
+    public string SectionId { get; set; } = string.Empty;
+    public string ConfigId { get; set; } = string.Empty;
+    public int ConfigVersionNo { get; set; }
+    public string ConfigHash { get; set; } = string.Empty;
+    public string Grain { get; set; } = "YEAR";
+    public string GrainKey { get; set; } = string.Empty;
+    public string YearKey { get; set; } = string.Empty;
     public string Status { get; set; } = string.Empty;
     public bool IsDirty { get; set; }
     public string? DirtyReason { get; set; }

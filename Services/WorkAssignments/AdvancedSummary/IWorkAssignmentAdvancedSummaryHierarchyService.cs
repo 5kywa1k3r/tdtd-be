@@ -18,4 +18,34 @@ public interface IWorkAssignmentAdvancedSummaryHierarchyService
         string actorUserId,
         string correlationId,
         CancellationToken ct);
+
+    Task<WorkAssignmentAdvancedSummaryMonthNodeDto> RequestMonthNodeBuildAsync(
+        string configId,
+        string monthKey,
+        BuildWorkAssignmentAdvancedSummaryMonthNodeRequest req,
+        string actorUserId,
+        CancellationToken ct);
+
+    Task BuildMonthNodeJobAsync(
+        string configId,
+        string monthKey,
+        string expectedConfigHash,
+        string actorUserId,
+        string correlationId,
+        CancellationToken ct);
+
+    Task<WorkAssignmentAdvancedSummaryYearNodeDto> RequestYearNodeBuildAsync(
+        string configId,
+        string yearKey,
+        BuildWorkAssignmentAdvancedSummaryYearNodeRequest req,
+        string actorUserId,
+        CancellationToken ct);
+
+    Task BuildYearNodeJobAsync(
+        string configId,
+        string yearKey,
+        string expectedConfigHash,
+        string actorUserId,
+        string correlationId,
+        CancellationToken ct);
 }

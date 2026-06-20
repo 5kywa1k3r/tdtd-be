@@ -82,6 +82,30 @@ public sealed class WorkAssignmentAdvancedSummaryController : ControllerBase
         return Ok(result);
     }
 
+    [HttpPost("configs/{configId}/hierarchy/month/{monthKey}/build")]
+    public async Task<IActionResult> BuildMonthNode(
+        [FromRoute] string configId,
+        [FromRoute] string monthKey,
+        [FromBody] BuildWorkAssignmentAdvancedSummaryMonthNodeRequest req,
+        CancellationToken ct)
+    {
+        var actorUserId = GetActorUserId();
+        var result = await _hierarchy.RequestMonthNodeBuildAsync(configId, monthKey, req ?? new BuildWorkAssignmentAdvancedSummaryMonthNodeRequest(), actorUserId, ct);
+        return Ok(result);
+    }
+
+    [HttpPost("configs/{configId}/hierarchy/year/{yearKey}/build")]
+    public async Task<IActionResult> BuildYearNode(
+        [FromRoute] string configId,
+        [FromRoute] string yearKey,
+        [FromBody] BuildWorkAssignmentAdvancedSummaryYearNodeRequest req,
+        CancellationToken ct)
+    {
+        var actorUserId = GetActorUserId();
+        var result = await _hierarchy.RequestYearNodeBuildAsync(configId, yearKey, req ?? new BuildWorkAssignmentAdvancedSummaryYearNodeRequest(), actorUserId, ct);
+        return Ok(result);
+    }
+
     private string GetActorUserId()
         => User.FindFirstValue("sub") ?? throw AppExceptionFactory.Unauthorized();
 }
