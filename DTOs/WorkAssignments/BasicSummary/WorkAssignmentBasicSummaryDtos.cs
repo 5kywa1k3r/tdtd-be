@@ -74,6 +74,9 @@ public sealed class SaveWorkAssignmentBasicSummaryConfigRequest
 
 public sealed class WorkAssignmentBasicSummaryMetaDto
 {
+    public string SummaryType { get; set; } = "BASIC";
+    public string ContractVersion { get; set; } = "basic-fixed-scope-v1";
+    public string SnapshotPayloadKind { get; set; } = "COMPACT_VALUES1D_OPTIMIZED";
     public string SnapshotId { get; set; } = string.Empty;
     public string ScopeAssignmentId { get; set; } = default!;
     public string ScopeMode { get; set; } = "DIRECT_CHILDREN_OR_SELF";

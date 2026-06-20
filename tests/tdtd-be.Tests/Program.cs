@@ -92,8 +92,10 @@ var tests = new (string Name, Action Run)[]
     ("dynamic form metric label targets validate range type and uniqueness", ValidatesDynamicFormMetricLabelTargets),
     ("dynamic excel numeric grid validates spec metadata", ValidatesDynamicExcelNumericGridSpecMetadata),
     ("values1D compression round-trips null and zero runs", CompressesValues1DBlankRuns),
-    ("basic summary allows numeric methods only", BasicSummaryAllowsNumericMethodsOnly),
-    ("basic summary merges period snapshots by numeric method", BasicSummaryMergesPeriodSnapshotsByNumericMethod),
+    ("basic summary normalizes typed methods", BasicSummaryNormalizesTypedMethods),
+    ("basic summary supports typed default methods", BasicSummarySupportsTypedDefaultMethods),
+    ("basic summary extracts typed table values", BasicSummaryExtractsTypedTableValues),
+    ("basic summary merges period snapshots by typed method", BasicSummaryMergesPeriodSnapshotsByTypedMethod),
     ("basic summary compact snapshot round-trips", BasicSummaryCompactSnapshotRoundTrips),
     ("basic summary respects compressed table null runs", BasicSummaryRespectsCompressedTableNullRuns),
     ("legacy work basis file resolves as work document", ResolvesLegacyWorkBasisFileAsWorkDocument),
@@ -2699,7 +2701,7 @@ static void CompressesValues1DBlankRuns()
     AssertEqual<decimal?>(5m, zeroReader.ReadDecimal(zeroValues.Count - 1), "indexed reader should read value after compressed zero run");
 }
 
-static void BasicSummaryAllowsNumericMethodsOnly()
+static void BasicSummaryNormalizesTypedMethods()
 {
     var normalize = typeof(WorkAssignmentBasicSummaryService).GetMethod(
         "NormalizeOperation",
@@ -2713,11 +2715,15 @@ static void BasicSummaryAllowsNumericMethodsOnly()
         ("average", "MEAN"),
         ("MIN", "MIN"),
         ("MAX", "MAX"),
-        ("JOIN", "SUM"),
-        ("MAX_DATE", "SUM"),
-        ("TRUE_COUNT", "SUM"),
-        ("BUCKET_COUNT", "SUM"),
-        (null, "SUM")
+        ("JOIN", "JOIN"),
+        ("sample", "JOIN"),
+        ("MAX_DATE", "MAX_DATE"),
+        ("latest_date", "MAX_DATE"),
+        ("TRUE_COUNT", "TRUE_COUNT"),
+        ("BUCKET_COUNT", "BUCKET_COUNT"),
+        ("option_count", "BUCKET_COUNT"),
+        (null, "SUM"),
+        ("PERCENTILE", "SUM")
     };
 
     foreach (var (input, expected) in cases)
@@ -2727,12 +2733,160 @@ static void BasicSummaryAllowsNumericMethodsOnly()
     }
 }
 
-static void BasicSummaryMergesPeriodSnapshotsByNumericMethod()
+static void BasicSummarySupportsTypedDefaultMethods()
+{
+    var normalize = typeof(WorkAssignmentBasicSummaryService).GetMethod(
+        "NormalizeDefaultMethods",
+        BindingFlags.NonPublic | BindingFlags.Static)
+        ?? throw new MissingMethodException(nameof(WorkAssignmentBasicSummaryService), "NormalizeDefaultMethods");
+    var normalizeForDataType = typeof(WorkAssignmentBasicSummaryService).GetMethod(
+        "NormalizeOperationForDataType",
+        BindingFlags.NonPublic | BindingFlags.Static)
+        ?? throw new MissingMethodException(nameof(WorkAssignmentBasicSummaryService), "NormalizeOperationForDataType");
+
+    var typedDefaults = new WorkAssignmentBasicSummaryDefaultMethodsDto
+    {
+        Number = "average",
+        Date = "latest_date",
+        Boolean = "false_count",
+        Text = "sample",
+        Selection = "option_count"
+    };
+
+    var typedNormalized = normalize.Invoke(null, new object?[] { typedDefaults })!;
+    AssertEqual("MEAN", GetReflectedProperty<string>(typedNormalized, "Number"), "basic summary should normalize numeric default method");
+    AssertEqual("MAX_DATE", GetReflectedProperty<string>(typedNormalized, "Date"), "basic summary should normalize date default method");
+    AssertEqual("FALSE_COUNT", GetReflectedProperty<string>(typedNormalized, "Boolean"), "basic summary should normalize boolean default method");
+    AssertEqual("JOIN", GetReflectedProperty<string>(typedNormalized, "Text"), "basic summary should normalize text default method");
+    AssertEqual("BUCKET_COUNT", GetReflectedProperty<string>(typedNormalized, "Selection"), "basic summary should normalize selection default method");
+
+    var legacyNumericDefaults = new WorkAssignmentBasicSummaryDefaultMethodsDto
+    {
+        Number = "count",
+        Date = "SUM",
+        Boolean = "MAX",
+        Text = null,
+        Selection = ""
+    };
+
+    var normalized = normalize.Invoke(null, new object?[] { legacyNumericDefaults })!;
+    AssertEqual("COUNT", GetReflectedProperty<string>(normalized, "Number"), "basic summary should keep numeric default method");
+    AssertEqual("MAX_DATE", GetReflectedProperty<string>(normalized, "Date"), "basic summary should fall back legacy numeric date default");
+    AssertEqual("TRUE_COUNT", GetReflectedProperty<string>(normalized, "Boolean"), "basic summary should fall back legacy numeric boolean default");
+    AssertEqual("COUNT", GetReflectedProperty<string>(normalized, "Text"), "basic summary should fall back blank text default");
+    AssertEqual("BUCKET_COUNT", GetReflectedProperty<string>(normalized, "Selection"), "basic summary should fall back blank selection default");
+
+    AssertThrowsFromReflection(
+        AppErrorCode.WORK_ASSIGNMENT_AGGREGATE_MODE_INVALID,
+        () => normalize.Invoke(null, new object?[]
+        {
+            new WorkAssignmentBasicSummaryDefaultMethodsDto { Text = "PERCENTILE" }
+        }));
+
+    AssertThrowsFromReflection(
+        AppErrorCode.WORK_ASSIGNMENT_AGGREGATE_MODE_INVALID,
+        () => normalize.Invoke(null, new object?[]
+        {
+            new WorkAssignmentBasicSummaryDefaultMethodsDto { Selection = "CONDITION" }
+        }));
+
+    AssertEqual(
+        "MAX_DATE",
+        (string)normalizeForDataType.Invoke(null, new object?[] { "SUM", "DATE", "MAX_DATE" })!,
+        "basic summary rule should fall back when a numeric method targets date data");
+    AssertEqual(
+        "BUCKET_COUNT",
+        (string)normalizeForDataType.Invoke(null, new object?[] { "SUM", "MULTI_SELECT", "BUCKET_COUNT" })!,
+        "basic summary rule should fall back when a numeric method targets choice data");
+    AssertEqual(
+        "JOIN",
+        (string)normalizeForDataType.Invoke(null, new object?[] { "sample", "SHORT_TEXT", "COUNT" })!,
+        "basic summary rule should keep a typed text method");
+}
+
+static void BasicSummaryExtractsTypedTableValues()
+{
+    var extract = typeof(WorkAssignmentBasicSummaryService).GetMethod(
+        "ExtractTableValues",
+        BindingFlags.NonPublic | BindingFlags.Static)
+        ?? throw new MissingMethodException(nameof(WorkAssignmentBasicSummaryService), "ExtractTableValues");
+
+    var tableValuesJson = """
+        {
+          "blocks": [
+            {
+              "blockId": "block_1",
+              "tableMode": "FIXED_GRID",
+              "w": 6,
+              "h": 1,
+              "metricDefinitions": [
+                { "index": 0, "metricKey": "num", "rowKey": "r1", "columnKey": "c1", "dataType": "NUMBER" },
+                { "index": 1, "metricKey": "flag", "rowKey": "r1", "columnKey": "c2", "dataType": "BOOLEAN" },
+                { "index": 2, "metricKey": "date", "rowKey": "r1", "columnKey": "c3", "dataType": "FULL_DATE" },
+                { "index": 3, "metricKey": "text", "rowKey": "r1", "columnKey": "c4", "dataType": "SHORT_TEXT" },
+                {
+                  "index": 4,
+                  "metricKey": "choice",
+                  "rowKey": "r1",
+                  "columnKey": "c5",
+                  "dataType": "SINGLE_SELECT",
+                  "options": [{ "code": "A", "label": "Alpha" }]
+                },
+                {
+                  "index": 5,
+                  "metricKey": "choices",
+                  "rowKey": "r1",
+                  "columnKey": "c6",
+                  "dataType": "MULTI_SELECT",
+                  "options": [
+                    { "code": "A", "label": "Alpha" },
+                    { "code": "B", "label": "Beta" }
+                  ]
+                }
+              ],
+              "values1D": [12.5, true, "20/06/2026", "ghi chú", "Alpha", ["B", "A"]]
+            }
+          ]
+        }
+        """;
+
+    var skipped = new HashSet<string>(StringComparer.Ordinal);
+    var rows = ((System.Collections.IEnumerable)extract.Invoke(null, new object?[] { tableValuesJson, skipped })!)
+        .Cast<object>()
+        .ToList();
+
+    AssertEqual(7, rows.Count, "basic summary should extract every typed table value, expanding multi-select buckets");
+    AssertEqual(0, skipped.Count, "typed table fixture should stay below direct aggregate limit");
+
+    var byMetric = rows.GroupBy(row => GetReflectedProperty<string>(row, "MetricKey") ?? string.Empty, StringComparer.Ordinal)
+        .ToDictionary(group => group.Key, group => group.ToList(), StringComparer.Ordinal);
+
+    AssertEqual<decimal?>(12.5m, GetReflectedProperty<decimal?>(byMetric["num"][0], "NumericValue"), "basic summary should extract numeric table value");
+    AssertEqual<bool?>(true, GetReflectedProperty<bool?>(byMetric["flag"][0], "BooleanValue"), "basic summary should extract boolean table value");
+    AssertEqual<DateTime?>(
+        new DateTime(2026, 6, 20, 0, 0, 0, DateTimeKind.Utc),
+        GetReflectedProperty<DateTime?>(byMetric["date"][0], "DateValueUtc"),
+        "basic summary should extract full date table value");
+    AssertEqual("ghi chú", GetReflectedProperty<string>(byMetric["text"][0], "TextValue"), "basic summary should extract text table value");
+    AssertEqual("A", GetReflectedProperty<string>(byMetric["choice"][0], "BucketKey"), "basic summary should resolve single choice code from label");
+    AssertEqual("Alpha", GetReflectedProperty<string>(byMetric["choice"][0], "BucketLabel"), "basic summary should resolve single choice label");
+
+    var choiceKeys = byMetric["choices"]
+        .Select(row => GetReflectedProperty<string>(row, "BucketKey"))
+        .OrderBy(x => x, StringComparer.Ordinal)
+        .ToList();
+    AssertEqual("A,B", string.Join(",", choiceKeys), "basic summary should expand multiple choice codes");
+}
+
+static void BasicSummaryMergesPeriodSnapshotsByTypedMethod()
 {
     var merge = typeof(WorkAssignmentBasicSummaryService).GetMethod(
-        "MergeNumericSummaryItems",
-        BindingFlags.NonPublic | BindingFlags.Static)
-        ?? throw new MissingMethodException(nameof(WorkAssignmentBasicSummaryService), "MergeNumericSummaryItems");
+        "MergeSummaryItems",
+        BindingFlags.NonPublic | BindingFlags.Static,
+        null,
+        new[] { typeof(IGrouping<string, WorkAssignmentBasicSummaryItemDto>) },
+        null)
+        ?? throw new MissingMethodException(nameof(WorkAssignmentBasicSummaryService), "MergeSummaryItems");
 
     var items = new List<WorkAssignmentBasicSummaryItemDto>
     {
@@ -2780,6 +2934,87 @@ static void BasicSummaryMergesPeriodSnapshotsByNumericMethod()
     AssertEqual<decimal?>(12m, merged.Max, "merged numeric summary should keep global max");
     AssertEqual<decimal?>(7.5m, merged.Mean, "merged numeric summary should compute weighted mean from sum/count");
     AssertEqual(7.5m, (decimal)merged.Value!, "MEAN operation value should be the weighted mean");
+
+    var booleanItems = new List<WorkAssignmentBasicSummaryItemDto>
+    {
+        new()
+        {
+            TargetKind = "FIELD",
+            TargetKey = "field:approved",
+            FieldId = "approved",
+            Label = "Approved",
+            DataType = "BOOLEAN",
+            Operation = "TRUE_COUNT",
+            ValueCount = 2,
+            ReportCount = 2,
+            TrueCount = 1,
+            FalseCount = 1
+        },
+        new()
+        {
+            TargetKind = "FIELD",
+            TargetKey = "field:approved",
+            FieldId = "approved",
+            Label = "Approved",
+            DataType = "BOOLEAN",
+            Operation = "TRUE_COUNT",
+            ValueCount = 2,
+            ReportCount = 2,
+            TrueCount = 2,
+            FalseCount = 0
+        }
+    };
+    var mergedBoolean = (WorkAssignmentBasicSummaryItemDto)merge.Invoke(
+        null,
+        new object?[] { booleanItems.GroupBy(x => x.TargetKey, StringComparer.Ordinal).First() })!;
+    AssertEqual(4, mergedBoolean.ValueCount, "merged boolean summary should sum value counts");
+    AssertEqual<int?>(3, mergedBoolean.TrueCount, "merged boolean summary should sum true counts");
+    AssertEqual<int?>(1, mergedBoolean.FalseCount, "merged boolean summary should sum false counts");
+    AssertEqual(3, (int)mergedBoolean.Value!, "TRUE_COUNT operation value should be the merged true count");
+
+    var bucketItems = new List<WorkAssignmentBasicSummaryItemDto>
+    {
+        new()
+        {
+            TargetKind = "TABLE",
+            TargetKey = "table:block_1:choice",
+            BlockId = "block_1",
+            MetricKey = "choice",
+            Label = "Choice",
+            DataType = "MULTI_SELECT",
+            Operation = "BUCKET_COUNT",
+            ValueCount = 2,
+            ReportCount = 1,
+            Buckets = new List<WorkAssignmentBasicSummaryBucketDto>
+            {
+                new() { Key = "A", Label = "Alpha", Count = 1 },
+                new() { Key = "B", Label = "Beta", Count = 1 }
+            }
+        },
+        new()
+        {
+            TargetKind = "TABLE",
+            TargetKey = "table:block_1:choice",
+            BlockId = "block_1",
+            MetricKey = "choice",
+            Label = "Choice",
+            DataType = "MULTI_SELECT",
+            Operation = "BUCKET_COUNT",
+            ValueCount = 2,
+            ReportCount = 1,
+            Buckets = new List<WorkAssignmentBasicSummaryBucketDto>
+            {
+                new() { Key = "A", Label = "Alpha", Count = 2 }
+            }
+        }
+    };
+    var mergedBuckets = (WorkAssignmentBasicSummaryItemDto)merge.Invoke(
+        null,
+        new object?[] { bucketItems.GroupBy(x => x.TargetKey, StringComparer.Ordinal).First() })!;
+    AssertEqual(4, mergedBuckets.ValueCount, "merged choice summary should sum value counts");
+    AssertEqual(2, mergedBuckets.Buckets.Count, "merged choice summary should keep distinct buckets");
+    AssertEqual(3, mergedBuckets.Buckets.First(x => x.Key == "A").Count, "merged choice summary should sum matching bucket counts");
+    AssertTrue(ReferenceEquals(mergedBuckets.Value, mergedBuckets.Buckets), "BUCKET_COUNT operation value should reuse merged buckets");
 }
 
 static void BasicSummaryCompactSnapshotRoundTrips()

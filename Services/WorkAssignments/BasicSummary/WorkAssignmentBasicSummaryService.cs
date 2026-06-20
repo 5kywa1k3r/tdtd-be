@@ -26,6 +26,9 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
     private const int SnapshotPayloadVersion = 8;
     private const string ScopeMode = "DIRECT_CHILDREN_OR_SELF";
     private const string FeatureVersion = "basic-summary-v8";
+    private const string SummaryType = "BASIC";
+    private const string ContractVersion = "basic-fixed-scope-v1";
+    private const string SnapshotPayloadKind = "COMPACT_VALUES1D_OPTIMIZED";
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
@@ -503,16 +506,14 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
         {
             Fields = periodResponses
                 .SelectMany(x => x.Fields ?? new List<WorkAssignmentBasicSummaryItemDto>())
-                .Where(IsNumericSummaryItem)
                 .GroupBy(x => x.TargetKey, StringComparer.Ordinal)
-                .Select(MergeNumericSummaryItems)
+                .Select(group => MergeSummaryItems(group, req.MaxTextChars))
                 .OrderBy(x => x.FieldKey ?? x.TargetKey, StringComparer.Ordinal)
                 .ToList(),
             Tables = periodResponses
                 .SelectMany(x => x.Tables ?? new List<WorkAssignmentBasicSummaryItemDto>())
-                .Where(IsNumericSummaryItem)
                 .GroupBy(x => x.TargetKey, StringComparer.Ordinal)
-                .Select(MergeNumericSummaryItems)
+                .Select(group => MergeSummaryItems(group, req.MaxTextChars))
                 .OrderBy(x => x.BlockId, StringComparer.Ordinal)
                 .ThenBy(x => x.Index ?? int.MaxValue)
                 .ThenBy(x => x.MetricKey, StringComparer.Ordinal)
@@ -560,8 +561,13 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
         => string.Equals(item.DataType, "NUMBER", StringComparison.OrdinalIgnoreCase) &&
            IsNumericOperation(item.Operation);
 
-    private static WorkAssignmentBasicSummaryItemDto MergeNumericSummaryItems(
+    private static WorkAssignmentBasicSummaryItemDto MergeSummaryItems(
         IGrouping<string, WorkAssignmentBasicSummaryItemDto> group)
+        => MergeSummaryItems(group, DefaultMaxTextChars);
+
+    private static WorkAssignmentBasicSummaryItemDto MergeSummaryItems(
+        IGrouping<string, WorkAssignmentBasicSummaryItemDto> group,
+        int maxTextChars)
     {
         var first = group.First();
         var valueCount = 0;
@@ -569,6 +575,15 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
         var sum = 0m;
         decimal? min = null;
         decimal? max = null;
+        var trueCount = 0;
+        var falseCount = 0;
+        DateTime? minDateUtc = null;
+        DateTime? maxDateUtc = null;
+        var text = new StringBuilder();
+        var textCharCount = 0;
+        var sourceTextTruncated = false;
+        var outputTextTruncated = false;
+        var bucketsByKey = new Dictionary<string, WorkAssignmentBasicSummaryBucketDto>(StringComparer.Ordinal);
 
         foreach (var item in group)
         {
@@ -580,10 +595,54 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
                 min = min.HasValue ? Math.Min(min.Value, item.Min.Value) : item.Min.Value;
             if (item.Max.HasValue)
                 max = max.HasValue ? Math.Max(max.Value, item.Max.Value) : item.Max.Value;
+            trueCount += item.TrueCount ?? 0;
+            falseCount += item.FalseCount ?? 0;
+            if (item.MinDateUtc.HasValue)
+                minDateUtc = minDateUtc.HasValue && minDateUtc.Value <= item.MinDateUtc.Value
+                    ? minDateUtc
+                    : item.MinDateUtc.Value;
+            if (item.MaxDateUtc.HasValue)
+                maxDateUtc = maxDateUtc.HasValue && maxDateUtc.Value >= item.MaxDateUtc.Value
+                    ? maxDateUtc
+                    : item.MaxDateUtc.Value;
+
+            var itemTextCharCount = item.TextCharCount.GetValueOrDefault();
+            textCharCount += itemTextCharCount > 0
+                ? itemTextCharCount
+                : item.Text?.Length ?? 0;
+            sourceTextTruncated = sourceTextTruncated || item.TextTruncated;
+            if (!string.IsNullOrWhiteSpace(item.Text))
+                AppendMergedText(text, item.Text, maxTextChars, ref outputTextTruncated);
+
+            foreach (var bucket in item.Buckets ?? new List<WorkAssignmentBasicSummaryBucketDto>())
+            {
+                if (string.IsNullOrWhiteSpace(bucket.Key))
+                    continue;
+
+                if (!bucketsByKey.TryGetValue(bucket.Key, out var mergedBucket))
+                {
+                    mergedBucket = new WorkAssignmentBasicSummaryBucketDto
+                    {
+                        Key = bucket.Key,
+                        Label = string.IsNullOrWhiteSpace(bucket.Label) ? bucket.Key : bucket.Label,
+                        Count = 0
+                    };
+                    bucketsByKey[bucket.Key] = mergedBucket;
+                }
+
+                mergedBucket.Count += bucket.Count;
+            }
         }
 
         var mean = valueCount > 0 ? sum / valueCount : (decimal?)null;
-        var operation = NormalizeNumericOperationOrDefault(first.Operation, "SUM");
+        var buckets = bucketsByKey.Values
+            .OrderByDescending(x => x.Count)
+            .ThenBy(x => x.Label, StringComparer.Ordinal)
+            .ToList();
+        var operation = NormalizeOperationForDataType(
+            first.Operation,
+            first.DataType,
+            DefaultOperationForDataType(first.DataType));
 
         return new WorkAssignmentBasicSummaryItemDto
         {
@@ -598,17 +657,66 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
             ColumnKey = first.ColumnKey,
             Index = first.Index,
             Label = first.Label,
-            DataType = "NUMBER",
+            DataType = first.DataType,
             Operation = operation,
-            Value = ResolveNumericValue(operation, valueCount, sum, min, max, mean),
+            Value = ResolveMergedValue(
+                operation,
+                valueCount,
+                sum,
+                min,
+                max,
+                mean,
+                trueCount,
+                falseCount,
+                minDateUtc,
+                maxDateUtc,
+                text.Length == 0 ? null : text.ToString(),
+                buckets),
             ValueCount = valueCount,
             ReportCount = reportCount,
             Sum = valueCount > 0 ? sum : null,
             Min = min,
             Max = max,
-            Mean = mean
+            Mean = mean,
+            TrueCount = trueCount,
+            FalseCount = falseCount,
+            MinDateUtc = minDateUtc,
+            MaxDateUtc = maxDateUtc,
+            Text = text.Length == 0 ? null : text.ToString(),
+            TextCharCount = textCharCount,
+            TextTruncated = sourceTextTruncated || outputTextTruncated,
+            Buckets = buckets
         };
     }
+
+    private static object? ResolveMergedValue(
+        string operation,
+        int valueCount,
+        decimal sum,
+        decimal? min,
+        decimal? max,
+        decimal? mean,
+        int trueCount,
+        int falseCount,
+        DateTime? minDateUtc,
+        DateTime? maxDateUtc,
+        string? text,
+        List<WorkAssignmentBasicSummaryBucketDto> buckets)
+        => operation switch
+        {
+            "SUM" => valueCount > 0 ? sum : null,
+            "MIN" => min,
+            "MAX" => max,
+            "MEAN" => mean,
+            "TRUE_COUNT" => trueCount,
+            "FALSE_COUNT" => falseCount,
+            "MIN_DATE" => minDateUtc,
+            "MAX_DATE" => maxDateUtc,
+            "JOIN" => text,
+            "BUCKET_COUNT" => buckets,
+            "COUNT" => valueCount,
+            _ => valueCount
+        };
 
     private static object? ResolveNumericValue(
         string operation,
@@ -617,13 +725,60 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
         decimal? min,
         decimal? max,
         decimal? mean)
-        => operation switch
+        => ResolveMergedValue(
+            operation,
+            valueCount,
+            sum,
+            min,
+            max,
+            mean,
+            trueCount: 0,
+            falseCount: 0,
+            minDateUtc: null,
+            maxDateUtc: null,
+            text: null,
+            buckets: new List<WorkAssignmentBasicSummaryBucketDto>());
+
+    private static void AppendMergedText(
+        StringBuilder output,
+        string value,
+        int maxTextChars,
+        ref bool outputTextTruncated)
+    {
+        if (outputTextTruncated)
+            return;
+
+        var text = value.Trim();
+        if (text.Length == 0)
+            return;
+
+        var prefix = output.Length == 0 ? string.Empty : Environment.NewLine;
+        var segment = prefix + text;
+        var remaining = Math.Max(0, maxTextChars) - output.Length;
+        if (remaining <= 0)
         {
-            "SUM" => valueCount > 0 ? sum : null,
-            "MIN" => min,
-            "MAX" => max,
-            "MEAN" => mean,
-            _ => valueCount
+            outputTextTruncated = true;
+            return;
+        }
+
+        if (segment.Length > remaining)
+        {
+            output.Append(segment.AsSpan(0, remaining));
+            outputTextTruncated = true;
+            return;
+        }
+
+        output.Append(segment);
+    }
+
+    private static string DefaultOperationForDataType(string dataType)
+        => dataType switch
+        {
+            "NUMBER" => "SUM",
+            "DATE" or "FULL_DATE" => "MAX_DATE",
+            "BOOLEAN" => "TRUE_COUNT",
+            "SINGLE_SELECT" or "MULTI_SELECT" => "BUCKET_COUNT",
+            _ => "COUNT"
         };
 
     private static string BuildCompositeSnapshotId(
@@ -902,18 +1057,19 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
         CancellationToken ct)
     {
         var fields = ExtractFieldDefinitions(template.FieldsJson)
-            .Where(x => x.FieldType == "number")
             .ToList();
         var fieldAccumulators = fields
             .Select(field =>
             {
                 var targetKey = $"field:{field.FieldId}";
+                var dataType = FieldTypeToSummaryDataType(field.FieldType);
+                var defaultOperation = DefaultFieldOperation(field, req.DefaultMethods);
                 return new SummaryAccumulator(
                     targetKind: "FIELD",
                     targetKey,
                     label: field.FieldLabel,
-                    dataType: FieldTypeToSummaryDataType(field.FieldType),
-                    operation: ResolveOperation(req.Rules, "FIELD", targetKey, field.FieldId, DefaultFieldOperation(field, req.DefaultMethods)),
+                    dataType,
+                    operation: ResolveOperation(req.Rules, "FIELD", targetKey, field.FieldId, dataType, defaultOperation),
                     maxTextChars: req.MaxTextChars)
                 {
                     FieldId = field.FieldId,
@@ -1014,7 +1170,31 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
         string reportId)
     {
         if (value.NumericValue.HasValue)
+        {
             accumulator.AddNumber(value.NumericValue.Value, reportId);
+            return;
+        }
+
+        if (value.BooleanValue.HasValue)
+        {
+            accumulator.AddBoolean(value.BooleanValue.Value, reportId);
+            return;
+        }
+
+        if (value.DateValueUtc.HasValue)
+        {
+            accumulator.AddDate(value.DateValueUtc.Value, reportId);
+            return;
+        }
+
+        if (!string.IsNullOrWhiteSpace(value.BucketKey))
+        {
+            accumulator.AddBucket(value.BucketKey, value.BucketLabel ?? value.BucketKey, reportId);
+            return;
+        }
+
+        if (!string.IsNullOrWhiteSpace(value.TextValue))
+            accumulator.AddText(value.TextValue, reportId);
     }
 
     private static WorkAssignmentBasicSummarySourceDto MapSource(
@@ -1520,6 +1700,9 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
     {
         response.Meta = new WorkAssignmentBasicSummaryMetaDto
         {
+            SummaryType = SummaryType,
+            ContractVersion = ContractVersion,
+            SnapshotPayloadKind = SnapshotPayloadKind,
             SnapshotId = snapshotId,
             ScopeAssignmentId = scope.Id,
             ScopeMode = ScopeMode,
@@ -1946,11 +2129,15 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
             WorkId = config.WorkId,
             AssignmentId = config.AssignmentId,
             DynamicFormTemplateId = config.DynamicFormTemplateId,
-            DefaultMethods = ParseConfigJson(config.DefaultMethodsJson, ToDefaultMethodsDto(NormalizeDefaultMethods(null))),
+            DefaultMethods = ParseAndNormalizeDefaultMethods(config.DefaultMethodsJson),
             Rules = NormalizeRules(ParseConfigJson<List<WorkAssignmentBasicSummaryRuleDto>>(config.RulesJson, new())),
             VersionNo = config.VersionNo,
             IsActive = config.IsActive
         };
+
+    private static WorkAssignmentBasicSummaryDefaultMethodsDto ParseAndNormalizeDefaultMethods(string? json)
+        => ToDefaultMethodsDto(NormalizeDefaultMethods(
+            ParseConfigJson<WorkAssignmentBasicSummaryDefaultMethodsDto>(json, new())));
 
     private static T ParseConfigJson<T>(string? json, T fallback)
     {
@@ -1997,13 +2184,41 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
 
     private static NormalizedDefaultMethods NormalizeDefaultMethods(WorkAssignmentBasicSummaryDefaultMethodsDto? value)
     {
-        var number = NormalizeNumericOperationOrDefault(value?.Number, "SUM");
         return new(
-            Number: number,
-            Date: number,
-            Boolean: number,
-            Text: number,
-            Selection: number);
+            Number: NormalizeDefaultMethod(value?.Number, "number", "SUM", IsNumericOperation),
+            Date: NormalizeDefaultMethod(value?.Date, "date", "MAX_DATE", IsDateOperation),
+            Boolean: NormalizeDefaultMethod(value?.Boolean, "boolean", "TRUE_COUNT", IsBooleanOperation),
+            Text: NormalizeDefaultMethod(value?.Text, "text", "COUNT", IsTextOperation),
+            Selection: NormalizeDefaultMethod(value?.Selection, "selection", "BUCKET_COUNT", IsSelectionOperation));
+    }
+
+    private static string NormalizeDefaultMethod(
+        string? value,
+        string fieldName,
+        string fallback,
+        Func<string?, bool> isAllowed)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return fallback;
+
+        var normalized = NormalizeBasicOperationOrDefault(value, string.Empty);
+        if (!string.IsNullOrWhiteSpace(normalized) && isAllowed(normalized))
+            return normalized;
+
+        if (!string.Equals(fieldName, "number", StringComparison.Ordinal) && IsNumericOperation(value))
+            return fallback;
+
+        throw AppExceptionFactory.BadRequest(
+            AppErrorCode.WORK_ASSIGNMENT_AGGREGATE_MODE_INVALID,
+            new
+            {
+                summaryType = SummaryType,
+                contractVersion = ContractVersion,
+                field = fieldName,
+                method = value.Trim(),
+                reason = "BASIC_SUMMARY_METHOD_UNSUPPORTED_FOR_DATA_TYPE"
+            },
+            "Basic summary method is not supported for this data type.");
     }
 
     private static NormalizedSourceView NormalizeSourceView(WorkAssignmentBasicSummarySourceViewRequestDto? value)
@@ -2023,13 +2238,14 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
         => string.IsNullOrWhiteSpace(value) ? null : value.Trim();
 
     private static string NormalizeOperationOrDefault(string? value, string fallback)
-        => NormalizeNumericOperationOrDefault(value, fallback);
+        => NormalizeBasicOperationOrDefault(value, fallback);
 
     private static string ResolveOperation(
         List<WorkAssignmentBasicSummaryRuleDto> rules,
         string targetKind,
         string targetKey,
         string alternateKey,
+        string dataType,
         string fallback)
     {
         var rule = rules.FirstOrDefault(x =>
@@ -2037,7 +2253,7 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
             (string.Equals(x.TargetKey, targetKey, StringComparison.OrdinalIgnoreCase) ||
              string.Equals(x.TargetKey, alternateKey, StringComparison.OrdinalIgnoreCase)));
 
-        return rule is null ? fallback : NormalizeOperation(rule.Operation);
+        return rule is null ? fallback : NormalizeOperationForDataType(rule.Operation, dataType, fallback);
     }
 
     private static string ResolveTableOperation(
@@ -2062,11 +2278,39 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
             string.Equals(x.TargetKind, "TABLE", StringComparison.OrdinalIgnoreCase) &&
             candidateKeys.Any(key => string.Equals(x.TargetKey, key, StringComparison.OrdinalIgnoreCase)));
 
-        return rule is null ? fallback : NormalizeOperation(rule.Operation);
+        return rule is null ? fallback : NormalizeOperationForDataType(rule.Operation, value.DataType, fallback);
     }
 
     private static string NormalizeOperation(string? value)
-        => NormalizeNumericOperationOrDefault(value, "SUM");
+        => NormalizeBasicOperationOrDefault(value, "SUM");
+
+    private static string NormalizeOperationForDataType(string? value, string dataType, string fallback)
+    {
+        var normalized = NormalizeBasicOperationOrDefault(value, string.Empty);
+        return !string.IsNullOrWhiteSpace(normalized) && IsOperationAllowedForDataType(normalized, dataType)
+            ? normalized
+            : fallback;
+    }
+
+    private static string NormalizeBasicOperationOrDefault(string? value, string fallback)
+    {
+        var op = value?.Trim().ToUpperInvariant();
+        return op switch
+        {
+            "SUM" => "SUM",
+            "MIN" => "MIN",
+            "MAX" => "MAX",
+            "MEAN" or "AVG" or "AVERAGE" => "MEAN",
+            "COUNT" => "COUNT",
+            "TRUE_COUNT" => "TRUE_COUNT",
+            "FALSE_COUNT" => "FALSE_COUNT",
+            "MIN_DATE" or "EARLIEST_DATE" => "MIN_DATE",
+            "MAX_DATE" or "LATEST_DATE" => "MAX_DATE",
+            "JOIN" or "SAMPLE" or "TEXT_SAMPLE" => "JOIN",
+            "BUCKET_COUNT" or "OPTION_COUNT" => "BUCKET_COUNT",
+            _ => fallback
+        };
+    }
 
     private static string NormalizeNumericOperationOrDefault(string? value, string fallback)
     {
@@ -2088,11 +2332,59 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
         return op is "SUM" or "MIN" or "MAX" or "MEAN" or "AVG" or "AVERAGE" or "COUNT";
     }
 
+    private static bool IsDateOperation(string? value)
+    {
+        var op = value?.Trim().ToUpperInvariant();
+        return op is "MIN_DATE" or "EARLIEST_DATE" or "MAX_DATE" or "LATEST_DATE" or "COUNT";
+    }
+
+    private static bool IsBooleanOperation(string? value)
+    {
+        var op = value?.Trim().ToUpperInvariant();
+        return op is "TRUE_COUNT" or "FALSE_COUNT" or "COUNT";
+    }
+
+    private static bool IsTextOperation(string? value)
+    {
+        var op = value?.Trim().ToUpperInvariant();
+        return op is "COUNT" or "JOIN" or "SAMPLE" or "TEXT_SAMPLE";
+    }
+
+    private static bool IsSelectionOperation(string? value)
+    {
+        var op = value?.Trim().ToUpperInvariant();
+        return op is "BUCKET_COUNT" or "OPTION_COUNT" or "COUNT";
+    }
+
+    private static bool IsOperationAllowedForDataType(string operation, string dataType)
+        => dataType switch
+        {
+            "NUMBER" => IsNumericOperation(operation),
+            "DATE" or "FULL_DATE" => IsDateOperation(operation),
+            "BOOLEAN" => IsBooleanOperation(operation),
+            "SINGLE_SELECT" or "MULTI_SELECT" => IsSelectionOperation(operation),
+            _ => IsTextOperation(operation)
+        };
+
     private static string DefaultFieldOperation(FieldDefinition field, NormalizedDefaultMethods defaults)
-        => defaults.Number;
+        => field.FieldType switch
+        {
+            "number" => defaults.Number,
+            "date" => defaults.Date,
+            "boolean" => defaults.Boolean,
+            "singleSelect" or "multiSelect" => defaults.Selection,
+            _ => defaults.Text
+        };
 
     private static string DefaultTableOperation(ParsedTableValue value, NormalizedDefaultMethods defaults)
-        => defaults.Number;
+        => value.DataType switch
+        {
+            "NUMBER" => defaults.Number,
+            "DATE" or "FULL_DATE" => defaults.Date,
+            "BOOLEAN" => defaults.Boolean,
+            "SINGLE_SELECT" or "MULTI_SELECT" => defaults.Selection,
+            _ => defaults.Text
+        };
 
     private static string FieldTypeToSummaryDataType(string fieldType)
         => fieldType switch
@@ -2455,12 +2747,62 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
         if (IsBlankJsonElement(value) || metric.DataType == "IGNORE")
             yield break;
 
-        if (metric.DataType != "NUMBER")
+        if (metric.DataType == "NUMBER")
+        {
+            var number = ToNullableDecimal(value);
+            if (number.HasValue)
+                yield return ParsedTableValue.Number(blockId, tableMode, metric, number.Value);
             yield break;
+        }
 
-        var number = ToNullableDecimal(value);
-        if (number.HasValue)
-            yield return ParsedTableValue.Number(blockId, tableMode, metric, number.Value);
+        if (metric.DataType == "BOOLEAN")
+        {
+            if (TryReadBoolean(value, out var boolean))
+                yield return ParsedTableValue.Boolean(blockId, tableMode, metric, boolean);
+            yield break;
+        }
+
+        if (metric.DataType is "DATE" or "FULL_DATE")
+        {
+            var date = ReadDateValue(value, requireFullDate: metric.DataType == "FULL_DATE");
+            if (date.HasValue)
+                yield return ParsedTableValue.Date(blockId, tableMode, metric, date.Value);
+            yield break;
+        }
+
+        if (metric.DataType == "SINGLE_SELECT")
+        {
+            var raw = ToNullableString(value)?.Trim();
+            if (!string.IsNullOrWhiteSpace(raw))
+            {
+                var option = ResolveMetricOption(metric.Options, raw);
+                yield return ParsedTableValue.Bucket(
+                    blockId,
+                    tableMode,
+                    metric,
+                    option?.Code ?? raw,
+                    option?.Label ?? raw);
+            }
+            yield break;
+        }
+
+        if (metric.DataType == "MULTI_SELECT")
+        {
+            foreach (var raw in ReadStringListValues(value).Distinct(StringComparer.Ordinal))
+            {
+                var option = ResolveMetricOption(metric.Options, raw);
+                yield return ParsedTableValue.Bucket(
+                    blockId,
+                    tableMode,
+                    metric,
+                    option?.Code ?? raw,
+                    option?.Label ?? raw);
+            }
+            yield break;
+        }
+
+        foreach (var text in ReadStringListValues(value))
+            yield return ParsedTableValue.Text(blockId, tableMode, metric, text);
     }
 
     private static List<MetricContract> NormalizeMetricDefinitions(
@@ -2632,6 +2974,7 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
         {
             "NUMBER" or "DECIMAL" or "NUMERIC" => "NUMBER",
             "SHORT_TEXT" or "SHORTTEXT" or "TEXT" or "STRING" or "STRING_LIST" or "STRINGLIST" => "SHORT_TEXT",
+            "SINGLE_SELECT" or "SINGLESELECT" or "SELECT" or "CHOICE" => "SINGLE_SELECT",
             "MULTI_SELECT" or "MULTISELECT" => "MULTI_SELECT",
             "BOOLEAN" or "BOOL" => "BOOLEAN",
             "DATE" => "DATE",
