@@ -591,19 +591,93 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
             ct);
 
         var includeValueJson = req?.IncludeValueJson == true;
-        var differences = CompareDayNodeDiagnostics(cacheNode, directNode);
+        var differences = CompareNodeDiagnostics(cacheNode, directNode);
         return new WorkAssignmentAdvancedSummaryDayNodeDiagnosticsResponse
         {
             ConfigId = config.Id,
             ConfigHash = config.ConfigHash,
             DayKey = normalizedDayKey,
-            Status = ResolveDayNodeDiagnosticsStatus(cacheNode, differences),
+            Status = ResolveNodeDiagnosticsStatus(cacheNode, differences),
             Matches = cacheNode is not null && differences.Count == 0,
             DiagnosticActorUserId = diagnosticActorUserId,
             CheckedAtUtc = DateTime.UtcNow,
             Differences = differences,
-            Cache = cacheNode is null ? null : ToDayNodeDiagnosticSnapshot(cacheNode, includeValueJson),
-            Direct = ToDayNodeDiagnosticSnapshot(directNode, includeValueJson)
+            Cache = cacheNode is null ? null : ToNodeDiagnosticSnapshot(cacheNode, includeValueJson),
+            Direct = ToNodeDiagnosticSnapshot(directNode, includeValueJson)
+        };
+    }
+
+    public async Task<WorkAssignmentAdvancedSummaryMonthNodeDiagnosticsResponse> DiagnoseMonthNodeAsync(
+        string configId,
+        string monthKey,
+        DiagnoseWorkAssignmentAdvancedSummaryMonthNodeRequest req,
+        string actorUserId,
+        CancellationToken ct)
+    {
+        EnsureActor(actorUserId);
+        req ??= new DiagnoseWorkAssignmentAdvancedSummaryMonthNodeRequest();
+        var normalizedMonthKey = NormalizeMonthKey(string.IsNullOrWhiteSpace(monthKey) ? req.MonthKey : monthKey);
+        var config = await LoadLockedConfigAsync(configId, ct);
+        var cacheNode = await LoadMonthNodeAsync(config, normalizedMonthKey, ct);
+        var diagnosticActorUserId = ResolveDiagnosticsActor(config, cacheNode, actorUserId);
+        var directNode = await BuildMonthNodeAsync(
+            config,
+            normalizedMonthKey,
+            diagnosticActorUserId,
+            $"diagnostics:{ObjectId.GenerateNewId()}",
+            ct);
+
+        var includeValueJson = req?.IncludeValueJson == true;
+        var differences = CompareNodeDiagnostics(cacheNode, directNode);
+        return new WorkAssignmentAdvancedSummaryMonthNodeDiagnosticsResponse
+        {
+            ConfigId = config.Id,
+            ConfigHash = config.ConfigHash,
+            MonthKey = normalizedMonthKey,
+            Status = ResolveNodeDiagnosticsStatus(cacheNode, differences),
+            Matches = cacheNode is not null && differences.Count == 0,
+            DiagnosticActorUserId = diagnosticActorUserId,
+            CheckedAtUtc = DateTime.UtcNow,
+            Differences = differences,
+            Cache = cacheNode is null ? null : ToNodeDiagnosticSnapshot(cacheNode, includeValueJson),
+            Direct = ToNodeDiagnosticSnapshot(directNode, includeValueJson)
+        };
+    }
+
+    public async Task<WorkAssignmentAdvancedSummaryYearNodeDiagnosticsResponse> DiagnoseYearNodeAsync(
+        string configId,
+        string yearKey,
+        DiagnoseWorkAssignmentAdvancedSummaryYearNodeRequest req,
+        string actorUserId,
+        CancellationToken ct)
+    {
+        EnsureActor(actorUserId);
+        req ??= new DiagnoseWorkAssignmentAdvancedSummaryYearNodeRequest();
+        var normalizedYearKey = NormalizeYearKey(string.IsNullOrWhiteSpace(yearKey) ? req.YearKey : yearKey);
+        var config = await LoadLockedConfigAsync(configId, ct);
+        var cacheNode = await LoadYearNodeAsync(config, normalizedYearKey, ct);
+        var diagnosticActorUserId = ResolveDiagnosticsActor(config, cacheNode, actorUserId);
+        var directNode = await BuildYearNodeAsync(
+            config,
+            normalizedYearKey,
+            diagnosticActorUserId,
+            $"diagnostics:{ObjectId.GenerateNewId()}",
+            ct);
+
+        var includeValueJson = req?.IncludeValueJson == true;
+        var differences = CompareNodeDiagnostics(cacheNode, directNode);
+        return new WorkAssignmentAdvancedSummaryYearNodeDiagnosticsResponse
+        {
+            ConfigId = config.Id,
+            ConfigHash = config.ConfigHash,
+            YearKey = normalizedYearKey,
+            Status = ResolveNodeDiagnosticsStatus(cacheNode, differences),
+            Matches = cacheNode is not null && differences.Count == 0,
+            DiagnosticActorUserId = diagnosticActorUserId,
+            CheckedAtUtc = DateTime.UtcNow,
+            Differences = differences,
+            Cache = cacheNode is null ? null : ToNodeDiagnosticSnapshot(cacheNode, includeValueJson),
+            Direct = ToNodeDiagnosticSnapshot(directNode, includeValueJson)
         };
     }
 
@@ -1902,8 +1976,8 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
             UpdatedAtUtc = x.UpdatedAtUtc
         };
 
-    private static WorkAssignmentAdvancedSummaryDayNodeDiagnosticSnapshot ToDayNodeDiagnosticSnapshot(
-        WorkAssignmentAdvancedSummaryDayNode x,
+    private static WorkAssignmentAdvancedSummaryNodeDiagnosticSnapshot ToNodeDiagnosticSnapshot(
+        WorkAssignmentAdvancedSummaryHierarchyNodeBase x,
         bool includeValueJson)
     {
         var comparableValueHash = TryBuildAdvancedSummaryComparableValueHash(
@@ -1913,12 +1987,18 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
             ? valueHash
             : null;
 
-        return new WorkAssignmentAdvancedSummaryDayNodeDiagnosticSnapshot
+        return new WorkAssignmentAdvancedSummaryNodeDiagnosticSnapshot
         {
             NodeId = x.Id,
             Status = x.Status,
             IsDirty = x.IsDirty,
             SourceReportCount = x.SourceReportCount,
+            SourceReportIds = x.SourceReportIds
+                .OrderBy(id => id, StringComparer.Ordinal)
+                .ToList(),
+            InputNodeKeys = x.InputNodeKeys
+                .OrderBy(key => key, StringComparer.Ordinal)
+                .ToList(),
             SourceSignatureHash = x.SourceSignatureHash,
             ValueHash = x.ValueHash,
             ComparableValueHash = comparableValueHash,
@@ -1933,9 +2013,10 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
         };
     }
 
-    private static List<string> CompareDayNodeDiagnostics(
-        WorkAssignmentAdvancedSummaryDayNode? cacheNode,
-        WorkAssignmentAdvancedSummaryDayNode directNode)
+    private static List<string> CompareNodeDiagnostics<TNode>(
+        TNode? cacheNode,
+        TNode directNode)
+        where TNode : WorkAssignmentAdvancedSummaryHierarchyNodeBase
     {
         var differences = new List<string>();
         if (cacheNode is null)
@@ -1956,6 +2037,10 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
                 directNode.SourceReportIds.OrderBy(x => x, StringComparer.Ordinal),
                 StringComparer.Ordinal))
             differences.Add("SOURCE_REPORT_IDS");
+        if (!cacheNode.InputNodeKeys.OrderBy(x => x, StringComparer.Ordinal).SequenceEqual(
+                directNode.InputNodeKeys.OrderBy(x => x, StringComparer.Ordinal),
+                StringComparer.Ordinal))
+            differences.Add("INPUT_NODE_KEYS");
 
         var cacheComparableOk = TryBuildAdvancedSummaryComparableValueHash(
             cacheNode.ValueJson,
@@ -1979,8 +2064,8 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
         return differences;
     }
 
-    private static string ResolveDayNodeDiagnosticsStatus(
-        WorkAssignmentAdvancedSummaryDayNode? cacheNode,
+    private static string ResolveNodeDiagnosticsStatus(
+        WorkAssignmentAdvancedSummaryHierarchyNodeBase? cacheNode,
         IReadOnlyCollection<string> differences)
     {
         if (cacheNode is null)
@@ -2000,7 +2085,7 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
 
     private static string ResolveDiagnosticsActor(
         WorkAssignmentAdvancedSummaryConfig config,
-        WorkAssignmentAdvancedSummaryDayNode? cacheNode,
+        WorkAssignmentAdvancedSummaryHierarchyNodeBase? cacheNode,
         string fallbackUserId)
     {
         if (!string.IsNullOrWhiteSpace(cacheNode?.UpdatedByUserId))

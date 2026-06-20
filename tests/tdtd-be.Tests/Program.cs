@@ -134,6 +134,7 @@ var tests = new (string Name, Action Run)[]
     ("advanced summary operations cleanup limit is bounded", AdvancedSummaryOperationsCleanupLimitIsBounded),
     ("advanced summary operations cleanup requires scope selector", AdvancedSummaryOperationsCleanupRequiresScopeSelector),
     ("advanced summary diagnostics comparable hash ignores generated time", AdvancedSummaryDiagnosticsComparableHashIgnoresGeneratedTime),
+    ("advanced summary diagnostics comparable hash covers rollup input count", AdvancedSummaryDiagnosticsComparableHashCoversRollupInputCount),
 };
 
 var failures = new List<string>();
@@ -577,6 +578,52 @@ static void AdvancedSummaryDiagnosticsComparableHashIgnoresGeneratedTime()
     AssertFalse(
         string.Equals(firstHash, changedHash, StringComparison.Ordinal),
         "diagnostics comparable hash should still change when statistic values change");
+}
+
+static void AdvancedSummaryDiagnosticsComparableHashCoversRollupInputCount()
+{
+    var monthValue = @"{
+        ""schemaVersion"": 1,
+        ""kind"": ""ADVANCED_SUMMARY_MONTH_NODE_V1"",
+        ""generatedAtUtc"": ""2026-06-20T01:00:00Z"",
+        ""configId"": ""cfg"",
+        ""configHash"": ""hash"",
+        ""grain"": ""MONTH"",
+        ""grainKey"": ""2026-06"",
+        ""dayKey"": null,
+        ""monthKey"": ""2026-06"",
+        ""yearKey"": ""2026"",
+        ""windowStartUtc"": ""2026-06-01T00:00:00Z"",
+        ""windowEndExclusiveUtc"": ""2026-07-01T00:00:00Z"",
+        ""sourceAssignmentCount"": 1,
+        ""sourceReportCount"": 30,
+        ""sectionReportCount"": 30,
+        ""sectionFieldCount"": 1,
+        ""targetFieldCount"": 1,
+        ""inputNodeCount"": 30,
+        ""warnings"": [],
+        ""fields"": [
+            {
+                ""fieldId"": ""f1"",
+                ""fieldKey"": ""field_1"",
+                ""label"": ""Field 1"",
+                ""dataType"": ""number"",
+                ""method"": ""SUM"",
+                ""valueCount"": 30,
+                ""sourceReportCount"": 30,
+                ""result"": 300,
+                ""sampleValues"": []
+            }
+        ]
+    }";
+    var changedInputCount = monthValue.Replace(@"""inputNodeCount"": 30", @"""inputNodeCount"": 29");
+
+    var firstHash = WorkAssignmentAdvancedSummaryHierarchyService.BuildAdvancedSummaryComparableValueHash(monthValue);
+    var changedHash = WorkAssignmentAdvancedSummaryHierarchyService.BuildAdvancedSummaryComparableValueHash(changedInputCount);
+
+    AssertFalse(
+        string.Equals(firstHash, changedHash, StringComparison.Ordinal),
+        "diagnostics comparable hash should change when rollup input node count changes");
 }
 
 static void BlocksOnceDueBeforeAssignmentStart()

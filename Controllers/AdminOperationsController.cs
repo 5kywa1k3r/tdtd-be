@@ -448,6 +448,40 @@ public sealed class AdminOperationsController : ControllerBase
             ct));
     }
 
+    [HttpPost("job-runs/advanced-summary-nodes/diagnostics/month")]
+    public async Task<IActionResult> DiagnoseAdvancedSummaryMonthNode(
+        [FromBody] DiagnoseWorkAssignmentAdvancedSummaryMonthNodeRequest? request,
+        CancellationToken ct = default)
+    {
+        var me = _me.RequireMe();
+        RoleGuard.RequireSystemAdmin(me);
+        request ??= new DiagnoseWorkAssignmentAdvancedSummaryMonthNodeRequest();
+
+        return Ok(await _jobRuns.DiagnoseAdvancedSummaryMonthNodeAsync(
+            request.ConfigId,
+            request.MonthKey,
+            request,
+            me.Id,
+            ct));
+    }
+
+    [HttpPost("job-runs/advanced-summary-nodes/diagnostics/year")]
+    public async Task<IActionResult> DiagnoseAdvancedSummaryYearNode(
+        [FromBody] DiagnoseWorkAssignmentAdvancedSummaryYearNodeRequest? request,
+        CancellationToken ct = default)
+    {
+        var me = _me.RequireMe();
+        RoleGuard.RequireSystemAdmin(me);
+        request ??= new DiagnoseWorkAssignmentAdvancedSummaryYearNodeRequest();
+
+        return Ok(await _jobRuns.DiagnoseAdvancedSummaryYearNodeAsync(
+            request.ConfigId,
+            request.YearKey,
+            request,
+            me.Id,
+            ct));
+    }
+
     [HttpGet("report-payloads/diagnostics")]
     public async Task<IActionResult> CheckReportPayloadDiagnostics(
         [FromQuery] string? workId = null,

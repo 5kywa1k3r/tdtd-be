@@ -61,4 +61,18 @@ public interface IWorkAssignmentAdvancedSummaryHierarchyService
         DiagnoseWorkAssignmentAdvancedSummaryDayNodeRequest req,
         string actorUserId,
         CancellationToken ct);
+
+    Task<WorkAssignmentAdvancedSummaryMonthNodeDiagnosticsResponse> DiagnoseMonthNodeAsync(
+        string configId,
+        string monthKey,
+        DiagnoseWorkAssignmentAdvancedSummaryMonthNodeRequest req,
+        string actorUserId,
+        CancellationToken ct);
+
+    Task<WorkAssignmentAdvancedSummaryYearNodeDiagnosticsResponse> DiagnoseYearNodeAsync(
+        string configId,
+        string yearKey,
+        DiagnoseWorkAssignmentAdvancedSummaryYearNodeRequest req,
+        string actorUserId,
+        CancellationToken ct);
 }

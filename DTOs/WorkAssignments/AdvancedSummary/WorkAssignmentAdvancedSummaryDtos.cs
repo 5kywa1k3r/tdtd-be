@@ -82,6 +82,20 @@ public sealed class DiagnoseWorkAssignmentAdvancedSummaryDayNodeRequest
     public bool IncludeValueJson { get; set; }
 }
 
+public sealed class DiagnoseWorkAssignmentAdvancedSummaryMonthNodeRequest
+{
+    public string ConfigId { get; set; } = string.Empty;
+    public string MonthKey { get; set; } = string.Empty;
+    public bool IncludeValueJson { get; set; }
+}
+
+public sealed class DiagnoseWorkAssignmentAdvancedSummaryYearNodeRequest
+{
+    public string ConfigId { get; set; } = string.Empty;
+    public string YearKey { get; set; } = string.Empty;
+    public bool IncludeValueJson { get; set; }
+}
+
 public sealed class WorkAssignmentAdvancedSummaryDayNodeDiagnosticsResponse
 {
     public string ConfigId { get; set; } = string.Empty;
@@ -92,16 +106,46 @@ public sealed class WorkAssignmentAdvancedSummaryDayNodeDiagnosticsResponse
     public string DiagnosticActorUserId { get; set; } = string.Empty;
     public DateTime CheckedAtUtc { get; set; }
     public List<string> Differences { get; set; } = new();
-    public WorkAssignmentAdvancedSummaryDayNodeDiagnosticSnapshot? Cache { get; set; }
-    public WorkAssignmentAdvancedSummaryDayNodeDiagnosticSnapshot Direct { get; set; } = new();
+    public WorkAssignmentAdvancedSummaryNodeDiagnosticSnapshot? Cache { get; set; }
+    public WorkAssignmentAdvancedSummaryNodeDiagnosticSnapshot Direct { get; set; } = new();
 }
 
-public sealed class WorkAssignmentAdvancedSummaryDayNodeDiagnosticSnapshot
+public sealed class WorkAssignmentAdvancedSummaryMonthNodeDiagnosticsResponse
+{
+    public string ConfigId { get; set; } = string.Empty;
+    public string ConfigHash { get; set; } = string.Empty;
+    public string MonthKey { get; set; } = string.Empty;
+    public string Status { get; set; } = string.Empty;
+    public bool Matches { get; set; }
+    public string DiagnosticActorUserId { get; set; } = string.Empty;
+    public DateTime CheckedAtUtc { get; set; }
+    public List<string> Differences { get; set; } = new();
+    public WorkAssignmentAdvancedSummaryNodeDiagnosticSnapshot? Cache { get; set; }
+    public WorkAssignmentAdvancedSummaryNodeDiagnosticSnapshot Direct { get; set; } = new();
+}
+
+public sealed class WorkAssignmentAdvancedSummaryYearNodeDiagnosticsResponse
+{
+    public string ConfigId { get; set; } = string.Empty;
+    public string ConfigHash { get; set; } = string.Empty;
+    public string YearKey { get; set; } = string.Empty;
+    public string Status { get; set; } = string.Empty;
+    public bool Matches { get; set; }
+    public string DiagnosticActorUserId { get; set; } = string.Empty;
+    public DateTime CheckedAtUtc { get; set; }
+    public List<string> Differences { get; set; } = new();
+    public WorkAssignmentAdvancedSummaryNodeDiagnosticSnapshot? Cache { get; set; }
+    public WorkAssignmentAdvancedSummaryNodeDiagnosticSnapshot Direct { get; set; } = new();
+}
+
+public sealed class WorkAssignmentAdvancedSummaryNodeDiagnosticSnapshot
 {
     public string? NodeId { get; set; }
     public string Status { get; set; } = string.Empty;
     public bool IsDirty { get; set; }
     public long SourceReportCount { get; set; }
+    public List<string> SourceReportIds { get; set; } = new();
+    public List<string> InputNodeKeys { get; set; } = new();
     public string? SourceSignatureHash { get; set; }
     public string? ValueHash { get; set; }
     public string? ComparableValueHash { get; set; }

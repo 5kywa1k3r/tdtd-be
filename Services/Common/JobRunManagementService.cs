@@ -53,6 +53,18 @@ public interface IJobRunManagementService
         DiagnoseWorkAssignmentAdvancedSummaryDayNodeRequest request,
         string actorUserId,
         CancellationToken ct = default);
+    Task<WorkAssignmentAdvancedSummaryMonthNodeDiagnosticsResponse> DiagnoseAdvancedSummaryMonthNodeAsync(
+        string configId,
+        string monthKey,
+        DiagnoseWorkAssignmentAdvancedSummaryMonthNodeRequest request,
+        string actorUserId,
+        CancellationToken ct = default);
+    Task<WorkAssignmentAdvancedSummaryYearNodeDiagnosticsResponse> DiagnoseAdvancedSummaryYearNodeAsync(
+        string configId,
+        string yearKey,
+        DiagnoseWorkAssignmentAdvancedSummaryYearNodeRequest request,
+        string actorUserId,
+        CancellationToken ct = default);
     Task<int> ProcessMaterializeJobsAsync(int maxJobs, int batchSize, CancellationToken ct = default);
     Task ProcessWorkAssignmentQueueScanAsync(CancellationToken ct = default);
     Task ProcessNotificationDueScanAsync(CancellationToken ct = default);
@@ -529,6 +541,22 @@ public sealed class JobRunManagementService : IJobRunManagementService
         string actorUserId,
         CancellationToken ct = default)
         => _advancedSummary.DiagnoseDayNodeAsync(configId, dayKey, request, actorUserId, ct);
+
+    public Task<WorkAssignmentAdvancedSummaryMonthNodeDiagnosticsResponse> DiagnoseAdvancedSummaryMonthNodeAsync(
+        string configId,
+        string monthKey,
+        DiagnoseWorkAssignmentAdvancedSummaryMonthNodeRequest request,
+        string actorUserId,
+        CancellationToken ct = default)
+        => _advancedSummary.DiagnoseMonthNodeAsync(configId, monthKey, request, actorUserId, ct);
+
+    public Task<WorkAssignmentAdvancedSummaryYearNodeDiagnosticsResponse> DiagnoseAdvancedSummaryYearNodeAsync(
+        string configId,
+        string yearKey,
+        DiagnoseWorkAssignmentAdvancedSummaryYearNodeRequest request,
+        string actorUserId,
+        CancellationToken ct = default)
+        => _advancedSummary.DiagnoseYearNodeAsync(configId, yearKey, request, actorUserId, ct);
 
     private async Task<(List<AdvancedSummaryNodeRow> Rows, long Total)> SearchAdvancedSummaryNodesByGrainAsync<T>(
         IMongoCollection<T> col,
