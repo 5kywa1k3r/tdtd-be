@@ -14,7 +14,11 @@ public sealed class WorkSummaryTokenLedger : BaseEntity
 
     [BsonElement("ownerUserId")]
     [BsonRepresentation(BsonType.ObjectId)]
-    public string OwnerUserId { get; set; } = default!;
+    public string? OwnerUserId { get; set; }
+
+    [BsonElement("ownerUnitId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? OwnerUnitId { get; set; }
 
     [BsonElement("actorUserId")]
     [BsonRepresentation(BsonType.ObjectId)]

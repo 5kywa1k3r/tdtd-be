@@ -4,7 +4,7 @@ namespace tdtd_be.DTOs.WorkAssignments.SummaryTokens;
 
 public sealed class WorkSummaryTokenGrantRequest
 {
-    public string OwnerUserId { get; set; } = string.Empty;
+    public string OwnerUnitId { get; set; } = string.Empty;
     public int Units { get; set; }
     public string? TokenKind { get; set; }
     public string? PeriodMonthKey { get; set; }
@@ -13,6 +13,7 @@ public sealed class WorkSummaryTokenGrantRequest
 
 public sealed class WorkSummaryTokenLedgerSearchRequest
 {
+    public string? OwnerUnitId { get; set; }
     public string? OwnerUserId { get; set; }
     public string? ActorUserId { get; set; }
     public string? IssuerUserId { get; set; }
@@ -29,7 +30,7 @@ public sealed class WorkSummaryTokenLedgerSearchRequest
 
 public sealed class WorkSummaryTokenQuotaResponse
 {
-    public string OwnerUserId { get; set; } = string.Empty;
+    public string OwnerUnitId { get; set; } = string.Empty;
     public string TokenKind { get; set; } = WorkSummaryTokenKinds.AdvancedSummaryConfigLock;
     public string PeriodMonthKey { get; set; } = string.Empty;
     public int BaseMonthlyQuota { get; set; }
@@ -42,7 +43,7 @@ public sealed class WorkSummaryTokenQuotaResponse
 public sealed class WorkSummaryTokenGrantResponse
 {
     public string LedgerId { get; set; } = string.Empty;
-    public string OwnerUserId { get; set; } = string.Empty;
+    public string OwnerUnitId { get; set; } = string.Empty;
     public string IssuerUserId { get; set; } = string.Empty;
     public string TokenKind { get; set; } = WorkSummaryTokenKinds.AdvancedSummaryConfigLock;
     public string PeriodMonthKey { get; set; } = string.Empty;
@@ -54,7 +55,8 @@ public sealed class WorkSummaryTokenGrantResponse
 public sealed class WorkSummaryTokenLedgerRow
 {
     public string Id { get; set; } = string.Empty;
-    public string OwnerUserId { get; set; } = string.Empty;
+    public string? OwnerUserId { get; set; }
+    public string? OwnerUnitId { get; set; }
     public string ActorUserId { get; set; } = string.Empty;
     public string? IssuerUserId { get; set; }
     public string TokenKind { get; set; } = WorkSummaryTokenKinds.AdvancedSummaryConfigLock;

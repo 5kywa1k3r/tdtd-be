@@ -118,7 +118,8 @@ var tests = new (string Name, Action Run)[]
     ("advanced summary hierarchy query plans largest grains", AdvancedSummaryHierarchyQueryPlansLargestGrains),
     ("summary token month key uses utc month", SummaryTokenMonthKeyUsesUtcMonth),
     ("summary token quota boundary allows free initial lock", SummaryTokenQuotaBoundaryAllowsFreeInitialLock),
-    ("summary token grants extend monthly allowance", SummaryTokenGrantsExtendMonthlyAllowance),
+    ("summary token unit base quota uses active users", SummaryTokenUnitBaseQuotaUsesActiveUsers),
+    ("summary token admin grants extend unit allowance", SummaryTokenAdminGrantsExtendUnitAllowance),
     ("summary token manager scope follows unit hierarchy", SummaryTokenManagerScopeFollowsUnitHierarchy),
     ("legacy work basis file resolves as work document", ResolvesLegacyWorkBasisFileAsWorkDocument),
     ("assignment file resolves as assignment branch document", ResolvesAssignmentFileAsBranchDocument),
@@ -3627,11 +3628,29 @@ static void SummaryTokenQuotaBoundaryAllowsFreeInitialLock()
         "next config change after quota exhaustion should be blocked");
 }
 
-static void SummaryTokenGrantsExtendMonthlyAllowance()
+static void SummaryTokenUnitBaseQuotaUsesActiveUsers()
+{
+    AssertEqual(0, WorkSummaryTokenService.CalculateBaseQuotaFromActiveUsers(-2), "negative active user counts should not reduce quota");
+    AssertEqual(0, WorkSummaryTokenService.CalculateBaseQuotaFromActiveUsers(0), "empty unit should have no base quota");
+    AssertEqual(12, WorkSummaryTokenService.CalculateBaseQuotaFromActiveUsers(12), "unit base quota should equal active users in that unit");
+}
+
+static void SummaryTokenAdminGrantsExtendUnitAllowance()
 {
     AssertEqual(35, WorkSummaryTokenService.CalculateAllowance(30, 5), "grant units should extend the monthly quota");
     AssertEqual(5, WorkSummaryTokenService.CalculateAllowance(0, 5), "grant units should work when base quota is zero");
     AssertEqual(30, WorkSummaryTokenService.CalculateAllowance(30, -5), "negative grants should not reduce allowance");
+
+    var admin = Me("admin", "NORMAL_USER", new List<string> { Roles.ADMIN });
+    var systemAdmin = Me("sysadmin", ManagementAccountKind.SystemAdmin, new List<string> { Roles.SYSTEM_ADMIN });
+    var unitManager = Me(
+        username: "mu_pv01",
+        accountKind: ManagementAccountKind.UnitManager,
+        roles: new List<string> { Roles.ManagerUnit(ObjectId(9)) });
+
+    AssertTrue(WorkSummaryTokenService.CanGrantExtraQuota(admin), "admin should be allowed to grant extra unit quota");
+    AssertTrue(WorkSummaryTokenService.CanGrantExtraQuota(systemAdmin), "system admin should be allowed to grant extra unit quota");
+    AssertFalse(WorkSummaryTokenService.CanGrantExtraQuota(unitManager), "mu should use the unit pool and contact admin for extra quota");
 }
 
 static void SummaryTokenManagerScopeFollowsUnitHierarchy()

@@ -13,7 +13,7 @@ public interface IWorkSummaryTokenService
         CancellationToken ct);
 
     Task<WorkSummaryTokenQuotaResponse> GetQuotaAsync(
-        string ownerUserId,
+        string ownerUnitId,
         string? tokenKind,
         string? periodMonthKey,
         MeResponse actor,

@@ -30,14 +30,15 @@ public sealed class WorkSummaryTokensController : ControllerBase
 
     [HttpGet("quota")]
     public async Task<IActionResult> GetQuota(
-        [FromQuery] string? ownerUserId = null,
+        [FromQuery] string? ownerUnitId = null,
         [FromQuery] string? tokenKind = null,
         [FromQuery] string? periodMonthKey = null,
         CancellationToken ct = default)
-        => Ok(await _tokens.GetQuotaAsync(ownerUserId ?? string.Empty, tokenKind, periodMonthKey, _me.RequireMe(), ct));
+        => Ok(await _tokens.GetQuotaAsync(ownerUnitId ?? string.Empty, tokenKind, periodMonthKey, _me.RequireMe(), ct));
 
     [HttpGet("ledger")]
     public async Task<IActionResult> SearchLedger(
+        [FromQuery] string? ownerUnitId = null,
         [FromQuery] string? ownerUserId = null,
         [FromQuery] string? actorUserId = null,
         [FromQuery] string? issuerUserId = null,
@@ -53,6 +54,7 @@ public sealed class WorkSummaryTokensController : ControllerBase
         CancellationToken ct = default)
         => Ok(await _tokens.SearchLedgerAsync(new WorkSummaryTokenLedgerSearchRequest
         {
+            OwnerUnitId = ownerUnitId,
             OwnerUserId = ownerUserId,
             ActorUserId = actorUserId,
             IssuerUserId = issuerUserId,

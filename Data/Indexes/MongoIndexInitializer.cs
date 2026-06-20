@@ -1902,10 +1902,10 @@
             CancellationToken ct)
         {
             await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
-                name: "ix_workSummaryTokenLedgers_owner_month_kind",
+                name: "ix_workSummaryTokenLedgers_ownerUnit_month_kind",
                 key: new BsonDocument
                 {
-                    { "ownerUserId", 1 },
+                    { "ownerUnitId", 1 },
                     { "periodMonthKey", 1 },
                     { "tokenKind", 1 },
                     { "direction", 1 },

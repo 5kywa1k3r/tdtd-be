@@ -1,6 +1,5 @@
 using System.Globalization;
 using System.Text.RegularExpressions;
-using Microsoft.Extensions.Options;
 using MongoDB.Bson;
 using MongoDB.Driver;
 using tdtd_be.Common.Auth;
@@ -10,7 +9,6 @@ using tdtd_be.DTOs.Auth;
 using tdtd_be.DTOs.Common;
 using tdtd_be.DTOs.WorkAssignments.SummaryTokens;
 using tdtd_be.Models;
-using tdtd_be.Options;
 
 namespace tdtd_be.Services.WorkAssignments.SummaryTokens;
 
@@ -20,14 +18,10 @@ public sealed class WorkSummaryTokenService : IWorkSummaryTokenService
     private static readonly Regex MonthKeyRegex = new(@"^\d{4}-(0[1-9]|1[0-2])$", RegexOptions.Compiled);
 
     private readonly MongoDbContext _ctx;
-    private readonly SummaryTokenOptions _options;
 
-    public WorkSummaryTokenService(
-        MongoDbContext ctx,
-        IOptions<SummaryTokenOptions> options)
+    public WorkSummaryTokenService(MongoDbContext ctx)
     {
         _ctx = ctx;
-        _options = options.Value;
     }
 
     public async Task<WorkSummaryTokenGrantResponse> GrantAsync(
@@ -38,7 +32,7 @@ public sealed class WorkSummaryTokenService : IWorkSummaryTokenService
         EnsureActor(issuer);
         request ??= new WorkSummaryTokenGrantRequest();
 
-        var ownerUserId = NormalizeRequired(request.OwnerUserId, "ownerUserId");
+        var ownerUnitId = NormalizeRequired(request.OwnerUnitId, "ownerUnitId");
         var units = request.Units;
         if (units <= 0 || units > MaxGrantUnits)
         {
@@ -49,31 +43,31 @@ public sealed class WorkSummaryTokenService : IWorkSummaryTokenService
 
         var tokenKind = NormalizeTokenKind(request.TokenKind);
         var monthKey = NormalizeMonthKey(request.PeriodMonthKey);
-        var owner = await LoadUserAsync(ownerUserId, ct);
-        await EnsureCanGrantToOwnerAsync(issuer, owner, ct);
+        var ownerUnit = await LoadUnitRequiredAsync(ownerUnitId, ct);
+        EnsureCanGrantExtraQuota(issuer, ownerUnit);
 
         var now = DateTime.UtcNow;
         var grantedBefore = await CountMonthlyUnitsAsync(
-            owner.Id,
+            ownerUnit.Id,
             monthKey,
             tokenKind,
             WorkSummaryTokenDirections.Grant,
             WorkSummaryTokenOutcomes.Success,
             ct);
         var used = await CountMonthlyUnitsAsync(
-            owner.Id,
+            ownerUnit.Id,
             monthKey,
             tokenKind,
             WorkSummaryTokenDirections.Consume,
             WorkSummaryTokenOutcomes.Success,
             ct);
-        var baseQuota = BaseMonthlyQuota();
-        var quota = BuildQuota(owner.Id, tokenKind, monthKey, baseQuota, grantedBefore + units, used);
+        var baseQuota = await CountActiveUsersInUnitAsync(ownerUnit.Id, ct);
+        var quota = BuildQuota(ownerUnit.Id, tokenKind, monthKey, baseQuota, grantedBefore + units, used);
 
         var ledger = new WorkSummaryTokenLedger
         {
             Id = ObjectId.GenerateNewId().ToString(),
-            OwnerUserId = owner.Id,
+            OwnerUnitId = ownerUnit.Id,
             ActorUserId = issuer.Id,
             IssuerUserId = issuer.Id,
             TokenKind = tokenKind,
@@ -95,7 +89,7 @@ public sealed class WorkSummaryTokenService : IWorkSummaryTokenService
         return new WorkSummaryTokenGrantResponse
         {
             LedgerId = ledger.Id,
-            OwnerUserId = owner.Id,
+            OwnerUnitId = ownerUnit.Id,
             IssuerUserId = issuer.Id,
             TokenKind = tokenKind,
             PeriodMonthKey = monthKey,
@@ -106,20 +100,22 @@ public sealed class WorkSummaryTokenService : IWorkSummaryTokenService
     }
 
     public async Task<WorkSummaryTokenQuotaResponse> GetQuotaAsync(
-        string ownerUserId,
+        string ownerUnitId,
         string? tokenKind,
         string? periodMonthKey,
         MeResponse actor,
         CancellationToken ct)
     {
         EnsureActor(actor);
-        var ownerId = string.IsNullOrWhiteSpace(ownerUserId) ? actor.Id : ownerUserId.Trim();
-        var owner = await LoadUserAsync(ownerId, ct);
-        await EnsureCanReadOwnerAsync(actor, owner, ct);
+        var unitId = string.IsNullOrWhiteSpace(ownerUnitId)
+            ? NormalizeRequired(actor.UnitId, "ownerUnitId")
+            : ownerUnitId.Trim();
+        var ownerUnit = await LoadUnitRequiredAsync(unitId, ct);
+        await EnsureCanReadUnitPoolAsync(actor, ownerUnit, ct);
 
         var kind = NormalizeTokenKind(tokenKind);
         var monthKey = NormalizeMonthKey(periodMonthKey);
-        return await BuildQuotaAsync(owner.Id, kind, monthKey, ct);
+        return await BuildQuotaAsync(ownerUnit.Id, kind, monthKey, ct);
     }
 
     public async Task<PagedResult<WorkSummaryTokenLedgerRow>> SearchLedgerAsync(
@@ -136,21 +132,20 @@ public sealed class WorkSummaryTokenService : IWorkSummaryTokenService
         var filter = fb.Eq(x => x.IsDeleted, false);
         var canReadAll = CanReadAllLedgers(actor);
 
-        var ownerUserId = NormalizeOptionalText(request.OwnerUserId);
-        if (ownerUserId is not null)
+        var ownerUnitId = NormalizeOptionalText(request.OwnerUnitId);
+        if (ownerUnitId is not null)
         {
-            var owner = await LoadUserAsync(ownerUserId, ct);
-            await EnsureCanReadOwnerAsync(actor, owner, ct);
-            filter &= fb.Eq(x => x.OwnerUserId, owner.Id);
+            var ownerUnit = await LoadUnitRequiredAsync(ownerUnitId, ct);
+            await EnsureCanReadUnitPoolAsync(actor, ownerUnit, ct);
+            filter &= fb.Eq(x => x.OwnerUnitId, ownerUnit.Id);
         }
         else if (!canReadAll)
         {
-            filter &= fb.Or(
-                fb.Eq(x => x.OwnerUserId, actor.Id),
-                fb.Eq(x => x.ActorUserId, actor.Id),
-                fb.Eq(x => x.IssuerUserId, actor.Id));
+            var actorUnitId = NormalizeRequired(actor.UnitId, "ownerUnitId");
+            filter &= fb.Eq(x => x.OwnerUnitId, actorUnitId);
         }
 
+        filter &= EqIfNotBlank(fb, x => x.OwnerUserId, request.OwnerUserId);
         filter &= EqIfNotBlank(fb, x => x.ActorUserId, request.ActorUserId);
         filter &= EqIfNotBlank(fb, x => x.IssuerUserId, request.IssuerUserId);
         filter &= EqIfNotBlank(fb, x => x.PeriodMonthKey, request.PeriodMonthKey);
@@ -203,7 +198,9 @@ public sealed class WorkSummaryTokenService : IWorkSummaryTokenService
         var tokenKind = WorkSummaryTokenKinds.AdvancedSummaryConfigLock;
         var isFree = existingLockedConfigCount <= 0;
         var units = isFree ? 0 : 1;
-        var quota = await BuildQuotaAsync(actorUserId, tokenKind, monthKey, ct);
+        var actor = await LoadUserAsync(actorUserId, ct);
+        var actorUnitId = NormalizeRequired(actor.UnitId, "ownerUnitId");
+        var quota = await BuildQuotaAsync(actorUnitId, tokenKind, monthKey, ct);
         var usedBefore = quota.UsedUnits;
 
         if (WouldExceedQuota(usedBefore, units, quota.MonthlyQuota))
@@ -213,6 +210,7 @@ public sealed class WorkSummaryTokenService : IWorkSummaryTokenService
                 new
                 {
                     actorUserId,
+                    ownerUnitId = actorUnitId,
                     monthKey,
                     monthlyQuota = quota.MonthlyQuota,
                     baseMonthlyQuota = quota.BaseMonthlyQuota,
@@ -232,6 +230,7 @@ public sealed class WorkSummaryTokenService : IWorkSummaryTokenService
         {
             Id = ObjectId.GenerateNewId().ToString(),
             OwnerUserId = actorUserId,
+            OwnerUnitId = actorUnitId,
             ActorUserId = actorUserId,
             TokenKind = tokenKind,
             Direction = isFree ? WorkSummaryTokenDirections.Free : WorkSummaryTokenDirections.Consume,
@@ -292,32 +291,32 @@ public sealed class WorkSummaryTokenService : IWorkSummaryTokenService
     }
 
     private async Task<WorkSummaryTokenQuotaResponse> BuildQuotaAsync(
-        string ownerUserId,
+        string ownerUnitId,
         string tokenKind,
         string monthKey,
         CancellationToken ct)
     {
-        var baseQuota = BaseMonthlyQuota();
+        var baseQuota = await CountActiveUsersInUnitAsync(ownerUnitId, ct);
         var granted = await CountMonthlyUnitsAsync(
-            ownerUserId,
+            ownerUnitId,
             monthKey,
             tokenKind,
             WorkSummaryTokenDirections.Grant,
             WorkSummaryTokenOutcomes.Success,
             ct);
         var used = await CountMonthlyUnitsAsync(
-            ownerUserId,
+            ownerUnitId,
             monthKey,
             tokenKind,
             WorkSummaryTokenDirections.Consume,
             WorkSummaryTokenOutcomes.Success,
             ct);
 
-        return BuildQuota(ownerUserId, tokenKind, monthKey, baseQuota, granted, used);
+        return BuildQuota(ownerUnitId, tokenKind, monthKey, baseQuota, granted, used);
     }
 
     private async Task<int> CountMonthlyUnitsAsync(
-        string ownerUserId,
+        string ownerUnitId,
         string monthKey,
         string tokenKind,
         string direction,
@@ -325,7 +324,7 @@ public sealed class WorkSummaryTokenService : IWorkSummaryTokenService
         CancellationToken ct)
     {
         var fb = Builders<WorkSummaryTokenLedger>.Filter;
-        var filter = fb.Eq(x => x.OwnerUserId, ownerUserId)
+        var filter = fb.Eq(x => x.OwnerUnitId, ownerUnitId)
                      & fb.Eq(x => x.PeriodMonthKey, monthKey)
                      & fb.Eq(x => x.TokenKind, tokenKind)
                      & fb.Eq(x => x.Direction, direction)
@@ -360,46 +359,41 @@ public sealed class WorkSummaryTokenService : IWorkSummaryTokenService
             .FirstOrDefaultAsync(ct);
     }
 
-    private async Task EnsureCanReadOwnerAsync(MeResponse actor, AppUser owner, CancellationToken ct)
+    private async Task<Unit> LoadUnitRequiredAsync(string unitId, CancellationToken ct)
     {
-        if (string.Equals(actor.Id, owner.Id, StringComparison.Ordinal))
+        var id = NormalizeRequired(unitId, "ownerUnitId");
+        return await LoadUnitAsync(id, ct)
+            ?? throw AppExceptionFactory.NotFound(AppErrorCode.COMMON_NOT_FOUND, new { ownerUnitId = id });
+    }
+
+    private static void EnsureCanGrantExtraQuota(MeResponse issuer, Unit ownerUnit)
+    {
+        if (CanGrantExtraQuota(issuer))
             return;
 
+        throw GrantForbidden("adminRequiredForExtraGrant", issuer.Id, ownerUnit.Id);
+    }
+
+    private async Task EnsureCanReadUnitPoolAsync(MeResponse actor, Unit ownerUnit, CancellationToken ct)
+    {
         if (CanReadAllLedgers(actor))
             return;
 
-        if (await IsOwnerInManagementScopeAsync(actor, owner, ct))
+        if (!string.IsNullOrWhiteSpace(actor.UnitId) &&
+            string.Equals(actor.UnitId, ownerUnit.Id, StringComparison.Ordinal))
             return;
 
-        throw GrantForbidden("readOwnerOutsideScope", actor.Id, owner.Id);
+        if (await IsUnitInManagementScopeAsync(actor, ownerUnit, ct))
+            return;
+
+        throw GrantForbidden("readUnitOutsideScope", actor.Id, ownerUnit.Id);
     }
 
-    private async Task EnsureCanGrantToOwnerAsync(MeResponse issuer, AppUser owner, CancellationToken ct)
-    {
-        if (string.Equals(issuer.Id, owner.Id, StringComparison.Ordinal))
-            throw GrantForbidden("selfGrant", issuer.Id, owner.Id);
-
-        if (CanReadAllLedgers(issuer))
-            return;
-
-        if (IsPrivilegedUser(owner))
-            throw GrantForbidden("targetPrivileged", issuer.Id, owner.Id);
-
-        if (await IsOwnerInManagementScopeAsync(issuer, owner, ct))
-            return;
-
-        throw GrantForbidden("targetOutsideScope", issuer.Id, owner.Id);
-    }
-
-    private async Task<bool> IsOwnerInManagementScopeAsync(
+    private async Task<bool> IsUnitInManagementScopeAsync(
         MeResponse actor,
-        AppUser owner,
+        Unit ownerUnit,
         CancellationToken ct)
     {
-        var ownerUnit = await LoadUnitAsync(owner.UnitId, ct);
-        if (ownerUnit is null)
-            return false;
-
         if (RoleGuard.TryGetManagerUnit(actor, out var managedUnitId))
         {
             var scopeUnit = await LoadUnitAsync(managedUnitId, ct);
@@ -418,6 +412,14 @@ public sealed class WorkSummaryTokenService : IWorkSummaryTokenService
         }
 
         return false;
+    }
+
+    private async Task<int> CountActiveUsersInUnitAsync(string unitId, CancellationToken ct)
+    {
+        var activeUsers = await _ctx.Users.CountDocumentsAsync(
+            x => x.UnitId == unitId && !x.IsDeleted,
+            cancellationToken: ct);
+        return CalculateBaseQuotaFromActiveUsers((int)activeUsers);
     }
 
     private async Task<ManagerLevelScope> ResolveManagerLevelScopeAsync(
@@ -447,7 +449,7 @@ public sealed class WorkSummaryTokenService : IWorkSummaryTokenService
     }
 
     private static WorkSummaryTokenQuotaResponse BuildQuota(
-        string ownerUserId,
+        string ownerUnitId,
         string tokenKind,
         string monthKey,
         int baseMonthlyQuota,
@@ -457,7 +459,7 @@ public sealed class WorkSummaryTokenService : IWorkSummaryTokenService
         var monthlyQuota = CalculateAllowance(baseMonthlyQuota, grantedUnits);
         return new WorkSummaryTokenQuotaResponse
         {
-            OwnerUserId = ownerUserId,
+            OwnerUnitId = ownerUnitId,
             TokenKind = tokenKind,
             PeriodMonthKey = monthKey,
             BaseMonthlyQuota = Math.Max(0, baseMonthlyQuota),
@@ -473,6 +475,7 @@ public sealed class WorkSummaryTokenService : IWorkSummaryTokenService
         {
             Id = x.Id,
             OwnerUserId = x.OwnerUserId,
+            OwnerUnitId = x.OwnerUnitId,
             ActorUserId = x.ActorUserId,
             IssuerUserId = x.IssuerUserId,
             TokenKind = x.TokenKind,
@@ -496,9 +499,6 @@ public sealed class WorkSummaryTokenService : IWorkSummaryTokenService
             UpdatedAtUtc = x.UpdatedAtUtc
         };
 
-    private int BaseMonthlyQuota()
-        => Math.Max(0, _options.MonthlyQuota);
-
     internal static string ToMonthKey(DateTime value)
         => value.ToUniversalTime().ToString("yyyy-MM", CultureInfo.InvariantCulture);
 
@@ -507,6 +507,12 @@ public sealed class WorkSummaryTokenService : IWorkSummaryTokenService
 
     internal static int CalculateAllowance(int baseMonthlyQuota, int grantedUnits)
         => Math.Max(0, baseMonthlyQuota) + Math.Max(0, grantedUnits);
+
+    internal static int CalculateBaseQuotaFromActiveUsers(int activeUserCount)
+        => Math.Max(0, activeUserCount);
+
+    internal static bool CanGrantExtraQuota(MeResponse actor)
+        => RoleGuard.IsAdmin(actor) || RoleGuard.IsSystemAdmin(actor);
 
     internal static bool IsSameOrDescendantUnit(Unit scopeUnit, Unit targetUnit)
     {
@@ -528,12 +534,6 @@ public sealed class WorkSummaryTokenService : IWorkSummaryTokenService
 
     private static bool CanReadAllLedgers(MeResponse actor)
         => RoleGuard.IsAdmin(actor) || RoleGuard.IsSystemAdmin(actor);
-
-    private static bool IsPrivilegedUser(AppUser user)
-        => user.Roles?.Any(x =>
-               string.Equals(x, Roles.ADMIN, StringComparison.OrdinalIgnoreCase) ||
-               string.Equals(x, Roles.SYSTEM_ADMIN, StringComparison.OrdinalIgnoreCase)) == true ||
-           string.Equals(user.AccountKind, ManagementAccountKind.SystemAdmin, StringComparison.OrdinalIgnoreCase);
 
     private static string NormalizeTokenKind(string? value)
     {
@@ -603,10 +603,10 @@ public sealed class WorkSummaryTokenService : IWorkSummaryTokenService
             throw AppExceptionFactory.Unauthorized(AppErrorCode.AUTH_ME_NOT_AVAILABLE);
     }
 
-    private static AppException GrantForbidden(string reason, string? actorUserId, string? ownerUserId)
+    private static AppException GrantForbidden(string reason, string? actorUserId, string? ownerUnitId)
         => AppExceptionFactory.Forbidden(
             AppErrorCode.WORK_SUMMARY_TOKEN_GRANT_FORBIDDEN,
-            new { reason, actorUserId, ownerUserId });
+            new { reason, actorUserId, ownerUnitId });
 
     private sealed record ManagerLevelScope(Unit? Unit, int Level, bool IsLevelWide);
 }

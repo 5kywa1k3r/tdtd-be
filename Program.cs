@@ -68,7 +68,6 @@ builder.Services.Configure<MongoOptions>(builder.Configuration.GetSection("Mongo
 builder.Services.Configure<JwtOptions>(builder.Configuration.GetSection("Jwt"));
 builder.Services.Configure<UploadOptions>(builder.Configuration.GetSection("Uploads"));
 builder.Services.Configure<WorkAssignmentScopeOptions>(builder.Configuration.GetSection("WorkAssignmentScope"));
-builder.Services.Configure<SummaryTokenOptions>(builder.Configuration.GetSection("SummaryToken"));
 builder.Services.Configure<ForwardedHeadersOptions>(opt =>
 {
     opt.ForwardedHeaders =
