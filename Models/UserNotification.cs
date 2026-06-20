@@ -27,6 +27,7 @@ public static class UserNotificationTypes
     public const string DynamicFormStatisticRebuild = "DYNAMIC_FORM_STATISTIC_REBUILD";
     public const string BasicSummaryRefresh = "BASIC_SUMMARY_REFRESH";
     public const string AdvancedSummaryPreview = "ADVANCED_SUMMARY_PREVIEW";
+    public const string AdvancedSummaryHierarchyBuild = "ADVANCED_SUMMARY_HIERARCHY_BUILD";
 }
 
 public static class UserNotificationSeverities

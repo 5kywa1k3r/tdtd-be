@@ -13,10 +13,14 @@ namespace tdtd_be.Controllers;
 public sealed class WorkAssignmentAdvancedSummaryController : ControllerBase
 {
     private readonly IWorkAssignmentAdvancedSummaryConfigService _configs;
+    private readonly IWorkAssignmentAdvancedSummaryHierarchyService _hierarchy;
 
-    public WorkAssignmentAdvancedSummaryController(IWorkAssignmentAdvancedSummaryConfigService configs)
+    public WorkAssignmentAdvancedSummaryController(
+        IWorkAssignmentAdvancedSummaryConfigService configs,
+        IWorkAssignmentAdvancedSummaryHierarchyService hierarchy)
     {
         _configs = configs;
+        _hierarchy = hierarchy;
     }
 
     [HttpGet("assignments/{assignmentId}/templates/{dynamicFormTemplateId}/sections/{sectionId}/configs")]
@@ -63,6 +67,18 @@ public sealed class WorkAssignmentAdvancedSummaryController : ControllerBase
     {
         var actorUserId = GetActorUserId();
         var result = await _configs.RequestPreviewAsync(configId, req ?? new PreviewWorkAssignmentAdvancedSummaryConfigRequest(), actorUserId, ct);
+        return Ok(result);
+    }
+
+    [HttpPost("configs/{configId}/hierarchy/day/{dayKey}/build")]
+    public async Task<IActionResult> BuildDayNode(
+        [FromRoute] string configId,
+        [FromRoute] string dayKey,
+        [FromBody] BuildWorkAssignmentAdvancedSummaryDayNodeRequest req,
+        CancellationToken ct)
+    {
+        var actorUserId = GetActorUserId();
+        var result = await _hierarchy.RequestDayNodeBuildAsync(configId, dayKey, req ?? new BuildWorkAssignmentAdvancedSummaryDayNodeRequest(), actorUserId, ct);
         return Ok(result);
     }
 

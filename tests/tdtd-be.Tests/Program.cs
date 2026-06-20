@@ -106,6 +106,7 @@ var tests = new (string Name, Action Run)[]
     ("advanced summary preview blocks unsupported range condition", AdvancedSummaryPreviewBlocksUnsupportedRangeCondition),
     ("advanced summary field gate enforces section limits", AdvancedSummaryFieldGateEnforcesSectionLimits),
     ("advanced summary hierarchy keys roll up day month year", AdvancedSummaryHierarchyKeysRollUpDayMonthYear),
+    ("advanced summary day node source day uses completed date first", AdvancedSummaryDayNodeSourceDayUsesCompletedDateFirst),
     ("legacy work basis file resolves as work document", ResolvesLegacyWorkBasisFileAsWorkDocument),
     ("assignment file resolves as assignment branch document", ResolvesAssignmentFileAsBranchDocument),
     ("assignment document path resolves ancestors only", ResolvesAssignmentDocumentAncestorsFromPath),
@@ -3322,8 +3323,10 @@ static void AdvancedSummaryFieldGateEnforcesSectionLimits()
 static void AdvancedSummaryHierarchyKeysRollUpDayMonthYear()
 {
     var date = new DateTime(2026, 6, 20, 13, 45, 0, DateTimeKind.Utc);
+    var dateOnly = new DateTime(2026, 6, 20, 0, 0, 0, DateTimeKind.Unspecified);
 
     AssertEqual("2026-06-20", AdvancedSummaryHierarchyKeyHelper.ToDayKey(date), "day key should be yyyy-MM-dd");
+    AssertEqual("2026-06-20", AdvancedSummaryHierarchyKeyHelper.ToDayKey(dateOnly), "date-only unspecified values should not shift day key");
     AssertEqual("2026-06", AdvancedSummaryHierarchyKeyHelper.ToMonthKey("2026-06-20"), "day should roll up to month key");
     AssertEqual("2026", AdvancedSummaryHierarchyKeyHelper.ToYearKeyFromMonth("2026-06"), "month should roll up to year key");
 
@@ -3334,6 +3337,31 @@ static void AdvancedSummaryHierarchyKeysRollUpDayMonthYear()
     var year = AdvancedSummaryHierarchyKeyHelper.GetYearBoundsUtc("2024");
     AssertEqual(new DateTime(2024, 1, 1, 0, 0, 0, DateTimeKind.Utc), year.StartUtc, "year start should be utc Jan 1");
     AssertEqual(new DateTime(2025, 1, 1, 0, 0, 0, DateTimeKind.Utc), year.EndExclusiveUtc, "year end should be exclusive next year");
+}
+
+static void AdvancedSummaryDayNodeSourceDayUsesCompletedDateFirst()
+{
+    var report = new WorkAssignmentReport
+    {
+        CompletedDate = new DateTime(2026, 1, 5, 0, 0, 0, DateTimeKind.Unspecified),
+        PeriodKey = "2026-01-07",
+        PeriodStart = new DateTime(2026, 1, 8, 0, 0, 0, DateTimeKind.Utc),
+        ReportDate = new DateTime(2026, 1, 9, 0, 0, 0, DateTimeKind.Utc),
+        ApprovedAtUtc = new DateTime(2026, 1, 10, 0, 0, 0, DateTimeKind.Utc)
+    };
+
+    var completedDay = InvokePrivateStatic<string>(
+        typeof(WorkAssignmentAdvancedSummaryHierarchyService),
+        "ResolveReportSourceDayKey",
+        report);
+    AssertEqual("2026-01-05", completedDay, "completed date should define source day before period metadata");
+
+    report.CompletedDate = null;
+    var periodDay = InvokePrivateStatic<string>(
+        typeof(WorkAssignmentAdvancedSummaryHierarchyService),
+        "ResolveReportSourceDayKey",
+        report);
+    AssertEqual("2026-01-07", periodDay, "period key should define source day when completed date is missing");
 }
 
 static void ResolvesLegacyWorkBasisFileAsWorkDocument()

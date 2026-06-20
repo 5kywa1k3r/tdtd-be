@@ -9,10 +9,10 @@ public static class AdvancedSummaryHierarchyKeyHelper
     private const string YearFormat = "yyyy";
 
     public static string ToDayKey(DateTime value)
-        => value.ToUniversalTime().ToString(DayFormat, CultureInfo.InvariantCulture);
+        => ToUtcDate(value).ToString(DayFormat, CultureInfo.InvariantCulture);
 
     public static string ToMonthKey(DateTime value)
-        => value.ToUniversalTime().ToString(MonthFormat, CultureInfo.InvariantCulture);
+        => ToUtcDate(value).ToString(MonthFormat, CultureInfo.InvariantCulture);
 
     public static string ToMonthKey(string dayKey)
     {
@@ -21,7 +21,7 @@ public static class AdvancedSummaryHierarchyKeyHelper
     }
 
     public static string ToYearKey(DateTime value)
-        => value.ToUniversalTime().ToString(YearFormat, CultureInfo.InvariantCulture);
+        => ToUtcDate(value).ToString(YearFormat, CultureInfo.InvariantCulture);
 
     public static string ToYearKeyFromDay(string dayKey)
     {
@@ -97,4 +97,9 @@ public static class AdvancedSummaryHierarchyKeyHelper
         var start = ParseYearKey(yearKey);
         return (start, start.AddYears(1));
     }
+
+    private static DateTime ToUtcDate(DateTime value)
+        => value.Kind == DateTimeKind.Unspecified
+            ? DateTime.SpecifyKind(value.Date, DateTimeKind.Utc)
+            : value.ToUniversalTime().Date;
 }
