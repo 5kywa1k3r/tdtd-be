@@ -44,6 +44,7 @@ using tdtd_be.Services.WorkAssignments.Progress;
 using tdtd_be.Services.WorkAssignments.Queue;
 using tdtd_be.Services.WorkAssignments.Review;
 using tdtd_be.Services.WorkAssignments.Runtime;
+using tdtd_be.Services.WorkAssignments.SummaryTokens;
 using tdtd_be.Services.Notifications;
 using tdtd_be.Services.WorkDocuments;
 using tdtd_be.Services.Works;
@@ -67,6 +68,7 @@ builder.Services.Configure<MongoOptions>(builder.Configuration.GetSection("Mongo
 builder.Services.Configure<JwtOptions>(builder.Configuration.GetSection("Jwt"));
 builder.Services.Configure<UploadOptions>(builder.Configuration.GetSection("Uploads"));
 builder.Services.Configure<WorkAssignmentScopeOptions>(builder.Configuration.GetSection("WorkAssignmentScope"));
+builder.Services.Configure<SummaryTokenOptions>(builder.Configuration.GetSection("SummaryToken"));
 builder.Services.Configure<ForwardedHeadersOptions>(opt =>
 {
     opt.ForwardedHeaders =
@@ -246,6 +248,7 @@ builder.Services.AddScoped<IWorkAssignmentBasicSummaryService, WorkAssignmentBas
 builder.Services.AddScoped<IWorkAssignmentAdvancedSummaryConfigService, WorkAssignmentAdvancedSummaryConfigService>();
 builder.Services.AddScoped<IWorkAssignmentAdvancedSummaryHierarchyService, WorkAssignmentAdvancedSummaryHierarchyService>();
 builder.Services.AddScoped<IWorkAssignmentAdvancedSummaryDirtyService, WorkAssignmentAdvancedSummaryDirtyService>();
+builder.Services.AddScoped<IWorkSummaryTokenService, WorkSummaryTokenService>();
 
 builder.Services.AddScoped<IWorkAssignmentRuntimeMaterializeService, WorkAssignmentRuntimeMaterializeService>();
 builder.Services.AddScoped<IWorkAssignmentQueueService, WorkAssignmentQueueService>();

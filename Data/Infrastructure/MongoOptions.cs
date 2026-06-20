@@ -29,6 +29,7 @@
         public string WorkAssignmentAdvancedSummaryDayNodeCollection { get; set; } = "work_assignment_advanced_summary_day_nodes";
         public string WorkAssignmentAdvancedSummaryMonthNodeCollection { get; set; } = "work_assignment_advanced_summary_month_nodes";
         public string WorkAssignmentAdvancedSummaryYearNodeCollection { get; set; } = "work_assignment_advanced_summary_year_nodes";
+        public string WorkSummaryTokenLedgerCollection { get; set; } = "work_summary_token_ledgers";
         public string WorkTemplateAssigneeCollection { get; set; } = "work_template_assignees";
         public string DocRoleCollection { get; set; } = "doc_roles";
         public string WorkListDocRoleCollection { get; set; } = "work_list_doc_roles";

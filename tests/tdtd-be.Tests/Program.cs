@@ -17,6 +17,7 @@ using tdtd_be.Services.WorkAssignments.AdvancedSummary;
 using tdtd_be.Services.WorkAssignments.BasicSummary;
 using tdtd_be.Services.WorkAssignments.Internal;
 using tdtd_be.Services.WorkAssignments.Runtime;
+using tdtd_be.Services.WorkAssignments.SummaryTokens;
 using tdtd_be.Services.WorkDocuments;
 using tdtd_be.Services.Works;
 using tdtd_be.Uploads;
@@ -115,6 +116,8 @@ var tests = new (string Name, Action Run)[]
     ("advanced summary hierarchy rollup merges child fields", AdvancedSummaryHierarchyRollupMergesChildFields),
     ("advanced summary hierarchy rollup requires clean children", AdvancedSummaryHierarchyRollupRequiresCleanChildren),
     ("advanced summary hierarchy query plans largest grains", AdvancedSummaryHierarchyQueryPlansLargestGrains),
+    ("summary token month key uses utc month", SummaryTokenMonthKeyUsesUtcMonth),
+    ("summary token quota boundary allows free initial lock", SummaryTokenQuotaBoundaryAllowsFreeInitialLock),
     ("legacy work basis file resolves as work document", ResolvesLegacyWorkBasisFileAsWorkDocument),
     ("assignment file resolves as assignment branch document", ResolvesAssignmentFileAsBranchDocument),
     ("assignment document path resolves ancestors only", ResolvesAssignmentDocumentAncestorsFromPath),
@@ -3598,6 +3601,28 @@ static void AdvancedSummaryHierarchyQueryPlansLargestGrains()
         },
         keys,
         "query planner should use the largest exact day/month/year spans");
+}
+
+static void SummaryTokenMonthKeyUsesUtcMonth()
+{
+    var localKindDate = new DateTime(2026, 6, 20, 23, 0, 0, DateTimeKind.Utc);
+
+    AssertEqual("2026-06", WorkSummaryTokenService.ToMonthKey(localKindDate), "token period should use utc yyyy-MM");
+}
+
+static void SummaryTokenQuotaBoundaryAllowsFreeInitialLock()
+{
+    AssertFalse(
+        WorkSummaryTokenService.WouldExceedQuota(30, 0, 30),
+        "free initial advanced config lock should not consume quota");
+
+    AssertFalse(
+        WorkSummaryTokenService.WouldExceedQuota(29, 1, 30),
+        "last available monthly token should be consumable");
+
+    AssertTrue(
+        WorkSummaryTokenService.WouldExceedQuota(30, 1, 30),
+        "next config change after quota exhaustion should be blocked");
 }
 
 static void ResolvesLegacyWorkBasisFileAsWorkDocument()

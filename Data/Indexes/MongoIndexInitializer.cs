@@ -142,6 +142,9 @@
                 "yearKey",
                 ct);
 
+            var workSummaryTokenLedgers = db.GetCollection<WorkSummaryTokenLedger>(opt.WorkSummaryTokenLedgerCollection);
+            await EnsureWorkSummaryTokenLedgersAsync(workSummaryTokenLedgers, ct);
+
             // WORK TEMPLATE ASSIGNEES
             var workTemplateAssignees = db.GetCollection<WorkTemplateAssignee>(opt.WorkTemplateAssigneeCollection);
             await EnsureWorkTemplateAssigneesAsync(workTemplateAssignees, ct);
@@ -1889,6 +1892,48 @@
                 key: new BsonDocument
                 {
                     { "buildCorrelationId", 1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
+        }
+
+        private static async Task EnsureWorkSummaryTokenLedgersAsync(
+            IMongoCollection<WorkSummaryTokenLedger> col,
+            CancellationToken ct)
+        {
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_workSummaryTokenLedgers_owner_month_kind",
+                key: new BsonDocument
+                {
+                    { "ownerUserId", 1 },
+                    { "periodMonthKey", 1 },
+                    { "tokenKind", 1 },
+                    { "direction", 1 },
+                    { "outcome", 1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_workSummaryTokenLedgers_scope_config",
+                key: new BsonDocument
+                {
+                    { "workId", 1 },
+                    { "workAssignmentId", 1 },
+                    { "dynamicFormTemplateId", 1 },
+                    { "sectionId", 1 },
+                    { "configId", 1 },
+                    { "createdAtUtc", -1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_workSummaryTokenLedgers_actor_created",
+                key: new BsonDocument
+                {
+                    { "actorUserId", 1 },
+                    { "createdAtUtc", -1 },
                     { "isDeleted", 1 }
                 }
             ), ct);

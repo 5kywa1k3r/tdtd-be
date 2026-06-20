@@ -13,6 +13,7 @@ using tdtd_be.Models;
 using tdtd_be.Models.Enums;
 using tdtd_be.Services.Notifications;
 using tdtd_be.Services.WorkAssignmentReports.Payloads;
+using tdtd_be.Services.WorkAssignments.SummaryTokens;
 
 namespace tdtd_be.Services.WorkAssignments.AdvancedSummary;
 
@@ -41,17 +42,20 @@ public sealed class WorkAssignmentAdvancedSummaryConfigService : IWorkAssignment
     private readonly IBackgroundJobClient _backgroundJobs;
     private readonly IWorkReportPayloadReader _payloadReader;
     private readonly INotificationService _notifications;
+    private readonly IWorkSummaryTokenService _summaryTokens;
 
     public WorkAssignmentAdvancedSummaryConfigService(
         MongoDbContext ctx,
         IBackgroundJobClient backgroundJobs,
         IWorkReportPayloadReader payloadReader,
-        INotificationService notifications)
+        INotificationService notifications,
+        IWorkSummaryTokenService summaryTokens)
     {
         _ctx = ctx;
         _backgroundJobs = backgroundJobs;
         _payloadReader = payloadReader;
         _notifications = notifications;
+        _summaryTokens = summaryTokens;
     }
 
     public async Task<List<WorkAssignmentAdvancedSummaryConfigDto>> ListConfigsAsync(
@@ -198,29 +202,43 @@ public sealed class WorkAssignmentAdvancedSummaryConfigService : IWorkAssignment
 
         EnsureFieldGateAllowsAdvanced(gate);
 
-        if (lockedCount > 0)
-        {
-            throw AppExceptionFactory.BadRequest(
-                AppErrorCode.COMMON_VALIDATION_FAILED,
-                new
-                {
-                    configId,
-                    tokenId = req?.TokenId,
-                    reason = "ADVANCED_SUMMARY_TOKEN_REQUIRED"
-                },
-                "Changing a locked Advanced summary config requires token governance in a later phase.");
-        }
+        var token = await _summaryTokens.ConsumeAdvancedConfigLockAsync(
+            entity,
+            lockedCount,
+            actorUserId,
+            req?.TokenId,
+            ct);
 
         var now = DateTime.UtcNow;
         entity.Status = WorkAssignmentAdvancedSummaryConfigStatuses.Locked;
         entity.VersionNo = await NextVersionNoAsync(context.Scope.Id, context.Template.Id, context.Section.Id, ct);
         entity.LockedAtUtc = now;
         entity.LockedByUserId = actorUserId;
-        entity.LockTokenId = null;
+        entity.LockTokenId = token.LedgerId;
         entity.UpdatedAtUtc = now;
         entity.UpdatedByUserId = actorUserId;
 
-        await _ctx.WorkAssignmentAdvancedSummaryConfigs.ReplaceOneAsync(x => x.Id == entity.Id, entity, cancellationToken: ct);
+        try
+        {
+            await _ctx.WorkAssignmentAdvancedSummaryConfigs.ReplaceOneAsync(x => x.Id == entity.Id, entity, cancellationToken: ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            try
+            {
+                await _summaryTokens.MarkFailedAsync(
+                    token.LedgerId,
+                    actorUserId,
+                    $"ADVANCED_SUMMARY_CONFIG_LOCK_FAILED: {ex.Message}",
+                    ct);
+            }
+            catch
+            {
+                // Preserve the original lock failure; the ledger can be repaired from operation logs.
+            }
+
+            throw;
+        }
 
         return Map(entity, lockedCount + 1, gate);
     }
@@ -1518,7 +1536,6 @@ public sealed class WorkAssignmentAdvancedSummaryConfigService : IWorkAssignment
             CanPreview = x.Status == WorkAssignmentAdvancedSummaryConfigStatuses.Draft && !gateBlocked,
             CanLock = x.Status == WorkAssignmentAdvancedSummaryConfigStatuses.Draft &&
                       !requiresPreview &&
-                      !requiresToken &&
                       !gateBlocked,
             FieldGateStatus = gate.Status,
             FieldGateReason = gate.Reason,

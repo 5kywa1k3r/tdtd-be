@@ -34,6 +34,7 @@ namespace tdtd_be.Data
         public IMongoCollection<WorkAssignmentAdvancedSummaryDayNode> WorkAssignmentAdvancedSummaryDayNodes { get; }
         public IMongoCollection<WorkAssignmentAdvancedSummaryMonthNode> WorkAssignmentAdvancedSummaryMonthNodes { get; }
         public IMongoCollection<WorkAssignmentAdvancedSummaryYearNode> WorkAssignmentAdvancedSummaryYearNodes { get; }
+        public IMongoCollection<WorkSummaryTokenLedger> WorkSummaryTokenLedgers { get; }
         public IMongoCollection<WorkTemplateAssignee> WorkTemplateAssignees { get; }
         public IMongoCollection<DocRole> DocRoles { get; }
         public IMongoCollection<WorkListDocRole> WorkListDocRoles { get; }
@@ -96,6 +97,7 @@ namespace tdtd_be.Data
             WorkAssignmentAdvancedSummaryDayNodes = Db.GetCollection<WorkAssignmentAdvancedSummaryDayNode>(o.WorkAssignmentAdvancedSummaryDayNodeCollection);
             WorkAssignmentAdvancedSummaryMonthNodes = Db.GetCollection<WorkAssignmentAdvancedSummaryMonthNode>(o.WorkAssignmentAdvancedSummaryMonthNodeCollection);
             WorkAssignmentAdvancedSummaryYearNodes = Db.GetCollection<WorkAssignmentAdvancedSummaryYearNode>(o.WorkAssignmentAdvancedSummaryYearNodeCollection);
+            WorkSummaryTokenLedgers = Db.GetCollection<WorkSummaryTokenLedger>(o.WorkSummaryTokenLedgerCollection);
             WorkTemplateAssignees = Db.GetCollection<WorkTemplateAssignee>(o.WorkTemplateAssigneeCollection);
             DocRoles = Db.GetCollection<DocRole>(o.DocRoleCollection);
             WorkListDocRoles = Db.GetCollection<WorkListDocRole>(o.WorkListDocRoleCollection);
