@@ -12,6 +12,7 @@ using tdtd_be.Services;
 using tdtd_be.Services.WorkAssignmentReports;
 using tdtd_be.Services.WorkAssignmentReports.Payloads;
 using tdtd_be.Services.WorkAssignmentReports.Statistics;
+using tdtd_be.Services.Common;
 using tdtd_be.Services.WorkAssignments.Domain;
 using tdtd_be.Services.WorkAssignments.AdvancedSummary;
 using tdtd_be.Services.WorkAssignments.BasicSummary;
@@ -127,6 +128,8 @@ var tests = new (string Name, Action Run)[]
     ("upload endpoint uses public base url override", BuildsUploadEndpointFromPublicBaseUrl),
     ("upload endpoint falls back to forwarded request scheme and host", BuildsUploadEndpointFromForwardedRequest),
     ("recurring job runner methods prevent overlap", RecurringJobRunnerMethodsPreventOverlap),
+    ("advanced summary operations normalize hierarchy grain", AdvancedSummaryOperationsNormalizeHierarchyGrain),
+    ("advanced summary operations reset actor uses original requester", AdvancedSummaryOperationsResetActorUsesOriginalRequester),
 };
 
 var failures = new List<string>();
@@ -437,6 +440,41 @@ static void RecurringJobRunnerMethodsPreventOverlap()
         if (!method.GetCustomAttributes(typeof(DisableConcurrentExecutionAttribute), inherit: false).Any())
             throw new InvalidOperationException($"Recurring job runner method {methodName} is missing overlap guard");
     }
+}
+
+static void AdvancedSummaryOperationsNormalizeHierarchyGrain()
+{
+    AssertEqual(
+        WorkAssignmentAdvancedSummaryHierarchyGrains.Day,
+        JobRunManagementService.NormalizeAdvancedSummaryGrain("day"),
+        "advanced operations should accept lowercase day grain");
+    AssertEqual(
+        WorkAssignmentAdvancedSummaryHierarchyGrains.Month,
+        JobRunManagementService.NormalizeAdvancedSummaryGrain("MONTH"),
+        "advanced operations should accept month grain");
+    AssertThrows(
+        AppErrorCode.COMMON_VALIDATION_FAILED,
+        () => JobRunManagementService.NormalizeAdvancedSummaryGrain("quarter"));
+}
+
+static void AdvancedSummaryOperationsResetActorUsesOriginalRequester()
+{
+    var node = new WorkAssignmentAdvancedSummaryDayNode
+    {
+        CreatedByUserId = UserId(1),
+        UpdatedByUserId = UserId(2)
+    };
+
+    AssertEqual(
+        UserId(2),
+        JobRunManagementService.ResolveAdvancedSummaryResetJobActor(node, UserId(9)),
+        "advanced reset should requeue under the last requester so assignment read scope is preserved");
+
+    node.UpdatedByUserId = null;
+    AssertEqual(
+        UserId(1),
+        JobRunManagementService.ResolveAdvancedSummaryResetJobActor(node, UserId(9)),
+        "advanced reset should fall back to creator when updated actor is missing");
 }
 
 static void BlocksOnceDueBeforeAssignmentStart()

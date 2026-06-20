@@ -4,10 +4,14 @@ public sealed class JobRunSearchRequest
 {
     public string? Status { get; init; }
     public string? Action { get; init; }
+    public string? Grain { get; init; }
     public string? WorkId { get; init; }
     public string? WorkAssignmentId { get; init; }
     public string? WorkReportPeriodId { get; init; }
     public string? DynamicFormTemplateId { get; init; }
+    public string? SectionId { get; init; }
+    public string? ConfigId { get; init; }
+    public string? ConfigHash { get; init; }
     public string? UserId { get; init; }
     public string? Query { get; init; }
     public bool IncludeInactive { get; init; }
@@ -126,4 +130,46 @@ public sealed class BasicSummaryJobResetResponse
     public string JobId { get; init; } = string.Empty;
     public string CorrelationId { get; init; } = string.Empty;
     public DateTime QueuedAtUtc { get; init; }
+}
+
+public sealed class AdvancedSummaryNodeRow
+{
+    public string Id { get; init; } = string.Empty;
+    public string Grain { get; init; } = string.Empty;
+    public string GrainKey { get; init; } = string.Empty;
+    public string WorkId { get; init; } = string.Empty;
+    public string AssignmentId { get; init; } = string.Empty;
+    public string DynamicFormTemplateId { get; init; } = string.Empty;
+    public string SectionId { get; init; } = string.Empty;
+    public string ConfigId { get; init; } = string.Empty;
+    public int ConfigVersionNo { get; init; }
+    public string ConfigHash { get; init; } = string.Empty;
+    public string Status { get; init; } = string.Empty;
+    public bool IsDirty { get; init; }
+    public string? DirtyReason { get; init; }
+    public string? SourceSignatureHash { get; init; }
+    public long SourceReportCount { get; init; }
+    public string? ValueHash { get; init; }
+    public DateTime? BuiltAtUtc { get; init; }
+    public string? BuildJobId { get; init; }
+    public string? BuildCorrelationId { get; init; }
+    public string? BuildError { get; init; }
+    public DateTime WindowStartUtc { get; init; }
+    public DateTime WindowEndExclusiveUtc { get; init; }
+    public bool IsDeleted { get; init; }
+    public DateTime CreatedAtUtc { get; init; }
+    public DateTime UpdatedAtUtc { get; init; }
+}
+
+public sealed class AdvancedSummaryNodeResetResponse
+{
+    public bool Ok { get; init; }
+    public string Grain { get; init; } = string.Empty;
+    public string NodeId { get; init; } = string.Empty;
+    public string ConfigId { get; init; } = string.Empty;
+    public string GrainKey { get; init; } = string.Empty;
+    public string JobId { get; init; } = string.Empty;
+    public string CorrelationId { get; init; } = string.Empty;
+    public DateTime QueuedAtUtc { get; init; }
+    public AdvancedSummaryNodeRow? Node { get; init; }
 }

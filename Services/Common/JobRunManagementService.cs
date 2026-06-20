@@ -1,13 +1,16 @@
 using System.Text.RegularExpressions;
 using MongoDB.Bson;
 using MongoDB.Driver;
+using tdtd_be.Common.Errors;
 using tdtd_be.Data;
 using tdtd_be.DTOs.Common;
 using tdtd_be.DTOs.Operations;
+using tdtd_be.DTOs.WorkAssignments.AdvancedSummary;
 using tdtd_be.Models;
 using tdtd_be.Models.Statistics;
 using tdtd_be.Services.Notifications;
 using tdtd_be.Services.WorkAssignmentReports.Statistics;
+using tdtd_be.Services.WorkAssignments.AdvancedSummary;
 using tdtd_be.Services.WorkAssignments.BasicSummary;
 using tdtd_be.Services.WorkAssignments.Queue;
 using tdtd_be.Services.WorkAssignments.Runtime;
@@ -28,8 +31,16 @@ public interface IJobRunManagementService
     Task<PagedResult<BasicSummaryJobRow>> SearchBasicSummaryJobsAsync(
         JobRunSearchRequest request,
         CancellationToken ct = default);
+    Task<PagedResult<AdvancedSummaryNodeRow>> SearchAdvancedSummaryNodesAsync(
+        JobRunSearchRequest request,
+        CancellationToken ct = default);
     Task<BasicSummaryJobResetResponse> ResetBasicSummaryJobAsync(
         string snapshotId,
+        string actorUserId,
+        CancellationToken ct = default);
+    Task<AdvancedSummaryNodeResetResponse> ResetAdvancedSummaryNodeAsync(
+        string grain,
+        string nodeId,
         string actorUserId,
         CancellationToken ct = default);
     Task<int> ProcessMaterializeJobsAsync(int maxJobs, int batchSize, CancellationToken ct = default);
@@ -50,6 +61,7 @@ public sealed class JobRunManagementService : IJobRunManagementService
     private readonly IUserActionLogService _userActionLog;
     private readonly IWorkReportStatisticRebuildJobService _statisticRebuildJobs;
     private readonly IWorkAssignmentBasicSummaryService _basicSummary;
+    private readonly IWorkAssignmentAdvancedSummaryHierarchyService _advancedSummary;
 
     public JobRunManagementService(
         MongoDbContext ctx,
@@ -59,7 +71,8 @@ public sealed class JobRunManagementService : IJobRunManagementService
         IDocRoleReadModelProjectionRetryJobService projectionRetry,
         IUserActionLogService userActionLog,
         IWorkReportStatisticRebuildJobService statisticRebuildJobs,
-        IWorkAssignmentBasicSummaryService basicSummary)
+        IWorkAssignmentBasicSummaryService basicSummary,
+        IWorkAssignmentAdvancedSummaryHierarchyService advancedSummary)
     {
         _ctx = ctx;
         _materializeJobs = materializeJobs;
@@ -69,6 +82,7 @@ public sealed class JobRunManagementService : IJobRunManagementService
         _userActionLog = userActionLog;
         _statisticRebuildJobs = statisticRebuildJobs;
         _basicSummary = basicSummary;
+        _advancedSummary = advancedSummary;
     }
 
     public async Task<PagedResult<MaterializeJobRow>> SearchMaterializeJobsAsync(
@@ -317,6 +331,225 @@ public sealed class JobRunManagementService : IJobRunManagementService
         };
     }
 
+    public async Task<PagedResult<AdvancedSummaryNodeRow>> SearchAdvancedSummaryNodesAsync(
+        JobRunSearchRequest request,
+        CancellationToken ct = default)
+    {
+        request ??= new JobRunSearchRequest();
+
+        var page = Math.Max(0, request.Page);
+        var pageSize = Math.Clamp(request.PageSize <= 0 ? 50 : request.PageSize, 1, 100);
+        var fetchLimit = Math.Clamp((page + 1) * pageSize, 1, 1000);
+        var grain = NormalizeAdvancedSummaryGrainOrNull(request.Grain);
+
+        var resultSets = new List<(List<AdvancedSummaryNodeRow> Rows, long Total)>();
+        if (grain is null || grain == WorkAssignmentAdvancedSummaryHierarchyGrains.Day)
+        {
+            resultSets.Add(await SearchAdvancedSummaryNodesByGrainAsync(
+                _ctx.WorkAssignmentAdvancedSummaryDayNodes,
+                WorkAssignmentAdvancedSummaryHierarchyGrains.Day,
+                request,
+                fetchLimit,
+                ct));
+        }
+
+        if (grain is null || grain == WorkAssignmentAdvancedSummaryHierarchyGrains.Month)
+        {
+            resultSets.Add(await SearchAdvancedSummaryNodesByGrainAsync(
+                _ctx.WorkAssignmentAdvancedSummaryMonthNodes,
+                WorkAssignmentAdvancedSummaryHierarchyGrains.Month,
+                request,
+                fetchLimit,
+                ct));
+        }
+
+        if (grain is null || grain == WorkAssignmentAdvancedSummaryHierarchyGrains.Year)
+        {
+            resultSets.Add(await SearchAdvancedSummaryNodesByGrainAsync(
+                _ctx.WorkAssignmentAdvancedSummaryYearNodes,
+                WorkAssignmentAdvancedSummaryHierarchyGrains.Year,
+                request,
+                fetchLimit,
+                ct));
+        }
+
+        var total = resultSets.Sum(x => x.Total);
+        var rows = resultSets
+            .SelectMany(x => x.Rows)
+            .OrderByDescending(x => x.UpdatedAtUtc)
+            .Skip(page * pageSize)
+            .Take(pageSize)
+            .ToList();
+
+        return new PagedResult<AdvancedSummaryNodeRow>(rows, total, page, pageSize);
+    }
+
+    public async Task<AdvancedSummaryNodeResetResponse> ResetAdvancedSummaryNodeAsync(
+        string grain,
+        string nodeId,
+        string actorUserId,
+        CancellationToken ct = default)
+    {
+        grain = NormalizeAdvancedSummaryGrain(grain);
+        nodeId = NullIfWhiteSpace(nodeId)
+            ?? throw AppExceptionFactory.BadRequest(AppErrorCode.COMMON_ARGUMENT_REQUIRED, new { field = "nodeId" });
+
+        var queuedAt = DateTime.UtcNow;
+        return grain switch
+        {
+            WorkAssignmentAdvancedSummaryHierarchyGrains.Day => await ResetDayNodeAsync(nodeId, actorUserId, queuedAt, ct),
+            WorkAssignmentAdvancedSummaryHierarchyGrains.Month => await ResetMonthNodeAsync(nodeId, actorUserId, queuedAt, ct),
+            WorkAssignmentAdvancedSummaryHierarchyGrains.Year => await ResetYearNodeAsync(nodeId, actorUserId, queuedAt, ct),
+            _ => throw AppExceptionFactory.BadRequest(
+                AppErrorCode.COMMON_VALIDATION_FAILED,
+                new { grain, reason = "ADVANCED_SUMMARY_GRAIN_INVALID" })
+        };
+    }
+
+    private async Task<(List<AdvancedSummaryNodeRow> Rows, long Total)> SearchAdvancedSummaryNodesByGrainAsync<T>(
+        IMongoCollection<T> col,
+        string grain,
+        JobRunSearchRequest request,
+        int limit,
+        CancellationToken ct)
+        where T : WorkAssignmentAdvancedSummaryHierarchyNodeBase
+    {
+        var fb = Builders<T>.Filter;
+        var filter = request.IncludeInactive
+            ? FilterDefinition<T>.Empty
+            : fb.Eq(x => x.IsDeleted, false);
+
+        filter &= EqIfNotBlank(fb, x => x.Status, request.Status);
+        filter &= EqIfNotBlank(fb, x => x.WorkId, request.WorkId);
+        filter &= EqIfNotBlank(fb, x => x.AssignmentId, request.WorkAssignmentId);
+        filter &= EqIfNotBlank(fb, x => x.DynamicFormTemplateId, request.DynamicFormTemplateId);
+        filter &= EqIfNotBlank(fb, x => x.SectionId, request.SectionId);
+        filter &= EqIfNotBlank(fb, x => x.ConfigId, request.ConfigId);
+        filter &= EqIfNotBlank(fb, x => x.ConfigHash, request.ConfigHash);
+
+        var query = NullIfWhiteSpace(request.Query);
+        if (query is not null)
+        {
+            var regex = new BsonRegularExpression(Regex.Escape(query), "i");
+            filter &= fb.Or(
+                fb.Regex(x => x.GrainKey, regex),
+                fb.Regex(x => x.BuildJobId, regex),
+                fb.Regex(x => x.BuildCorrelationId, regex),
+                fb.Regex(x => x.BuildError, regex),
+                fb.Regex(x => x.ConfigHash, regex),
+                fb.Regex(x => x.ValueHash, regex),
+                fb.Regex(x => x.SourceSignatureHash, regex));
+        }
+
+        var total = await col.CountDocumentsAsync(filter, cancellationToken: ct);
+        var rows = await col
+            .Find(filter)
+            .Sort(Builders<T>.Sort.Descending(x => x.UpdatedAtUtc))
+            .Limit(limit)
+            .ToListAsync(ct);
+
+        return (rows.Select(x => ToAdvancedSummaryNodeRow(x, grain)).ToList(), total);
+    }
+
+    private async Task<AdvancedSummaryNodeResetResponse> ResetDayNodeAsync(
+        string nodeId,
+        string actorUserId,
+        DateTime queuedAt,
+        CancellationToken ct)
+    {
+        var node = await _ctx.WorkAssignmentAdvancedSummaryDayNodes
+            .Find(x => x.Id == nodeId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct)
+            ?? throw AppExceptionFactory.NotFound(AppErrorCode.COMMON_NOT_FOUND, new { grain = "DAY", nodeId });
+
+        var jobActorUserId = ResolveAdvancedSummaryResetJobActor(node, actorUserId);
+        var dto = await _advancedSummary.RequestDayNodeBuildAsync(
+            node.ConfigId,
+            node.DayKey,
+            new BuildWorkAssignmentAdvancedSummaryDayNodeRequest { ForceRefresh = true },
+            jobActorUserId,
+            ct);
+
+        return new AdvancedSummaryNodeResetResponse
+        {
+            Ok = true,
+            Grain = WorkAssignmentAdvancedSummaryHierarchyGrains.Day,
+            NodeId = node.Id,
+            ConfigId = node.ConfigId,
+            GrainKey = node.DayKey,
+            JobId = dto.BuildJobId ?? string.Empty,
+            CorrelationId = dto.BuildCorrelationId ?? string.Empty,
+            QueuedAtUtc = queuedAt,
+            Node = ToAdvancedSummaryNodeRow(dto)
+        };
+    }
+
+    private async Task<AdvancedSummaryNodeResetResponse> ResetMonthNodeAsync(
+        string nodeId,
+        string actorUserId,
+        DateTime queuedAt,
+        CancellationToken ct)
+    {
+        var node = await _ctx.WorkAssignmentAdvancedSummaryMonthNodes
+            .Find(x => x.Id == nodeId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct)
+            ?? throw AppExceptionFactory.NotFound(AppErrorCode.COMMON_NOT_FOUND, new { grain = "MONTH", nodeId });
+
+        var jobActorUserId = ResolveAdvancedSummaryResetJobActor(node, actorUserId);
+        var dto = await _advancedSummary.RequestMonthNodeBuildAsync(
+            node.ConfigId,
+            node.MonthKey,
+            new BuildWorkAssignmentAdvancedSummaryMonthNodeRequest { ForceRefresh = true },
+            jobActorUserId,
+            ct);
+
+        return new AdvancedSummaryNodeResetResponse
+        {
+            Ok = true,
+            Grain = WorkAssignmentAdvancedSummaryHierarchyGrains.Month,
+            NodeId = node.Id,
+            ConfigId = node.ConfigId,
+            GrainKey = node.MonthKey,
+            JobId = dto.BuildJobId ?? string.Empty,
+            CorrelationId = dto.BuildCorrelationId ?? string.Empty,
+            QueuedAtUtc = queuedAt,
+            Node = ToAdvancedSummaryNodeRow(dto)
+        };
+    }
+
+    private async Task<AdvancedSummaryNodeResetResponse> ResetYearNodeAsync(
+        string nodeId,
+        string actorUserId,
+        DateTime queuedAt,
+        CancellationToken ct)
+    {
+        var node = await _ctx.WorkAssignmentAdvancedSummaryYearNodes
+            .Find(x => x.Id == nodeId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct)
+            ?? throw AppExceptionFactory.NotFound(AppErrorCode.COMMON_NOT_FOUND, new { grain = "YEAR", nodeId });
+
+        var jobActorUserId = ResolveAdvancedSummaryResetJobActor(node, actorUserId);
+        var dto = await _advancedSummary.RequestYearNodeBuildAsync(
+            node.ConfigId,
+            node.YearKey,
+            new BuildWorkAssignmentAdvancedSummaryYearNodeRequest { ForceRefresh = true },
+            jobActorUserId,
+            ct);
+
+        return new AdvancedSummaryNodeResetResponse
+        {
+            Ok = true,
+            Grain = WorkAssignmentAdvancedSummaryHierarchyGrains.Year,
+            NodeId = node.Id,
+            ConfigId = node.ConfigId,
+            GrainKey = node.YearKey,
+            JobId = dto.BuildJobId ?? string.Empty,
+            CorrelationId = dto.BuildCorrelationId ?? string.Empty,
+            QueuedAtUtc = queuedAt,
+            Node = ToAdvancedSummaryNodeRow(dto)
+        };
+    }
+
     private static MaterializeJobRow ToMaterializeRow(WorkAssignmentMaterializeJobs x)
         => new()
         {
@@ -423,6 +656,158 @@ public sealed class JobRunManagementService : IJobRunManagementService
             CreatedAtUtc = x.CreatedAtUtc,
             UpdatedAtUtc = x.UpdatedAtUtc
         };
+
+    private static AdvancedSummaryNodeRow ToAdvancedSummaryNodeRow(
+        WorkAssignmentAdvancedSummaryHierarchyNodeBase x,
+        string grain)
+        => new()
+        {
+            Id = x.Id,
+            Grain = grain,
+            GrainKey = x.GrainKey,
+            WorkId = x.WorkId,
+            AssignmentId = x.AssignmentId,
+            DynamicFormTemplateId = x.DynamicFormTemplateId,
+            SectionId = x.SectionId,
+            ConfigId = x.ConfigId,
+            ConfigVersionNo = x.ConfigVersionNo,
+            ConfigHash = x.ConfigHash,
+            Status = x.Status,
+            IsDirty = x.IsDirty,
+            DirtyReason = x.DirtyReason,
+            SourceSignatureHash = x.SourceSignatureHash,
+            SourceReportCount = x.SourceReportCount,
+            ValueHash = x.ValueHash,
+            BuiltAtUtc = x.BuiltAtUtc,
+            BuildJobId = x.BuildJobId,
+            BuildCorrelationId = x.BuildCorrelationId,
+            BuildError = x.BuildError,
+            WindowStartUtc = x.WindowStartUtc,
+            WindowEndExclusiveUtc = x.WindowEndExclusiveUtc,
+            IsDeleted = x.IsDeleted,
+            CreatedAtUtc = x.CreatedAtUtc,
+            UpdatedAtUtc = x.UpdatedAtUtc
+        };
+
+    private static AdvancedSummaryNodeRow ToAdvancedSummaryNodeRow(WorkAssignmentAdvancedSummaryDayNodeDto x)
+        => new()
+        {
+            Id = x.Id,
+            Grain = WorkAssignmentAdvancedSummaryHierarchyGrains.Day,
+            GrainKey = x.DayKey,
+            WorkId = x.WorkId,
+            AssignmentId = x.AssignmentId,
+            DynamicFormTemplateId = x.DynamicFormTemplateId,
+            SectionId = x.SectionId,
+            ConfigId = x.ConfigId,
+            ConfigVersionNo = x.ConfigVersionNo,
+            ConfigHash = x.ConfigHash,
+            Status = x.Status,
+            IsDirty = x.IsDirty,
+            DirtyReason = x.DirtyReason,
+            SourceSignatureHash = x.SourceSignatureHash,
+            SourceReportCount = x.SourceReportCount,
+            ValueHash = x.ValueHash,
+            BuiltAtUtc = x.BuiltAtUtc,
+            BuildJobId = x.BuildJobId,
+            BuildCorrelationId = x.BuildCorrelationId,
+            BuildError = x.BuildError,
+            WindowStartUtc = x.WindowStartUtc,
+            WindowEndExclusiveUtc = x.WindowEndExclusiveUtc,
+            CreatedAtUtc = x.CreatedAtUtc,
+            UpdatedAtUtc = x.UpdatedAtUtc
+        };
+
+    private static AdvancedSummaryNodeRow ToAdvancedSummaryNodeRow(WorkAssignmentAdvancedSummaryMonthNodeDto x)
+        => new()
+        {
+            Id = x.Id,
+            Grain = WorkAssignmentAdvancedSummaryHierarchyGrains.Month,
+            GrainKey = x.MonthKey,
+            WorkId = x.WorkId,
+            AssignmentId = x.AssignmentId,
+            DynamicFormTemplateId = x.DynamicFormTemplateId,
+            SectionId = x.SectionId,
+            ConfigId = x.ConfigId,
+            ConfigVersionNo = x.ConfigVersionNo,
+            ConfigHash = x.ConfigHash,
+            Status = x.Status,
+            IsDirty = x.IsDirty,
+            DirtyReason = x.DirtyReason,
+            SourceSignatureHash = x.SourceSignatureHash,
+            SourceReportCount = x.SourceReportCount,
+            ValueHash = x.ValueHash,
+            BuiltAtUtc = x.BuiltAtUtc,
+            BuildJobId = x.BuildJobId,
+            BuildCorrelationId = x.BuildCorrelationId,
+            BuildError = x.BuildError,
+            WindowStartUtc = x.WindowStartUtc,
+            WindowEndExclusiveUtc = x.WindowEndExclusiveUtc,
+            CreatedAtUtc = x.CreatedAtUtc,
+            UpdatedAtUtc = x.UpdatedAtUtc
+        };
+
+    private static AdvancedSummaryNodeRow ToAdvancedSummaryNodeRow(WorkAssignmentAdvancedSummaryYearNodeDto x)
+        => new()
+        {
+            Id = x.Id,
+            Grain = WorkAssignmentAdvancedSummaryHierarchyGrains.Year,
+            GrainKey = x.YearKey,
+            WorkId = x.WorkId,
+            AssignmentId = x.AssignmentId,
+            DynamicFormTemplateId = x.DynamicFormTemplateId,
+            SectionId = x.SectionId,
+            ConfigId = x.ConfigId,
+            ConfigVersionNo = x.ConfigVersionNo,
+            ConfigHash = x.ConfigHash,
+            Status = x.Status,
+            IsDirty = x.IsDirty,
+            DirtyReason = x.DirtyReason,
+            SourceSignatureHash = x.SourceSignatureHash,
+            SourceReportCount = x.SourceReportCount,
+            ValueHash = x.ValueHash,
+            BuiltAtUtc = x.BuiltAtUtc,
+            BuildJobId = x.BuildJobId,
+            BuildCorrelationId = x.BuildCorrelationId,
+            BuildError = x.BuildError,
+            WindowStartUtc = x.WindowStartUtc,
+            WindowEndExclusiveUtc = x.WindowEndExclusiveUtc,
+            CreatedAtUtc = x.CreatedAtUtc,
+            UpdatedAtUtc = x.UpdatedAtUtc
+        };
+
+    internal static string? NormalizeAdvancedSummaryGrainOrNull(string? value)
+    {
+        value = NullIfWhiteSpace(value);
+        return value is null ? null : NormalizeAdvancedSummaryGrain(value);
+    }
+
+    internal static string NormalizeAdvancedSummaryGrain(string value)
+    {
+        var text = NullIfWhiteSpace(value)?.ToUpperInvariant();
+        return text switch
+        {
+            WorkAssignmentAdvancedSummaryHierarchyGrains.Day => WorkAssignmentAdvancedSummaryHierarchyGrains.Day,
+            WorkAssignmentAdvancedSummaryHierarchyGrains.Month => WorkAssignmentAdvancedSummaryHierarchyGrains.Month,
+            WorkAssignmentAdvancedSummaryHierarchyGrains.Year => WorkAssignmentAdvancedSummaryHierarchyGrains.Year,
+            _ => throw AppExceptionFactory.BadRequest(
+                AppErrorCode.COMMON_VALIDATION_FAILED,
+                new { grain = value, reason = "ADVANCED_SUMMARY_GRAIN_INVALID" })
+        };
+    }
+
+    internal static string ResolveAdvancedSummaryResetJobActor(
+        WorkAssignmentAdvancedSummaryHierarchyNodeBase node,
+        string actorUserId)
+    {
+        if (!string.IsNullOrWhiteSpace(node.UpdatedByUserId))
+            return node.UpdatedByUserId;
+
+        if (!string.IsNullOrWhiteSpace(node.CreatedByUserId))
+            return node.CreatedByUserId;
+
+        return actorUserId;
+    }
 
     private static FilterDefinition<T> EqIfNotBlank<T>(
         FilterDefinitionBuilder<T> fb,

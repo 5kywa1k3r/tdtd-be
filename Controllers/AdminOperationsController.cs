@@ -360,6 +360,53 @@ public sealed class AdminOperationsController : ControllerBase
         return Ok(await _jobRuns.ResetBasicSummaryJobAsync(snapshotId, me.Id, ct));
     }
 
+    [HttpGet("job-runs/advanced-summary-nodes")]
+    public async Task<IActionResult> SearchAdvancedSummaryNodes(
+        [FromQuery] string? status = null,
+        [FromQuery] string? grain = null,
+        [FromQuery] string? workId = null,
+        [FromQuery] string? workAssignmentId = null,
+        [FromQuery] string? dynamicFormTemplateId = null,
+        [FromQuery] string? sectionId = null,
+        [FromQuery] string? configId = null,
+        [FromQuery] string? configHash = null,
+        [FromQuery] string? q = null,
+        [FromQuery] bool includeInactive = false,
+        [FromQuery] int page = 0,
+        [FromQuery] int pageSize = 50,
+        CancellationToken ct = default)
+    {
+        RequireSystemAdmin();
+
+        return Ok(await _jobRuns.SearchAdvancedSummaryNodesAsync(new JobRunSearchRequest
+        {
+            Status = status,
+            Grain = grain,
+            WorkId = workId,
+            WorkAssignmentId = workAssignmentId,
+            DynamicFormTemplateId = dynamicFormTemplateId,
+            SectionId = sectionId,
+            ConfigId = configId,
+            ConfigHash = configHash,
+            Query = q,
+            IncludeInactive = includeInactive,
+            Page = page,
+            PageSize = pageSize
+        }, ct));
+    }
+
+    [HttpPost("job-runs/advanced-summary-nodes/{grain}/{nodeId}/reset")]
+    public async Task<IActionResult> ResetAdvancedSummaryNode(
+        string grain,
+        string nodeId,
+        CancellationToken ct = default)
+    {
+        var me = _me.RequireMe();
+        RoleGuard.RequireSystemAdmin(me);
+
+        return Ok(await _jobRuns.ResetAdvancedSummaryNodeAsync(grain, nodeId, me.Id, ct));
+    }
+
     [HttpGet("report-payloads/diagnostics")]
     public async Task<IActionResult> CheckReportPayloadDiagnostics(
         [FromQuery] string? workId = null,
