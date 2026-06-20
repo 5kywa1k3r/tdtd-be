@@ -79,6 +79,25 @@ public sealed class WorkAssignmentReportsController : ControllerBase
         return Ok(rs);
     }
 
+    [HttpGet("work-assignment-reports/{id}/sections")]
+    public async Task<IActionResult> GetSections([FromRoute] string id, CancellationToken ct)
+    {
+        var actorUserId = GetActorUserId();
+        var rs = await _service.GetSectionSummariesAsync(id, actorUserId, ct);
+        return Ok(rs);
+    }
+
+    [HttpGet("work-assignment-reports/{id}/sections/{sectionId}")]
+    public async Task<IActionResult> GetSectionDetail(
+        [FromRoute] string id,
+        [FromRoute] string sectionId,
+        CancellationToken ct)
+    {
+        var actorUserId = GetActorUserId();
+        var rs = await _service.GetSectionDetailAsync(id, sectionId, actorUserId, ct);
+        return Ok(rs);
+    }
+
     [HttpGet("work-assignment-reports/{id}/template-workbook/{dynamicExcelTemplateId}")]
     public async Task<IActionResult> GetTemplateWorkbook(
         [FromRoute] string id,

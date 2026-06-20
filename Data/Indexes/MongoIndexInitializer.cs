@@ -50,6 +50,9 @@
             var dynamicForms = db.GetCollection<DynamicFormTemplate>(opt.DynamicFormTemplateCollection);
             await EnsureDynamicFormsAsync(dynamicForms, ct);
 
+            var dynamicFormSections = db.GetCollection<DynamicFormSectionDocument>(opt.DynamicFormSectionCollection);
+            await EnsureDynamicFormSectionsAsync(dynamicFormSections, ct);
+
             // LABELS
             var labels = db.GetCollection<LabelCatalogItem>(opt.LabelCollection);
             await EnsureLabelsAsync(labels, ct);
@@ -122,6 +125,9 @@
             // WORK ASSIGNMENT REPORTS
             var workAssignmentReports = db.GetCollection<WorkAssignmentReport>(opt.WorkAssignmentReportCollection);
             await EnsureWorkAssignmentReportsAsync(workAssignmentReports, ct);
+
+            var workAssignmentReportSections = db.GetCollection<WorkAssignmentReportSection>(opt.WorkAssignmentReportSectionCollection);
+            await EnsureWorkAssignmentReportSectionsAsync(workAssignmentReportSections, ct);
 
             // WORK REPORT PAYLOADS
             var workReportPayloads = db.GetCollection<WorkReportPayload>(opt.WorkReportPayloadCollection);
@@ -569,6 +575,37 @@
                 key: new BsonDocument
                 {
                     { "excelBlockDynamicExcelTemplateId", 1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
+        }
+
+        private static async Task EnsureDynamicFormSectionsAsync(
+            IMongoCollection<DynamicFormSectionDocument> col,
+            CancellationToken ct)
+        {
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(
+                col,
+                new IndexSpec("ix_dynamicFormSections_isDeleted", new BsonDocument("isDeleted", 1)),
+                ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ux_dynamicFormSections_template_section_active",
+                key: new BsonDocument
+                {
+                    { "dynamicFormTemplateId", 1 },
+                    { "sectionId", 1 }
+                },
+                unique: true,
+                partial: new BsonDocument("isDeleted", false)
+            ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_dynamicFormSections_template_order_active",
+                key: new BsonDocument
+                {
+                    { "dynamicFormTemplateId", 1 },
+                    { "order", 1 },
                     { "isDeleted", 1 }
                 }
             ), ct);
@@ -1973,6 +2010,49 @@
                 {
                     { "dueAtUtc", 1 },
                     { "status", 1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
+        }
+
+        private static async Task EnsureWorkAssignmentReportSectionsAsync(
+            IMongoCollection<WorkAssignmentReportSection> col,
+            CancellationToken ct)
+        {
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(
+                col,
+                new IndexSpec("ix_workAssignmentReportSections_isDeleted", new BsonDocument("isDeleted", 1)),
+                ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ux_workAssignmentReportSections_report_section_active",
+                key: new BsonDocument
+                {
+                    { "workAssignmentReportId", 1 },
+                    { "sectionId", 1 }
+                },
+                unique: true,
+                partial: new BsonDocument("isDeleted", false)
+            ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_workAssignmentReportSections_report_order_active",
+                key: new BsonDocument
+                {
+                    { "workAssignmentReportId", 1 },
+                    { "sectionOrder", 1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_workAssignmentReportSections_template_updated_active",
+                key: new BsonDocument
+                {
+                    { "dynamicFormTemplateId", 1 },
+                    { "sectionId", 1 },
+                    { "hasData", 1 },
+                    { "lastUpdatedAtUtc", -1 },
                     { "isDeleted", 1 }
                 }
             ), ct);

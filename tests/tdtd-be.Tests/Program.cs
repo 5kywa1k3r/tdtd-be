@@ -58,6 +58,7 @@ var tests = new (string Name, Action Run)[]
     ("materialize job backfills semiannual periods before rolling future", MaterializeJobBackfillsSemiAnnualPeriodsBeforeRollingFuture),
     ("materialize job keeps separate due occurrences inside long periods", MaterializeJobKeepsSeparateDueOccurrencesInsideLongPeriods),
     ("backfill period policy uses due occurrence before assignment creation", BackfillPeriodPolicyUsesDueOccurrenceBeforeAssignmentCreation),
+    ("draft can omit historical completed date while submit requires it", DraftCanOmitHistoricalCompletedDateWhileSubmitRequiresIt),
     ("assignment completion blocks open materialized report periods", BlocksCompletionWithOpenMaterializedReportPeriod),
     ("assignment completion blocks future expected report periods", BlocksCompletionWithFutureExpectedReportPeriods),
     ("assignment completion allows approved periods with no future expected periods", AllowsCompletionWhenReportsAreTerminalAndNoFutureExpected),
@@ -90,7 +91,7 @@ var tests = new (string Name, Action Run)[]
     ("dynamic form table target labels use dynamic excel default type", ValidatesDynamicFormTableTargetDefaultDataType),
     ("dynamic form metric label targets validate range type and uniqueness", ValidatesDynamicFormMetricLabelTargets),
     ("dynamic excel numeric grid validates spec metadata", ValidatesDynamicExcelNumericGridSpecMetadata),
-    ("values1D compression round-trips null runs", CompressesValues1DNullRuns),
+    ("values1D compression round-trips null and zero runs", CompressesValues1DBlankRuns),
     ("basic summary allows numeric methods only", BasicSummaryAllowsNumericMethodsOnly),
     ("basic summary merges period snapshots by numeric method", BasicSummaryMergesPeriodSnapshotsByNumericMethod),
     ("basic summary compact snapshot round-trips", BasicSummaryCompactSnapshotRoundTrips),
@@ -936,7 +937,7 @@ static void BackfillPeriodPolicyUsesDueOccurrenceBeforeAssignmentCreation()
 
     AssertTrue(isJanuaryBackfill, "wholly past scheduled windows before assignment creation should be historical backfill");
     AssertEqual(new DateTime(2026, 1, 1), minDate, "backfill completed date min should start at the source window");
-    AssertEqual(new DateTime(2026, 1, 31), maxDate, "backfill completed date max should stop at the source window");
+    AssertEqual(new DateTime(2026, 6, 18), maxDate, "backfill completed date max should allow late completion after the source window up to today");
 
     var isJuneDueBackfill = WorkAssignmentBackfillPeriodPolicy.TryResolveCompletedDateBounds(
         assignment,
@@ -949,7 +950,19 @@ static void BackfillPeriodPolicyUsesDueOccurrenceBeforeAssignmentCreation()
 
     AssertTrue(isJuneDueBackfill, "mixed monthly window should be historical backfill when its due occurrence is before assignment creation");
     AssertEqual(new DateTime(2026, 6, 1), juneMinDate, "backfill completed date min should keep the source window start");
-    AssertEqual(new DateTime(2026, 6, 18), juneMaxDate, "mixed backfill completed date max should stop at assignment creation date");
+    AssertEqual(new DateTime(2026, 6, 18), juneMaxDate, "mixed backfill completed date max should allow late completion up to today");
+
+    var isJuneLateBackfill = WorkAssignmentBackfillPeriodPolicy.TryResolveCompletedDateBounds(
+        assignment,
+        new DateTime(2026, 6, 1),
+        new DateTime(2026, 6, 30),
+        new DateTime(2026, 6, 16),
+        new DateTime(2026, 6, 20, 9, 0, 0),
+        out _,
+        out var juneLateMaxDate);
+
+    AssertTrue(isJuneLateBackfill, "mixed monthly backfill should stay historical after assignment creation");
+    AssertEqual(new DateTime(2026, 6, 20), juneLateMaxDate, "mixed backfill completed date max should move with today so late completion can be recorded");
 
     AssertFalse(
         WorkAssignmentBackfillPeriodPolicy.IsBackfillHistoricalPeriod(
@@ -1022,6 +1035,42 @@ static void BackfillPeriodPolicyUsesDueOccurrenceBeforeAssignmentCreation()
             new DateTime(2026, 7, 17),
             now),
         "future source window should use normal runtime due logic");
+}
+
+static void DraftCanOmitHistoricalCompletedDateWhileSubmitRequiresIt()
+{
+    var serviceType = typeof(WorkAssignmentReportService);
+    var policyType = serviceType.GetNestedType("ReportCompletedDatePolicy", BindingFlags.NonPublic)
+        ?? throw new InvalidOperationException("ReportCompletedDatePolicy helper type was not found.");
+
+    var policy = Activator.CreateInstance(
+        policyType,
+        true,
+        true,
+        new DateTime(2026, 1, 1),
+        new DateTime(2026, 6, 18),
+        WorkAssignmentBackfillPeriodPolicy.CompletedDatePolicyReason)
+        ?? throw new InvalidOperationException("ReportCompletedDatePolicy helper instance was not created.");
+
+    var draftCompletedDate = InvokePrivateStatic<DateTime?>(
+        serviceType,
+        "ValidateReportCompletedDateInput",
+        policy,
+        null,
+        new { reportId = "draft" },
+        false);
+
+    AssertEqual<DateTime?>(null, draftCompletedDate, "draft save should allow missing historical completed date");
+
+    AssertThrowsFromReflection(
+        AppErrorCode.WORK_ASSIGNMENT_REPORT_HISTORICAL_COMPLETED_DATE_REQUIRED,
+        () => InvokePrivateStatic<DateTime?>(
+            serviceType,
+            "ValidateReportCompletedDateInput",
+            policy,
+            null,
+            new { reportId = "submit" },
+            true));
 }
 
 static void BlocksCompletionWithOpenMaterializedReportPeriod()
@@ -2574,7 +2623,7 @@ static void ValidatesDynamicExcelNumericGridSpecMetadata()
                 2)));
 }
 
-static void CompressesValues1DNullRuns()
+static void CompressesValues1DBlankRuns()
 {
     var options = new JsonSerializerOptions(JsonSerializerDefaults.Web);
     var smallValues = new List<object?>();
@@ -2629,6 +2678,25 @@ static void CompressesValues1DNullRuns()
         denseJson,
         JsonSerializer.Serialize(Values1DCompression.ReadBlockObjects(block, options), options),
         "compressed table block values1D should expand to dense values");
+
+    var zeroValues = new List<object?> { "head" };
+    zeroValues.AddRange(Enumerable.Repeat<object?>(0, 300));
+    zeroValues.Add(5);
+    var denseZeroJson = JsonSerializer.Serialize(zeroValues, options);
+    var compressedZeroJson = Values1DCompression.Serialize(zeroValues, options);
+    AssertTrue(
+        compressedZeroJson.Contains("\"values1DCompressed\":true", StringComparison.Ordinal),
+        "top-level values1D should compress long zero runs");
+    AssertEqual(
+        denseZeroJson,
+        JsonSerializer.Serialize(Values1DCompression.DeserializeObjects(compressedZeroJson, options), options),
+        "compressed zero-run values1D should round-trip to dense values");
+
+    using var compressedZeroDoc = JsonDocument.Parse(compressedZeroJson);
+    using var zeroReader = Values1DCompression.CreateBlockReader(compressedZeroDoc.RootElement);
+    AssertTrue(zeroReader is not null && zeroReader.IsCompressed, "zero-run payload should create an indexed values1D reader");
+    AssertEqual<decimal?>(0m, zeroReader!.ReadDecimal(1), "indexed reader should return zero inside compressed zero run");
+    AssertEqual<decimal?>(5m, zeroReader.ReadDecimal(zeroValues.Count - 1), "indexed reader should read value after compressed zero run");
 }
 
 static void BasicSummaryAllowsNumericMethodsOnly()

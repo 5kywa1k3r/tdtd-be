@@ -8,6 +8,12 @@ public static class Values1DCompression
     private const string CompressionKind = "NULL_RUNS";
     public const int MinValues1DCompressionLength = 251;
     private const int MinNullRunLength = 8;
+    private enum CompressibleBlankKind
+    {
+        Null,
+        NumericZero,
+        StringZero
+    }
 
     public static string Serialize(IReadOnlyList<object?> values, JsonSerializerOptions options)
     {
@@ -216,7 +222,8 @@ public static class Values1DCompression
 
         for (var index = 0; index < dense.Count;)
         {
-            if (!IsJsonNull(dense[index]))
+            var runKind = GetCompressibleBlankKind(dense[index]);
+            if (runKind is null)
             {
                 compressed.Add(dense[index]?.DeepClone());
                 index++;
@@ -224,7 +231,7 @@ public static class Values1DCompression
             }
 
             var end = index + 1;
-            while (end < dense.Count && IsJsonNull(dense[end]))
+            while (end < dense.Count && GetCompressibleBlankKind(dense[end]) == runKind)
                 end++;
 
             var runLength = end - index;
@@ -232,12 +239,12 @@ public static class Values1DCompression
             {
                 indexes.Add(index);
                 counts.Add(runLength);
-                compressed.Add(null);
+                compressed.Add(dense[index]?.DeepClone());
             }
             else
             {
                 for (var cursor = index; cursor < end; cursor++)
-                    compressed.Add(null);
+                    compressed.Add(dense[cursor]?.DeepClone());
             }
 
             index = end;
@@ -285,11 +292,15 @@ public static class Values1DCompression
                 compressedIndex++;
             }
 
+            var runValue = compressedIndex < values.Count
+                ? values[compressedIndex]?.DeepClone()
+                : null;
+
             if (compressedIndex < values.Count)
                 compressedIndex++;
 
             while (output.Count < originalIndex + count)
-                output.Add(null);
+                output.Add(runValue?.DeepClone());
         }
 
         while (output.Count < length && compressedIndex < values.Count)
@@ -375,10 +386,7 @@ public static class Values1DCompression
             if (originalIndex < 0 || originalIndex >= Length)
                 return null;
 
-            var compressedIndex = MapIndex(originalIndex, out var inCompressedRun);
-            if (inCompressedRun)
-                return null;
-
+            var compressedIndex = MapIndex(originalIndex, out _);
             if (compressedIndex < 0 || compressedIndex >= _values.GetArrayLength())
                 return null;
 
@@ -546,8 +554,37 @@ public static class Values1DCompression
         block.Remove("values1DCompressedCounts");
     }
 
-    private static bool IsJsonNull(JsonNode? node)
-        => node is null;
+    private static CompressibleBlankKind? GetCompressibleBlankKind(JsonNode? node)
+    {
+        if (node is null)
+            return CompressibleBlankKind.Null;
+        if (node is not JsonValue value)
+            return null;
+        if (value.TryGetValue<JsonElement>(out var element))
+            return GetCompressibleBlankKind(element);
+        if (value.TryGetValue<int>(out var intValue))
+            return intValue == 0 ? CompressibleBlankKind.NumericZero : null;
+        if (value.TryGetValue<long>(out var longValue))
+            return longValue == 0L ? CompressibleBlankKind.NumericZero : null;
+        if (value.TryGetValue<decimal>(out var decimalValue))
+            return decimalValue == 0m ? CompressibleBlankKind.NumericZero : null;
+        if (value.TryGetValue<double>(out var doubleValue))
+            return doubleValue == 0d ? CompressibleBlankKind.NumericZero : null;
+        return value.TryGetValue<string>(out var text) && text.Trim() == "0"
+            ? CompressibleBlankKind.StringZero
+            : null;
+    }
+
+    private static CompressibleBlankKind? GetCompressibleBlankKind(JsonElement element)
+    {
+        return element.ValueKind switch
+        {
+            JsonValueKind.Null or JsonValueKind.Undefined => CompressibleBlankKind.Null,
+            JsonValueKind.Number when element.TryGetDecimal(out var number) && number == 0m => CompressibleBlankKind.NumericZero,
+            JsonValueKind.String when string.Equals(element.GetString()?.Trim(), "0", StringComparison.Ordinal) => CompressibleBlankKind.StringZero,
+            _ => null
+        };
+    }
 
     private static bool IsCompressed(JsonElement element)
         => ReadJsonBool(element, "values1DCompressed") == true &&

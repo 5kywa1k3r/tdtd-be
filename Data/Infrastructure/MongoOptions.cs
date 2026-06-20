@@ -14,6 +14,7 @@
         public string FileDocCollection { get; set; } = "file_doc";
         public string DynamicExcelTemplateCollection { get; set; } = "dynamic_excel_templates";
         public string DynamicFormTemplateCollection { get; set; } = "dynamic_form_templates";
+        public string DynamicFormSectionCollection { get; set; } = "dynamic_form_sections";
         public string LabelCollection { get; set; } = "labels";
         public string LabelEnumCatalogCollection { get; set; } = "label_enum_catalogs";
         public string LabelEnumOptionReadModelCollection { get; set; } = "label_enum_option_read_models";
@@ -34,6 +35,7 @@
         public string ReviewAssignmentSummaryDocRoleCollection { get; set; } = "review_assignment_summary_doc_roles";
         public string DocRoleReadModelProjectionRetryJobCollection { get; set; } = "docrole_read_model_projection_retry_jobs";
         public string WorkAssignmentReportCollection { get; set; } = "work_assignment_report";
+        public string WorkAssignmentReportSectionCollection { get; set; } = "work_assignment_report_sections";
         public string WorkReportPayloadCollection { get; set; } = "work_report_payloads";
         public string WorkReportTableValueCollection { get; set; } = "work_report_table_values";
         public string WorkReportPeriodCollection { get; set; } = "work_report_periods";

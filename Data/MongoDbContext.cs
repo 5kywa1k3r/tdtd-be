@@ -19,6 +19,7 @@ namespace tdtd_be.Data
         public IMongoCollection<FileDoc> Files { get; }
         public IMongoCollection<DynamicExcelTemplate> DynamicExcelTemplates { get; }
         public IMongoCollection<DynamicFormTemplate> DynamicFormTemplates { get; }
+        public IMongoCollection<DynamicFormSectionDocument> DynamicFormSections { get; }
         public IMongoCollection<LabelCatalogItem> Labels { get; }
         public IMongoCollection<LabelEnumCatalog> LabelEnumCatalogs { get; }
         public IMongoCollection<LabelEnumOptionReadModel> LabelEnumOptionReadModels { get; }
@@ -39,6 +40,7 @@ namespace tdtd_be.Data
         public IMongoCollection<ReviewAssignmentSummaryDocRole> ReviewAssignmentSummaryDocRoles { get; }
         public IMongoCollection<DocRoleReadModelProjectionRetryJob> DocRoleReadModelProjectionRetryJobs { get; }
         public IMongoCollection<WorkAssignmentReport> WorkAssignmentReports { get; }
+        public IMongoCollection<WorkAssignmentReportSection> WorkAssignmentReportSections { get; }
         public IMongoCollection<WorkReportPayload> WorkReportPayloads { get; }
         public IMongoCollection<WorkReportTableValue> WorkReportTableValues { get; }
         public IMongoCollection<WorkReportPeriod> WorkReportPeriods { get; }
@@ -75,6 +77,7 @@ namespace tdtd_be.Data
             Files = Db.GetCollection<FileDoc>(o.FileDocCollection);
             DynamicExcelTemplates = Db.GetCollection<DynamicExcelTemplate>(o.DynamicExcelTemplateCollection);
             DynamicFormTemplates = Db.GetCollection<DynamicFormTemplate>(o.DynamicFormTemplateCollection);
+            DynamicFormSections = Db.GetCollection<DynamicFormSectionDocument>(o.DynamicFormSectionCollection);
             Labels = Db.GetCollection<LabelCatalogItem>(o.LabelCollection);
             LabelEnumCatalogs = Db.GetCollection<LabelEnumCatalog>(o.LabelEnumCatalogCollection);
             LabelEnumOptionReadModels = Db.GetCollection<LabelEnumOptionReadModel>(o.LabelEnumOptionReadModelCollection);
@@ -95,6 +98,7 @@ namespace tdtd_be.Data
             ReviewAssignmentSummaryDocRoles = Db.GetCollection<ReviewAssignmentSummaryDocRole>(o.ReviewAssignmentSummaryDocRoleCollection);
             DocRoleReadModelProjectionRetryJobs = Db.GetCollection<DocRoleReadModelProjectionRetryJob>(o.DocRoleReadModelProjectionRetryJobCollection);
             WorkAssignmentReports = Db.GetCollection<WorkAssignmentReport>(o.WorkAssignmentReportCollection);
+            WorkAssignmentReportSections = Db.GetCollection<WorkAssignmentReportSection>(o.WorkAssignmentReportSectionCollection);
             WorkReportPayloads = Db.GetCollection<WorkReportPayload>(o.WorkReportPayloadCollection);
             WorkReportTableValues = Db.GetCollection<WorkReportTableValue>(o.WorkReportTableValueCollection);
             WorkReportPeriods = Db.GetCollection<WorkReportPeriod>(o.WorkReportPeriodCollection);

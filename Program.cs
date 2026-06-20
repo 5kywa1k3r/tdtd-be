@@ -8,6 +8,7 @@ using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.IdentityModel.Tokens;
 using Microsoft.OpenApi.Models;
+using Microsoft.Extensions.FileProviders;
 using Minio;
 using Minio.DataModel.Args;
 using MongoDB.Driver;
@@ -390,6 +391,33 @@ var app = builder.Build();
 app.UseForwardedHeaders();
 app.UseCors("fe");
 
+var frontendStaticFilesEnabled = false;
+var frontendStaticIndexPath = "";
+if (app.Configuration.GetValue<bool>("Frontend:Enabled"))
+{
+    var frontendStaticRootConfig = app.Configuration["Frontend:StaticRoot"] ?? "../wwwroot";
+    var frontendStaticRoot = Path.GetFullPath(
+        Path.IsPathRooted(frontendStaticRootConfig)
+            ? frontendStaticRootConfig
+            : Path.Combine(app.Environment.ContentRootPath, frontendStaticRootConfig));
+    frontendStaticIndexPath = Path.Combine(frontendStaticRoot, "index.html");
+
+    if (File.Exists(frontendStaticIndexPath))
+    {
+        var frontendFileProvider = new PhysicalFileProvider(frontendStaticRoot);
+        app.UseDefaultFiles(new DefaultFilesOptions { FileProvider = frontendFileProvider });
+        app.UseStaticFiles(new StaticFileOptions { FileProvider = frontendFileProvider });
+        frontendStaticFilesEnabled = true;
+        app.Logger.LogInformation("Serving frontend static files from {FrontendStaticRoot}", frontendStaticRoot);
+    }
+    else
+    {
+        app.Logger.LogWarning(
+            "Frontend static files are enabled but index.html was not found at {FrontendStaticIndexPath}",
+            frontendStaticIndexPath);
+    }
+}
+
 if (app.Environment.IsDevelopment())
 {
     app.UseSwagger();
@@ -426,6 +454,24 @@ app.UseHangfireDashboard("/hangfire", new DashboardOptions
 app.MapControllers();
 app.MapHub<NotificationsHub>("/hubs/notifications");
 app.MapTusUploads();
+if (frontendStaticFilesEnabled)
+{
+    app.MapFallback(async context =>
+    {
+        var path = context.Request.Path;
+        if (path.StartsWithSegments("/api") ||
+            path.StartsWithSegments("/hubs") ||
+            path.StartsWithSegments("/hangfire") ||
+            path.StartsWithSegments("/swagger"))
+        {
+            context.Response.StatusCode = StatusCodes.Status404NotFound;
+            return;
+        }
+
+        context.Response.ContentType = "text/html; charset=utf-8";
+        await context.Response.SendFileAsync(frontendStaticIndexPath);
+    });
+}
 
 using (var scope = app.Services.CreateScope())
 {

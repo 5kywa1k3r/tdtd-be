@@ -2,6 +2,8 @@
 using Microsoft.Extensions.Logging;
 using MongoDB.Bson;
 using System.Globalization;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
@@ -677,6 +679,359 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         return await MapToResponseAsync(entity, period, ct);
     }
 
+    public async Task<List<WorkAssignmentReportSectionSummaryRow>> GetSectionSummariesAsync(
+        string id,
+        string actorUserId,
+        CancellationToken ct = default)
+    {
+        var entity = await EnsureReadableReportAsync(id, actorUserId, ct);
+
+        var sections = await _ctx.WorkAssignmentReportSections
+            .Find(x => x.WorkAssignmentReportId == entity.Id && !x.IsDeleted)
+            .SortBy(x => x.SectionOrder)
+            .ThenBy(x => x.SectionId)
+            .ToListAsync(ct);
+
+        return sections.Select(MapSectionSummaryRow).ToList();
+    }
+
+    public async Task<WorkAssignmentReportSectionDetailResponse> GetSectionDetailAsync(
+        string id,
+        string sectionId,
+        string actorUserId,
+        CancellationToken ct = default)
+    {
+        var normalizedSectionId = NormalizeOptionalTextOrNull(sectionId);
+        if (string.IsNullOrWhiteSpace(normalizedSectionId))
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.COMMON_ARGUMENT_REQUIRED,
+                new { reportId = id, sectionId },
+                "sectionId is required.");
+
+        var entity = await EnsureReadableReportAsync(id, actorUserId, ct);
+
+        var section = await _ctx.WorkAssignmentReportSections
+            .Find(x =>
+                x.WorkAssignmentReportId == entity.Id &&
+                x.SectionId == normalizedSectionId &&
+                !x.IsDeleted)
+            .FirstOrDefaultAsync(ct);
+
+        if (section is null)
+            throw AppExceptionFactory.NotFound(
+                AppErrorCode.COMMON_NOT_FOUND,
+                new { reportId = id, sectionId = normalizedSectionId },
+                "Không tìm thấy dữ liệu phần của báo cáo.");
+
+        DynamicFormSectionDocument? templateSection = null;
+        if (!string.IsNullOrWhiteSpace(section.DynamicFormTemplateId))
+        {
+            templateSection = await _ctx.DynamicFormSections
+                .Find(x =>
+                    x.DynamicFormTemplateId == section.DynamicFormTemplateId &&
+                    x.SectionId == section.SectionId &&
+                    !x.IsDeleted)
+                .FirstOrDefaultAsync(ct);
+        }
+
+        return new WorkAssignmentReportSectionDetailResponse
+        {
+            ReportId = entity.Id,
+            SectionId = section.SectionId,
+            SectionTitle = section.SectionTitle,
+            SectionOrder = section.SectionOrder,
+            FieldCount = section.FieldCount,
+            BlockCount = section.BlockCount,
+            HasData = section.HasData,
+            LastUpdatedAtUtc = section.LastUpdatedAtUtc,
+            LastUpdatedByUserId = section.LastUpdatedByUserId,
+            SourcePayloadUpdatedAtUtc = section.SourcePayloadUpdatedAtUtc,
+            DynamicFormTemplateId = section.DynamicFormTemplateId,
+            DynamicFormTemplateCode = section.DynamicFormTemplateCode,
+            DynamicFormTemplateName = section.DynamicFormTemplateName,
+            FieldsJson = templateSection?.FieldsJson ?? "[]",
+            BlocksJson = templateSection?.BlocksJson ?? "[]",
+            FieldValuesJson = section.FieldValuesJson,
+            TableValuesJson = section.TableValuesJson
+        };
+    }
+
+    private async Task<WorkAssignmentReport> EnsureReadableReportAsync(
+        string id,
+        string actorUserId,
+        CancellationToken ct)
+    {
+        EnsureActor(actorUserId);
+
+        if (string.IsNullOrWhiteSpace(id))
+            throw ReportIdRequired(id);
+
+        var entity = await _ctx.WorkAssignmentReports
+            .Find(x => x.Id == id && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct);
+
+        if (entity is null)
+            throw ReportNotFound(id);
+
+        EnsureReportIsActive(entity);
+        await EnsureReportAccessAsync(entity, actorUserId, ct);
+        return entity;
+    }
+
+    private static WorkAssignmentReportSectionSummaryRow MapSectionSummaryRow(
+        WorkAssignmentReportSection section)
+        => new()
+        {
+            SectionId = section.SectionId,
+            SectionTitle = section.SectionTitle,
+            SectionOrder = section.SectionOrder,
+            FieldCount = section.FieldCount,
+            BlockCount = section.BlockCount,
+            HasData = section.HasData,
+            LastUpdatedAtUtc = section.LastUpdatedAtUtc,
+            LastUpdatedByUserId = section.LastUpdatedByUserId,
+            SourcePayloadUpdatedAtUtc = section.SourcePayloadUpdatedAtUtc
+        };
+
+    private async Task UpsertReportSectionProjectionsAsync(
+        WorkAssignmentReport report,
+        string? fieldValuesJson,
+        string? tableValuesJson,
+        string actorUserId,
+        DateTime now,
+        CancellationToken ct)
+    {
+        var templateId = NormalizeOptionalTextOrNull(report.DynamicFormTemplateId);
+        if (string.IsNullOrWhiteSpace(templateId) || string.IsNullOrWhiteSpace(report.Id))
+            return;
+
+        var templateSections = await _ctx.DynamicFormSections
+            .Find(x => x.DynamicFormTemplateId == templateId && !x.IsDeleted)
+            .SortBy(x => x.Order)
+            .ThenBy(x => x.SectionId)
+            .ToListAsync(ct);
+
+        if (templateSections.Count == 0)
+            return;
+
+        var existingSections = await _ctx.WorkAssignmentReportSections
+            .Find(x => x.WorkAssignmentReportId == report.Id && !x.IsDeleted)
+            .ToListAsync(ct);
+        var existingBySectionId = existingSections
+            .GroupBy(x => x.SectionId, StringComparer.Ordinal)
+            .ToDictionary(x => x.Key, x => x.First(), StringComparer.Ordinal);
+
+        var fieldRoot = ParseJsonObjectNodeOrNull(fieldValuesJson);
+        var fieldValues = fieldRoot?["values"] as JsonObject ?? fieldRoot ?? new JsonObject();
+        var tableRoot = ParseJsonObjectNodeOrNull(tableValuesJson);
+        var tableBlocksById = BuildTableBlockMap(tableRoot);
+
+        foreach (var templateSection in templateSections)
+        {
+            var sectionValues = BuildSectionFieldValues(fieldValues, templateSection.FieldIds);
+            var sectionBlocks = BuildSectionTableBlocks(tableBlocksById, templateSection.BlockIds);
+            var hasData = JsonObjectHasData(sectionValues) ||
+                          sectionBlocks.OfType<JsonObject>().Any(TableBlockHasEnteredData);
+            var payloadHash = ComputeSectionPayloadHash(sectionValues, sectionBlocks);
+            existingBySectionId.TryGetValue(templateSection.SectionId, out var existing);
+            var changed = existing is null ||
+                          !string.Equals(existing.PayloadHash, payloadHash, StringComparison.Ordinal);
+            DateTime? lastUpdatedAtUtc = hasData
+                ? (changed ? now : existing?.LastUpdatedAtUtc ?? now)
+                : null;
+            var lastUpdatedByUserId = hasData
+                ? (changed ? actorUserId : existing?.LastUpdatedByUserId ?? actorUserId)
+                : null;
+
+            var section = new WorkAssignmentReportSection
+            {
+                Id = existing?.Id ?? ObjectId.GenerateNewId().ToString(),
+                WorkAssignmentReportId = report.Id,
+                WorkId = report.WorkId,
+                WorkAssignmentId = report.WorkAssignmentId,
+                WorkReportPeriodId = report.WorkReportPeriodId,
+                DynamicFormTemplateId = report.DynamicFormTemplateId,
+                DynamicFormTemplateCode = report.DynamicFormTemplateCode,
+                DynamicFormTemplateName = report.DynamicFormTemplateName,
+                SectionId = templateSection.SectionId,
+                SectionTitle = templateSection.Title,
+                SectionOrder = templateSection.Order,
+                Status = report.Status,
+                FieldValuesJson = BuildSectionFieldValuesJson(report, templateSection.SchemaVersion, sectionValues, now),
+                TableValuesJson = BuildSectionTableValuesJson(report, tableRoot, sectionBlocks, now),
+                FieldCount = templateSection.FieldIds.Length,
+                BlockCount = templateSection.BlockIds.Length,
+                HasData = hasData,
+                LastUpdatedAtUtc = lastUpdatedAtUtc,
+                LastUpdatedByUserId = lastUpdatedByUserId,
+                SourcePayloadUpdatedAtUtc = report.PayloadUpdatedAtUtc ?? now,
+                PayloadHash = payloadHash,
+                CreatedAtUtc = existing?.CreatedAtUtc ?? now,
+                UpdatedAtUtc = now,
+                CreatedByUserId = existing?.CreatedByUserId ?? actorUserId,
+                UpdatedByUserId = actorUserId,
+                IsDeleted = false
+            };
+
+            await _ctx.WorkAssignmentReportSections.ReplaceOneAsync(
+                x => x.WorkAssignmentReportId == report.Id &&
+                     x.SectionId == templateSection.SectionId &&
+                     !x.IsDeleted,
+                section,
+                new ReplaceOptions { IsUpsert = true },
+                ct);
+        }
+    }
+
+    private static JsonObject? ParseJsonObjectNodeOrNull(string? json)
+    {
+        if (string.IsNullOrWhiteSpace(json))
+            return null;
+
+        try
+        {
+            return JsonNode.Parse(json) as JsonObject;
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
+    private static Dictionary<string, JsonObject> BuildTableBlockMap(JsonObject? tableRoot)
+    {
+        var result = new Dictionary<string, JsonObject>(StringComparer.Ordinal);
+        if (tableRoot?["blocks"] is not JsonArray blocks)
+            return result;
+
+        foreach (var item in blocks)
+        {
+            if (item is not JsonObject block)
+                continue;
+
+            var blockId = NormalizeBlockId(ReadJsonNodeString(block, "blockId") ?? ReadJsonNodeString(block, "id"));
+            if (!string.IsNullOrWhiteSpace(blockId))
+                result[blockId] = block;
+        }
+
+        return result;
+    }
+
+    private static JsonObject BuildSectionFieldValues(JsonObject fieldValues, IReadOnlyCollection<string> fieldIds)
+    {
+        var result = new JsonObject();
+        foreach (var fieldId in fieldIds)
+        {
+            if (fieldValues.TryGetPropertyValue(fieldId, out var value))
+                result[fieldId] = CloneJsonNode(value);
+        }
+
+        return result;
+    }
+
+    private static JsonArray BuildSectionTableBlocks(
+        IReadOnlyDictionary<string, JsonObject> tableBlocksById,
+        IReadOnlyCollection<string> blockIds)
+    {
+        var result = new JsonArray();
+        foreach (var blockId in blockIds)
+        {
+            var normalizedBlockId = NormalizeBlockId(blockId);
+            if (tableBlocksById.TryGetValue(normalizedBlockId, out var block))
+                result.Add(CloneJsonNode(block));
+        }
+
+        return result;
+    }
+
+    private static string BuildSectionFieldValuesJson(
+        WorkAssignmentReport report,
+        int schemaVersion,
+        JsonObject values,
+        DateTime updatedAtUtc)
+        => new JsonObject
+        {
+            ["dynamicFormTemplateId"] = report.DynamicFormTemplateId,
+            ["dynamicFormTemplateCode"] = report.DynamicFormTemplateCode,
+            ["dynamicFormTemplateName"] = report.DynamicFormTemplateName,
+            ["schemaVersion"] = schemaVersion,
+            ["values"] = CloneJsonNode(values),
+            ["updatedAtUtc"] = updatedAtUtc.ToString("O", CultureInfo.InvariantCulture)
+        }.ToJsonString(_jsonOptions);
+
+    private static string? BuildSectionTableValuesJson(
+        WorkAssignmentReport report,
+        JsonObject? tableRoot,
+        JsonArray blocks,
+        DateTime updatedAtUtc)
+    {
+        if (blocks.Count == 0)
+            return null;
+
+        var root = CloneJsonObject(tableRoot) ?? new JsonObject();
+        root["dynamicFormTemplateId"] = report.DynamicFormTemplateId;
+        root["dynamicFormTemplateCode"] = report.DynamicFormTemplateCode;
+        root["dynamicFormTemplateName"] = report.DynamicFormTemplateName;
+        root["updatedAtUtc"] = updatedAtUtc.ToString("O", CultureInfo.InvariantCulture);
+        root["blocks"] = CloneJsonNode(blocks);
+        return root.ToJsonString(_jsonOptions);
+    }
+
+    private static string ComputeSectionPayloadHash(JsonObject sectionValues, JsonArray sectionBlocks)
+    {
+        var root = new JsonObject
+        {
+            ["fieldValues"] = CloneJsonNode(sectionValues),
+            ["tableBlocks"] = CloneJsonNode(sectionBlocks)
+        };
+
+        return Sha256Hex(root.ToJsonString(_jsonOptions));
+    }
+
+    private static bool JsonObjectHasData(JsonObject obj)
+        => obj.Any(item => JsonNodeHasData(item.Value));
+
+    private static bool TableBlockHasEnteredData(JsonObject block)
+        => block.TryGetPropertyValue("values1D", out var values) && JsonNodeHasData(values);
+
+    private static bool JsonNodeHasData(JsonNode? node)
+    {
+        if (node is null)
+            return false;
+
+        if (node is JsonArray array)
+            return array.Any(JsonNodeHasData);
+
+        if (node is JsonObject obj)
+            return obj.Any(item => JsonNodeHasData(item.Value));
+
+        if (node is not JsonValue value)
+            return false;
+
+        if (value.TryGetValue<string>(out var text))
+            return !string.IsNullOrWhiteSpace(text);
+
+        if (value.TryGetValue<bool>(out _))
+            return true;
+
+        if (value.TryGetValue<double>(out var number))
+            return !double.IsNaN(number);
+
+        return true;
+    }
+
+    private static JsonObject? CloneJsonObject(JsonObject? obj)
+        => CloneJsonNode(obj) as JsonObject;
+
+    private static JsonNode? CloneJsonNode(JsonNode? node)
+        => node is null ? null : JsonNode.Parse(node.ToJsonString(_jsonOptions));
+
+    private static string Sha256Hex(string value)
+    {
+        var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(value));
+        return Convert.ToHexString(bytes).ToLowerInvariant();
+    }
+
     public async Task<DynamicExcelDetail> GetReportTemplateWorkbookAsync(
         string id,
         string dynamicExcelTemplateId,
@@ -925,7 +1280,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             completedDatePolicy,
             completedDatePolicy.CanEditCompletedDate ? requestedCompletedDate ?? entity.CompletedDate : requestedCompletedDate,
             ReportDetails(entity, actorUserId),
-            requireWhenMissing: completedDatePolicy.RequiresCompletedDate);
+            requireWhenMissing: false);
         EnsureReportDateRange(startedDate, completedDate, "StartedDate", "CompletedDate");
         var effectiveDueAtUtc = ResolveEffectiveReportDueAtUtc(entity.DueAtUtc ?? period?.DueAtUtc, reportAccess.assignment);
         var nextDataOrigin = ResolveReportDataOrigin(req.DataOrigin, entity.DataOrigin);
@@ -1048,6 +1403,14 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         entity.CreatedByUserId = string.IsNullOrWhiteSpace(entity.CreatedByUserId) ? actorUserId : entity.CreatedByUserId;
         entity.UpdatedAtUtc = now;
         entity.UpdatedByUserId = actorUserId;
+
+        await UpsertReportSectionProjectionsAsync(
+            entity,
+            fieldValuesJson,
+            tableValuesJson,
+            actorUserId,
+            now,
+            ct);
 
         if (period is not null)
         {
@@ -1707,6 +2070,14 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             now,
             ct);
         ApplyPayloadMetadata(entity, payloadResult, now);
+
+        await UpsertReportSectionProjectionsAsync(
+            entity,
+            entity.FieldValuesJson,
+            entity.TableValuesJson,
+            entity.UpdatedByUserId ?? actorUserId,
+            now,
+            ct);
 
         await _ctx.WorkAssignmentReports.UpdateOneAsync(
             x => x.Id == id && !x.IsDeleted,

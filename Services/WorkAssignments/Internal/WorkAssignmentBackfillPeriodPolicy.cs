@@ -62,9 +62,7 @@ internal static class WorkAssignmentBackfillPeriodPolicy
         minDate = sourceStart.Value > assignmentStartDate
             ? sourceStart.Value
             : assignmentStartDate;
-        maxDate = sourceEnd.Value < assignmentCreatedDate
-            ? sourceEnd.Value
-            : assignmentCreatedDate;
+        maxDate = nowUtc.Date;
 
         return maxDate >= minDate;
     }

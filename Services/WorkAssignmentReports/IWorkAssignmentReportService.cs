@@ -63,6 +63,17 @@ public interface IWorkAssignmentReportService
         string currentUserId,
         CancellationToken ct = default);
 
+    Task<List<WorkAssignmentReportSectionSummaryRow>> GetSectionSummariesAsync(
+        string id,
+        string currentUserId,
+        CancellationToken ct = default);
+
+    Task<WorkAssignmentReportSectionDetailResponse> GetSectionDetailAsync(
+        string id,
+        string sectionId,
+        string currentUserId,
+        CancellationToken ct = default);
+
     Task<DynamicExcelDetail> GetReportTemplateWorkbookAsync(
         string id,
         string dynamicExcelTemplateId,
