@@ -173,3 +173,33 @@ public sealed class AdvancedSummaryNodeResetResponse
     public DateTime QueuedAtUtc { get; init; }
     public AdvancedSummaryNodeRow? Node { get; init; }
 }
+
+public sealed class AdvancedSummaryNodeCleanupRequest
+{
+    public string? Grain { get; init; }
+    public string? Status { get; init; }
+    public string? WorkId { get; init; }
+    public string? WorkAssignmentId { get; init; }
+    public string? DynamicFormTemplateId { get; init; }
+    public string? SectionId { get; init; }
+    public string? ConfigId { get; init; }
+    public int? ConfigVersionNo { get; init; }
+    public string? ConfigHash { get; init; }
+    public string? SourceSignatureHash { get; init; }
+    public DateTime? UpdatedBeforeUtc { get; init; }
+    public DateTime? BuiltBeforeUtc { get; init; }
+    public bool DryRun { get; init; } = true;
+    public int Limit { get; init; } = 500;
+}
+
+public sealed class AdvancedSummaryNodeCleanupResponse
+{
+    public bool Ok { get; init; }
+    public bool DryRun { get; init; }
+    public int Limit { get; init; }
+    public long MatchedCount { get; init; }
+    public int SelectedCount { get; init; }
+    public long SoftDeletedCount { get; init; }
+    public bool HasMore { get; init; }
+    public List<AdvancedSummaryNodeRow> SampleRows { get; init; } = new();
+}

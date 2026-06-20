@@ -407,6 +407,29 @@ public sealed class AdminOperationsController : ControllerBase
         return Ok(await _jobRuns.ResetAdvancedSummaryNodeAsync(grain, nodeId, me.Id, ct));
     }
 
+    [HttpPost("job-runs/advanced-summary-nodes/cleanup")]
+    public async Task<IActionResult> CleanupAdvancedSummaryNodes(
+        [FromBody] AdvancedSummaryNodeCleanupRequest? request,
+        CancellationToken ct = default)
+    {
+        var me = _me.RequireMe();
+        RoleGuard.RequireSystemAdmin(me);
+        request ??= new AdvancedSummaryNodeCleanupRequest();
+        var startedAtUtc = DateTime.UtcNow;
+
+        try
+        {
+            var result = await _jobRuns.CleanupAdvancedSummaryNodesAsync(request, me.Id, ct);
+            await WriteAdvancedSummaryNodeCleanupLogAsync(request, result, startedAtUtc, me.Id, ex: null, ct);
+            return Ok(result);
+        }
+        catch (Exception ex)
+        {
+            await WriteAdvancedSummaryNodeCleanupLogAsync(request, result: null, startedAtUtc, me.Id, ex, ct);
+            throw;
+        }
+    }
+
     [HttpGet("report-payloads/diagnostics")]
     public async Task<IActionResult> CheckReportPayloadDiagnostics(
         [FromQuery] string? workId = null,
@@ -508,6 +531,39 @@ public sealed class AdminOperationsController : ControllerBase
     private void RequireSystemAdmin()
         => RoleGuard.RequireSystemAdmin(_me.RequireMe());
 
+    private Task WriteAdvancedSummaryNodeCleanupLogAsync(
+        AdvancedSummaryNodeCleanupRequest request,
+        AdvancedSummaryNodeCleanupResponse? result,
+        DateTime startedAtUtc,
+        string actorUserId,
+        Exception? ex,
+        CancellationToken ct)
+    {
+        var completedAtUtc = DateTime.UtcNow;
+        var logResult = ex is not null
+            ? "FAILED"
+            : result?.DryRun == true
+                ? "DRY_RUN"
+                : "SUCCESS";
+
+        return _operationLogs.WriteAsync(new WorkStatusOperationLog
+        {
+            Operation = "ADVANCED_SUMMARY_NODE_CLEANUP",
+            Scope = "advanced-summary-nodes",
+            Result = logResult,
+            WorkId = request.WorkId,
+            WorkAssignmentId = request.WorkAssignmentId,
+            ActorUserId = actorUserId,
+            Summary = BuildAdvancedSummaryNodeCleanupSummary(request, result),
+            ErrorType = ex?.GetType().FullName,
+            ErrorMessage = ex?.Message,
+            ErrorStackTrace = ex?.ToString(),
+            StartedAtUtc = startedAtUtc,
+            CompletedAtUtc = completedAtUtc,
+            DurationMs = (long)(completedAtUtc - startedAtUtc).TotalMilliseconds
+        }, ct);
+    }
+
     private Task WriteReportPayloadDiagnosticsRepairLogAsync(
         WorkReportPayloadDiagnosticsRepairResult result,
         DateTime startedAtUtc,
@@ -545,4 +601,9 @@ public sealed class AdminOperationsController : ControllerBase
     private static string BuildReportPayloadDiagnosticsRepairSummary(
         WorkReportPayloadDiagnosticsRepairResult result)
         => $"dryRun={result.DryRun};limit={result.Limit};issues={result.Diagnostics.IssueCount};plannedPayloadOrphans={result.PlannedOrphanPayloadRows};softDeletedPayloads={result.SoftDeletedPayloadRows};plannedTableOrphans={result.PlannedOrphanTableValueRows};softDeletedTableValues={result.SoftDeletedTableValueRows};plannedStatisticTemplates={result.PlannedStatisticTemplateRebuilds};enqueuedStatisticTemplates={result.EnqueuedStatisticTemplateRebuilds};failed={result.FailedCount}";
+
+    private static string BuildAdvancedSummaryNodeCleanupSummary(
+        AdvancedSummaryNodeCleanupRequest request,
+        AdvancedSummaryNodeCleanupResponse? result)
+        => $"dryRun={request.DryRun};limit={JobRunManagementService.NormalizeAdvancedSummaryCleanupLimit(request.Limit)};grain={request.Grain};status={request.Status};dynamicFormTemplateId={request.DynamicFormTemplateId};sectionId={request.SectionId};configId={request.ConfigId};configVersionNo={request.ConfigVersionNo};configHash={request.ConfigHash};sourceSignatureHash={request.SourceSignatureHash};updatedBeforeUtc={request.UpdatedBeforeUtc:O};builtBeforeUtc={request.BuiltBeforeUtc:O};matched={result?.MatchedCount ?? 0};selected={result?.SelectedCount ?? 0};softDeleted={result?.SoftDeletedCount ?? 0};hasMore={result?.HasMore ?? false}";
 }

@@ -43,6 +43,10 @@ public interface IJobRunManagementService
         string nodeId,
         string actorUserId,
         CancellationToken ct = default);
+    Task<AdvancedSummaryNodeCleanupResponse> CleanupAdvancedSummaryNodesAsync(
+        AdvancedSummaryNodeCleanupRequest request,
+        string actorUserId,
+        CancellationToken ct = default);
     Task<int> ProcessMaterializeJobsAsync(int maxJobs, int batchSize, CancellationToken ct = default);
     Task ProcessWorkAssignmentQueueScanAsync(CancellationToken ct = default);
     Task ProcessNotificationDueScanAsync(CancellationToken ct = default);
@@ -406,6 +410,112 @@ public sealed class JobRunManagementService : IJobRunManagementService
         };
     }
 
+    public async Task<AdvancedSummaryNodeCleanupResponse> CleanupAdvancedSummaryNodesAsync(
+        AdvancedSummaryNodeCleanupRequest request,
+        string actorUserId,
+        CancellationToken ct = default)
+    {
+        request ??= new AdvancedSummaryNodeCleanupRequest();
+        actorUserId = NullIfWhiteSpace(actorUserId)
+            ?? throw AppExceptionFactory.BadRequest(AppErrorCode.COMMON_ARGUMENT_REQUIRED, new { field = "actorUserId" });
+
+        if (!HasAdvancedSummaryCleanupSelector(request))
+        {
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.COMMON_VALIDATION_FAILED,
+                new { reason = "ADVANCED_SUMMARY_CLEANUP_REQUIRES_SCOPE_SELECTOR" });
+        }
+
+        var limit = NormalizeAdvancedSummaryCleanupLimit(request.Limit);
+        var grain = NormalizeAdvancedSummaryGrainOrNull(request.Grain);
+        var resultSets = new List<(string Grain, List<AdvancedSummaryNodeRow> Rows, long Total)>();
+
+        if (grain is null || grain == WorkAssignmentAdvancedSummaryHierarchyGrains.Day)
+        {
+            var result = await FindAdvancedSummaryCleanupCandidatesByGrainAsync(
+                _ctx.WorkAssignmentAdvancedSummaryDayNodes,
+                WorkAssignmentAdvancedSummaryHierarchyGrains.Day,
+                request,
+                limit,
+                ct);
+            resultSets.Add((WorkAssignmentAdvancedSummaryHierarchyGrains.Day, result.Rows, result.Total));
+        }
+
+        if (grain is null || grain == WorkAssignmentAdvancedSummaryHierarchyGrains.Month)
+        {
+            var result = await FindAdvancedSummaryCleanupCandidatesByGrainAsync(
+                _ctx.WorkAssignmentAdvancedSummaryMonthNodes,
+                WorkAssignmentAdvancedSummaryHierarchyGrains.Month,
+                request,
+                limit,
+                ct);
+            resultSets.Add((WorkAssignmentAdvancedSummaryHierarchyGrains.Month, result.Rows, result.Total));
+        }
+
+        if (grain is null || grain == WorkAssignmentAdvancedSummaryHierarchyGrains.Year)
+        {
+            var result = await FindAdvancedSummaryCleanupCandidatesByGrainAsync(
+                _ctx.WorkAssignmentAdvancedSummaryYearNodes,
+                WorkAssignmentAdvancedSummaryHierarchyGrains.Year,
+                request,
+                limit,
+                ct);
+            resultSets.Add((WorkAssignmentAdvancedSummaryHierarchyGrains.Year, result.Rows, result.Total));
+        }
+
+        var matchedCount = resultSets.Sum(x => x.Total);
+        var selectedRows = resultSets
+            .SelectMany(x => x.Rows)
+            .OrderByDescending(x => x.UpdatedAtUtc)
+            .Take(limit)
+            .ToList();
+
+        long softDeletedCount = 0;
+        if (!request.DryRun && selectedRows.Count > 0)
+        {
+            var now = DateTime.UtcNow;
+            softDeletedCount += await SoftDeleteAdvancedSummaryCleanupRowsAsync(
+                _ctx.WorkAssignmentAdvancedSummaryDayNodes,
+                selectedRows
+                    .Where(x => x.Grain == WorkAssignmentAdvancedSummaryHierarchyGrains.Day)
+                    .Select(x => x.Id)
+                    .ToList(),
+                actorUserId,
+                now,
+                ct);
+            softDeletedCount += await SoftDeleteAdvancedSummaryCleanupRowsAsync(
+                _ctx.WorkAssignmentAdvancedSummaryMonthNodes,
+                selectedRows
+                    .Where(x => x.Grain == WorkAssignmentAdvancedSummaryHierarchyGrains.Month)
+                    .Select(x => x.Id)
+                    .ToList(),
+                actorUserId,
+                now,
+                ct);
+            softDeletedCount += await SoftDeleteAdvancedSummaryCleanupRowsAsync(
+                _ctx.WorkAssignmentAdvancedSummaryYearNodes,
+                selectedRows
+                    .Where(x => x.Grain == WorkAssignmentAdvancedSummaryHierarchyGrains.Year)
+                    .Select(x => x.Id)
+                    .ToList(),
+                actorUserId,
+                now,
+                ct);
+        }
+
+        return new AdvancedSummaryNodeCleanupResponse
+        {
+            Ok = true,
+            DryRun = request.DryRun,
+            Limit = limit,
+            MatchedCount = matchedCount,
+            SelectedCount = selectedRows.Count,
+            SoftDeletedCount = softDeletedCount,
+            HasMore = matchedCount > selectedRows.Count,
+            SampleRows = selectedRows
+        };
+    }
+
     private async Task<(List<AdvancedSummaryNodeRow> Rows, long Total)> SearchAdvancedSummaryNodesByGrainAsync<T>(
         IMongoCollection<T> col,
         string grain,
@@ -449,6 +559,77 @@ public sealed class JobRunManagementService : IJobRunManagementService
             .ToListAsync(ct);
 
         return (rows.Select(x => ToAdvancedSummaryNodeRow(x, grain)).ToList(), total);
+    }
+
+    private async Task<(List<AdvancedSummaryNodeRow> Rows, long Total)> FindAdvancedSummaryCleanupCandidatesByGrainAsync<T>(
+        IMongoCollection<T> col,
+        string grain,
+        AdvancedSummaryNodeCleanupRequest request,
+        int limit,
+        CancellationToken ct)
+        where T : WorkAssignmentAdvancedSummaryHierarchyNodeBase
+    {
+        var fb = Builders<T>.Filter;
+        var filter = BuildAdvancedSummaryCleanupFilter(fb, request);
+        var total = await col.CountDocumentsAsync(filter, cancellationToken: ct);
+        var rows = await col
+            .Find(filter)
+            .Sort(Builders<T>.Sort.Descending(x => x.UpdatedAtUtc))
+            .Limit(limit)
+            .ToListAsync(ct);
+
+        return (rows.Select(x => ToAdvancedSummaryNodeRow(x, grain)).ToList(), total);
+    }
+
+    private static FilterDefinition<T> BuildAdvancedSummaryCleanupFilter<T>(
+        FilterDefinitionBuilder<T> fb,
+        AdvancedSummaryNodeCleanupRequest request)
+        where T : WorkAssignmentAdvancedSummaryHierarchyNodeBase
+    {
+        var filter = fb.Eq(x => x.IsDeleted, false);
+
+        filter &= EqIfNotBlank(fb, x => x.Status, request.Status);
+        filter &= EqIfNotBlank(fb, x => x.WorkId, request.WorkId);
+        filter &= EqIfNotBlank(fb, x => x.AssignmentId, request.WorkAssignmentId);
+        filter &= EqIfNotBlank(fb, x => x.DynamicFormTemplateId, request.DynamicFormTemplateId);
+        filter &= EqIfNotBlank(fb, x => x.SectionId, request.SectionId);
+        filter &= EqIfNotBlank(fb, x => x.ConfigId, request.ConfigId);
+        filter &= EqIfNotBlank(fb, x => x.ConfigHash, request.ConfigHash);
+        filter &= EqIfNotBlank(fb, x => x.SourceSignatureHash, request.SourceSignatureHash);
+
+        if (request.ConfigVersionNo is int configVersionNo)
+            filter &= fb.Eq(x => x.ConfigVersionNo, configVersionNo);
+
+        if (request.UpdatedBeforeUtc is DateTime updatedBeforeUtc)
+            filter &= fb.Lt(x => x.UpdatedAtUtc, updatedBeforeUtc.ToUniversalTime());
+
+        if (request.BuiltBeforeUtc is DateTime builtBeforeUtc)
+            filter &= fb.Lt(x => x.BuiltAtUtc, builtBeforeUtc.ToUniversalTime());
+
+        return filter;
+    }
+
+    private static async Task<long> SoftDeleteAdvancedSummaryCleanupRowsAsync<T>(
+        IMongoCollection<T> col,
+        IReadOnlyCollection<string> ids,
+        string actorUserId,
+        DateTime now,
+        CancellationToken ct)
+        where T : WorkAssignmentAdvancedSummaryHierarchyNodeBase
+    {
+        if (ids.Count == 0)
+            return 0;
+
+        var fb = Builders<T>.Filter;
+        var filter = fb.In(x => x.Id, ids) & fb.Eq(x => x.IsDeleted, false);
+        var update = Builders<T>.Update
+            .Set(x => x.IsDeleted, true)
+            .Set(x => x.DeletedAtUtc, now)
+            .Set(x => x.DeletedByUserId, actorUserId)
+            .Set(x => x.UpdatedAtUtc, now)
+            .Set(x => x.UpdatedByUserId, actorUserId);
+        var result = await col.UpdateManyAsync(filter, update, cancellationToken: ct);
+        return result.ModifiedCount;
     }
 
     private async Task<AdvancedSummaryNodeResetResponse> ResetDayNodeAsync(
@@ -807,6 +988,21 @@ public sealed class JobRunManagementService : IJobRunManagementService
             return node.CreatedByUserId;
 
         return actorUserId;
+    }
+
+    internal static int NormalizeAdvancedSummaryCleanupLimit(int limit)
+        => Math.Clamp(limit <= 0 ? 500 : limit, 1, 1000);
+
+    internal static bool HasAdvancedSummaryCleanupSelector(AdvancedSummaryNodeCleanupRequest request)
+    {
+        return NullIfWhiteSpace(request.WorkId) is not null ||
+               NullIfWhiteSpace(request.WorkAssignmentId) is not null ||
+               NullIfWhiteSpace(request.DynamicFormTemplateId) is not null ||
+               NullIfWhiteSpace(request.SectionId) is not null ||
+               NullIfWhiteSpace(request.ConfigId) is not null ||
+               request.ConfigVersionNo.HasValue ||
+               NullIfWhiteSpace(request.ConfigHash) is not null ||
+               NullIfWhiteSpace(request.SourceSignatureHash) is not null;
     }
 
     private static FilterDefinition<T> EqIfNotBlank<T>(

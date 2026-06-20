@@ -2,6 +2,7 @@ using tdtd_be.Common.Auth;
 using tdtd_be.Common.Errors;
 using tdtd_be.DTOs.Auth;
 using tdtd_be.DTOs.DynamicExcel;
+using tdtd_be.DTOs.Operations;
 using tdtd_be.DTOs.WorkAssignments;
 using tdtd_be.DTOs.WorkAssignments.AggregateTable;
 using tdtd_be.DTOs.WorkAssignments.BasicSummary;
@@ -130,6 +131,8 @@ var tests = new (string Name, Action Run)[]
     ("recurring job runner methods prevent overlap", RecurringJobRunnerMethodsPreventOverlap),
     ("advanced summary operations normalize hierarchy grain", AdvancedSummaryOperationsNormalizeHierarchyGrain),
     ("advanced summary operations reset actor uses original requester", AdvancedSummaryOperationsResetActorUsesOriginalRequester),
+    ("advanced summary operations cleanup limit is bounded", AdvancedSummaryOperationsCleanupLimitIsBounded),
+    ("advanced summary operations cleanup requires scope selector", AdvancedSummaryOperationsCleanupRequiresScopeSelector),
 };
 
 var failures = new List<string>();
@@ -475,6 +478,55 @@ static void AdvancedSummaryOperationsResetActorUsesOriginalRequester()
         UserId(1),
         JobRunManagementService.ResolveAdvancedSummaryResetJobActor(node, UserId(9)),
         "advanced reset should fall back to creator when updated actor is missing");
+}
+
+static void AdvancedSummaryOperationsCleanupLimitIsBounded()
+{
+    AssertEqual(
+        500,
+        JobRunManagementService.NormalizeAdvancedSummaryCleanupLimit(0),
+        "advanced cleanup should default empty limits to 500");
+    AssertEqual(
+        500,
+        JobRunManagementService.NormalizeAdvancedSummaryCleanupLimit(-10),
+        "advanced cleanup should default negative limits to 500");
+    AssertEqual(
+        1000,
+        JobRunManagementService.NormalizeAdvancedSummaryCleanupLimit(5000),
+        "advanced cleanup should cap each run to 1000 nodes");
+}
+
+static void AdvancedSummaryOperationsCleanupRequiresScopeSelector()
+{
+    AssertFalse(
+        JobRunManagementService.HasAdvancedSummaryCleanupSelector(new AdvancedSummaryNodeCleanupRequest
+        {
+            Grain = WorkAssignmentAdvancedSummaryHierarchyGrains.Day,
+            Status = WorkAssignmentAdvancedSummaryHierarchyNodeStatuses.Failed
+        }),
+        "advanced cleanup should not allow a broad grain/status-only sweep");
+
+    AssertFalse(
+        JobRunManagementService.HasAdvancedSummaryCleanupSelector(new AdvancedSummaryNodeCleanupRequest
+        {
+            UpdatedBeforeUtc = new DateTime(2026, 6, 1, 0, 0, 0, DateTimeKind.Utc)
+        }),
+        "advanced cleanup should not allow a broad time-only sweep");
+
+    AssertTrue(
+        JobRunManagementService.HasAdvancedSummaryCleanupSelector(new AdvancedSummaryNodeCleanupRequest
+        {
+            ConfigVersionNo = 2
+        }),
+        "advanced cleanup should allow config version scoped cleanup");
+
+    AssertTrue(
+        JobRunManagementService.HasAdvancedSummaryCleanupSelector(new AdvancedSummaryNodeCleanupRequest
+        {
+            SectionId = "summary-section",
+            SourceSignatureHash = "source-sig"
+        }),
+        "advanced cleanup should allow section/source-signature scoped cleanup");
 }
 
 static void BlocksOnceDueBeforeAssignmentStart()
