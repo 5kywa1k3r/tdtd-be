@@ -118,6 +118,8 @@ var tests = new (string Name, Action Run)[]
     ("advanced summary hierarchy query plans largest grains", AdvancedSummaryHierarchyQueryPlansLargestGrains),
     ("summary token month key uses utc month", SummaryTokenMonthKeyUsesUtcMonth),
     ("summary token quota boundary allows free initial lock", SummaryTokenQuotaBoundaryAllowsFreeInitialLock),
+    ("summary token grants extend monthly allowance", SummaryTokenGrantsExtendMonthlyAllowance),
+    ("summary token manager scope follows unit hierarchy", SummaryTokenManagerScopeFollowsUnitHierarchy),
     ("legacy work basis file resolves as work document", ResolvesLegacyWorkBasisFileAsWorkDocument),
     ("assignment file resolves as assignment branch document", ResolvesAssignmentFileAsBranchDocument),
     ("assignment document path resolves ancestors only", ResolvesAssignmentDocumentAncestorsFromPath),
@@ -3623,6 +3625,49 @@ static void SummaryTokenQuotaBoundaryAllowsFreeInitialLock()
     AssertTrue(
         WorkSummaryTokenService.WouldExceedQuota(30, 1, 30),
         "next config change after quota exhaustion should be blocked");
+}
+
+static void SummaryTokenGrantsExtendMonthlyAllowance()
+{
+    AssertEqual(35, WorkSummaryTokenService.CalculateAllowance(30, 5), "grant units should extend the monthly quota");
+    AssertEqual(5, WorkSummaryTokenService.CalculateAllowance(0, 5), "grant units should work when base quota is zero");
+    AssertEqual(30, WorkSummaryTokenService.CalculateAllowance(30, -5), "negative grants should not reduce allowance");
+}
+
+static void SummaryTokenManagerScopeFollowsUnitHierarchy()
+{
+    var parent = new Unit
+    {
+        Id = ObjectId(1),
+        Code = "001",
+        Level = 1
+    };
+    var child = new Unit
+    {
+        Id = ObjectId(2),
+        Code = "001001",
+        Level = 2,
+        ParentUnitId = parent.Id
+    };
+    var sibling = new Unit
+    {
+        Id = ObjectId(3),
+        Code = "002",
+        Level = 1
+    };
+
+    AssertTrue(
+        WorkSummaryTokenService.IsSameOrDescendantUnit(parent, child),
+        "manager unit should cover descendant units");
+    AssertTrue(
+        WorkSummaryTokenService.IsSameOrDescendantUnit(parent, parent),
+        "manager unit should cover its own unit");
+    AssertFalse(
+        WorkSummaryTokenService.IsSameOrDescendantUnit(child, parent),
+        "child manager should not cover parent unit");
+    AssertFalse(
+        WorkSummaryTokenService.IsSameOrDescendantUnit(parent, sibling),
+        "manager unit should not cover sibling branches");
 }
 
 static void ResolvesLegacyWorkBasisFileAsWorkDocument()
