@@ -4,6 +4,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
+using Hangfire;
 using MongoDB.Bson;
 using MongoDB.Driver;
 using tdtd_be.Common.Errors;
@@ -43,15 +44,18 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
     private readonly MongoDbContext _ctx;
     private readonly IWorkReportPayloadReader _payloadReader;
     private readonly IUnitSelectionService _unitSelection;
+    private readonly IBackgroundJobClient _backgroundJobs;
 
     public WorkAssignmentBasicSummaryService(
         MongoDbContext ctx,
         IWorkReportPayloadReader payloadReader,
-        IUnitSelectionService unitSelection)
+        IUnitSelectionService unitSelection,
+        IBackgroundJobClient backgroundJobs)
     {
         _ctx = ctx;
         _payloadReader = payloadReader;
         _unitSelection = unitSelection;
+        _backgroundJobs = backgroundJobs;
     }
 
     public async Task<WorkAssignmentBasicSummaryConfigDto?> GetConfigAsync(
@@ -211,6 +215,76 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
         return response;
     }
 
+    public async Task RefreshSnapshotJobAsync(
+        string snapshotId,
+        WorkAssignmentBasicSummaryRequest req,
+        string actorUserId,
+        CancellationToken ct)
+    {
+        EnsureActor(actorUserId);
+
+        if (string.IsNullOrWhiteSpace(snapshotId))
+            throw new ArgumentException("Snapshot id is required.", nameof(snapshotId));
+
+        try
+        {
+            var normalized = await NormalizeRequestAsync(req, ct);
+            var scope = await LoadScopeAssignmentAsync(normalized.ScopeAssignmentId, ct);
+
+            if (!CanReadAssignment(scope, actorUserId))
+            {
+                throw AppExceptionFactory.Forbidden(
+                    AppErrorCode.WORK_ASSIGNMENT_AGGREGATE_READ_FORBIDDEN,
+                    new { normalized.ScopeAssignmentId, actorUserId });
+            }
+
+            ValidateSummaryScope(scope, normalized);
+
+            if (IsPeriodicAssignment(scope) && normalized.PeriodScopeMode == "PERIOD_RANGE")
+                throw new InvalidOperationException("Basic summary refresh job must target one snapshot, not a period range.");
+
+            var dynamicFormTemplateId = normalized.DynamicFormTemplateId ?? scope.DynamicFormTemplateId;
+            if (string.IsNullOrWhiteSpace(dynamicFormTemplateId))
+                throw AppExceptionFactory.BadRequest(AppErrorCode.WORK_ASSIGNMENT_AGGREGATE_DYNAMIC_FORM_TEMPLATE_ID_REQUIRED);
+
+            dynamicFormTemplateId = dynamicFormTemplateId.Trim();
+            var template = await _ctx.DynamicFormTemplates
+                .Find(x => x.Id == dynamicFormTemplateId && !x.IsDeleted)
+                .FirstOrDefaultAsync(ct)
+                ?? throw AppExceptionFactory.NotFound(
+                    AppErrorCode.DYNAMIC_FORM_TEMPLATE_NOT_FOUND,
+                    new { dynamicFormTemplateId });
+
+            var sourceAssignments = await LoadSourceAssignmentsAsync(
+                scope,
+                dynamicFormTemplateId,
+                normalized.SelectedUnitIds,
+                ct);
+            var sourceReports = await LoadSourceReportsAsync(
+                sourceAssignments.Select(x => x.Id).ToList(),
+                dynamicFormTemplateId,
+                normalized,
+                ct);
+
+            await MarkSnapshotRefreshStartedAsync(snapshotId, ct);
+
+            await BuildAndSaveSummarySnapshotAsync(
+                snapshotId,
+                scope,
+                template,
+                normalized,
+                sourceAssignments,
+                sourceReports,
+                actorUserId,
+                ct);
+        }
+        catch (Exception ex)
+        {
+            await MarkSnapshotRefreshErrorAsync(snapshotId, BuildRefreshErrorMessage(ex), ct);
+            throw;
+        }
+    }
+
     private async Task<WorkAssignmentBasicSummaryResponse> GetOrBuildSummarySnapshotAsync(
         WorkAssignment scope,
         DynamicFormTemplate template,
@@ -255,45 +329,214 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
                 snapshotDirty: false,
                 snapshot.SourceSignatureHash,
                 snapshot.SnapshotDirtyAtUtc,
-                snapshot.SnapshotRefreshedAtUtc);
+                snapshot.SnapshotRefreshedAtUtc,
+                snapshot.RefreshStatus,
+                snapshot.RefreshJobId,
+                snapshot.RefreshQueuedAtUtc,
+                snapshot.RefreshStartedAtUtc,
+                snapshot.RefreshFinishedAtUtc,
+                snapshot.RefreshError);
 
             return cached;
         }
 
-        try
-        {
-            var snapshotId = snapshot?.Id ?? ObjectId.GenerateNewId().ToString();
-            var response = await BuildSummaryAsync(
-                snapshotId,
-                scope,
-                template,
-                normalized,
-                sourceAssignments,
-                sourceReports,
-                sourceSignatureHash,
-                ct);
+        var queuedSnapshot = await EnsureQueuedSnapshotAsync(
+            snapshot?.Id ?? ObjectId.GenerateNewId().ToString(),
+            scope,
+            template.Id,
+            requestHash,
+            normalized,
+            sourceAssignments,
+            sourceReports,
+            sourceSignatureHash,
+            actorUserId,
+            ct);
 
-            await SaveSnapshotAsync(
-                snapshotId,
-                scope,
-                template.Id,
-                requestHash,
-                normalized,
-                sourceAssignments,
-                sourceReports,
-                sourceSignatureHash,
-                response,
-                actorUserId,
-                snapshot is null,
-                ct);
+        await EnqueueSnapshotRefreshIfNeededAsync(
+            queuedSnapshot,
+            ToRequestDto(normalized),
+            actorUserId,
+            ct);
 
-            return response;
-        }
-        catch (Exception ex) when (snapshot is not null)
+        return CreateCalculatingResponse(
+            queuedSnapshot,
+            snapshot,
+            scope,
+            template,
+            normalized,
+            sourceAssignments,
+            sourceReports,
+            sourceSignatureHash);
+    }
+
+    private async Task<WorkAssignmentBasicSummaryResponse> BuildAndSaveSummarySnapshotAsync(
+        string snapshotId,
+        WorkAssignment scope,
+        DynamicFormTemplate template,
+        NormalizedRequest normalized,
+        List<WorkAssignment> sourceAssignments,
+        List<WorkAssignmentReport> sourceReports,
+        string actorUserId,
+        CancellationToken ct)
+    {
+        var requestHash = BuildRequestHash(normalized, scope.Id, template.Id);
+        var sourceSignatureHash = BuildSourceSignatureHash(sourceAssignments, sourceReports);
+        var existing = await _ctx.WorkAssignmentBasicSummarySnapshots
+            .Find(x => x.Id == snapshotId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct);
+
+        var response = await BuildSummaryAsync(
+            snapshotId,
+            scope,
+            template,
+            normalized,
+            sourceAssignments,
+            sourceReports,
+            sourceSignatureHash,
+            ct);
+
+        await SaveSnapshotAsync(
+            snapshotId,
+            scope,
+            template.Id,
+            requestHash,
+            normalized,
+            sourceAssignments,
+            sourceReports,
+            sourceSignatureHash,
+            response,
+            actorUserId,
+            existing is null,
+            ct);
+
+        return response;
+    }
+
+    private async Task<WorkAssignmentBasicSummarySnapshot> EnsureQueuedSnapshotAsync(
+        string snapshotId,
+        WorkAssignment scope,
+        string dynamicFormTemplateId,
+        string requestHash,
+        NormalizedRequest req,
+        List<WorkAssignment> sourceAssignments,
+        List<WorkAssignmentReport> sourceReports,
+        string sourceSignatureHash,
+        string actorUserId,
+        CancellationToken ct)
+    {
+        var now = DateTime.UtcNow;
+        var requestJson = BuildSnapshotRequestJson(scope, dynamicFormTemplateId, req);
+
+        var update = Builders<WorkAssignmentBasicSummarySnapshot>.Update
+            .SetOnInsert(x => x.Id, snapshotId)
+            .SetOnInsert(x => x.CreatedAtUtc, now)
+            .SetOnInsert(x => x.CreatedByUserId, actorUserId)
+            .SetOnInsert(x => x.SnapshotJson, "{}")
+            .Set(x => x.WorkId, scope.WorkId)
+            .Set(x => x.ScopeAssignmentId, scope.Id)
+            .Set(x => x.DynamicFormTemplateId, dynamicFormTemplateId)
+            .Set(x => x.RequestHash, requestHash)
+            .Set(x => x.RequestJson, requestJson)
+            .Set(x => x.SourceAssignmentIds, sourceAssignments.Select(x => x.Id).ToList())
+            .Set(x => x.SourceReportIds, sourceReports.Select(x => x.Id).ToList())
+            .Set(x => x.SourceSignatureHash, sourceSignatureHash)
+            .Set(x => x.SnapshotDirty, true)
+            .Set(x => x.SnapshotDirtyAtUtc, now)
+            .Set(x => x.UpdatedAtUtc, now)
+            .Set(x => x.UpdatedByUserId, actorUserId)
+            .Set(x => x.IsDeleted, false);
+
+        await _ctx.WorkAssignmentBasicSummarySnapshots.UpdateOneAsync(
+            x => x.RequestHash == requestHash && !x.IsDeleted,
+            update,
+            new UpdateOptions { IsUpsert = true },
+            ct);
+
+        return await LoadSnapshotAsync(requestHash, ct)
+               ?? throw new InvalidOperationException("Unable to create basic summary snapshot refresh record.");
+    }
+
+    private async Task EnqueueSnapshotRefreshIfNeededAsync(
+        WorkAssignmentBasicSummarySnapshot snapshot,
+        WorkAssignmentBasicSummaryRequest req,
+        string actorUserId,
+        CancellationToken ct)
+    {
+        if (!ShouldEnqueueSnapshotRefresh(snapshot.RefreshStatus, req.ForceRefresh))
+            return;
+
+        var jobId = _backgroundJobs.Enqueue<IWorkAssignmentBasicSummaryService>(
+            svc => svc.RefreshSnapshotJobAsync(snapshot.Id, req, actorUserId, CancellationToken.None));
+
+        await MarkSnapshotRefreshQueuedAsync(snapshot.Id, jobId, actorUserId, ct);
+        snapshot.RefreshStatus = WorkAssignmentBasicSummaryRefreshStatuses.Queued;
+        snapshot.RefreshJobId = jobId;
+        snapshot.RefreshRequestedByUserId = actorUserId;
+        snapshot.RefreshQueuedAtUtc = DateTime.UtcNow;
+        snapshot.RefreshError = null;
+    }
+
+    private static bool ShouldEnqueueSnapshotRefresh(string? status, bool forceRefresh)
+    {
+        var normalized = NormalizeRefreshStatus(status);
+        if (normalized == WorkAssignmentBasicSummaryRefreshStatuses.Queued ||
+            normalized == WorkAssignmentBasicSummaryRefreshStatuses.Running)
+            return false;
+
+        if (normalized == WorkAssignmentBasicSummaryRefreshStatuses.Failed && !forceRefresh)
+            return false;
+
+        return true;
+    }
+
+    private static WorkAssignmentBasicSummaryResponse CreateCalculatingResponse(
+        WorkAssignmentBasicSummarySnapshot queuedSnapshot,
+        WorkAssignmentBasicSummarySnapshot? staleSnapshot,
+        WorkAssignment scope,
+        DynamicFormTemplate template,
+        NormalizedRequest normalized,
+        List<WorkAssignment> sourceAssignments,
+        List<WorkAssignmentReport> sourceReports,
+        string sourceSignatureHash)
+    {
+        var response = staleSnapshot is null
+            ? new WorkAssignmentBasicSummaryResponse()
+            : DeserializeSnapshot(staleSnapshot, sourceAssignments, sourceReports);
+
+        if (staleSnapshot is null)
         {
-            await MarkSnapshotRefreshErrorAsync(snapshot.Id, ex.Message, ct);
-            throw;
+            var assignmentById = sourceAssignments.ToDictionary(x => x.Id, StringComparer.Ordinal);
+            response.Sources = sourceReports.Select(report => MapSource(report, assignmentById)).ToList();
         }
+
+        response.SummaryValues = BuildSummaryValues(response.Fields, response.Tables);
+        response.Warnings ??= new List<string>();
+
+        PrepareMeta(
+            response,
+            queuedSnapshot.Id,
+            scope,
+            template,
+            normalized.SelectedUnitIds,
+            normalized.PeriodScopeMode,
+            normalized.PeriodKey,
+            normalized.PeriodKeyFrom,
+            normalized.PeriodKeyTo,
+            sourceAssignments.Count,
+            sourceReports.Count,
+            fromSnapshot: staleSnapshot is not null,
+            snapshotDirty: true,
+            sourceSignatureHash,
+            queuedSnapshot.SnapshotDirtyAtUtc ?? DateTime.UtcNow,
+            staleSnapshot?.SnapshotRefreshedAtUtc ?? queuedSnapshot.SnapshotRefreshedAtUtc,
+            queuedSnapshot.RefreshStatus,
+            queuedSnapshot.RefreshJobId,
+            queuedSnapshot.RefreshQueuedAtUtc,
+            queuedSnapshot.RefreshStartedAtUtc,
+            queuedSnapshot.RefreshFinishedAtUtc,
+            queuedSnapshot.RefreshError);
+
+        return response;
     }
 
     private async Task<WorkAssignmentBasicSummaryResponse> GetPeriodicRangeSummaryAsync(
@@ -552,7 +795,25 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
                 .Select(x => x.Meta.SnapshotRefreshedAtUtc)
                 .Where(x => x.HasValue)
                 .OrderByDescending(x => x)
-                .FirstOrDefault());
+                .FirstOrDefault(),
+            MergeRefreshStatus(periodResponses),
+            periodResponses.Select(x => x.Meta.CalculationJobId).FirstOrDefault(x => !string.IsNullOrWhiteSpace(x)),
+            periodResponses
+                .Select(x => x.Meta.CalculationQueuedAtUtc)
+                .Where(x => x.HasValue)
+                .OrderBy(x => x)
+                .FirstOrDefault(),
+            periodResponses
+                .Select(x => x.Meta.CalculationStartedAtUtc)
+                .Where(x => x.HasValue)
+                .OrderBy(x => x)
+                .FirstOrDefault(),
+            periodResponses
+                .Select(x => x.Meta.CalculationFinishedAtUtc)
+                .Where(x => x.HasValue)
+                .OrderByDescending(x => x)
+                .FirstOrDefault(),
+            periodResponses.Select(x => x.Meta.CalculationError).FirstOrDefault(x => !string.IsNullOrWhiteSpace(x)));
 
         return response;
     }
@@ -827,6 +1088,25 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
                 .OrderBy(x => x.PeriodKey, StringComparer.Ordinal)
                 .ToList(),
             JsonOptions));
+
+    private static string? MergeRefreshStatus(IEnumerable<WorkAssignmentBasicSummaryResponse> periodResponses)
+    {
+        var statuses = periodResponses
+            .Select(x => NormalizeRefreshStatus(x.Meta.CalculationStatus))
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .ToList();
+
+        if (statuses.Contains(WorkAssignmentBasicSummaryRefreshStatuses.Running, StringComparer.Ordinal))
+            return WorkAssignmentBasicSummaryRefreshStatuses.Running;
+        if (statuses.Contains(WorkAssignmentBasicSummaryRefreshStatuses.Queued, StringComparer.Ordinal))
+            return WorkAssignmentBasicSummaryRefreshStatuses.Queued;
+        if (statuses.Contains(WorkAssignmentBasicSummaryRefreshStatuses.Failed, StringComparer.Ordinal))
+            return WorkAssignmentBasicSummaryRefreshStatuses.Failed;
+        if (statuses.Contains(WorkAssignmentBasicSummaryRefreshStatuses.Done, StringComparer.Ordinal))
+            return WorkAssignmentBasicSummaryRefreshStatuses.Done;
+
+        return null;
+    }
 
     private async Task<NormalizedRequest> NormalizeRequestAsync(
         WorkAssignmentBasicSummaryRequest req,
@@ -1328,20 +1608,7 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
         CancellationToken ct)
     {
         var now = DateTime.UtcNow;
-        var requestJson = JsonSerializer.Serialize(new
-        {
-            FeatureVersion,
-            scopeAssignmentId = scope.Id,
-            dynamicFormTemplateId,
-            periodScopeMode = req.PeriodScopeMode,
-            periodKey = req.PeriodKey,
-            periodKeyFrom = req.PeriodKeyFrom,
-            periodKeyTo = req.PeriodKeyTo,
-            selectedUnitIds = req.SelectedUnitIds,
-            defaultMethods = req.DefaultMethods,
-            rules = req.Rules,
-            maxTextChars = req.MaxTextChars
-        }, JsonOptions);
+        var requestJson = BuildSnapshotRequestJson(scope, dynamicFormTemplateId, req);
 
         var update = Builders<WorkAssignmentBasicSummarySnapshot>.Update
             .SetOnInsert(x => x.Id, snapshotId)
@@ -1359,6 +1626,8 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
             .Set(x => x.SnapshotDirty, false)
             .Set(x => x.SnapshotDirtyAtUtc, (DateTime?)null)
             .Set(x => x.SnapshotRefreshedAtUtc, now)
+            .Set(x => x.RefreshStatus, WorkAssignmentBasicSummaryRefreshStatuses.Done)
+            .Set(x => x.RefreshFinishedAtUtc, now)
             .Set(x => x.RefreshError, (string?)null)
             .Set(x => x.UpdatedAtUtc, now)
             .Set(x => x.UpdatedByUserId, actorUserId)
@@ -1370,6 +1639,25 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
             new UpdateOptions { IsUpsert = isNew },
             ct);
     }
+
+    private static string BuildSnapshotRequestJson(
+        WorkAssignment scope,
+        string dynamicFormTemplateId,
+        NormalizedRequest req)
+        => JsonSerializer.Serialize(new
+        {
+            FeatureVersion,
+            scopeAssignmentId = scope.Id,
+            dynamicFormTemplateId,
+            periodScopeMode = req.PeriodScopeMode,
+            periodKey = req.PeriodKey,
+            periodKeyFrom = req.PeriodKeyFrom,
+            periodKeyTo = req.PeriodKeyTo,
+            selectedUnitIds = req.SelectedUnitIds,
+            defaultMethods = req.DefaultMethods,
+            rules = req.Rules,
+            maxTextChars = req.MaxTextChars
+        }, JsonOptions);
 
     private static BasicSummarySnapshotPayload CreateSnapshotPayload(
         WorkAssignmentBasicSummaryResponse response)
@@ -1670,13 +1958,51 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
             cancellationToken: ct);
     }
 
-    private async Task MarkSnapshotRefreshErrorAsync(string snapshotId, string error, CancellationToken ct)
+    private async Task MarkSnapshotRefreshQueuedAsync(
+        string snapshotId,
+        string jobId,
+        string actorUserId,
+        CancellationToken ct)
     {
+        var now = DateTime.UtcNow;
         await _ctx.WorkAssignmentBasicSummarySnapshots.UpdateOneAsync(
             x => x.Id == snapshotId,
             Builders<WorkAssignmentBasicSummarySnapshot>.Update
+                .Set(x => x.RefreshStatus, WorkAssignmentBasicSummaryRefreshStatuses.Queued)
+                .Set(x => x.RefreshJobId, jobId)
+                .Set(x => x.RefreshRequestedByUserId, actorUserId)
+                .Set(x => x.RefreshQueuedAtUtc, now)
+                .Set(x => x.RefreshFinishedAtUtc, (DateTime?)null)
+                .Set(x => x.RefreshError, (string?)null)
+                .Set(x => x.UpdatedAtUtc, now)
+                .Set(x => x.UpdatedByUserId, actorUserId),
+            cancellationToken: ct);
+    }
+
+    private async Task MarkSnapshotRefreshStartedAsync(string snapshotId, CancellationToken ct)
+    {
+        var now = DateTime.UtcNow;
+        await _ctx.WorkAssignmentBasicSummarySnapshots.UpdateOneAsync(
+            x => x.Id == snapshotId,
+            Builders<WorkAssignmentBasicSummarySnapshot>.Update
+                .Set(x => x.RefreshStatus, WorkAssignmentBasicSummaryRefreshStatuses.Running)
+                .Set(x => x.RefreshStartedAtUtc, now)
+                .Set(x => x.RefreshFinishedAtUtc, (DateTime?)null)
+                .Set(x => x.RefreshError, (string?)null)
+                .Set(x => x.UpdatedAtUtc, now),
+            cancellationToken: ct);
+    }
+
+    private async Task MarkSnapshotRefreshErrorAsync(string snapshotId, string error, CancellationToken ct)
+    {
+        var now = DateTime.UtcNow;
+        await _ctx.WorkAssignmentBasicSummarySnapshots.UpdateOneAsync(
+            x => x.Id == snapshotId,
+            Builders<WorkAssignmentBasicSummarySnapshot>.Update
+                .Set(x => x.RefreshStatus, WorkAssignmentBasicSummaryRefreshStatuses.Failed)
+                .Set(x => x.RefreshFinishedAtUtc, now)
                 .Set(x => x.RefreshError, error)
-                .Set(x => x.UpdatedAtUtc, DateTime.UtcNow),
+                .Set(x => x.UpdatedAtUtc, now),
             cancellationToken: ct);
     }
 
@@ -1696,8 +2022,15 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
         bool snapshotDirty,
         string? sourceSignatureHash,
         DateTime? snapshotDirtyAtUtc,
-        DateTime? snapshotRefreshedAtUtc)
+        DateTime? snapshotRefreshedAtUtc,
+        string? calculationStatus = null,
+        string? calculationJobId = null,
+        DateTime? calculationQueuedAtUtc = null,
+        DateTime? calculationStartedAtUtc = null,
+        DateTime? calculationFinishedAtUtc = null,
+        string? calculationError = null)
     {
+        calculationStatus = NormalizeRefreshStatus(calculationStatus);
         response.Meta = new WorkAssignmentBasicSummaryMetaDto
         {
             SummaryType = SummaryType,
@@ -1721,8 +2054,48 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
             SnapshotDirty = snapshotDirty,
             SnapshotDirtyAtUtc = snapshotDirtyAtUtc,
             SnapshotRefreshedAtUtc = snapshotRefreshedAtUtc,
-            SourceSignatureHash = sourceSignatureHash
+            SourceSignatureHash = sourceSignatureHash,
+            IsCalculating = IsActiveRefreshStatus(calculationStatus),
+            CalculationStatus = calculationStatus,
+            CalculationJobId = calculationJobId,
+            CalculationQueuedAtUtc = calculationQueuedAtUtc,
+            CalculationStartedAtUtc = calculationStartedAtUtc,
+            CalculationFinishedAtUtc = calculationFinishedAtUtc,
+            CalculationError = calculationError
         };
+    }
+
+    private static string? NormalizeRefreshStatus(string? status)
+    {
+        if (string.IsNullOrWhiteSpace(status))
+            return null;
+
+        var normalized = status.Trim().ToUpperInvariant();
+        return normalized switch
+        {
+            WorkAssignmentBasicSummaryRefreshStatuses.Queued => WorkAssignmentBasicSummaryRefreshStatuses.Queued,
+            WorkAssignmentBasicSummaryRefreshStatuses.Running => WorkAssignmentBasicSummaryRefreshStatuses.Running,
+            WorkAssignmentBasicSummaryRefreshStatuses.Done => WorkAssignmentBasicSummaryRefreshStatuses.Done,
+            WorkAssignmentBasicSummaryRefreshStatuses.Failed => WorkAssignmentBasicSummaryRefreshStatuses.Failed,
+            _ => normalized
+        };
+    }
+
+    private static bool IsActiveRefreshStatus(string? status)
+    {
+        var normalized = NormalizeRefreshStatus(status);
+        return normalized == WorkAssignmentBasicSummaryRefreshStatuses.Queued ||
+               normalized == WorkAssignmentBasicSummaryRefreshStatuses.Running;
+    }
+
+    private static string BuildRefreshErrorMessage(Exception ex)
+    {
+        var message = ex.GetBaseException().Message;
+        if (string.IsNullOrWhiteSpace(message))
+            message = ex.GetType().Name;
+
+        message = message.Trim();
+        return message.Length <= 2000 ? message : message[..2000];
     }
 
     private static void ApplySourceView(
@@ -2133,6 +2506,37 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
             Rules = NormalizeStoredRules(ParseConfigJson<List<WorkAssignmentBasicSummaryRuleDto>>(config.RulesJson, new())),
             VersionNo = config.VersionNo,
             IsActive = config.IsActive
+        };
+
+    private static WorkAssignmentBasicSummaryRequest ToRequestDto(NormalizedRequest req)
+        => new()
+        {
+            ScopeAssignmentId = req.ScopeAssignmentId,
+            DynamicFormTemplateId = req.DynamicFormTemplateId,
+            SelectedUnitIds = req.SelectedUnitIds.Count == 0 ? null : req.SelectedUnitIds.ToList(),
+            PeriodScopeMode = req.PeriodScopeMode,
+            PeriodKey = req.PeriodKey,
+            PeriodKeyFrom = req.PeriodKeyFrom,
+            PeriodKeyTo = req.PeriodKeyTo,
+            DefaultMethods = ToDefaultMethodsDto(req.DefaultMethods),
+            Rules = req.Rules.Select(x => new WorkAssignmentBasicSummaryRuleDto
+            {
+                TargetKind = x.TargetKind,
+                TargetKey = x.TargetKey,
+                Operation = x.Operation
+            }).ToList(),
+            SourceView = new WorkAssignmentBasicSummarySourceViewRequestDto
+            {
+                Q = req.SourceView.Q,
+                PeriodKey = req.SourceView.PeriodKey,
+                UnitId = req.SourceView.UnitId,
+                AssigneeUserId = req.SourceView.AssigneeUserId,
+                Page = req.SourceView.Page,
+                PageSize = req.SourceView.PageSize
+            },
+            ForceRefresh = req.ForceRefresh,
+            IncludeSourceRows = req.IncludeSourceRows,
+            MaxTextChars = req.MaxTextChars
         };
 
     private static WorkAssignmentBasicSummaryDefaultMethodsDto ParseAndNormalizeDefaultMethods(string? json)

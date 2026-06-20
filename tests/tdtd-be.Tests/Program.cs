@@ -95,6 +95,7 @@ var tests = new (string Name, Action Run)[]
     ("basic summary normalizes typed methods", BasicSummaryNormalizesTypedMethods),
     ("basic summary supports typed default methods", BasicSummarySupportsTypedDefaultMethods),
     ("basic summary rejects table method rules", BasicSummaryRejectsTableMethodRules),
+    ("basic summary refresh status controls enqueue", BasicSummaryRefreshStatusControlsEnqueue),
     ("basic summary extracts typed table values", BasicSummaryExtractsTypedTableValues),
     ("basic summary merges period snapshots by typed method", BasicSummaryMergesPeriodSnapshotsByTypedMethod),
     ("basic summary compact snapshot round-trips", BasicSummaryCompactSnapshotRoundTrips),
@@ -2843,6 +2844,24 @@ static void BasicSummaryRejectsTableMethodRules()
                 }
             }
         }));
+}
+
+static void BasicSummaryRefreshStatusControlsEnqueue()
+{
+    var shouldEnqueue = typeof(WorkAssignmentBasicSummaryService).GetMethod(
+        "ShouldEnqueueSnapshotRefresh",
+        BindingFlags.NonPublic | BindingFlags.Static)
+        ?? throw new MissingMethodException(nameof(WorkAssignmentBasicSummaryService), "ShouldEnqueueSnapshotRefresh");
+
+    bool Invoke(string? status, bool forceRefresh)
+        => (bool)shouldEnqueue.Invoke(null, new object?[] { status, forceRefresh })!;
+
+    AssertTrue(Invoke(null, false), "missing refresh status should enqueue a basic summary refresh");
+    AssertTrue(Invoke("DONE", false), "dirty completed snapshot should enqueue a refresh");
+    AssertFalse(Invoke("QUEUED", false), "queued snapshot should not enqueue duplicate refresh jobs");
+    AssertFalse(Invoke("RUNNING", true), "running snapshot should not enqueue duplicate refresh jobs even on force refresh");
+    AssertFalse(Invoke("FAILED", false), "failed snapshot should wait for explicit reset/force refresh");
+    AssertTrue(Invoke("FAILED", true), "force refresh should reset a failed basic summary job");
 }
 
 static void BasicSummaryExtractsTypedTableValues()

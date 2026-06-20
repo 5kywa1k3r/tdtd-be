@@ -55,6 +55,36 @@ public sealed class WorkAssignmentBasicSummarySnapshot : BaseEntity
     [BsonDateTimeOptions(Kind = DateTimeKind.Utc)]
     public DateTime? SnapshotRefreshedAtUtc { get; set; }
 
+    [BsonElement("refreshStatus")]
+    public string? RefreshStatus { get; set; }
+
+    [BsonElement("refreshJobId")]
+    public string? RefreshJobId { get; set; }
+
+    [BsonElement("refreshRequestedByUserId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? RefreshRequestedByUserId { get; set; }
+
+    [BsonElement("refreshQueuedAtUtc")]
+    [BsonDateTimeOptions(Kind = DateTimeKind.Utc)]
+    public DateTime? RefreshQueuedAtUtc { get; set; }
+
+    [BsonElement("refreshStartedAtUtc")]
+    [BsonDateTimeOptions(Kind = DateTimeKind.Utc)]
+    public DateTime? RefreshStartedAtUtc { get; set; }
+
+    [BsonElement("refreshFinishedAtUtc")]
+    [BsonDateTimeOptions(Kind = DateTimeKind.Utc)]
+    public DateTime? RefreshFinishedAtUtc { get; set; }
+
     [BsonElement("refreshError")]
     public string? RefreshError { get; set; }
+}
+
+public static class WorkAssignmentBasicSummaryRefreshStatuses
+{
+    public const string Queued = "QUEUED";
+    public const string Running = "RUNNING";
+    public const string Done = "DONE";
+    public const string Failed = "FAILED";
 }

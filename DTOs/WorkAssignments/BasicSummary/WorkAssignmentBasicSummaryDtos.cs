@@ -75,7 +75,7 @@ public sealed class SaveWorkAssignmentBasicSummaryConfigRequest
 public sealed class WorkAssignmentBasicSummaryMetaDto
 {
     public string SummaryType { get; set; } = "BASIC";
-    public string ContractVersion { get; set; } = "basic-fixed-scope-v1";
+    public string ContractVersion { get; set; } = "basic-fixed-scope-v2";
     public string SnapshotPayloadKind { get; set; } = "COMPACT_VALUES1D_OPTIMIZED";
     public string SnapshotId { get; set; } = string.Empty;
     public string ScopeAssignmentId { get; set; } = default!;
@@ -96,6 +96,13 @@ public sealed class WorkAssignmentBasicSummaryMetaDto
     public DateTime? SnapshotDirtyAtUtc { get; set; }
     public DateTime? SnapshotRefreshedAtUtc { get; set; }
     public string? SourceSignatureHash { get; set; }
+    public bool IsCalculating { get; set; }
+    public string? CalculationStatus { get; set; }
+    public string? CalculationJobId { get; set; }
+    public DateTime? CalculationQueuedAtUtc { get; set; }
+    public DateTime? CalculationStartedAtUtc { get; set; }
+    public DateTime? CalculationFinishedAtUtc { get; set; }
+    public string? CalculationError { get; set; }
 }
 
 public sealed class WorkAssignmentBasicSummaryItemDto

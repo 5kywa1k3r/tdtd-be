@@ -21,4 +21,10 @@ public interface IWorkAssignmentBasicSummaryService
         WorkAssignmentBasicSummaryRequest req,
         string actorUserId,
         CancellationToken ct);
+
+    Task RefreshSnapshotJobAsync(
+        string snapshotId,
+        WorkAssignmentBasicSummaryRequest req,
+        string actorUserId,
+        CancellationToken ct);
 }
