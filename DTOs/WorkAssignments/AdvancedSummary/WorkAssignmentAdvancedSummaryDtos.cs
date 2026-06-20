@@ -40,3 +40,8 @@ public sealed class LockWorkAssignmentAdvancedSummaryConfigRequest
 {
     public string? TokenId { get; set; }
 }
+
+public sealed class PreviewWorkAssignmentAdvancedSummaryConfigRequest
+{
+    public bool ForceRefresh { get; set; }
+}

@@ -26,6 +26,7 @@ public static class UserNotificationTypes
     public const string ReportPeriodOverdue = "REPORT_PERIOD_OVERDUE";
     public const string DynamicFormStatisticRebuild = "DYNAMIC_FORM_STATISTIC_REBUILD";
     public const string BasicSummaryRefresh = "BASIC_SUMMARY_REFRESH";
+    public const string AdvancedSummaryPreview = "ADVANCED_SUMMARY_PREVIEW";
 }
 
 public static class UserNotificationSeverities

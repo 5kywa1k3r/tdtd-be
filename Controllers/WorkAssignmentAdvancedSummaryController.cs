@@ -55,6 +55,17 @@ public sealed class WorkAssignmentAdvancedSummaryController : ControllerBase
         return Ok(result);
     }
 
+    [HttpPost("configs/{configId}/preview")]
+    public async Task<IActionResult> RequestPreview(
+        [FromRoute] string configId,
+        [FromBody] PreviewWorkAssignmentAdvancedSummaryConfigRequest req,
+        CancellationToken ct)
+    {
+        var actorUserId = GetActorUserId();
+        var result = await _configs.RequestPreviewAsync(configId, req ?? new PreviewWorkAssignmentAdvancedSummaryConfigRequest(), actorUserId, ct);
+        return Ok(result);
+    }
+
     private string GetActorUserId()
         => User.FindFirstValue("sub") ?? throw AppExceptionFactory.Unauthorized();
 }

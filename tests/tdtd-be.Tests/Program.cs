@@ -103,6 +103,7 @@ var tests = new (string Name, Action Run)[]
     ("basic summary compact snapshot round-trips", BasicSummaryCompactSnapshotRoundTrips),
     ("basic summary respects compressed table null runs", BasicSummaryRespectsCompressedTableNullRuns),
     ("advanced summary config normalizes object json", AdvancedSummaryConfigNormalizesObjectJson),
+    ("advanced summary preview blocks unsupported range condition", AdvancedSummaryPreviewBlocksUnsupportedRangeCondition),
     ("legacy work basis file resolves as work document", ResolvesLegacyWorkBasisFileAsWorkDocument),
     ("assignment file resolves as assignment branch document", ResolvesAssignmentFileAsBranchDocument),
     ("assignment document path resolves ancestors only", ResolvesAssignmentDocumentAncestorsFromPath),
@@ -3259,6 +3260,21 @@ static void AdvancedSummaryConfigNormalizesObjectJson()
             typeof(WorkAssignmentAdvancedSummaryConfigService),
             "NormalizeConfigJson",
             "[]"));
+}
+
+static void AdvancedSummaryPreviewBlocksUnsupportedRangeCondition()
+{
+    InvokePrivateStatic<object?>(
+        typeof(WorkAssignmentAdvancedSummaryConfigService),
+        "EnsurePreviewConfigSupported",
+        """{ "targets": [{ "fieldId": "score", "method": "SUM" }] }""");
+
+    AssertThrowsFromReflection(
+        AppErrorCode.COMMON_VALIDATION_FAILED,
+        () => InvokePrivateStatic<object?>(
+            typeof(WorkAssignmentAdvancedSummaryConfigService),
+            "EnsurePreviewConfigSupported",
+            """{ "dataRanges": [{ "fieldIds": ["score"] }], "conditions": [{ "fieldId": "status" }] }"""));
 }
 
 static void ResolvesLegacyWorkBasisFileAsWorkDocument()

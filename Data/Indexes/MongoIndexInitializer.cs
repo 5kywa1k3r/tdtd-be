@@ -1797,6 +1797,25 @@
                     { "isDeleted", 1 }
                 }
             ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_workAssignmentAdvancedSummaryConfigs_preview_status",
+                key: new BsonDocument
+                {
+                    { "previewStatus", 1 },
+                    { "previewRequestedAtUtc", -1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_workAssignmentAdvancedSummaryConfigs_preview_correlation",
+                key: new BsonDocument
+                {
+                    { "previewCorrelationId", 1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
         }
 
         private static async Task EnsureWorkTemplateAssigneesAsync(IMongoCollection<WorkTemplateAssignee> col, CancellationToken ct)

@@ -24,4 +24,17 @@ public interface IWorkAssignmentAdvancedSummaryConfigService
         LockWorkAssignmentAdvancedSummaryConfigRequest req,
         string actorUserId,
         CancellationToken ct);
+
+    Task<WorkAssignmentAdvancedSummaryConfigDto> RequestPreviewAsync(
+        string configId,
+        PreviewWorkAssignmentAdvancedSummaryConfigRequest req,
+        string actorUserId,
+        CancellationToken ct);
+
+    Task RunPreviewJobAsync(
+        string configId,
+        string expectedConfigHash,
+        string actorUserId,
+        string correlationId,
+        CancellationToken ct);
 }
