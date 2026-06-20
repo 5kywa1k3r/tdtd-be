@@ -104,6 +104,7 @@ var tests = new (string Name, Action Run)[]
     ("basic summary respects compressed table null runs", BasicSummaryRespectsCompressedTableNullRuns),
     ("advanced summary config normalizes object json", AdvancedSummaryConfigNormalizesObjectJson),
     ("advanced summary preview blocks unsupported range condition", AdvancedSummaryPreviewBlocksUnsupportedRangeCondition),
+    ("advanced summary field gate enforces section limits", AdvancedSummaryFieldGateEnforcesSectionLimits),
     ("legacy work basis file resolves as work document", ResolvesLegacyWorkBasisFileAsWorkDocument),
     ("assignment file resolves as assignment branch document", ResolvesAssignmentFileAsBranchDocument),
     ("assignment document path resolves ancestors only", ResolvesAssignmentDocumentAncestorsFromPath),
@@ -3275,6 +3276,46 @@ static void AdvancedSummaryPreviewBlocksUnsupportedRangeCondition()
             typeof(WorkAssignmentAdvancedSummaryConfigService),
             "EnsurePreviewConfigSupported",
             """{ "dataRanges": [{ "fieldIds": ["score"] }], "conditions": [{ "fieldId": "status" }] }"""));
+}
+
+static void AdvancedSummaryFieldGateEnforcesSectionLimits()
+{
+    var nonCumulativeOk = InvokePrivateStatic<object>(
+        typeof(WorkAssignmentAdvancedSummaryConfigService),
+        "BuildFieldGateInfoFromCounts",
+        "{}",
+        1000,
+        1000);
+    AssertEqual("ALLOWED", GetReflectedProperty<string>(nonCumulativeOk, "Status"), "1000 non-cumulative section fields should be allowed");
+    AssertEqual(false, GetReflectedProperty<bool>(nonCumulativeOk, "IsCumulative"), "empty config should not be cumulative");
+
+    var nonCumulativeBlocked = InvokePrivateStatic<object>(
+        typeof(WorkAssignmentAdvancedSummaryConfigService),
+        "BuildFieldGateInfoFromCounts",
+        "{}",
+        1001,
+        10);
+    AssertEqual("BLOCKED", GetReflectedProperty<string>(nonCumulativeBlocked, "Status"), "1001 non-cumulative section fields should be blocked");
+    AssertEqual(1000, GetReflectedProperty<int>(nonCumulativeBlocked, "FieldLimit"), "non-cumulative field limit should be 1000");
+
+    var cumulativeOk = InvokePrivateStatic<object>(
+        typeof(WorkAssignmentAdvancedSummaryConfigService),
+        "BuildFieldGateInfoFromCounts",
+        """{ "cumulative": true }""",
+        249,
+        249);
+    AssertEqual("ALLOWED", GetReflectedProperty<string>(cumulativeOk, "Status"), "249 cumulative section fields should be allowed");
+    AssertEqual(true, GetReflectedProperty<bool>(cumulativeOk, "IsCumulative"), "cumulative flag should be detected");
+    AssertEqual(249, GetReflectedProperty<int>(cumulativeOk, "FieldLimit"), "cumulative display limit should be 249");
+
+    var cumulativeBlocked = InvokePrivateStatic<object>(
+        typeof(WorkAssignmentAdvancedSummaryConfigService),
+        "BuildFieldGateInfoFromCounts",
+        """{ "periodScopeMode": "CUMULATIVE_TO_PERIOD" }""",
+        250,
+        1);
+    AssertEqual("BLOCKED", GetReflectedProperty<string>(cumulativeBlocked, "Status"), "250 cumulative section fields should be blocked");
+    AssertEqual(true, GetReflectedProperty<bool>(cumulativeBlocked, "IsCumulative"), "cumulative period scope should be detected");
 }
 
 static void ResolvesLegacyWorkBasisFileAsWorkDocument()

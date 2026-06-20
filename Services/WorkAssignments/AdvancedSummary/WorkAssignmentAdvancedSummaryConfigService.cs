@@ -23,6 +23,8 @@ public sealed class WorkAssignmentAdvancedSummaryConfigService : IWorkAssignment
     private const int PreviewSourceReportLimit = 3000;
     private const int PreviewFieldSampleLimit = 5;
     private const int PreviewSampleTextLimit = 160;
+    private const int CumulativeSectionFieldLimitExclusive = 250;
+    private const int NonCumulativeSectionFieldLimitInclusive = 1000;
     private const string PreviewResultKind = "ADVANCED_SUMMARY_LATEST_THREE_PERIOD_PREVIEW";
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
@@ -74,7 +76,11 @@ public sealed class WorkAssignmentAdvancedSummaryConfigService : IWorkAssignment
                 .Descending(x => x.UpdatedAtUtc))
             .ToListAsync(ct);
 
-        return rows.Select(x => Map(x, lockedCount)).ToList();
+        var gatesByConfigId = new Dictionary<string, AdvancedSummaryFieldGateInfo>(StringComparer.Ordinal);
+        foreach (var row in rows)
+            gatesByConfigId[row.Id] = await BuildFieldGateInfoAsync(context.Template, context.Section.Id, row.ConfigJson, ct);
+
+        return rows.Select(x => Map(x, lockedCount, gatesByConfigId[x.Id])).ToList();
     }
 
     public async Task<WorkAssignmentAdvancedSummaryConfigDto> SaveDraftAsync(
@@ -89,6 +95,8 @@ public sealed class WorkAssignmentAdvancedSummaryConfigService : IWorkAssignment
         var context = await LoadContextAsync(assignmentId, dynamicFormTemplateId, sectionId, actorUserId, ct);
         var configJson = NormalizeConfigJson(req?.ConfigJson);
         var configHash = Sha256(configJson);
+        var gate = await BuildFieldGateInfoAsync(context.Template, context.Section.Id, configJson, ct);
+        EnsureFieldGateAllowsAdvanced(gate);
         var now = DateTime.UtcNow;
         var lockedCount = await CountLockedAsync(context.Scope.Id, context.Template.Id, context.Section.Id, ct);
         var versionNo = await NextVersionNoAsync(context.Scope.Id, context.Template.Id, context.Section.Id, ct);
@@ -137,7 +145,7 @@ public sealed class WorkAssignmentAdvancedSummaryConfigService : IWorkAssignment
         else
             await _ctx.WorkAssignmentAdvancedSummaryConfigs.ReplaceOneAsync(x => x.Id == entity.Id, entity, cancellationToken: ct);
 
-        return Map(entity, lockedCount);
+        return Map(entity, lockedCount, gate);
     }
 
     public async Task<WorkAssignmentAdvancedSummaryConfigDto> LockConfigAsync(
@@ -164,8 +172,9 @@ public sealed class WorkAssignmentAdvancedSummaryConfigService : IWorkAssignment
             ct);
 
         var lockedCount = await CountLockedAsync(context.Scope.Id, context.Template.Id, context.Section.Id, ct);
+        var gate = await BuildFieldGateInfoAsync(context.Template, context.Section.Id, entity.ConfigJson, ct);
         if (entity.Status == WorkAssignmentAdvancedSummaryConfigStatuses.Locked)
-            return Map(entity, lockedCount);
+            return Map(entity, lockedCount, gate);
 
         if (entity.Status != WorkAssignmentAdvancedSummaryConfigStatuses.Draft)
         {
@@ -186,6 +195,8 @@ public sealed class WorkAssignmentAdvancedSummaryConfigService : IWorkAssignment
                 },
                 "Advanced summary config must complete the latest-three-period preview before lock.");
         }
+
+        EnsureFieldGateAllowsAdvanced(gate);
 
         if (lockedCount > 0)
         {
@@ -211,7 +222,7 @@ public sealed class WorkAssignmentAdvancedSummaryConfigService : IWorkAssignment
 
         await _ctx.WorkAssignmentAdvancedSummaryConfigs.ReplaceOneAsync(x => x.Id == entity.Id, entity, cancellationToken: ct);
 
-        return Map(entity, lockedCount + 1);
+        return Map(entity, lockedCount + 1, gate);
     }
 
     public async Task<WorkAssignmentAdvancedSummaryConfigDto> RequestPreviewAsync(
@@ -236,13 +247,16 @@ public sealed class WorkAssignmentAdvancedSummaryConfigService : IWorkAssignment
                 new { configId = entity.Id, entity.Status, reason = "ADVANCED_SUMMARY_CONFIG_STATUS_NOT_PREVIEWABLE" });
         }
 
+        var gate = await BuildFieldGateInfoAsync(context.Template, context.Section.Id, entity.ConfigJson, ct);
+        EnsureFieldGateAllowsAdvanced(gate);
+
         var previewStatus = NormalizePreviewStatus(entity.PreviewStatus);
         if (req?.ForceRefresh != true &&
             (previewStatus == WorkAssignmentAdvancedSummaryPreviewStatuses.Queued ||
              previewStatus == WorkAssignmentAdvancedSummaryPreviewStatuses.Running))
         {
             var lockedCount = await CountLockedAsync(context.Scope.Id, context.Template.Id, context.Section.Id, ct);
-            return Map(entity, lockedCount);
+            return Map(entity, lockedCount, gate);
         }
 
         var correlationId = ObjectId.GenerateNewId().ToString();
@@ -264,7 +278,7 @@ public sealed class WorkAssignmentAdvancedSummaryConfigService : IWorkAssignment
         await _ctx.WorkAssignmentAdvancedSummaryConfigs.ReplaceOneAsync(x => x.Id == entity.Id, entity, cancellationToken: ct);
 
         var lockedAfterQueue = await CountLockedAsync(context.Scope.Id, context.Template.Id, context.Section.Id, ct);
-        return Map(entity, lockedAfterQueue);
+        return Map(entity, lockedAfterQueue, gate);
     }
 
     public async Task RunPreviewJobAsync(
@@ -413,6 +427,8 @@ public sealed class WorkAssignmentAdvancedSummaryConfigService : IWorkAssignment
         EnsurePreviewConfigSupported(config.ConfigJson);
 
         var sectionFields = await LoadSectionFieldsAsync(context.Template, context.Section.Id, ct);
+        var gate = BuildFieldGateInfo(config.ConfigJson, sectionFields);
+        EnsureFieldGateAllowsAdvanced(gate);
         var configAnalysis = AnalyzePreviewConfigJson(config.ConfigJson, sectionFields);
         if (configAnalysis.UnsupportedFeatures.Count > 0)
             throw UnsupportedPreviewConfig(configAnalysis.UnsupportedFeatures);
@@ -645,6 +661,88 @@ public sealed class WorkAssignmentAdvancedSummaryConfigService : IWorkAssignment
         return ExtractFieldDefinitions(template.FieldsJson, sectionId, null);
     }
 
+    private async Task<AdvancedSummaryFieldGateInfo> BuildFieldGateInfoAsync(
+        DynamicFormTemplate template,
+        string sectionId,
+        string configJson,
+        CancellationToken ct)
+    {
+        var sectionFields = await LoadSectionFieldsAsync(template, sectionId, ct);
+        return BuildFieldGateInfo(configJson, sectionFields);
+    }
+
+    private static AdvancedSummaryFieldGateInfo BuildFieldGateInfo(
+        string configJson,
+        List<AdvancedFieldDefinition> sectionFields)
+    {
+        var analysis = AnalyzePreviewConfigJson(configJson, sectionFields);
+        var sectionFieldCount = sectionFields.Count;
+        var targetFieldCount = analysis.HasExplicitTargets
+            ? analysis.Targets.Count + analysis.UnknownFieldRefs.Count
+            : sectionFieldCount;
+        return BuildFieldGateInfoFromCounts(configJson, sectionFieldCount, targetFieldCount);
+    }
+
+    private static AdvancedSummaryFieldGateInfo BuildFieldGateInfoFromCounts(
+        string configJson,
+        int sectionFieldCount,
+        int targetFieldCount)
+    {
+        var isCumulative = DetectCumulativeConfig(configJson);
+        var fieldLimit = isCumulative
+            ? CumulativeSectionFieldLimitExclusive - 1
+            : NonCumulativeSectionFieldLimitInclusive;
+
+        if (isCumulative && sectionFieldCount >= CumulativeSectionFieldLimitExclusive)
+        {
+            return new AdvancedSummaryFieldGateInfo(
+                FieldGateStatuses.Blocked,
+                isCumulative,
+                sectionFieldCount,
+                targetFieldCount,
+                fieldLimit,
+                $"Cumulative Advanced summary requires the section to have fewer than {CumulativeSectionFieldLimitExclusive} fields.");
+        }
+
+        if (!isCumulative && sectionFieldCount > NonCumulativeSectionFieldLimitInclusive)
+        {
+            return new AdvancedSummaryFieldGateInfo(
+                FieldGateStatuses.Blocked,
+                isCumulative,
+                sectionFieldCount,
+                targetFieldCount,
+                fieldLimit,
+                $"Advanced summary requires the section to have at most {NonCumulativeSectionFieldLimitInclusive} fields.");
+        }
+
+        return new AdvancedSummaryFieldGateInfo(
+            FieldGateStatuses.Allowed,
+            isCumulative,
+            sectionFieldCount,
+            targetFieldCount,
+            fieldLimit,
+            null);
+    }
+
+    private static void EnsureFieldGateAllowsAdvanced(AdvancedSummaryFieldGateInfo gate)
+    {
+        if (gate.Status == FieldGateStatuses.Allowed)
+            return;
+
+        throw AppExceptionFactory.BadRequest(
+            AppErrorCode.COMMON_VALIDATION_FAILED,
+            new
+            {
+                gate.Status,
+                gate.IsCumulative,
+                gate.SectionFieldCount,
+                gate.TargetFieldCount,
+                gate.FieldLimit,
+                reason = "ADVANCED_SUMMARY_SECTION_FIELD_LIMIT_EXCEEDED"
+            },
+            $"{gate.Reason} Please split the Dynamic Form section or use Basic summary.");
+    }
+
     private static List<AdvancedPreviewTarget> ResolvePreviewTargetFields(
         AdvancedPreviewConfigAnalysis analysis,
         List<AdvancedFieldDefinition> sectionFields,
@@ -829,6 +927,63 @@ public sealed class WorkAssignmentAdvancedSummaryConfigService : IWorkAssignment
         var normalized = name.Trim().ToLowerInvariant();
         return normalized is "methods" or "operations" or "statistics";
     }
+
+    private static bool DetectCumulativeConfig(string configJson)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(string.IsNullOrWhiteSpace(configJson) ? "{}" : configJson);
+            return DetectCumulativeConfig(document.RootElement);
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+    }
+
+    private static bool DetectCumulativeConfig(JsonElement element)
+    {
+        if (element.ValueKind == JsonValueKind.Array)
+            return element.EnumerateArray().Any(DetectCumulativeConfig);
+
+        if (element.ValueKind != JsonValueKind.Object)
+            return false;
+
+        foreach (var prop in element.EnumerateObject())
+        {
+            var normalizedName = prop.Name.Trim().ToLowerInvariant();
+            if (IsCumulativeBooleanName(normalizedName) &&
+                prop.Value.ValueKind is JsonValueKind.True or JsonValueKind.False)
+            {
+                if (prop.Value.GetBoolean())
+                    return true;
+            }
+
+            if (IsCumulativeModeName(normalizedName) &&
+                prop.Value.ValueKind == JsonValueKind.String &&
+                IsCumulativeText(prop.Value.GetString()))
+            {
+                return true;
+            }
+
+            if (DetectCumulativeConfig(prop.Value))
+                return true;
+        }
+
+        return false;
+    }
+
+    private static bool IsCumulativeBooleanName(string normalizedName)
+        => normalizedName is "cumulative" or "iscumulative" or "usecumulative" or
+            "cumulativeenabled" or "enablecumulative";
+
+    private static bool IsCumulativeModeName(string normalizedName)
+        => normalizedName is "mode" or "summarymode" or "aggregationmode" or
+            "periodscopemode" or "periodmode" or "rangemode";
+
+    private static bool IsCumulativeText(string? value)
+        => !string.IsNullOrWhiteSpace(value) &&
+           value.Trim().Contains("CUMULATIVE", StringComparison.OrdinalIgnoreCase);
 
     private static string? ReadStringProperty(JsonElement element, string name)
     {
@@ -1325,11 +1480,14 @@ public sealed class WorkAssignmentAdvancedSummaryConfigService : IWorkAssignment
 
     private static WorkAssignmentAdvancedSummaryConfigDto Map(
         WorkAssignmentAdvancedSummaryConfig x,
-        long lockedCount)
+        long lockedCount,
+        AdvancedSummaryFieldGateInfo? gate)
     {
+        gate ??= AdvancedSummaryFieldGateInfo.Unknown;
         var isLocked = x.Status == WorkAssignmentAdvancedSummaryConfigStatuses.Locked;
         var requiresPreview = !isLocked && x.PreviewStatus != WorkAssignmentAdvancedSummaryPreviewStatuses.Done;
         var requiresToken = !isLocked && lockedCount > 0;
+        var gateBlocked = gate.Status == FieldGateStatuses.Blocked;
 
         return new WorkAssignmentAdvancedSummaryConfigDto
         {
@@ -1357,9 +1515,17 @@ public sealed class WorkAssignmentAdvancedSummaryConfigService : IWorkAssignment
             LockTokenId = x.LockTokenId,
             RequiresPreviewToLock = requiresPreview,
             RequiresTokenToLock = requiresToken,
+            CanPreview = x.Status == WorkAssignmentAdvancedSummaryConfigStatuses.Draft && !gateBlocked,
             CanLock = x.Status == WorkAssignmentAdvancedSummaryConfigStatuses.Draft &&
                       !requiresPreview &&
-                      !requiresToken,
+                      !requiresToken &&
+                      !gateBlocked,
+            FieldGateStatus = gate.Status,
+            FieldGateReason = gate.Reason,
+            IsCumulative = gate.IsCumulative,
+            SectionFieldCount = gate.SectionFieldCount,
+            TargetFieldCount = gate.TargetFieldCount,
+            FieldLimit = gate.FieldLimit,
             CreatedAtUtc = x.CreatedAtUtc,
             UpdatedAtUtc = x.UpdatedAtUtc
         };
@@ -1450,6 +1616,30 @@ public sealed class WorkAssignmentAdvancedSummaryConfigService : IWorkAssignment
     private sealed record AdvancedPreviewTarget(
         AdvancedFieldDefinition Field,
         string Method);
+
+    private static class FieldGateStatuses
+    {
+        public const string Allowed = "ALLOWED";
+        public const string Blocked = "BLOCKED";
+        public const string Unknown = "UNKNOWN";
+    }
+
+    private sealed record AdvancedSummaryFieldGateInfo(
+        string Status,
+        bool IsCumulative,
+        int SectionFieldCount,
+        int TargetFieldCount,
+        int FieldLimit,
+        string? Reason)
+    {
+        public static AdvancedSummaryFieldGateInfo Unknown { get; } = new(
+            FieldGateStatuses.Unknown,
+            IsCumulative: false,
+            SectionFieldCount: 0,
+            TargetFieldCount: 0,
+            FieldLimit: 0,
+            Reason: null);
+    }
 
     private sealed record FieldOption(string Code, string Label);
 

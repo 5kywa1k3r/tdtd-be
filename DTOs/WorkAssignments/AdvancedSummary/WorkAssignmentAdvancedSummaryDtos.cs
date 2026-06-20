@@ -27,6 +27,13 @@ public sealed class WorkAssignmentAdvancedSummaryConfigDto
     public bool RequiresPreviewToLock { get; set; }
     public bool RequiresTokenToLock { get; set; }
     public bool CanLock { get; set; }
+    public bool CanPreview { get; set; }
+    public string FieldGateStatus { get; set; } = "UNKNOWN";
+    public string? FieldGateReason { get; set; }
+    public bool IsCumulative { get; set; }
+    public int SectionFieldCount { get; set; }
+    public int TargetFieldCount { get; set; }
+    public int FieldLimit { get; set; }
     public DateTime CreatedAtUtc { get; set; }
     public DateTime UpdatedAtUtc { get; set; }
 }
