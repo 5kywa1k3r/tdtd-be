@@ -62,6 +62,8 @@ var tests = new (string Name, Action Run)[]
     ("dynamic flow template lock payload validates steps", DynamicFlowTemplateLockPayloadValidatesSteps),
     ("dynamic flow policy validation checks dynamic form references", DynamicFlowPolicyValidationChecksDynamicFormReferences),
     ("dynamic flow policy evaluator applies field and table permissions", DynamicFlowPolicyEvaluatorAppliesFieldAndTablePermissions),
+    ("dynamic flow runtime planner creates branch per target unit", DynamicFlowRuntimePlannerCreatesBranchPerTargetUnit),
+    ("dynamic flow runtime planner rejects invalid launch inputs", DynamicFlowRuntimePlannerRejectsInvalidLaunchInputs),
     ("periodic assignment date range caps occurrence validation", ValidatesPeriodicAssignmentDateRange),
     ("materialize job backfills elapsed monthly periods before rolling future", MaterializeJobBackfillsElapsedMonthlyPeriodsBeforeRollingFuture),
     ("materialize job limits multi-day monthly schedules to exact occurrences", MaterializeJobLimitsMonthlyMultiDayScheduleToExactOccurrences),
@@ -1057,6 +1059,148 @@ static void DynamicFlowPolicyEvaluatorAppliesFieldAndTablePermissions()
     AssertTrue(amount.Required, "locked table column should preserve required flag");
     AssertTrue(amount.Locked, "lockedAfterSubmit table column should lock after submit");
     AssertTrue(amount.LockedAfterSubmit, "table lockedAfterSubmit flag should be retained");
+}
+
+static void DynamicFlowRuntimePlannerCreatesBranchPerTargetUnit()
+{
+    var template = new DynamicFlowTemplate
+    {
+        Id = ObjectId(91),
+        Code = "FLOW_RUNTIME",
+        Name = "Flow runtime",
+        DynamicFormTemplateId = ObjectId(92),
+        Status = DynamicFlowTemplateStatuses.Active
+    };
+
+    var version = new DynamicFlowTemplateVersion
+    {
+        Id = ObjectId(93),
+        TemplateId = template.Id,
+        DynamicFormTemplateId = template.DynamicFormTemplateId,
+        VersionNo = 3,
+        Status = DynamicFlowTemplateVersionStatuses.Locked,
+        PayloadJson = """
+        {
+          "steps": [
+            { "stepId": "draft", "stepCode": "DRAFT", "stepOrder": 1 },
+            { "stepId": "review", "stepCode": "REVIEW", "stepOrder": 2 },
+            { "stepId": "final", "stepCode": "FINAL", "stepOrder": 3 }
+          ],
+          "transitions": [
+            { "fromStepId": "draft", "toStepId": "review" },
+            { "fromStepCode": "REVIEW", "toStepId": "final" }
+          ],
+          "actorPolicies": [
+            { "stepCode": "REVIEW", "actorRole": "ASSIGNEE", "allowSubFlow": true }
+          ]
+        }
+        """
+    };
+
+    var parent = new WorkAssignment
+    {
+        Id = ObjectId(94),
+        WorkId = ObjectId(95),
+        FlowInstanceId = ObjectId(96),
+        FlowBranchId = ObjectId(97),
+        FlowAttemptNo = 2
+    };
+
+    var targetUnitA = ObjectId(98);
+    var targetUnitB = ObjectId(99);
+    var request = new CreateDynamicFlowInstanceRequest
+    {
+        FlowTemplateVersionId = version.Id,
+        ParentAssignmentId = parent.Id,
+        StepCode = "REVIEW",
+        TargetUnitIds = new List<string> { targetUnitA, targetUnitB, targetUnitA }
+    };
+
+    var plan = DynamicFlowRuntimePlanner.CreateLaunchPlan(
+        template,
+        version,
+        request,
+        parent,
+        actorUnitId: ObjectId(90));
+
+    AssertEqual(template.Id, plan.FlowTemplateId, "flow template id should come from locked version");
+    AssertEqual(3, plan.FlowTemplateVersionNo, "flow template version should be captured");
+    AssertEqual(template.DynamicFormTemplateId, plan.DynamicFormTemplateId, "dynamic form template should be captured");
+    AssertEqual(parent.FlowInstanceId, plan.FlowInstanceId, "child launch should reuse parent flow instance");
+    AssertEqual("review", plan.Step.StepId, "requested step should resolve by step code");
+    AssertEqual("REVIEW", plan.Step.StepCode, "requested step code should be captured");
+    AssertEqual(2, plan.Step.StepOrder, "step order should come from payload");
+    AssertSequenceEqual(
+        new List<string> { targetUnitA, targetUnitB },
+        plan.Branches.Select(x => x.TargetUnitId).ToList(),
+        "target unit ids should be deduplicated in order");
+
+    foreach (var branch in plan.Branches)
+    {
+        AssertEqual(parent.FlowBranchId, branch.ParentFlowBranchId, "branch should link back to parent flow branch");
+        AssertEqual(2, branch.FlowAttemptNo, "branch should inherit parent flow attempt");
+        AssertEqual(DynamicFlowRuntimePlanner.AssignmentFlowRole, branch.FlowRole, "branch role should be assignee");
+        AssertEqual(DynamicFlowRuntimePlanner.EffectiveStatus, branch.FlowEffectiveStatus, "branch status should start effective");
+        AssertTrue(branch.AllowSubFlow, "actor policy should allow sub-flow on selected step");
+        AssertFalse(branch.IsFlowFinalNode, "review step should not be final while it has an outgoing transition");
+        AssertTrue(MongoDB.Bson.ObjectId.TryParse(branch.FlowBranchId, out _), "branch id should be a generated ObjectId");
+    }
+}
+
+static void DynamicFlowRuntimePlannerRejectsInvalidLaunchInputs()
+{
+    var template = new DynamicFlowTemplate
+    {
+        Id = ObjectId(101),
+        Code = "FLOW_RUNTIME_BLOCKED",
+        Name = "Flow runtime blocked",
+        DynamicFormTemplateId = ObjectId(102),
+        Status = DynamicFlowTemplateStatuses.Active
+    };
+
+    var version = new DynamicFlowTemplateVersion
+    {
+        Id = ObjectId(103),
+        TemplateId = template.Id,
+        DynamicFormTemplateId = template.DynamicFormTemplateId,
+        VersionNo = 1,
+        Status = DynamicFlowTemplateVersionStatuses.Draft,
+        PayloadJson = """
+        {
+          "steps": [
+            { "stepId": "draft", "stepCode": "DRAFT" }
+          ]
+        }
+        """
+    };
+
+    AssertThrows(
+        AppErrorCode.COMMON_VALIDATION_FAILED,
+        () => DynamicFlowRuntimePlanner.CreateLaunchPlan(
+            template,
+            version,
+            new CreateDynamicFlowInstanceRequest
+            {
+                FlowTemplateVersionId = version.Id,
+                TargetUnitIds = new List<string> { ObjectId(104) }
+            },
+            parent: null,
+            actorUnitId: ObjectId(105)));
+
+    version.Status = DynamicFlowTemplateVersionStatuses.Locked;
+
+    AssertThrows(
+        AppErrorCode.COMMON_ARGUMENT_REQUIRED,
+        () => DynamicFlowRuntimePlanner.CreateLaunchPlan(
+            template,
+            version,
+            new CreateDynamicFlowInstanceRequest
+            {
+                FlowTemplateVersionId = version.Id,
+                TargetUnitIds = new List<string>()
+            },
+            parent: null,
+            actorUnitId: ObjectId(105)));
 }
 
 static void ValidatesPeriodicAssignmentDateRange()
