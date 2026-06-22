@@ -200,6 +200,7 @@ builder.Services.AddScoped<IDynamicExcelService, DynamicExcelService>();
 builder.Services.AddScoped<IDynamicFormService, DynamicFormService>();
 builder.Services.AddScoped<IDynamicFormCloneRequestService, DynamicFormCloneRequestService>();
 builder.Services.AddScoped<IDynamicFlowTemplateService, DynamicFlowTemplateService>();
+builder.Services.AddSingleton<IDynamicFlowPolicyEvaluator, DynamicFlowPolicyEvaluator>();
 builder.Services.AddScoped<ILabelService, LabelService>();
 builder.Services.AddScoped<ILabelEnumCatalogService, LabelEnumCatalogService>();
 builder.Services.AddSingleton<WorkAssignmentTargetScopePolicy>();

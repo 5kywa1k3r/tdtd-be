@@ -1,6 +1,7 @@
 using tdtd_be.Common.Auth;
 using tdtd_be.Common.Errors;
 using tdtd_be.DTOs.Auth;
+using tdtd_be.DTOs.DynamicFlows;
 using tdtd_be.DTOs.DynamicExcel;
 using tdtd_be.DTOs.Operations;
 using tdtd_be.DTOs.WorkAssignments;
@@ -59,6 +60,8 @@ var tests = new (string Name, Action Run)[]
     ("non-flow assignment maps null dynamic flow metadata", MapsNonFlowAssignmentWithNullFlowMetadata),
     ("dynamic flow template payload normalizes defaults", DynamicFlowTemplatePayloadNormalizesDefaults),
     ("dynamic flow template lock payload validates steps", DynamicFlowTemplateLockPayloadValidatesSteps),
+    ("dynamic flow policy validation checks dynamic form references", DynamicFlowPolicyValidationChecksDynamicFormReferences),
+    ("dynamic flow policy evaluator applies field and table permissions", DynamicFlowPolicyEvaluatorAppliesFieldAndTablePermissions),
     ("periodic assignment date range caps occurrence validation", ValidatesPeriodicAssignmentDateRange),
     ("materialize job backfills elapsed monthly periods before rolling future", MaterializeJobBackfillsElapsedMonthlyPeriodsBeforeRollingFuture),
     ("materialize job limits multi-day monthly schedules to exact occurrences", MaterializeJobLimitsMonthlyMultiDayScheduleToExactOccurrences),
@@ -906,6 +909,154 @@ static void DynamicFlowTemplateLockPayloadValidatesSteps()
 
     using var doc = JsonDocument.Parse(normalized);
     AssertEqual(2, doc.RootElement.GetProperty("steps").GetArrayLength(), "lockable payload should keep valid steps");
+}
+
+static void DynamicFlowPolicyValidationChecksDynamicFormReferences()
+{
+    var form = new DynamicFormTemplate
+    {
+        Id = ObjectId(90),
+        Code = "FORM_FLOW",
+        Name = "Flow Form",
+        CreatedByUsername = "admin",
+        FieldsJson = """
+        [
+          { "id": "f_total", "key": "total", "name": "Total", "type": "number" }
+        ]
+        """,
+        BlocksJson = """
+        [
+          {
+            "blockId": "b1",
+            "statisticColumns": [
+              { "columnKey": "amount" },
+              { "columnIndex": 1 }
+            ]
+          }
+        ]
+        """
+    };
+
+    var normalized = DynamicFlowTemplateService.NormalizePayloadJson(
+        """
+        {
+          "steps": [
+            { "stepId": "draft", "stepCode": "DRAFT" }
+          ],
+          "fieldPolicies": [
+            { "stepId": "draft", "actorRole": "ISSUER", "fieldKey": "total", "read": true, "write": true, "required": true }
+          ],
+          "tableColumnPolicies": [
+            { "stepCode": "DRAFT", "actorRole": "ISSUER", "blockId": "b1", "columnKey": "amount", "read": true },
+            { "stepCode": "DRAFT", "actorRole": "ISSUER", "blockId": "b1", "columnKey": "col_2", "read": true }
+          ]
+        }
+        """,
+        requireLockable: true,
+        form);
+
+    using var doc = JsonDocument.Parse(normalized);
+    AssertEqual(1, doc.RootElement.GetProperty("fieldPolicies").GetArrayLength(), "valid field policy should remain");
+    AssertEqual(2, doc.RootElement.GetProperty("tableColumnPolicies").GetArrayLength(), "valid table policies should remain");
+
+    AssertThrows(
+        AppErrorCode.COMMON_VALIDATION_FAILED,
+        () => DynamicFlowTemplateService.NormalizePayloadJson(
+            """
+            {
+              "steps": [
+                { "stepId": "draft", "stepCode": "DRAFT" }
+              ],
+              "fieldPolicies": [
+                { "stepId": "draft", "fieldKey": "missing", "read": true }
+              ]
+            }
+            """,
+            requireLockable: true,
+            form));
+
+    AssertThrows(
+        AppErrorCode.COMMON_VALIDATION_FAILED,
+        () => DynamicFlowTemplateService.NormalizePayloadJson(
+            """
+            {
+              "steps": [
+                { "stepId": "draft", "stepCode": "DRAFT" }
+              ],
+              "tableColumnPolicies": [
+                { "stepId": "draft", "blockId": "b1", "columnKey": "missing", "read": true }
+              ]
+            }
+            """,
+            requireLockable: true,
+            form));
+}
+
+static void DynamicFlowPolicyEvaluatorAppliesFieldAndTablePermissions()
+{
+    var evaluator = new DynamicFlowPolicyEvaluator();
+    const string payload = """
+    {
+      "steps": [
+        { "stepId": "draft", "stepCode": "DRAFT" }
+      ],
+      "fieldPolicies": [
+        { "policyId": "issuer-secret", "stepId": "draft", "actorRole": "ISSUER", "fieldKey": "secret", "read": true, "write": true, "required": true, "hidden": true },
+        { "policyId": "review-score", "stepCode": "DRAFT", "actorRole": "REVIEWER", "fieldKey": "score", "read": true, "write": true, "required": true, "lockedAfterSubmit": true },
+        { "policyId": "all-note", "stepCode": "DRAFT", "actorRole": "*", "fieldKey": "note", "read": true, "write": true }
+      ],
+      "tableColumnPolicies": [
+        { "policyId": "review-amount", "stepId": "draft", "actorRole": "REVIEWER", "blockId": "b1", "columnKey": "amount", "read": true, "write": true, "required": true, "lockedAfterSubmit": true },
+        { "policyId": "issuer-secret-col", "stepId": "draft", "actorRole": "ISSUER", "blockId": "b1", "columnKey": "secret_col", "read": true, "write": true, "required": true, "hidden": true }
+      ]
+    }
+    """;
+
+    var issuer = evaluator.Evaluate(payload, new DynamicFlowPolicyEvaluationContext
+    {
+        StepId = "draft",
+        StepCode = "DRAFT",
+        ActorRole = "ISSUER",
+        IsAfterSubmit = false
+    });
+
+    var secret = issuer.Fields["secret"];
+    AssertTrue(secret.Hidden, "hidden field should be marked hidden");
+    AssertFalse(secret.Read, "hidden field should not be readable");
+    AssertFalse(secret.Write, "hidden field should not be writable");
+    AssertFalse(secret.Required, "hidden field should not remain required");
+
+    var note = issuer.Fields["note"];
+    AssertTrue(note.Read, "wildcard actor field should be readable");
+    AssertTrue(note.Write, "wildcard actor field should be writable");
+
+    var secretColumn = issuer.TableColumns["b1:secret_col"];
+    AssertTrue(secretColumn.Hidden, "hidden table column should be marked hidden");
+    AssertFalse(secretColumn.Read, "hidden table column should not be readable");
+    AssertFalse(secretColumn.Write, "hidden table column should not be writable");
+    AssertFalse(secretColumn.Required, "hidden table column should not remain required");
+
+    var reviewer = evaluator.Evaluate(payload, new DynamicFlowPolicyEvaluationContext
+    {
+        StepId = "draft",
+        StepCode = "DRAFT",
+        ActorRole = "REVIEWER",
+        IsAfterSubmit = true
+    });
+
+    var score = reviewer.Fields["score"];
+    AssertTrue(score.Read, "locked field should remain readable");
+    AssertFalse(score.Write, "locked field should not be writable after submit");
+    AssertTrue(score.Required, "locked field should preserve required flag");
+    AssertTrue(score.Locked, "lockedAfterSubmit field should lock after submit");
+    AssertTrue(score.LockedAfterSubmit, "lockedAfterSubmit flag should be retained");
+
+    var amount = reviewer.TableColumns["b1:amount"];
+    AssertTrue(amount.Read, "locked table column should remain readable");
+    AssertFalse(amount.Write, "locked table column should not be writable after submit");
+    AssertTrue(amount.Required, "locked table column should preserve required flag");
+    AssertTrue(amount.Locked, "lockedAfterSubmit table column should lock after submit");
+    AssertTrue(amount.LockedAfterSubmit, "table lockedAfterSubmit flag should be retained");
 }
 
 static void ValidatesPeriodicAssignmentDateRange()

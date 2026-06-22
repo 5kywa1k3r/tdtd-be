@@ -4,6 +4,7 @@ public sealed class DynamicFlowTemplateSearchRequest
 {
     public string? Query { get; set; }
     public string? Status { get; set; }
+    public string? DynamicFormTemplateId { get; set; }
     public int Page { get; set; }
     public int PageSize { get; set; } = 20;
 }
@@ -14,6 +15,7 @@ public sealed class DynamicFlowTemplateDto
     public string Code { get; set; } = string.Empty;
     public string Name { get; set; } = string.Empty;
     public string? Description { get; set; }
+    public string? DynamicFormTemplateId { get; set; }
     public string Status { get; set; } = "DRAFT";
     public string? CurrentVersionId { get; set; }
     public int? CurrentVersionNo { get; set; }
@@ -29,6 +31,7 @@ public sealed class DynamicFlowTemplateVersionDto
 {
     public string Id { get; set; } = string.Empty;
     public string TemplateId { get; set; } = string.Empty;
+    public string? DynamicFormTemplateId { get; set; }
     public int VersionNo { get; set; }
     public string Status { get; set; } = "DRAFT";
     public int DraftRevision { get; set; }
@@ -48,6 +51,7 @@ public sealed class CreateDynamicFlowTemplateRequest
     public string Code { get; set; } = string.Empty;
     public string Name { get; set; } = string.Empty;
     public string? Description { get; set; }
+    public string? DynamicFormTemplateId { get; set; }
     public string? PayloadJson { get; set; }
 }
 
@@ -56,6 +60,7 @@ public sealed class UpdateDynamicFlowTemplateRequest
     public string? Code { get; set; }
     public string? Name { get; set; }
     public string? Description { get; set; }
+    public string? DynamicFormTemplateId { get; set; }
 }
 
 public sealed class SaveDynamicFlowTemplateVersionDraftRequest

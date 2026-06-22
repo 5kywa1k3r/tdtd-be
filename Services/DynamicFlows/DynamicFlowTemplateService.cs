@@ -53,6 +53,10 @@ public sealed class DynamicFlowTemplateService : IDynamicFlowTemplateService
         if (!string.IsNullOrWhiteSpace(status))
             filter &= fb.Eq(x => x.Status, status);
 
+        var dynamicFormTemplateId = NormalizeOptionalObjectId(req.DynamicFormTemplateId, "dynamicFormTemplateId");
+        if (!string.IsNullOrWhiteSpace(dynamicFormTemplateId))
+            filter &= fb.Eq(x => x.DynamicFormTemplateId, dynamicFormTemplateId);
+
         var query = req.Query?.Trim();
         if (!string.IsNullOrWhiteSpace(query))
         {
@@ -95,9 +99,11 @@ public sealed class DynamicFlowTemplateService : IDynamicFlowTemplateService
         var code = NormalizeCode(req.Code);
         var name = NormalizeRequiredText(req.Name, "name", maxLength: 240);
         var description = NormalizeOptionalText(req.Description, maxLength: 2000);
+        var dynamicFormTemplateId = NormalizeOptionalObjectId(req.DynamicFormTemplateId, "dynamicFormTemplateId");
+        var dynamicFormTemplate = await LoadDynamicFormTemplateOrNullAsync(dynamicFormTemplateId, ct);
         await EnsureCodeAvailableAsync(code, exceptTemplateId: null, ct);
 
-        var payloadJson = NormalizePayloadJson(req.PayloadJson, requireLockable: false);
+        var payloadJson = NormalizePayloadJson(req.PayloadJson, requireLockable: false, dynamicFormTemplate);
         var payloadHash = Sha256(payloadJson);
         var now = DateTime.UtcNow;
         var template = new DynamicFlowTemplate
@@ -106,6 +112,7 @@ public sealed class DynamicFlowTemplateService : IDynamicFlowTemplateService
             Code = code,
             Name = name,
             Description = description,
+            DynamicFormTemplateId = dynamicFormTemplateId,
             Status = DynamicFlowTemplateStatuses.Draft,
             IsDeleted = false,
             CreatedAtUtc = now,
@@ -118,6 +125,7 @@ public sealed class DynamicFlowTemplateService : IDynamicFlowTemplateService
         {
             Id = ObjectId.GenerateNewId().ToString(),
             TemplateId = template.Id,
+            DynamicFormTemplateId = dynamicFormTemplateId,
             VersionNo = 1,
             Status = DynamicFlowTemplateVersionStatuses.Draft,
             DraftRevision = 1,
@@ -152,6 +160,11 @@ public sealed class DynamicFlowTemplateService : IDynamicFlowTemplateService
         if (!string.Equals(code, template.Code, StringComparison.Ordinal))
             await EnsureCodeAvailableAsync(code, exceptTemplateId: template.Id, ct);
 
+        var dynamicFormTemplateId = req.DynamicFormTemplateId is null
+            ? template.DynamicFormTemplateId
+            : NormalizeOptionalObjectId(req.DynamicFormTemplateId, "dynamicFormTemplateId");
+        _ = await LoadDynamicFormTemplateOrNullAsync(dynamicFormTemplateId, ct);
+
         template.Code = code;
         template.Name = string.IsNullOrWhiteSpace(req.Name)
             ? template.Name
@@ -159,6 +172,7 @@ public sealed class DynamicFlowTemplateService : IDynamicFlowTemplateService
         template.Description = req.Description is null
             ? template.Description
             : NormalizeOptionalText(req.Description, maxLength: 2000);
+        template.DynamicFormTemplateId = dynamicFormTemplateId;
         template.UpdatedAtUtc = DateTime.UtcNow;
         template.UpdatedByUserId = actorUserId;
 
@@ -188,7 +202,8 @@ public sealed class DynamicFlowTemplateService : IDynamicFlowTemplateService
         await EnsureCanManageAsync(template, actorUserId, ct);
         EnsureTemplateNotArchived(template);
 
-        var payloadJson = NormalizePayloadJson(req.PayloadJson, requireLockable: false);
+        var dynamicFormTemplate = await LoadDynamicFormTemplateOrNullAsync(template.DynamicFormTemplateId, ct);
+        var payloadJson = NormalizePayloadJson(req.PayloadJson, requireLockable: false, dynamicFormTemplate);
         var payloadHash = Sha256(payloadJson);
         var now = DateTime.UtcNow;
         var existingDraft = await _ctx.DynamicFlowTemplateVersions
@@ -202,6 +217,7 @@ public sealed class DynamicFlowTemplateService : IDynamicFlowTemplateService
         if (existingDraft is not null)
         {
             existingDraft.DraftRevision++;
+            existingDraft.DynamicFormTemplateId = template.DynamicFormTemplateId;
             existingDraft.PayloadJson = payloadJson;
             existingDraft.PayloadHash = payloadHash;
             existingDraft.UpdatedAtUtc = now;
@@ -217,6 +233,7 @@ public sealed class DynamicFlowTemplateService : IDynamicFlowTemplateService
         {
             Id = ObjectId.GenerateNewId().ToString(),
             TemplateId = template.Id,
+            DynamicFormTemplateId = template.DynamicFormTemplateId,
             VersionNo = await NextVersionNoAsync(template.Id, ct),
             Status = DynamicFlowTemplateVersionStatuses.Draft,
             DraftRevision = 1,
@@ -255,7 +272,8 @@ public sealed class DynamicFlowTemplateService : IDynamicFlowTemplateService
                 new { versionId, version.Status, reason = "DYNAMIC_FLOW_TEMPLATE_VERSION_NOT_LOCKABLE" });
         }
 
-        var normalizedPayload = NormalizePayloadJson(version.PayloadJson, requireLockable: true);
+        var dynamicFormTemplate = await LoadDynamicFormTemplateOrNullAsync(version.DynamicFormTemplateId, ct);
+        var normalizedPayload = NormalizePayloadJson(version.PayloadJson, requireLockable: true, dynamicFormTemplate);
         var now = DateTime.UtcNow;
         version.PayloadJson = normalizedPayload;
         version.PayloadHash = Sha256(normalizedPayload);
@@ -442,6 +460,7 @@ public sealed class DynamicFlowTemplateService : IDynamicFlowTemplateService
             Code = template.Code,
             Name = template.Name,
             Description = template.Description,
+            DynamicFormTemplateId = template.DynamicFormTemplateId,
             Status = template.Status,
             CurrentVersionId = template.CurrentVersionId,
             CurrentVersionNo = template.CurrentVersionNo,
@@ -459,6 +478,7 @@ public sealed class DynamicFlowTemplateService : IDynamicFlowTemplateService
         {
             Id = version.Id,
             TemplateId = version.TemplateId,
+            DynamicFormTemplateId = version.DynamicFormTemplateId,
             VersionNo = version.VersionNo,
             Status = version.Status,
             DraftRevision = version.DraftRevision,
@@ -473,7 +493,10 @@ public sealed class DynamicFlowTemplateService : IDynamicFlowTemplateService
             UpdatedAtUtc = version.UpdatedAtUtc
         };
 
-    internal static string NormalizePayloadJson(string? payloadJson, bool requireLockable)
+    internal static string NormalizePayloadJson(
+        string? payloadJson,
+        bool requireLockable,
+        DynamicFormTemplate? dynamicFormTemplate = null)
     {
         if (string.IsNullOrWhiteSpace(payloadJson))
             payloadJson = "{}";
@@ -507,7 +530,24 @@ public sealed class DynamicFlowTemplateService : IDynamicFlowTemplateService
         if (requireLockable)
             ValidateLockablePayload(root);
 
+        DynamicFlowPolicyValidator.ValidatePayload(root, dynamicFormTemplate);
+
         return root.ToJsonString(JsonOptions);
+    }
+
+    private async Task<DynamicFormTemplate?> LoadDynamicFormTemplateOrNullAsync(
+        string? dynamicFormTemplateId,
+        CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(dynamicFormTemplateId))
+            return null;
+
+        return await _ctx.DynamicFormTemplates
+            .Find(x => x.Id == dynamicFormTemplateId && !x.IsDeleted && x.IsActive)
+            .FirstOrDefaultAsync(ct)
+            ?? throw AppExceptionFactory.NotFound(
+                AppErrorCode.COMMON_NOT_FOUND,
+                new { dynamicFormTemplateId, reason = "DYNAMIC_FORM_TEMPLATE_NOT_FOUND" });
     }
 
     private static void ValidateLockablePayload(JsonObject root)
@@ -661,6 +701,22 @@ public sealed class DynamicFlowTemplateService : IDynamicFlowTemplateService
         }
 
         return status;
+    }
+
+    private static string? NormalizeOptionalObjectId(string? value, string field)
+    {
+        value = value?.Trim();
+        if (string.IsNullOrWhiteSpace(value))
+            return null;
+
+        if (!ObjectId.TryParse(value, out _))
+        {
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.COMMON_VALIDATION_FAILED,
+                new { field, reason = "OBJECT_ID_INVALID" });
+        }
+
+        return value;
     }
 
     private static void EnsureActor(string actorUserId)

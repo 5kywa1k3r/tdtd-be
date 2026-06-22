@@ -2025,6 +2025,17 @@
                     { "isDeleted", 1 }
                 }
             ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_dynamicFlowTemplates_dynamicForm_status_updated",
+                key: new BsonDocument
+                {
+                    { "dynamicFormTemplateId", 1 },
+                    { "status", 1 },
+                    { "updatedAtUtc", -1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
         }
 
         private static async Task EnsureDynamicFlowTemplateVersionsAsync(
@@ -2058,6 +2069,16 @@
                 key: new BsonDocument
                 {
                     { "payloadHash", 1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_dynamicFlowTemplateVersions_dynamicForm_status",
+                key: new BsonDocument
+                {
+                    { "dynamicFormTemplateId", 1 },
+                    { "status", 1 },
                     { "isDeleted", 1 }
                 }
             ), ct);

@@ -21,6 +21,10 @@ public sealed class DynamicFlowTemplate : BaseEntity
     [BsonElement("description")]
     public string? Description { get; set; }
 
+    [BsonElement("dynamicFormTemplateId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? DynamicFormTemplateId { get; set; }
+
     [BsonElement("status")]
     public string Status { get; set; } = DynamicFlowTemplateStatuses.Draft;
 
@@ -46,6 +50,10 @@ public sealed class DynamicFlowTemplateVersion : BaseEntity
     [BsonElement("templateId")]
     [BsonRepresentation(BsonType.ObjectId)]
     public string TemplateId { get; set; } = default!;
+
+    [BsonElement("dynamicFormTemplateId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? DynamicFormTemplateId { get; set; }
 
     [BsonElement("versionNo")]
     public int VersionNo { get; set; } = 1;
