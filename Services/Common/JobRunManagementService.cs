@@ -28,6 +28,13 @@ public interface IJobRunManagementService
     Task<PagedResult<StatisticRebuildJobRow>> SearchStatisticRebuildJobsAsync(
         JobRunSearchRequest request,
         CancellationToken ct = default);
+    Task<StatisticRebuildJobResetResponse> ResetStatisticRebuildJobAsync(
+        string jobId,
+        string actorUserId,
+        CancellationToken ct = default);
+    Task<FlowStatisticProjectionDiagnosticsResponse> DiagnoseFlowStatisticProjectionAsync(
+        FlowStatisticProjectionDiagnosticsRequest request,
+        CancellationToken ct = default);
     Task<PagedResult<BasicSummaryJobRow>> SearchBasicSummaryJobsAsync(
         JobRunSearchRequest request,
         CancellationToken ct = default);
@@ -236,6 +243,11 @@ public sealed class JobRunManagementService : IJobRunManagementService
 
         filter &= EqIfNotBlank(fb, x => x.Status, request.Status);
         filter &= EqIfNotBlank(fb, x => x.DynamicFormTemplateId, request.DynamicFormTemplateId);
+        filter &= EqIfNotBlank(fb, x => x.WorkId, request.WorkId);
+        filter &= EqIfNotBlank(fb, x => x.WorkAssignmentId, request.WorkAssignmentId);
+        filter &= EqIfNotBlank(fb, x => x.FlowInstanceId, request.FlowInstanceId);
+        filter &= EqIfNotBlank(fb, x => x.FlowEffectiveStatus, request.FlowEffectiveStatus);
+        filter &= EqIfNotBlank(fb, x => x.PeriodInstanceKey, request.PeriodInstanceKey);
         filter &= EqIfNotBlank(fb, x => x.RequestedByUserId, request.UserId);
 
         var query = NullIfWhiteSpace(request.Query);
@@ -245,6 +257,9 @@ public sealed class JobRunManagementService : IJobRunManagementService
             filter &= fb.Or(
                 fb.Regex(x => x.Status, regex),
                 fb.Regex(x => x.DedupeKey, regex),
+                fb.Regex(x => x.ScopeKind, regex),
+                fb.Regex(x => x.FlowEffectiveStatus, regex),
+                fb.Regex(x => x.PeriodInstanceKey, regex),
                 fb.Regex(x => x.DynamicFormTemplateCode, regex),
                 fb.Regex(x => x.DynamicFormTemplateName, regex),
                 fb.Regex(x => x.LastErrorType, regex),
@@ -273,6 +288,152 @@ public sealed class JobRunManagementService : IJobRunManagementService
             Math.Clamp(maxJobs, 1, 20),
             Math.Clamp(batchSize, 1, 100),
             ct);
+
+    public async Task<StatisticRebuildJobResetResponse> ResetStatisticRebuildJobAsync(
+        string jobId,
+        string actorUserId,
+        CancellationToken ct = default)
+    {
+        jobId = NullIfWhiteSpace(jobId)
+            ?? throw AppExceptionFactory.BadRequest(AppErrorCode.COMMON_ARGUMENT_REQUIRED, new { field = "jobId" });
+        actorUserId = NullIfWhiteSpace(actorUserId)
+            ?? throw AppExceptionFactory.BadRequest(AppErrorCode.COMMON_ARGUMENT_REQUIRED, new { field = "actorUserId" });
+
+        var now = DateTime.UtcNow;
+        var update = Builders<WorkReportStatisticRebuildJob>.Update
+            .Set(x => x.Status, WorkReportStatisticRebuildJobStatuses.Pending)
+            .Set(x => x.IsActive, true)
+            .Set(x => x.RetryCount, 0)
+            .Set(x => x.NextRetryAtUtc, now)
+            .Set(x => x.LeaseUntilUtc, null)
+            .Set(x => x.LastRunAtUtc, null)
+            .Set(x => x.CompletedAtUtc, null)
+            .Set(x => x.LastErrorType, null)
+            .Set(x => x.LastError, null)
+            .Set(x => x.LastErrorAtUtc, null)
+            .Set(x => x.UpdatedAtUtc, now)
+            .Set(x => x.UpdatedByUserId, actorUserId);
+
+        var job = await _ctx.WorkReportStatisticRebuildJobs.FindOneAndUpdateAsync(
+            x => x.Id == jobId && !x.IsDeleted,
+            update,
+            new FindOneAndUpdateOptions<WorkReportStatisticRebuildJob>
+            {
+                ReturnDocument = ReturnDocument.After
+            },
+            ct) ?? throw AppExceptionFactory.NotFound(AppErrorCode.COMMON_NOT_FOUND, new { jobId });
+
+        return new StatisticRebuildJobResetResponse
+        {
+            Ok = true,
+            JobId = job.Id,
+            QueuedAtUtc = now,
+            Job = ToStatisticRebuildJobRow(job)
+        };
+    }
+
+    public async Task<FlowStatisticProjectionDiagnosticsResponse> DiagnoseFlowStatisticProjectionAsync(
+        FlowStatisticProjectionDiagnosticsRequest request,
+        CancellationToken ct = default)
+    {
+        request ??= new FlowStatisticProjectionDiagnosticsRequest();
+        var workId = NullIfWhiteSpace(request.WorkId)
+            ?? throw AppExceptionFactory.BadRequest(AppErrorCode.COMMON_ARGUMENT_REQUIRED, new { field = "workId" });
+        var flowInstanceId = NullIfWhiteSpace(request.FlowInstanceId)
+            ?? throw AppExceptionFactory.BadRequest(AppErrorCode.COMMON_ARGUMENT_REQUIRED, new { field = "flowInstanceId" });
+        var dynamicFormTemplateId = NullIfWhiteSpace(request.DynamicFormTemplateId);
+        var flowEffectiveStatus = NullIfWhiteSpace(request.FlowEffectiveStatus);
+        var periodInstanceKey = NullIfWhiteSpace(request.PeriodInstanceKey);
+        var limit = NormalizeFlowStatisticDiagnosticsLimit(request.Limit);
+
+        var assignmentFilter = BuildFlowAssignmentDiagnosticsFilter(
+            workId,
+            flowInstanceId,
+            dynamicFormTemplateId,
+            flowEffectiveStatus);
+        var assignmentCount = await _ctx.WorkAssignments.CountDocumentsAsync(assignmentFilter, cancellationToken: ct);
+        var assignmentIds = await _ctx.WorkAssignments
+            .Find(assignmentFilter)
+            .SortBy(x => x.Path)
+            .Project(x => x.Id)
+            .Limit(Math.Min(limit * 5, 1000))
+            .ToListAsync(ct);
+
+        var reportFilter = BuildFlowReportDiagnosticsFilter(
+            workId,
+            assignmentIds,
+            dynamicFormTemplateId,
+            periodInstanceKey);
+        var matchingReportCount = assignmentIds.Count == 0
+            ? 0
+            : await _ctx.WorkAssignmentReports.CountDocumentsAsync(reportFilter, cancellationToken: ct);
+        var reports = assignmentIds.Count == 0
+            ? new List<WorkAssignmentReport>()
+            : await _ctx.WorkAssignmentReports
+                .Find(reportFilter)
+                .SortByDescending(x => x.UpdatedAtUtc)
+                .Limit(limit + 1)
+                .ToListAsync(ct);
+        var truncated = reports.Count > limit;
+        if (truncated)
+            reports = reports.Take(limit).ToList();
+
+        var reportIds = reports.Select(x => x.Id).ToList();
+        var fieldValues = reportIds.Count == 0
+            ? new List<WorkReportFieldStatValue>()
+            : await _ctx.WorkReportFieldStatValues
+                .Find(Builders<WorkReportFieldStatValue>.Filter.In(x => x.WorkAssignmentReportId, reportIds) &
+                      Builders<WorkReportFieldStatValue>.Filter.Eq(x => x.IsDeleted, false))
+                .ToListAsync(ct);
+        var tableValues = reportIds.Count == 0
+            ? new List<WorkReportTableStatValue>()
+            : await _ctx.WorkReportTableStatValues
+                .Find(Builders<WorkReportTableStatValue>.Filter.In(x => x.WorkAssignmentReportId, reportIds) &
+                      Builders<WorkReportTableStatValue>.Filter.Eq(x => x.IsDeleted, false))
+                .ToListAsync(ct);
+
+        var fieldByReport = fieldValues
+            .GroupBy(x => x.WorkAssignmentReportId, StringComparer.Ordinal)
+            .ToDictionary(x => x.Key, x => x.ToList(), StringComparer.Ordinal);
+        var tableByReport = tableValues
+            .GroupBy(x => x.WorkAssignmentReportId, StringComparer.Ordinal)
+            .ToDictionary(x => x.Key, x => x.ToList(), StringComparer.Ordinal);
+
+        var rows = reports.Select(report =>
+        {
+            fieldByReport.TryGetValue(report.Id, out var fields);
+            tableByReport.TryGetValue(report.Id, out var tables);
+            fields ??= new List<WorkReportFieldStatValue>();
+            tables ??= new List<WorkReportTableStatValue>();
+
+            return BuildFlowStatisticProjectionDiagnosticRow(
+                report,
+                fields,
+                tables,
+                flowInstanceId,
+                flowEffectiveStatus);
+        }).ToList();
+
+        return new FlowStatisticProjectionDiagnosticsResponse
+        {
+            WorkId = workId,
+            FlowInstanceId = flowInstanceId,
+            DynamicFormTemplateId = dynamicFormTemplateId,
+            FlowEffectiveStatus = flowEffectiveStatus,
+            PeriodInstanceKey = periodInstanceKey,
+            Limit = limit,
+            AssignmentCount = assignmentCount,
+            MatchingReportCount = matchingReportCount,
+            ScannedReportCount = reports.Count,
+            FieldProjectionRowCount = fieldValues.Count,
+            TableProjectionRowCount = tableValues.Count,
+            NoProjectionReportCount = rows.Count(x => x.IssueTypes.Contains("NO_STAT_PROJECTION", StringComparer.Ordinal)),
+            StaleProjectionReportCount = rows.Count(x => x.IssueTypes.Contains("STALE_STAT_PROJECTION", StringComparer.Ordinal)),
+            FlowMetadataMismatchReportCount = rows.Count(x => x.IssueTypes.Contains("FLOW_METADATA_MISMATCH", StringComparer.Ordinal)),
+            Truncated = truncated || matchingReportCount > reports.Count,
+            Rows = rows
+        };
+    }
 
     public async Task<PagedResult<BasicSummaryJobRow>> SearchBasicSummaryJobsAsync(
         JobRunSearchRequest request,
@@ -823,6 +984,145 @@ public sealed class JobRunManagementService : IJobRunManagementService
             UpdatedAtUtc = x.UpdatedAtUtc
         };
 
+    private static FilterDefinition<WorkAssignment> BuildFlowAssignmentDiagnosticsFilter(
+        string workId,
+        string flowInstanceId,
+        string? dynamicFormTemplateId,
+        string? flowEffectiveStatus)
+    {
+        var fb = Builders<WorkAssignment>.Filter;
+        var filter = fb.Eq(x => x.WorkId, workId) &
+                     fb.Eq(x => x.FlowInstanceId, flowInstanceId) &
+                     fb.Eq(x => x.IsDeleted, false) &
+                     fb.Eq(x => x.IsActive, true);
+
+        if (!string.IsNullOrWhiteSpace(dynamicFormTemplateId))
+            filter &= fb.Eq(x => x.DynamicFormTemplateId, dynamicFormTemplateId);
+
+        if (!string.IsNullOrWhiteSpace(flowEffectiveStatus))
+            filter &= fb.Eq(x => x.FlowEffectiveStatus, flowEffectiveStatus);
+
+        return filter;
+    }
+
+    private static FilterDefinition<WorkAssignmentReport> BuildFlowReportDiagnosticsFilter(
+        string workId,
+        IReadOnlyCollection<string> assignmentIds,
+        string? dynamicFormTemplateId,
+        string? periodInstanceKey)
+    {
+        var fb = Builders<WorkAssignmentReport>.Filter;
+        var filter = fb.Eq(x => x.WorkId, workId) &
+                     fb.In(x => x.WorkAssignmentId, assignmentIds) &
+                     fb.Eq(x => x.IsDeleted, false) &
+                     fb.Eq(x => x.IsCurrent, true) &
+                     fb.Ne(x => x.IsActive, false);
+
+        if (!string.IsNullOrWhiteSpace(dynamicFormTemplateId))
+            filter &= fb.Eq(x => x.DynamicFormTemplateId, dynamicFormTemplateId);
+
+        if (!string.IsNullOrWhiteSpace(periodInstanceKey))
+            filter &= fb.Eq(x => x.PeriodInstanceKey, periodInstanceKey);
+
+        return filter;
+    }
+
+    private static FlowStatisticProjectionDiagnosticRow BuildFlowStatisticProjectionDiagnosticRow(
+        WorkAssignmentReport report,
+        IReadOnlyCollection<WorkReportFieldStatValue> fieldValues,
+        IReadOnlyCollection<WorkReportTableStatValue> tableValues,
+        string flowInstanceId,
+        string? flowEffectiveStatus)
+    {
+        var hasProjection = fieldValues.Count > 0 || tableValues.Count > 0;
+        var fieldFresh = ProjectionRowsFresh(fieldValues, report.PayloadRevision, report.PayloadHash);
+        var tableFresh = ProjectionRowsFresh(tableValues, report.PayloadRevision, report.PayloadHash);
+        var flowMatches = ProjectionRowsMatchFlow(fieldValues, flowInstanceId, flowEffectiveStatus) &&
+                          ProjectionRowsMatchFlow(tableValues, flowInstanceId, flowEffectiveStatus);
+        var issues = new List<string>();
+
+        if (!hasProjection)
+            issues.Add("NO_STAT_PROJECTION");
+        if (!fieldFresh || !tableFresh)
+            issues.Add("STALE_STAT_PROJECTION");
+        if (!flowMatches)
+            issues.Add("FLOW_METADATA_MISMATCH");
+
+        return new FlowStatisticProjectionDiagnosticRow
+        {
+            WorkAssignmentReportId = report.Id,
+            WorkAssignmentId = report.WorkAssignmentId,
+            PeriodKey = report.PeriodKey,
+            PeriodInstanceKey = report.PeriodInstanceKey,
+            ReportStatus = (int)report.Status,
+            PayloadRevision = report.PayloadRevision,
+            PayloadHash = report.PayloadHash,
+            FieldProjectionRows = fieldValues.Count,
+            TableProjectionRows = tableValues.Count,
+            FieldProjectionFresh = fieldFresh,
+            TableProjectionFresh = tableFresh,
+            FlowMetadataMatches = flowMatches,
+            IssueTypes = issues
+        };
+    }
+
+    private static bool ProjectionRowsFresh<T>(
+        IReadOnlyCollection<T> values,
+        int payloadRevision,
+        string? payloadHash)
+    {
+        if (values.Count == 0)
+            return true;
+
+        return values.All(value =>
+        {
+            var revision = value switch
+            {
+                WorkReportFieldStatValue field => field.SourcePayloadRevision,
+                WorkReportTableStatValue table => table.SourcePayloadRevision,
+                _ => payloadRevision
+            };
+            var hash = value switch
+            {
+                WorkReportFieldStatValue field => field.SourcePayloadHash,
+                WorkReportTableStatValue table => table.SourcePayloadHash,
+                _ => payloadHash
+            };
+
+            return revision == payloadRevision &&
+                   string.Equals(hash, payloadHash, StringComparison.Ordinal);
+        });
+    }
+
+    private static bool ProjectionRowsMatchFlow<T>(
+        IReadOnlyCollection<T> values,
+        string flowInstanceId,
+        string? flowEffectiveStatus)
+    {
+        if (values.Count == 0)
+            return true;
+
+        return values.All(value =>
+        {
+            var rowFlowInstanceId = value switch
+            {
+                WorkReportFieldStatValue field => field.FlowInstanceId,
+                WorkReportTableStatValue table => table.FlowInstanceId,
+                _ => null
+            };
+            var rowFlowEffectiveStatus = value switch
+            {
+                WorkReportFieldStatValue field => field.FlowEffectiveStatus,
+                WorkReportTableStatValue table => table.FlowEffectiveStatus,
+                _ => null
+            };
+
+            return string.Equals(rowFlowInstanceId, flowInstanceId, StringComparison.Ordinal) &&
+                   (string.IsNullOrWhiteSpace(flowEffectiveStatus) ||
+                    string.Equals(rowFlowEffectiveStatus, flowEffectiveStatus, StringComparison.Ordinal));
+        });
+    }
+
     private static StatisticRebuildJobRow ToStatisticRebuildJobRow(WorkReportStatisticRebuildJob x)
         => new()
         {
@@ -1040,6 +1340,9 @@ public sealed class JobRunManagementService : IJobRunManagementService
 
     internal static int NormalizeAdvancedSummaryCleanupLimit(int limit)
         => Math.Clamp(limit <= 0 ? 500 : limit, 1, 1000);
+
+    internal static int NormalizeFlowStatisticDiagnosticsLimit(int limit)
+        => Math.Clamp(limit <= 0 ? 100 : limit, 1, 500);
 
     internal static bool HasAdvancedSummaryCleanupSelector(AdvancedSummaryNodeCleanupRequest request)
     {

@@ -281,7 +281,12 @@ public sealed class AdminOperationsController : ControllerBase
     [HttpGet("job-runs/statistic-rebuild-jobs")]
     public async Task<IActionResult> SearchStatisticRebuildJobs(
         [FromQuery] string? status = null,
+        [FromQuery] string? workId = null,
+        [FromQuery] string? workAssignmentId = null,
         [FromQuery] string? dynamicFormTemplateId = null,
+        [FromQuery] string? flowInstanceId = null,
+        [FromQuery] string? flowEffectiveStatus = null,
+        [FromQuery] string? periodInstanceKey = null,
         [FromQuery] string? userId = null,
         [FromQuery] string? q = null,
         [FromQuery] bool includeInactive = false,
@@ -294,7 +299,12 @@ public sealed class AdminOperationsController : ControllerBase
         return Ok(await _jobRuns.SearchStatisticRebuildJobsAsync(new JobRunSearchRequest
         {
             Status = status,
+            WorkId = workId,
+            WorkAssignmentId = workAssignmentId,
             DynamicFormTemplateId = dynamicFormTemplateId,
+            FlowInstanceId = flowInstanceId,
+            FlowEffectiveStatus = flowEffectiveStatus,
+            PeriodInstanceKey = periodInstanceKey,
             UserId = userId,
             Query = q,
             IncludeInactive = includeInactive,
@@ -309,16 +319,80 @@ public sealed class AdminOperationsController : ControllerBase
         [FromQuery] int batchSize = 25,
         CancellationToken ct = default)
     {
+        var me = _me.RequireMe();
+        RoleGuard.RequireSystemAdmin(me);
+        var startedAtUtc = DateTime.UtcNow;
+
+        try
+        {
+            var processed = await _jobRuns.ProcessStatisticRebuildJobsAsync(maxJobs, batchSize, ct);
+            var response = new
+            {
+                ok = true,
+                processed,
+                maxJobs = Math.Clamp(maxJobs, 1, 20),
+                batchSize = Math.Clamp(batchSize, 1, 100)
+            };
+            await WriteStatisticRebuildProcessLogAsync(response.processed, response.maxJobs, response.batchSize, startedAtUtc, me.Id, ex: null, ct);
+            return Ok(response);
+        }
+        catch (Exception ex)
+        {
+            await WriteStatisticRebuildProcessLogAsync(0, Math.Clamp(maxJobs, 1, 20), Math.Clamp(batchSize, 1, 100), startedAtUtc, me.Id, ex, ct);
+            throw;
+        }
+    }
+
+    [HttpPost("job-runs/statistic-rebuild-jobs/{jobId}/reset")]
+    public async Task<IActionResult> ResetStatisticRebuildJob(
+        string jobId,
+        CancellationToken ct = default)
+    {
+        var me = _me.RequireMe();
+        RoleGuard.RequireSystemAdmin(me);
+        var startedAtUtc = DateTime.UtcNow;
+
+        try
+        {
+            var result = await _jobRuns.ResetStatisticRebuildJobAsync(jobId, me.Id, ct);
+            await WriteStatisticRebuildResetLogAsync(result, startedAtUtc, me.Id, ex: null, ct);
+            return Ok(result);
+        }
+        catch (Exception ex)
+        {
+            await WriteStatisticRebuildResetLogAsync(
+                new StatisticRebuildJobResetResponse { JobId = jobId },
+                startedAtUtc,
+                me.Id,
+                ex,
+                ct);
+            throw;
+        }
+    }
+
+    [HttpGet("job-runs/flow-statistics/diagnostics")]
+    public async Task<IActionResult> DiagnoseFlowStatisticProjections(
+        [FromQuery] string? workId = null,
+        [FromQuery] string? flowInstanceId = null,
+        [FromQuery] string? dynamicFormTemplateId = null,
+        [FromQuery] string? flowEffectiveStatus = null,
+        [FromQuery] string? periodInstanceKey = null,
+        [FromQuery] int limit = 100,
+        CancellationToken ct = default)
+    {
         RequireSystemAdmin();
 
-        var processed = await _jobRuns.ProcessStatisticRebuildJobsAsync(maxJobs, batchSize, ct);
-        return Ok(new
-        {
-            ok = true,
-            processed,
-            maxJobs = Math.Clamp(maxJobs, 1, 20),
-            batchSize = Math.Clamp(batchSize, 1, 100)
-        });
+        return Ok(await _jobRuns.DiagnoseFlowStatisticProjectionAsync(
+            new FlowStatisticProjectionDiagnosticsRequest
+            {
+                WorkId = workId,
+                FlowInstanceId = flowInstanceId,
+                DynamicFormTemplateId = dynamicFormTemplateId,
+                FlowEffectiveStatus = flowEffectiveStatus,
+                PeriodInstanceKey = periodInstanceKey,
+                Limit = limit
+            },
+            ct));
     }
 
     [HttpGet("job-runs/basic-summary-jobs")]
@@ -649,6 +723,61 @@ public sealed class AdminOperationsController : ControllerBase
             DurationMs = (long)(completedAtUtc - startedAtUtc).TotalMilliseconds
         }, ct);
     }
+
+    private Task WriteStatisticRebuildProcessLogAsync(
+        int processed,
+        int maxJobs,
+        int batchSize,
+        DateTime startedAtUtc,
+        string actorUserId,
+        Exception? ex,
+        CancellationToken ct)
+    {
+        var completedAtUtc = DateTime.UtcNow;
+        return _operationLogs.WriteAsync(new WorkStatusOperationLog
+        {
+            Operation = "STATISTIC_REBUILD_JOB_PROCESS",
+            Scope = "statistic-rebuild-jobs",
+            Result = ex is null ? "SUCCESS" : "FAILED",
+            ActorUserId = actorUserId,
+            Summary = $"processed={processed};maxJobs={maxJobs};batchSize={batchSize}",
+            ErrorType = ex?.GetType().FullName,
+            ErrorMessage = ex?.Message,
+            ErrorStackTrace = ex?.ToString(),
+            StartedAtUtc = startedAtUtc,
+            CompletedAtUtc = completedAtUtc,
+            DurationMs = (long)(completedAtUtc - startedAtUtc).TotalMilliseconds
+        }, ct);
+    }
+
+    private Task WriteStatisticRebuildResetLogAsync(
+        StatisticRebuildJobResetResponse result,
+        DateTime startedAtUtc,
+        string actorUserId,
+        Exception? ex,
+        CancellationToken ct)
+    {
+        var completedAtUtc = DateTime.UtcNow;
+        return _operationLogs.WriteAsync(new WorkStatusOperationLog
+        {
+            Operation = "STATISTIC_REBUILD_JOB_RESET",
+            Scope = "statistic-rebuild-jobs",
+            Result = ex is null ? "SUCCESS" : "FAILED",
+            WorkId = result.Job?.WorkId,
+            WorkAssignmentId = result.Job?.WorkAssignmentId,
+            ActorUserId = actorUserId,
+            Summary = BuildStatisticRebuildResetSummary(result),
+            ErrorType = ex?.GetType().FullName,
+            ErrorMessage = ex?.Message,
+            ErrorStackTrace = ex?.ToString(),
+            StartedAtUtc = startedAtUtc,
+            CompletedAtUtc = completedAtUtc,
+            DurationMs = (long)(completedAtUtc - startedAtUtc).TotalMilliseconds
+        }, ct);
+    }
+
+    private static string BuildStatisticRebuildResetSummary(StatisticRebuildJobResetResponse result)
+        => $"jobId={result.JobId};dynamicFormTemplateId={result.Job?.DynamicFormTemplateId};flowInstanceId={result.Job?.FlowInstanceId};flowEffectiveStatus={result.Job?.FlowEffectiveStatus};periodInstanceKey={result.Job?.PeriodInstanceKey};status={result.Job?.Status}";
 
     private static string BuildReportPayloadDiagnosticsRepairSummary(
         WorkReportPayloadDiagnosticsRepairResult result)

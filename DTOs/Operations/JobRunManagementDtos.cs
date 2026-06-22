@@ -9,6 +9,9 @@ public sealed class JobRunSearchRequest
     public string? WorkAssignmentId { get; init; }
     public string? WorkReportPeriodId { get; init; }
     public string? DynamicFormTemplateId { get; init; }
+    public string? FlowInstanceId { get; init; }
+    public string? FlowEffectiveStatus { get; init; }
+    public string? PeriodInstanceKey { get; init; }
     public string? SectionId { get; init; }
     public string? ConfigId { get; init; }
     public string? ConfigHash { get; init; }
@@ -98,6 +101,67 @@ public sealed class StatisticRebuildJobRow
     public bool IsActive { get; init; }
     public DateTime CreatedAtUtc { get; init; }
     public DateTime UpdatedAtUtc { get; init; }
+}
+
+public sealed class StatisticRebuildJobResetResponse
+{
+    public bool Ok { get; init; }
+    public string JobId { get; init; } = string.Empty;
+    public DateTime QueuedAtUtc { get; init; }
+    public StatisticRebuildJobRow? Job { get; init; }
+}
+
+public sealed class FlowStatisticProjectionDiagnosticsRequest
+{
+    public string? WorkId { get; init; }
+    public string? FlowInstanceId { get; init; }
+    public string? DynamicFormTemplateId { get; init; }
+    public string? FlowEffectiveStatus { get; init; }
+    public string? PeriodInstanceKey { get; init; }
+    public int Limit { get; init; } = 100;
+}
+
+public sealed class FlowStatisticProjectionDiagnosticsResponse
+{
+    public DateTime CheckedAtUtc { get; init; } = DateTime.UtcNow;
+    public string WorkId { get; init; } = string.Empty;
+    public string FlowInstanceId { get; init; } = string.Empty;
+    public string? DynamicFormTemplateId { get; init; }
+    public string? FlowEffectiveStatus { get; init; }
+    public string? PeriodInstanceKey { get; init; }
+    public int Limit { get; init; }
+    public long AssignmentCount { get; init; }
+    public long MatchingReportCount { get; init; }
+    public int ScannedReportCount { get; init; }
+    public long FieldProjectionRowCount { get; init; }
+    public long TableProjectionRowCount { get; init; }
+    public int NoProjectionReportCount { get; init; }
+    public int StaleProjectionReportCount { get; init; }
+    public int FlowMetadataMismatchReportCount { get; init; }
+    public bool Truncated { get; init; }
+    public List<FlowStatisticProjectionDiagnosticRow> Rows { get; init; } = new();
+    public Dictionary<string, int> IssueCountsByType => Rows
+        .SelectMany(x => x.IssueTypes)
+        .GroupBy(x => x, StringComparer.Ordinal)
+        .OrderBy(x => x.Key, StringComparer.Ordinal)
+        .ToDictionary(x => x.Key, x => x.Count(), StringComparer.Ordinal);
+}
+
+public sealed class FlowStatisticProjectionDiagnosticRow
+{
+    public string WorkAssignmentReportId { get; init; } = string.Empty;
+    public string WorkAssignmentId { get; init; } = string.Empty;
+    public string PeriodKey { get; init; } = string.Empty;
+    public string PeriodInstanceKey { get; init; } = string.Empty;
+    public int ReportStatus { get; init; }
+    public int PayloadRevision { get; init; }
+    public string? PayloadHash { get; init; }
+    public int FieldProjectionRows { get; init; }
+    public int TableProjectionRows { get; init; }
+    public bool FieldProjectionFresh { get; init; }
+    public bool TableProjectionFresh { get; init; }
+    public bool FlowMetadataMatches { get; init; }
+    public List<string> IssueTypes { get; init; } = new();
 }
 
 public sealed class BasicSummaryJobRow

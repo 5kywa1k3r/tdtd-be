@@ -11,6 +11,7 @@ using tdtd_be.DTOs.WorkAssignments.BasicSummary;
 using tdtd_be.Enum;
 using tdtd_be.Models;
 using tdtd_be.Models.Enums;
+using tdtd_be.Models.Statistics;
 using tdtd_be.Services;
 using tdtd_be.Services.DynamicFlows;
 using tdtd_be.Services.WorkAssignmentReports;
@@ -161,6 +162,8 @@ var tests = new (string Name, Action Run)[]
     ("advanced summary operations reset actor uses original requester", AdvancedSummaryOperationsResetActorUsesOriginalRequester),
     ("advanced summary operations cleanup limit is bounded", AdvancedSummaryOperationsCleanupLimitIsBounded),
     ("advanced summary operations cleanup requires scope selector", AdvancedSummaryOperationsCleanupRequiresScopeSelector),
+    ("flow statistic diagnostics limit is bounded", FlowStatisticDiagnosticsLimitIsBounded),
+    ("statistic rebuild operation row includes flow scope", StatisticRebuildOperationRowIncludesFlowScope),
     ("advanced summary diagnostics comparable hash ignores generated time", AdvancedSummaryDiagnosticsComparableHashIgnoresGeneratedTime),
     ("advanced summary diagnostics comparable hash covers rollup input count", AdvancedSummaryDiagnosticsComparableHashCoversRollupInputCount),
 };
@@ -652,6 +655,59 @@ static void AdvancedSummaryDiagnosticsComparableHashCoversRollupInputCount()
     AssertFalse(
         string.Equals(firstHash, changedHash, StringComparison.Ordinal),
         "diagnostics comparable hash should change when rollup input node count changes");
+}
+
+static void FlowStatisticDiagnosticsLimitIsBounded()
+{
+    AssertEqual(
+        100,
+        JobRunManagementService.NormalizeFlowStatisticDiagnosticsLimit(0),
+        "flow statistic diagnostics should default empty limits to 100");
+    AssertEqual(
+        12,
+        JobRunManagementService.NormalizeFlowStatisticDiagnosticsLimit(12),
+        "flow statistic diagnostics should preserve small explicit limits");
+    AssertEqual(
+        500,
+        JobRunManagementService.NormalizeFlowStatisticDiagnosticsLimit(5000),
+        "flow statistic diagnostics should cap each sample to 500 reports");
+}
+
+static void StatisticRebuildOperationRowIncludesFlowScope()
+{
+    var job = new WorkReportStatisticRebuildJob
+    {
+        Id = ObjectId(90),
+        DedupeKey = "bounded:flow:period",
+        DynamicFormTemplateId = ObjectId(91),
+        DynamicFormTemplateCode = "T-FLOW",
+        DynamicFormTemplateName = "Flow Template",
+        ScopeKind = WorkReportStatisticRebuildJobScopeKinds.Bounded,
+        WorkId = ObjectId(92),
+        WorkAssignmentId = ObjectId(93),
+        FlowInstanceId = "flow-2026-06",
+        FlowEffectiveStatus = DynamicFlowEffectiveStatuses.Effective,
+        PeriodInstanceKey = "20260622",
+        Status = WorkReportStatisticRebuildJobStatuses.RetryWaiting,
+        RequestedByUserId = UserId(7),
+        Priority = WorkReportStatisticRebuildJobPriorities.High,
+        TotalReportCount = 10,
+        ProcessedReportCount = 4,
+        FailedReportCount = 1,
+        IsActive = true
+    };
+
+    var row = InvokePrivateStatic<StatisticRebuildJobRow>(
+        typeof(JobRunManagementService),
+        "ToStatisticRebuildJobRow",
+        job);
+
+    AssertEqual(job.ScopeKind, row.ScopeKind, "statistic rebuild operations should expose scope kind");
+    AssertEqual(job.WorkId, row.WorkId, "statistic rebuild operations should expose work scope");
+    AssertEqual(job.WorkAssignmentId, row.WorkAssignmentId, "statistic rebuild operations should expose assignment scope");
+    AssertEqual(job.FlowInstanceId, row.FlowInstanceId, "statistic rebuild operations should expose flow scope");
+    AssertEqual(job.FlowEffectiveStatus, row.FlowEffectiveStatus, "statistic rebuild operations should expose flow status scope");
+    AssertEqual(job.PeriodInstanceKey, row.PeriodInstanceKey, "statistic rebuild operations should expose period scope");
 }
 
 static void BlocksOnceDueBeforeAssignmentStart()
