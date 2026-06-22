@@ -1053,6 +1053,19 @@
             ), ct);
 
             await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_assignmentDocRoles_user_work_visible_flow_path",
+                key: new BsonDocument
+                {
+                    { "userId", 1 },
+                    { "workId", 1 },
+                    { "visibleUnitIds", 1 },
+                    { "flowInstanceId", 1 },
+                    { "isDeleted", 1 },
+                    { "path", 1 }
+                }
+            ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
                 name: "ix_assignmentDocRoles_user_work_progress_due",
                 key: new BsonDocument
                 {

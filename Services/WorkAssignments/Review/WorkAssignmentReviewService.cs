@@ -12,6 +12,7 @@ using tdtd_be.Enum;
 using tdtd_be.Models;
 using tdtd_be.Models.Enums;
 using tdtd_be.Services.Common;
+using tdtd_be.Services.DynamicFlows;
 using tdtd_be.Services.WorkAssignmentReports;
 using tdtd_be.Services.WorkAssignmentReports.Payloads;
 using tdtd_be.Services.WorkAssignmentReports.Statistics;
@@ -1893,6 +1894,7 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
             .FirstOrDefaultAsync(ct)
             ?? throw EvaluationAssignmentNotFound(assignmentId);
 
+        await EnsureFlowAssignmentVisibleAsync(assignment, me.Id, ct);
         EnsureCanEvaluateAssignment(assignment, me.Id);
 
         var fb = Builders<WorkReportPeriod>.Filter;
@@ -2004,6 +2006,7 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
             .FirstOrDefaultAsync(ct)
             ?? throw EvaluationAssignmentNotFound(assignmentId);
 
+        await EnsureFlowAssignmentVisibleAsync(assignment, me.Id, ct);
         EnsureCanEvaluateAssignment(assignment, me.Id);
 
         page = page < 0 ? 0 : page;
@@ -2248,6 +2251,28 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
                     actorUserId,
                     ownerUserId = assignment.CreatedByUserId
                 });
+    }
+
+    private async Task EnsureFlowAssignmentVisibleAsync(
+        WorkAssignment assignment,
+        string actorUserId,
+        CancellationToken ct)
+    {
+        if (!DynamicFlowBranchVisibility.IsFlowAssignment(assignment))
+            return;
+
+        if (await WorkAssignmentReadAccessHelper.CanReadAssignmentAsync(_ctx, assignment.Id, actorUserId, ct))
+            return;
+
+        throw AppExceptionFactory.Forbidden(
+            AppErrorCode.WORK_ASSIGNMENT_EVALUATION_FORBIDDEN,
+            new
+            {
+                assignmentId = assignment.Id,
+                assignment.WorkId,
+                actorUserId,
+                reason = "DYNAMIC_FLOW_BRANCH_NOT_VISIBLE"
+            });
     }
 
     private async Task<WorkAssignment> LoadParentForReviewAsync(

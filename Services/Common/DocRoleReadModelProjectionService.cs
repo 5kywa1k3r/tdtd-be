@@ -3,6 +3,7 @@ using MongoDB.Bson;
 using tdtd_be.Data;
 using tdtd_be.Models;
 using tdtd_be.Models.Enums;
+using tdtd_be.Services.DynamicFlows;
 using tdtd_be.Services.WorkAssignments.Domain;
 
 namespace tdtd_be.Services.Common;
@@ -144,6 +145,10 @@ public sealed class DocRoleReadModelProjectionService : IDocRoleReadModelProject
                 .Select(x => x!)
                 .Distinct(StringComparer.Ordinal)
                 .ToList();
+            var inheritedVisibleUnitIds = await ResolveInheritedFlowVisibleUnitIdsAsync(assignment, ct);
+            var visibleUnitIds = DynamicFlowBranchVisibility.BuildVisibleUnitIds(
+                assignment,
+                inheritedVisibleUnitIds);
 
             var leaderWatcherIds = (assignment.LeaderWatcherUserIds ?? new List<string>())
                 .Where(x => !string.IsNullOrWhiteSpace(x))
@@ -188,6 +193,7 @@ public sealed class DocRoleReadModelProjectionService : IDocRoleReadModelProject
                     .Set(x => x.FlowEffectiveStatus, assignment.FlowEffectiveStatus)
                     .Set(x => x.IssuedByUnitId, NullIfWhiteSpace(assignment.IssuedByUnitId))
                     .Set(x => x.TargetUnitIds, assignment.TargetUnitIds)
+                    .Set(x => x.VisibleUnitIds, visibleUnitIds)
                     .Set(x => x.AllowSubFlow, assignment.AllowSubFlow)
                     .Set(x => x.IsFlowFinalNode, assignment.IsFlowFinalNode)
                     .Set(x => x.InvalidatedByFlowEventId, NullIfWhiteSpace(assignment.InvalidatedByFlowEventId))
@@ -459,6 +465,40 @@ public sealed class DocRoleReadModelProjectionService : IDocRoleReadModelProject
         }
 
         return map;
+    }
+
+    private async Task<List<string>> ResolveInheritedFlowVisibleUnitIdsAsync(
+        WorkAssignment assignment,
+        CancellationToken ct)
+    {
+        if (!DynamicFlowBranchVisibility.IsFlowAssignment(assignment) ||
+            string.IsNullOrWhiteSpace(assignment.Path))
+        {
+            return new List<string>();
+        }
+
+        var ancestorIds = assignment.Path
+            .Split('/', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Where(x => !string.Equals(x, assignment.Id, StringComparison.Ordinal))
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+
+        if (ancestorIds.Count == 0)
+            return new List<string>();
+
+        var ancestors = await _ctx.WorkAssignments
+            .Find(x => ancestorIds.Contains(x.Id) && !x.IsDeleted)
+            .ToListAsync(ct);
+
+        var visibleUnitIds = new List<string>();
+        foreach (var ancestor in ancestors.OrderBy(x => x.Level).ThenBy(x => x.Path))
+        {
+            visibleUnitIds = DynamicFlowBranchVisibility.BuildVisibleUnitIds(
+                ancestor,
+                visibleUnitIds);
+        }
+
+        return visibleUnitIds;
     }
 
     private async Task<WorkAssignmentReport?> LoadCurrentReportAsync(WorkReportPeriod period, CancellationToken ct)

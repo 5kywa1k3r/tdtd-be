@@ -149,6 +149,10 @@ public sealed class AssignmentListDocRole : DocRoleReadModelBase
     [BsonRepresentation(BsonType.ObjectId)]
     public List<string>? TargetUnitIds { get; set; }
 
+    [BsonElement("visibleUnitIds")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public List<string> VisibleUnitIds { get; set; } = new();
+
     [BsonElement("allowSubFlow")]
     public bool? AllowSubFlow { get; set; }
 

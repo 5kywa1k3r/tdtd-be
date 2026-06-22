@@ -18,6 +18,7 @@ using tdtd_be.Models;
 using tdtd_be.Models.Enums;
 using tdtd_be.Services.Common;
 using tdtd_be.Services;
+using tdtd_be.Services.DynamicFlows;
 using tdtd_be.Services.WorkAssignments.Domain;
 using tdtd_be.Services.WorkAssignments.Internal;
 using tdtd_be.Services.WorkAssignments.Lookups;
@@ -103,6 +104,7 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
                      & fb.Eq(x => x.UserId, actorUserId)
                      & fb.Eq(x => x.IsDeleted, false)
                      & fb.AnyEq(x => x.Roles, DocRoleType.ASSIGNER);
+        filter &= await BuildAssignmentDocRoleVisibilityFilterAsync(fb, actorUserId, ct);
 
         var items = await _ctx.AssignmentListDocRoles
             .Find(filter)
@@ -132,6 +134,7 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
                      & fb.Eq(x => x.IsActive, true)
                      & fb.Eq(x => x.IsDeleted, false)
                      & fb.AnyEq(x => x.Roles, DocRoleType.ASSIGNEE);
+        filter &= await BuildAssignmentDocRoleVisibilityFilterAsync(fb, actorUserId, ct);
 
         var items = await _ctx.AssignmentListDocRoles
             .Find(filter)
@@ -162,6 +165,8 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
                               & fb.Eq(x => x.IsActive, true)
                               & fb.Eq(x => x.IsDeleted, false)
                               & fb.AnyEq(x => x.Roles, DocRoleType.ASSIGNER);
+        var visibilityFilter = await BuildAssignmentDocRoleVisibilityFilterAsync(fb, actorUserId, ct);
+        candidateFilter &= visibilityFilter;
 
         var candidates = await _ctx.AssignmentListDocRoles
             .Find(candidateFilter)
@@ -180,7 +185,8 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
                           & fb.Eq(x => x.UserId, actorUserId)
                           & fb.Eq(x => x.IsActive, true)
                           & fb.Eq(x => x.IsDeleted, false)
-                          & fb.In(x => x.ParentAssignmentId, candidateIds);
+                          & fb.In(x => x.ParentAssignmentId, candidateIds)
+                          & visibilityFilter;
 
         var parentIds = await _ctx.AssignmentListDocRoles
             .Find(childFilter)
@@ -226,6 +232,7 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
         {
             filter &= fb.AnyEq(x => x.Roles, DocRoleType.ASSIGNEE);
         }
+        filter &= await BuildAssignmentDocRoleVisibilityFilterAsync(fb, actorUserId, ct);
 
         var items = await _ctx.AssignmentListDocRoles
             .Find(filter)
@@ -285,13 +292,20 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
                 AppErrorCode.WORK_ASSIGNMENT_PARENT_NOT_FOUND,
                 new { parentAssignmentId });
 
-        var items = await _ctx.WorkAssignments
-            .Find(x =>
-                x.WorkId == parent.WorkId &&
-                x.ParentAssignmentId == parent.Id &&
-                !x.IsDeleted)
+        if (!await EnsureAssignmentListDocRolesForUserWorkAsync(parent.WorkId, actorUserId, ct))
+            return new List<WorkAssignmentListResponse>();
+
+        var fb = Builders<AssignmentListDocRole>.Filter;
+        var filter = fb.Eq(x => x.WorkId, parent.WorkId)
+                     & fb.Eq(x => x.UserId, actorUserId)
+                     & fb.Eq(x => x.ParentAssignmentId, parent.Id)
+                     & fb.Eq(x => x.IsDeleted, false);
+        filter &= await BuildAssignmentDocRoleVisibilityFilterAsync(fb, actorUserId, ct);
+
+        var items = await _ctx.AssignmentListDocRoles
+            .Find(filter)
             .SortByDescending(x => x.IsActive)
-            .ThenByDescending(x => x.UpdatedAtUtc)
+            .ThenByDescending(x => x.AssignmentUpdatedAtUtc)
             .ThenBy(x => x.Path)
             .ToListAsync(ct);
 
@@ -1295,6 +1309,15 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
         string actorUserId,
         CancellationToken ct)
     {
+        if (DynamicFlowBranchVisibility.IsFlowAssignment(assignment))
+        {
+            return await WorkAssignmentReadAccessHelper.CanReadAssignmentAsync(
+                _ctx,
+                assignment.Id,
+                actorUserId,
+                ct);
+        }
+
         if (CanConfigureDataSourceRules(assignment, actorUserId))
             return true;
 
@@ -1412,6 +1435,28 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
 
     private static DateTime? NormalizeDate(DateTime? value)
         => value?.Date;
+
+    private async Task<FilterDefinition<AssignmentListDocRole>> BuildAssignmentDocRoleVisibilityFilterAsync(
+        FilterDefinitionBuilder<AssignmentListDocRole> fb,
+        string actorUserId,
+        CancellationToken ct)
+    {
+        var actorUnitId = await LoadActorUnitIdAsync(actorUserId, ct);
+        return DynamicFlowBranchVisibility.BuildAssignmentListFilter(fb, actorUnitId);
+    }
+
+    private async Task<string?> LoadActorUnitIdAsync(string actorUserId, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(actorUserId))
+            return null;
+
+        var actor = await _ctx.Users
+            .Find(x => x.Id == actorUserId && !x.IsDeleted)
+            .Project(x => new { x.UnitId })
+            .FirstOrDefaultAsync(ct);
+
+        return actor?.UnitId;
+    }
 
     private async Task<bool> EnsureAssignmentListDocRolesForUserWorkAsync(
         string workId,

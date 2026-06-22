@@ -1,6 +1,7 @@
 using MongoDB.Driver;
 using tdtd_be.Data;
 using tdtd_be.Models;
+using tdtd_be.Services.DynamicFlows;
 
 namespace tdtd_be.Services.WorkAssignments.Internal;
 
@@ -15,12 +16,15 @@ internal static class WorkAssignmentReadAccessHelper
         if (string.IsNullOrWhiteSpace(assignmentId) || string.IsNullOrWhiteSpace(actorUserId))
             return false;
 
+        var actorUnitId = await ResolveActorUnitIdAsync(ctx, actorUserId, ct);
+        var fb = Builders<AssignmentListDocRole>.Filter;
         var hasProjectedRole = await ctx.AssignmentListDocRoles
-            .Find(x =>
-                x.AssignmentId == assignmentId &&
-                x.UserId == actorUserId &&
-                !x.IsDeleted &&
-                x.Roles.Any())
+            .Find(
+                fb.Eq(x => x.AssignmentId, assignmentId) &
+                fb.Eq(x => x.UserId, actorUserId) &
+                fb.Eq(x => x.IsDeleted, false) &
+                fb.Where(x => x.Roles.Any()) &
+                DynamicFlowBranchVisibility.BuildAssignmentListFilter(fb, actorUnitId))
             .Limit(1)
             .AnyAsync(ct);
 
@@ -30,6 +34,9 @@ internal static class WorkAssignmentReadAccessHelper
         var assignment = await ctx.WorkAssignments
             .Find(x => x.Id == assignmentId && !x.IsDeleted)
             .FirstOrDefaultAsync(ct);
+
+        if (DynamicFlowBranchVisibility.IsFlowAssignment(assignment))
+            return false;
 
         return CanReadAssignmentDirectly(assignment, actorUserId);
     }
@@ -46,16 +53,22 @@ internal static class WorkAssignmentReadAccessHelper
         if (await CanReadAssignmentAsync(ctx, assignment.Id, actorUserId, ct))
             return true;
 
+        if (DynamicFlowBranchVisibility.IsFlowAssignment(assignment))
+            return false;
+
         var ancestorIds = ResolveAncestorIds(assignment);
         if (ancestorIds.Count == 0)
             return false;
 
+        var actorUnitId = await ResolveActorUnitIdAsync(ctx, actorUserId, ct);
+        var fb = Builders<AssignmentListDocRole>.Filter;
         var hasProjectedAncestorRole = await ctx.AssignmentListDocRoles
-            .Find(x =>
-                ancestorIds.Contains(x.AssignmentId) &&
-                x.UserId == actorUserId &&
-                !x.IsDeleted &&
-                x.Roles.Any())
+            .Find(
+                fb.In(x => x.AssignmentId, ancestorIds) &
+                fb.Eq(x => x.UserId, actorUserId) &
+                fb.Eq(x => x.IsDeleted, false) &
+                fb.Where(x => x.Roles.Any()) &
+                DynamicFlowBranchVisibility.BuildAssignmentListFilter(fb, actorUnitId))
             .Limit(1)
             .AnyAsync(ct);
 
@@ -92,6 +105,9 @@ internal static class WorkAssignmentReadAccessHelper
         if (!await CanReadAssignmentOrAncestorAsync(ctx, scopeAssignment, actorUserId, ct))
             return new HashSet<string>(StringComparer.Ordinal);
 
+        if (DynamicFlowBranchVisibility.IsFlowAssignment(scopeAssignment))
+            return await ResolveFlowVisibleScopeIdsAsync(ctx, workId, scopeAssignment, actorUserId, ct);
+
         var assignments = await ctx.WorkAssignments
             .Find(x => x.WorkId == workId && !x.IsDeleted)
             .Project(x => new { x.Id, x.Path })
@@ -107,6 +123,53 @@ internal static class WorkAssignmentReadAccessHelper
             .Select(x => x.Id)
             .Where(x => !string.IsNullOrWhiteSpace(x))
             .ToHashSet(StringComparer.Ordinal);
+    }
+
+    private static async Task<HashSet<string>> ResolveFlowVisibleScopeIdsAsync(
+        MongoDbContext ctx,
+        string workId,
+        WorkAssignment scopeAssignment,
+        string actorUserId,
+        CancellationToken ct)
+    {
+        var actorUnitId = await ResolveActorUnitIdAsync(ctx, actorUserId, ct);
+        var fb = Builders<AssignmentListDocRole>.Filter;
+        var filter = fb.Eq(x => x.WorkId, workId) &
+                     fb.Eq(x => x.UserId, actorUserId) &
+                     fb.Eq(x => x.IsDeleted, false) &
+                     DynamicFlowBranchVisibility.BuildAssignmentListFilter(fb, actorUnitId);
+
+        var rows = await ctx.AssignmentListDocRoles
+            .Find(filter)
+            .Project(x => new { x.AssignmentId, x.Path })
+            .ToListAsync(ct);
+
+        var scopePath = scopeAssignment.Path?.Trim();
+        return rows
+            .Where(x =>
+                string.Equals(x.AssignmentId, scopeAssignment.Id, StringComparison.Ordinal) ||
+                (!string.IsNullOrWhiteSpace(scopePath) &&
+                 !string.IsNullOrWhiteSpace(x.Path) &&
+                 x.Path.StartsWith($"{scopePath}/", StringComparison.Ordinal)))
+            .Select(x => x.AssignmentId)
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .ToHashSet(StringComparer.Ordinal);
+    }
+
+    private static async Task<string?> ResolveActorUnitIdAsync(
+        MongoDbContext ctx,
+        string actorUserId,
+        CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(actorUserId))
+            return null;
+
+        var actor = await ctx.Users
+            .Find(x => x.Id == actorUserId && !x.IsDeleted)
+            .Project(x => new { x.UnitId })
+            .FirstOrDefaultAsync(ct);
+
+        return actor?.UnitId;
     }
 
     private static bool CanReadAssignmentDirectly(WorkAssignment? assignment, string actorUserId)

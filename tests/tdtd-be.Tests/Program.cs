@@ -64,6 +64,8 @@ var tests = new (string Name, Action Run)[]
     ("dynamic flow policy evaluator applies field and table permissions", DynamicFlowPolicyEvaluatorAppliesFieldAndTablePermissions),
     ("dynamic flow runtime planner creates branch per target unit", DynamicFlowRuntimePlannerCreatesBranchPerTargetUnit),
     ("dynamic flow runtime planner rejects invalid launch inputs", DynamicFlowRuntimePlannerRejectsInvalidLaunchInputs),
+    ("dynamic flow branch visibility inherits downstream units", DynamicFlowBranchVisibilityInheritsDownstreamUnits),
+    ("dynamic flow branch visibility hides sibling branches", DynamicFlowBranchVisibilityHidesSiblingBranches),
     ("periodic assignment date range caps occurrence validation", ValidatesPeriodicAssignmentDateRange),
     ("materialize job backfills elapsed monthly periods before rolling future", MaterializeJobBackfillsElapsedMonthlyPeriodsBeforeRollingFuture),
     ("materialize job limits multi-day monthly schedules to exact occurrences", MaterializeJobLimitsMonthlyMultiDayScheduleToExactOccurrences),
@@ -1201,6 +1203,90 @@ static void DynamicFlowRuntimePlannerRejectsInvalidLaunchInputs()
             },
             parent: null,
             actorUnitId: ObjectId(105)));
+}
+
+static void DynamicFlowBranchVisibilityInheritsDownstreamUnits()
+{
+    var issuerUnitId = ObjectId(111);
+    var targetUnitId = ObjectId(112);
+    var downstreamUnitId = ObjectId(113);
+
+    var branch = new WorkAssignment
+    {
+        Id = ObjectId(114),
+        WorkId = ObjectId(115),
+        FlowInstanceId = ObjectId(116),
+        FlowBranchId = ObjectId(117),
+        IssuedByUnitId = issuerUnitId,
+        TargetUnitIds = new List<string> { targetUnitId },
+        Assignees = new List<UserRef>
+        {
+            new() { UserId = UserId(11), UnitId = targetUnitId }
+        }
+    };
+
+    var branchVisibleUnits = DynamicFlowBranchVisibility.BuildVisibleUnitIds(branch);
+    AssertSequenceEqual(
+        new List<string> { issuerUnitId, targetUnitId },
+        branchVisibleUnits,
+        "issuer and target units should see the assigned branch");
+
+    var downstream = new WorkAssignment
+    {
+        Id = ObjectId(118),
+        WorkId = branch.WorkId,
+        ParentAssignmentId = branch.Id,
+        FlowInstanceId = branch.FlowInstanceId,
+        FlowBranchId = ObjectId(119),
+        ParentFlowBranchId = branch.FlowBranchId,
+        IssuedByUnitId = targetUnitId,
+        TargetUnitIds = new List<string> { downstreamUnitId },
+        Assignees = new List<UserRef>
+        {
+            new() { UserId = UserId(12), UnitId = downstreamUnitId }
+        }
+    };
+
+    var downstreamVisibleUnits = DynamicFlowBranchVisibility.BuildVisibleUnitIds(downstream, branchVisibleUnits);
+    AssertSequenceEqual(
+        new List<string> { issuerUnitId, targetUnitId, downstreamUnitId },
+        downstreamVisibleUnits,
+        "downstream branch should inherit parent visible units and add its target");
+    AssertTrue(
+        DynamicFlowBranchVisibility.CanUnitRead(downstream, targetUnitId, downstreamVisibleUnits),
+        "target unit should see downstream branches it creates");
+}
+
+static void DynamicFlowBranchVisibilityHidesSiblingBranches()
+{
+    var issuerUnitId = ObjectId(121);
+    var targetUnitA = ObjectId(122);
+    var targetUnitB = ObjectId(123);
+
+    var branchA = new AssignmentListDocRole
+    {
+        AssignmentId = ObjectId(124),
+        FlowInstanceId = ObjectId(125),
+        FlowBranchId = ObjectId(126),
+        VisibleUnitIds = new List<string> { issuerUnitId, targetUnitA }
+    };
+    var branchB = new AssignmentListDocRole
+    {
+        AssignmentId = ObjectId(127),
+        FlowInstanceId = branchA.FlowInstanceId,
+        FlowBranchId = ObjectId(128),
+        VisibleUnitIds = new List<string> { issuerUnitId, targetUnitB }
+    };
+
+    AssertTrue(
+        DynamicFlowBranchVisibility.CanUnitRead(branchA, targetUnitA),
+        "target unit A should see its own branch");
+    AssertFalse(
+        DynamicFlowBranchVisibility.CanUnitRead(branchB, targetUnitA),
+        "target unit A should not see sibling branch B");
+    AssertTrue(
+        DynamicFlowBranchVisibility.CanUnitRead(branchB, issuerUnitId),
+        "issuer unit should see branches it created");
 }
 
 static void ValidatesPeriodicAssignmentDateRange()

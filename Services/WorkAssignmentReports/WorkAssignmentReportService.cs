@@ -21,6 +21,7 @@ using tdtd_be.Models.Enums;
 using tdtd_be.Services.Common;
 using tdtd_be.Services.Common.Time;
 using tdtd_be.Services;
+using tdtd_be.Services.DynamicFlows;
 using tdtd_be.Services.WorkAssignments.Domain;
 using tdtd_be.Services.WorkAssignments.Internal;
 using tdtd_be.Services.WorkAssignments.AdvancedSummary;
@@ -358,6 +359,14 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                     !x.IsDeleted)
                 .Limit(1)
                 .AnyAsync(ct);
+        }
+
+        if (DynamicFlowBranchVisibility.IsFlowAssignment(assignment) &&
+            !await WorkAssignmentReadAccessHelper.CanReadAssignmentAsync(_ctx, assignment.Id, actorUserId, ct))
+        {
+            throw AppExceptionFactory.Forbidden(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_ACCESS_FORBIDDEN,
+                ReportDetails(report, actorUserId));
         }
 
         var canReview = !isOwner && !isAssignee && await HasReviewReportReadAccessAsync(report, actorUserId, ct);
@@ -1113,6 +1122,11 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             workAssignmentId,
             actorUserId,
             ct);
+
+        if (DynamicFlowBranchVisibility.IsFlowAssignment(assignment) && !canReadAssignment)
+            throw AppExceptionFactory.Forbidden(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_ASSIGNMENT_ACCESS_FORBIDDEN,
+                new { workAssignmentId, actorUserId });
 
         if (!isOwner && !isAssignee && !canReadAssignment)
             throw AppExceptionFactory.Forbidden(
@@ -2302,6 +2316,16 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             .Find(x => x.Id == report.WorkAssignmentId && !x.IsDeleted)
             .FirstOrDefaultAsync(ct)
             ?? throw ReportAssignmentNotFound(report.WorkAssignmentId);
+
+        var canReadAssignment = await WorkAssignmentReadAccessHelper.CanReadAssignmentAsync(
+            _ctx,
+            assignment.Id,
+            actorUserId,
+            ct);
+        if (DynamicFlowBranchVisibility.IsFlowAssignment(assignment) && !canReadAssignment)
+            throw AppExceptionFactory.Forbidden(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_LOG_ACCESS_FORBIDDEN,
+                ReportDetails(report, actorUserId));
 
         var isAssignee = report.AssigneeUserId == actorUserId;
         var canReview = false;
