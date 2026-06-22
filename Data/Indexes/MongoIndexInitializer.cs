@@ -151,6 +151,9 @@
             var dynamicFlowTemplateVersions = db.GetCollection<DynamicFlowTemplateVersion>(opt.DynamicFlowTemplateVersionCollection);
             await EnsureDynamicFlowTemplateVersionsAsync(dynamicFlowTemplateVersions, ct);
 
+            var dynamicFlowEvents = db.GetCollection<DynamicFlowEvent>(opt.DynamicFlowEventCollection);
+            await EnsureDynamicFlowEventsAsync(dynamicFlowEvents, ct);
+
             // WORK TEMPLATE ASSIGNEES
             var workTemplateAssignees = db.GetCollection<WorkTemplateAssignee>(opt.WorkTemplateAssigneeCollection);
             await EnsureWorkTemplateAssigneesAsync(workTemplateAssignees, ct);
@@ -2092,6 +2095,43 @@
                 {
                     { "dynamicFormTemplateId", 1 },
                     { "status", 1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
+        }
+
+        private static async Task EnsureDynamicFlowEventsAsync(
+            IMongoCollection<DynamicFlowEvent> col,
+            CancellationToken ct)
+        {
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_dynamicFlowEvents_work_flow_action_at",
+                key: new BsonDocument
+                {
+                    { "workId", 1 },
+                    { "flowInstanceId", 1 },
+                    { "action", 1 },
+                    { "actionAtUtc", -1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_dynamicFlowEvents_assignment_at",
+                key: new BsonDocument
+                {
+                    { "assignmentId", 1 },
+                    { "actionAtUtc", -1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_dynamicFlowEvents_affected_assignment_at",
+                key: new BsonDocument
+                {
+                    { "affectedAssignmentIds", 1 },
+                    { "actionAtUtc", -1 },
                     { "isDeleted", 1 }
                 }
             ), ct);

@@ -51,3 +51,22 @@ public sealed class DynamicFlowAssignmentBranchResponse
     public bool IsFlowFinalNode { get; set; }
     public WorkAssignmentResponse Assignment { get; set; } = default!;
 }
+
+public sealed class DynamicFlowBranchActionRequest
+{
+    public string? Reason { get; set; }
+    public string? TargetAssignmentId { get; set; }
+    public string? SnapshotJson { get; set; }
+    public bool? IncludeDescendants { get; set; }
+}
+
+public sealed class DynamicFlowBranchActionResponse
+{
+    public string EventId { get; set; } = string.Empty;
+    public string Action { get; set; } = string.Empty;
+    public string AssignmentId { get; set; } = string.Empty;
+    public string FlowEffectiveStatus { get; set; } = string.Empty;
+    public int? FlowAttemptNo { get; set; }
+    public int AffectedAssignmentCount { get; set; }
+    public int DirtyReportCount { get; set; }
+}

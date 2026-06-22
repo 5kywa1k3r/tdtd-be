@@ -37,6 +37,7 @@ namespace tdtd_be.Data
         public IMongoCollection<WorkSummaryTokenLedger> WorkSummaryTokenLedgers { get; }
         public IMongoCollection<DynamicFlowTemplate> DynamicFlowTemplates { get; }
         public IMongoCollection<DynamicFlowTemplateVersion> DynamicFlowTemplateVersions { get; }
+        public IMongoCollection<DynamicFlowEvent> DynamicFlowEvents { get; }
         public IMongoCollection<WorkTemplateAssignee> WorkTemplateAssignees { get; }
         public IMongoCollection<DocRole> DocRoles { get; }
         public IMongoCollection<WorkListDocRole> WorkListDocRoles { get; }
@@ -102,6 +103,7 @@ namespace tdtd_be.Data
             WorkSummaryTokenLedgers = Db.GetCollection<WorkSummaryTokenLedger>(o.WorkSummaryTokenLedgerCollection);
             DynamicFlowTemplates = Db.GetCollection<DynamicFlowTemplate>(o.DynamicFlowTemplateCollection);
             DynamicFlowTemplateVersions = Db.GetCollection<DynamicFlowTemplateVersion>(o.DynamicFlowTemplateVersionCollection);
+            DynamicFlowEvents = Db.GetCollection<DynamicFlowEvent>(o.DynamicFlowEventCollection);
             WorkTemplateAssignees = Db.GetCollection<WorkTemplateAssignee>(o.WorkTemplateAssigneeCollection);
             DocRoles = Db.GetCollection<DocRole>(o.DocRoleCollection);
             WorkListDocRoles = Db.GetCollection<WorkListDocRole>(o.WorkListDocRoleCollection);

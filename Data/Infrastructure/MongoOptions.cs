@@ -32,6 +32,7 @@
         public string WorkSummaryTokenLedgerCollection { get; set; } = "work_summary_token_ledgers";
         public string DynamicFlowTemplateCollection { get; set; } = "dynamic_flow_templates";
         public string DynamicFlowTemplateVersionCollection { get; set; } = "dynamic_flow_template_versions";
+        public string DynamicFlowEventCollection { get; set; } = "dynamic_flow_events";
         public string WorkTemplateAssigneeCollection { get; set; } = "work_template_assignees";
         public string DocRoleCollection { get; set; } = "doc_roles";
         public string WorkListDocRoleCollection { get; set; } = "work_list_doc_roles";

@@ -68,6 +68,7 @@ var tests = new (string Name, Action Run)[]
     ("dynamic flow report permissions reject table column writes", DynamicFlowReportPermissionsRejectTableColumnWrites),
     ("dynamic flow runtime planner creates branch per target unit", DynamicFlowRuntimePlannerCreatesBranchPerTargetUnit),
     ("dynamic flow runtime planner rejects invalid launch inputs", DynamicFlowRuntimePlannerRejectsInvalidLaunchInputs),
+    ("dynamic flow branch mutation planner invalidates downstream branches", DynamicFlowBranchMutationPlannerInvalidatesDownstreamBranches),
     ("dynamic flow branch visibility inherits downstream units", DynamicFlowBranchVisibilityInheritsDownstreamUnits),
     ("dynamic flow branch visibility hides sibling branches", DynamicFlowBranchVisibilityHidesSiblingBranches),
     ("periodic assignment date range caps occurrence validation", ValidatesPeriodicAssignmentDateRange),
@@ -1486,6 +1487,99 @@ static void DynamicFlowRuntimePlannerRejectsInvalidLaunchInputs()
             },
             parent: null,
             actorUnitId: ObjectId(105)));
+}
+
+static void DynamicFlowBranchMutationPlannerInvalidatesDownstreamBranches()
+{
+    var workId = ObjectId(131);
+    var flowInstanceId = ObjectId(132);
+    var eventId = ObjectId(133);
+    var rootId = ObjectId(134);
+    var childId = ObjectId(135);
+    var grandchildId = ObjectId(136);
+    var siblingId = ObjectId(137);
+
+    var root = new WorkAssignment
+    {
+        Id = rootId,
+        WorkId = workId,
+        FlowInstanceId = flowInstanceId,
+        Path = $"/{rootId}",
+        FlowAttemptNo = 2,
+        FlowEffectiveStatus = DynamicFlowEffectiveStatuses.Effective
+    };
+    var child = new WorkAssignment
+    {
+        Id = childId,
+        WorkId = workId,
+        ParentAssignmentId = root.Id,
+        FlowInstanceId = flowInstanceId,
+        Path = $"{root.Path}/{childId}",
+        FlowAttemptNo = 2,
+        FlowEffectiveStatus = DynamicFlowEffectiveStatuses.Invalidated
+    };
+    var grandchild = new WorkAssignment
+    {
+        Id = grandchildId,
+        WorkId = workId,
+        ParentAssignmentId = child.Id,
+        FlowInstanceId = flowInstanceId,
+        Path = $"{child.Path}/{grandchildId}",
+        FlowAttemptNo = 2,
+        FlowEffectiveStatus = DynamicFlowEffectiveStatuses.Effective
+    };
+    var sibling = new WorkAssignment
+    {
+        Id = siblingId,
+        WorkId = workId,
+        ParentAssignmentId = root.Id,
+        FlowInstanceId = flowInstanceId,
+        Path = $"{root.Path}/{siblingId}",
+        FlowAttemptNo = 2,
+        FlowEffectiveStatus = DynamicFlowEffectiveStatuses.Effective
+    };
+    var assignments = new List<WorkAssignment> { root, child, grandchild, sibling };
+
+    var rollbackPlan = DynamicFlowBranchMutationPlanner.Create(
+        assignments,
+        child,
+        DynamicFlowEventActions.Rollback,
+        eventId,
+        includeDescendants: true);
+
+    AssertEqual(child.Id, rollbackPlan.TargetUpdate.AssignmentId, "rollback target should stay on selected branch");
+    AssertEqual(DynamicFlowEffectiveStatuses.Effective, rollbackPlan.TargetUpdate.NextStatus, "rollback target should become effective");
+    AssertEqual(3, rollbackPlan.TargetUpdate.NextAttemptNo, "rollback should open a new target attempt");
+    AssertEqual<string?>(null, rollbackPlan.TargetUpdate.InvalidatedByFlowEventId, "rollback target should clear invalidation marker");
+    AssertEqual(1, rollbackPlan.DownstreamUpdates.Count, "rollback should affect only downstream descendants");
+    AssertEqual(grandchild.Id, rollbackPlan.DownstreamUpdates[0].AssignmentId, "rollback downstream should include grandchild");
+    AssertEqual(DynamicFlowEffectiveStatuses.Invalidated, rollbackPlan.DownstreamUpdates[0].NextStatus, "rollback downstream should be invalidated");
+    AssertEqual(eventId, rollbackPlan.DownstreamUpdates[0].InvalidatedByFlowEventId, "rollback downstream should reference flow event");
+    AssertSequenceEqual(
+        new List<string> { child.Id, grandchild.Id },
+        rollbackPlan.AffectedAssignmentIds,
+        "rollback affected ids should exclude siblings");
+    AssertFalse(
+        rollbackPlan.AffectedAssignmentIds.Contains(sibling.Id),
+        "rollback should not affect sibling branches");
+    AssertTrue(
+        DynamicFlowBranchMutationPlanner.IsAncestorOrSelf(assignments, child, grandchild),
+        "child should be an ancestor of grandchild");
+    AssertFalse(
+        DynamicFlowBranchMutationPlanner.IsAncestorOrSelf(assignments, sibling, grandchild),
+        "sibling should not be an ancestor of grandchild");
+
+    var terminatePlan = DynamicFlowBranchMutationPlanner.Create(
+        assignments,
+        child,
+        DynamicFlowEventActions.Terminated,
+        eventId,
+        includeDescendants: true);
+
+    AssertEqual(DynamicFlowEffectiveStatuses.Terminated, terminatePlan.TargetUpdate.NextStatus, "terminate target should be terminated");
+    AssertEqual(2, terminatePlan.TargetUpdate.NextAttemptNo, "terminate should not create a new attempt");
+    AssertEqual(eventId, terminatePlan.TargetUpdate.InvalidatedByFlowEventId, "terminate target should reference flow event");
+    AssertEqual(DynamicFlowEffectiveStatuses.Terminated, terminatePlan.DownstreamUpdates[0].NextStatus, "terminate downstream should be terminated");
 }
 
 static void DynamicFlowBranchVisibilityInheritsDownstreamUnits()
