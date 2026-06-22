@@ -2,6 +2,7 @@
 using Microsoft.AspNetCore.Mvc;
 using System.Security.Claims;
 using tdtd_be.Common.Errors;
+using tdtd_be.DTOs.DynamicFlows;
 using tdtd_be.DTOs.WorkAssignmentReports;
 using tdtd_be.Services.WorkAssignmentReports;
 
@@ -138,6 +139,22 @@ public sealed class WorkAssignmentReportsController : ControllerBase
     {
         var actorUserId = GetActorUserId();
         var rs = await _service.PreviewDynamicFormAggregateDraftAsync(id, req, actorUserId, ct);
+        return Ok(rs);
+    }
+
+    [HttpPost("work-assignment-reports/{id}/draft/preview-dynamic-flow-mapping")]
+    public async Task<IActionResult> PreviewDynamicFlowMapping([FromRoute] string id, [FromBody] DynamicFlowMappingRequest req, CancellationToken ct)
+    {
+        var actorUserId = GetActorUserId();
+        var rs = await _service.PreviewDynamicFlowMappingAsync(id, req ?? new DynamicFlowMappingRequest(), actorUserId, ct);
+        return Ok(rs);
+    }
+
+    [HttpPost("work-assignment-reports/{id}/draft/apply-dynamic-flow-mapping")]
+    public async Task<IActionResult> ApplyDynamicFlowMapping([FromRoute] string id, [FromBody] DynamicFlowMappingRequest req, CancellationToken ct)
+    {
+        var actorUserId = GetActorUserId();
+        var rs = await _service.ApplyDynamicFlowMappingAsync(id, req ?? new DynamicFlowMappingRequest(), actorUserId, ct);
         return Ok(rs);
     }
 

@@ -2,6 +2,8 @@
 using tdtd_be.DTOs.WorkAssignmentReports;
 using tdtd_be.DTOs.DynamicExcel;
 
+using tdtd_be.DTOs.DynamicFlows;
+
 namespace tdtd_be.Services.WorkAssignmentReports;
 
 /// <summary>
@@ -121,6 +123,18 @@ public interface IWorkAssignmentReportService
     Task<WorkAssignmentReportResponse> PreviewDynamicFormAggregateDraftAsync(
         string id,
         ApplyDynamicFormAggregateDraftRequest req,
+        string currentUserId,
+        CancellationToken ct = default);
+
+    Task<DynamicFlowMappingPreviewResponse> PreviewDynamicFlowMappingAsync(
+        string id,
+        DynamicFlowMappingRequest req,
+        string currentUserId,
+        CancellationToken ct = default);
+
+    Task<WorkAssignmentReportResponse> ApplyDynamicFlowMappingAsync(
+        string id,
+        DynamicFlowMappingRequest req,
         string currentUserId,
         CancellationToken ct = default);
 

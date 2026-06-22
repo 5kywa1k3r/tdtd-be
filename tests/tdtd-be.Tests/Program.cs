@@ -61,6 +61,8 @@ var tests = new (string Name, Action Run)[]
     ("dynamic flow template payload normalizes defaults", DynamicFlowTemplatePayloadNormalizesDefaults),
     ("dynamic flow template lock payload validates steps", DynamicFlowTemplateLockPayloadValidatesSteps),
     ("dynamic flow policy validation checks dynamic form references", DynamicFlowPolicyValidationChecksDynamicFormReferences),
+    ("dynamic flow mapping validation checks schema and references", DynamicFlowMappingValidationChecksSchemaAndReferences),
+    ("dynamic flow mapping engine projects values and provenance", DynamicFlowMappingEngineProjectsValuesAndProvenance),
     ("dynamic flow policy evaluator applies field and table permissions", DynamicFlowPolicyEvaluatorAppliesFieldAndTablePermissions),
     ("dynamic flow report permissions reject field writes", DynamicFlowReportPermissionsRejectFieldWrites),
     ("dynamic flow report permissions reject table column writes", DynamicFlowReportPermissionsRejectTableColumnWrites),
@@ -996,6 +998,222 @@ static void DynamicFlowPolicyValidationChecksDynamicFormReferences()
             """,
             requireLockable: true,
             form));
+}
+
+static void DynamicFlowMappingValidationChecksSchemaAndReferences()
+{
+    var form = new DynamicFormTemplate
+    {
+        Id = ObjectId(91),
+        Code = "FORM_FLOW_MAP",
+        Name = "Flow Mapping Form",
+        CreatedByUsername = "admin",
+        FieldsJson = """
+        [
+          { "id": "f_total", "key": "total", "name": "Total", "type": "number" },
+          { "id": "f_note", "key": "note", "name": "Note", "type": "text" }
+        ]
+        """,
+        BlocksJson = """
+        [
+          {
+            "blockId": "b1",
+            "statisticColumns": [
+              { "columnKey": "amount" },
+              { "columnKey": "note" }
+            ]
+          }
+        ]
+        """
+    };
+
+    var normalized = DynamicFlowTemplateService.NormalizePayloadJson(
+        """
+        {
+          "steps": [
+            { "stepId": "child", "stepCode": "CHILD" },
+            { "stepId": "parent", "stepCode": "PARENT" }
+          ],
+          "mappingRules": [
+            {
+              "mappingId": "m_field_to_field",
+              "mappingVersion": 1,
+              "sourceStepId": "child",
+              "targetStepId": "parent",
+              "sourceFieldId": "f_total",
+              "targetFieldKey": "total",
+              "conceptCode": "TOTAL",
+              "dataType": "NUMBER",
+              "valueTransform": "SUM",
+              "conflictPolicy": "OVERWRITE",
+              "contributionPolicy": "EXCLUDE"
+            },
+            {
+              "mappingId": "m_table_to_table",
+              "mappingVersion": 1,
+              "sourceStepCode": "CHILD",
+              "targetStepCode": "PARENT",
+              "sourceBlockId": "b1",
+              "sourceColumnKey": "amount",
+              "targetBlockId": "b1",
+              "targetColumnKey": "amount",
+              "joinKey": "rowKey",
+              "valueTransform": "COPY",
+              "conflictPolicy": "TARGET_WINS",
+              "contributionPolicy": "INCLUDE"
+            }
+          ]
+        }
+        """,
+        requireLockable: true,
+        form);
+
+    using var doc = JsonDocument.Parse(normalized);
+    AssertEqual(2, doc.RootElement.GetProperty("mappingRules").GetArrayLength(), "valid mapping rules should remain");
+
+    AssertThrows(
+        AppErrorCode.COMMON_VALIDATION_FAILED,
+        () => DynamicFlowTemplateService.NormalizePayloadJson(
+            """
+            {
+              "steps": [
+                { "stepId": "child", "stepCode": "CHILD" }
+              ],
+              "mappingRules": [
+                { "mappingId": "m1", "sourceFieldId": "missing", "targetFieldId": "f_total" }
+              ]
+            }
+            """,
+            requireLockable: true,
+            form));
+
+    AssertThrows(
+        AppErrorCode.COMMON_VALIDATION_FAILED,
+        () => DynamicFlowTemplateService.NormalizePayloadJson(
+            """
+            {
+              "steps": [
+                { "stepId": "child", "stepCode": "CHILD" }
+              ],
+              "mappingRules": [
+                { "mappingId": "dup", "sourceFieldId": "f_total", "targetFieldId": "f_note" },
+                { "mappingId": "dup", "sourceFieldId": "f_note", "targetFieldId": "f_total" }
+              ]
+            }
+            """,
+            requireLockable: true,
+            form));
+
+    AssertThrows(
+        AppErrorCode.COMMON_VALIDATION_FAILED,
+        () => DynamicFlowTemplateService.NormalizePayloadJson(
+            """
+            {
+              "steps": [
+                { "stepId": "child", "stepCode": "CHILD" }
+              ],
+              "mappingRules": [
+                { "mappingId": "m_bad_policy", "sourceFieldId": "f_total", "targetFieldId": "f_note", "conflictPolicy": "SILENT_DROP" }
+              ]
+            }
+            """,
+            requireLockable: true,
+            form));
+}
+
+static void DynamicFlowMappingEngineProjectsValuesAndProvenance()
+{
+    var target = new WorkAssignmentReport
+    {
+        Id = ObjectId(106),
+        WorkId = ObjectId(107),
+        WorkAssignmentId = ObjectId(108),
+        WorkReportPeriodId = ObjectId(109),
+        DynamicFormTemplateId = ObjectId(110),
+        AssigneeUserId = ObjectId(111),
+        PeriodKey = "2026-06",
+        PeriodInstanceKey = "2026-06",
+        Values1DJson = "[]",
+        FieldValuesJson = """{"values":{"existing":"keep"}}""",
+        TableValuesJson = """{"blocks":[]}"""
+    };
+    var sourceReport = new WorkAssignmentReport
+    {
+        Id = ObjectId(112),
+        WorkId = target.WorkId,
+        WorkAssignmentId = ObjectId(113),
+        WorkReportPeriodId = ObjectId(114),
+        DynamicFormTemplateId = target.DynamicFormTemplateId,
+        AssigneeUserId = ObjectId(115),
+        PeriodKey = target.PeriodKey,
+        PeriodInstanceKey = target.PeriodInstanceKey,
+        Values1DJson = "[]",
+        FieldValuesJson = """{"values":{"total":5}}""",
+        TableValuesJson = """
+        {
+          "blocks": [
+            {
+              "blockId": "b1",
+              "tableMode": "APPEND_ROWS",
+              "rows": [
+                { "rowKey": "r1", "cells": { "amount": 2 } },
+                { "rowKey": "r2", "cells": { "amount": 3 } }
+              ]
+            }
+          ]
+        }
+        """
+    };
+    var source = new DynamicFlowMappingSourceReport(
+        sourceReport,
+        "child",
+        "CHILD",
+        sourceReport.FieldValuesJson,
+        sourceReport.TableValuesJson);
+
+    var projection = DynamicFlowMappingEngine.Preview(
+        target,
+        new List<DynamicFlowMappingSourceReport> { source },
+        new List<DynamicFlowMappingRuleDto>
+        {
+            new()
+            {
+                MappingId = "m_field",
+                MappingVersion = 1,
+                SourceStepId = "child",
+                SourceFieldKey = "total",
+                TargetFieldKey = "mapped_total",
+                ContributionPolicy = "EXCLUDE"
+            },
+            new()
+            {
+                MappingId = "m_sum",
+                MappingVersion = 1,
+                SourceStepCode = "CHILD",
+                SourceBlockId = "b1",
+                SourceColumnKey = "amount",
+                TargetFieldKey = "mapped_sum",
+                ValueTransform = "SUM"
+            }
+        },
+        requestConflictPolicy: null,
+        requestContributionPolicy: null,
+        nowUtc: new DateTime(2026, 6, 22, 0, 0, 0, DateTimeKind.Utc));
+
+    using var fields = JsonDocument.Parse(projection.FieldValuesJson!);
+    var values = fields.RootElement.GetProperty("values");
+    AssertEqual(5m, values.GetProperty("mapped_total").GetDecimal(), "field mapping should copy source field value");
+    AssertEqual(5m, values.GetProperty("mapped_sum").GetDecimal(), "table-to-field SUM mapping should aggregate values");
+    AssertEqual(2, projection.Changes.Count(x => x.Status == "APPLIED"), "mapping preview should report applied changes");
+    AssertFalse(projection.HasBlockingConflicts, "mapping preview should not mark non-conflicting projection as blocked");
+
+    using var summary = JsonDocument.Parse(projection.SummarySourceJson!);
+    AssertEqual("DYNAMIC_FLOW_MAPPING", summary.RootElement.GetProperty("kind").GetString(), "summary source should preserve mapping kind");
+    AssertEqual(sourceReport.Id, summary.RootElement.GetProperty("sourceReportIds")[0].GetString(), "summary source should keep source report id");
+
+    using var contribution = JsonDocument.Parse(projection.CumulativeContributionPolicyJson!);
+    AssertEqual("INCLUDE", contribution.RootElement.GetProperty("defaultMode").GetString(), "partial mapping report should remain included by default");
+    AssertEqual(2, contribution.RootElement.GetProperty("rules").GetArrayLength(), "generated mapping targets should be excluded by default");
 }
 
 static void DynamicFlowPolicyEvaluatorAppliesFieldAndTablePermissions()

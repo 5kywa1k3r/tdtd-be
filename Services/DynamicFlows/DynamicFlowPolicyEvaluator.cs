@@ -253,6 +253,7 @@ internal static class DynamicFlowPolicyValidator
         ValidateActorPolicies(root, stepRefs);
         ValidateFieldPolicies(root, stepRefs, refs);
         ValidateTableColumnPolicies(root, stepRefs, refs);
+        ValidateMappingRules(root, stepRefs, refs);
     }
 
     private static void ValidateActorPolicies(JsonObject root, DynamicFlowStepReferenceIndex stepRefs)
@@ -322,6 +323,158 @@ internal static class DynamicFlowPolicyValidator
         }
     }
 
+    private static void ValidateMappingRules(
+        JsonObject root,
+        DynamicFlowStepReferenceIndex stepRefs,
+        DynamicFormPolicyReferenceIndex? refs)
+    {
+        var ids = new HashSet<string>(StringComparer.Ordinal);
+        var index = 0;
+        foreach (var rule in ReadRequiredObjectArray(root, "mappingRules"))
+        {
+            var fieldName = $"mappingRules[{index}]";
+            ValidateMappingStepScope(rule, stepRefs, fieldName);
+
+            var mappingId = ReadString(rule, "mappingId", "id");
+            if (string.IsNullOrWhiteSpace(mappingId))
+            {
+                throw AppExceptionFactory.BadRequest(
+                    AppErrorCode.COMMON_VALIDATION_FAILED,
+                    new { field = $"{fieldName}.mappingId", reason = "DYNAMIC_FLOW_MAPPING_ID_REQUIRED" });
+            }
+
+            if (!ids.Add(mappingId))
+            {
+                throw AppExceptionFactory.BadRequest(
+                    AppErrorCode.COMMON_VALIDATION_FAILED,
+                    new { field = $"{fieldName}.mappingId", mappingId, reason = "DYNAMIC_FLOW_MAPPING_ID_DUPLICATE" });
+            }
+
+            var mappingVersion = ReadInt(rule, "mappingVersion", "version");
+            if (mappingVersion.HasValue && mappingVersion.Value <= 0)
+            {
+                throw AppExceptionFactory.BadRequest(
+                    AppErrorCode.COMMON_VALIDATION_FAILED,
+                    new { field = $"{fieldName}.mappingVersion", mappingVersion, reason = "DYNAMIC_FLOW_MAPPING_VERSION_INVALID" });
+            }
+
+            var sourceFieldId = ReadString(rule, "sourceFieldId");
+            var sourceFieldKey = ReadString(rule, "sourceFieldKey");
+            var sourceBlockId = ReadString(rule, "sourceBlockId");
+            var sourceColumnKey = ReadString(rule, "sourceColumnKey");
+            var targetFieldId = ReadString(rule, "targetFieldId");
+            var targetFieldKey = ReadString(rule, "targetFieldKey");
+            var targetBlockId = ReadString(rule, "targetBlockId");
+            var targetColumnKey = ReadString(rule, "targetColumnKey");
+
+            var hasSourceField = !string.IsNullOrWhiteSpace(sourceFieldId) || !string.IsNullOrWhiteSpace(sourceFieldKey);
+            var hasSourceTable = !string.IsNullOrWhiteSpace(sourceBlockId) || !string.IsNullOrWhiteSpace(sourceColumnKey);
+            var hasTargetField = !string.IsNullOrWhiteSpace(targetFieldId) || !string.IsNullOrWhiteSpace(targetFieldKey);
+            var hasTargetTable = !string.IsNullOrWhiteSpace(targetBlockId) || !string.IsNullOrWhiteSpace(targetColumnKey);
+
+            if (!hasSourceField && !hasSourceTable)
+            {
+                throw AppExceptionFactory.BadRequest(
+                    AppErrorCode.COMMON_VALIDATION_FAILED,
+                    new { field = fieldName, reason = "DYNAMIC_FLOW_MAPPING_SOURCE_REQUIRED" });
+            }
+
+            if (hasSourceField && hasSourceTable)
+            {
+                throw AppExceptionFactory.BadRequest(
+                    AppErrorCode.COMMON_VALIDATION_FAILED,
+                    new { field = fieldName, reason = "DYNAMIC_FLOW_MAPPING_SOURCE_AMBIGUOUS" });
+            }
+
+            if (!hasTargetField && !hasTargetTable)
+            {
+                throw AppExceptionFactory.BadRequest(
+                    AppErrorCode.COMMON_VALIDATION_FAILED,
+                    new { field = fieldName, reason = "DYNAMIC_FLOW_MAPPING_TARGET_REQUIRED" });
+            }
+
+            if (hasTargetField && hasTargetTable)
+            {
+                throw AppExceptionFactory.BadRequest(
+                    AppErrorCode.COMMON_VALIDATION_FAILED,
+                    new { field = fieldName, reason = "DYNAMIC_FLOW_MAPPING_TARGET_AMBIGUOUS" });
+            }
+
+            if (hasSourceTable && (string.IsNullOrWhiteSpace(sourceBlockId) || string.IsNullOrWhiteSpace(sourceColumnKey)))
+            {
+                throw AppExceptionFactory.BadRequest(
+                    AppErrorCode.COMMON_VALIDATION_FAILED,
+                    new { field = fieldName, reason = "DYNAMIC_FLOW_MAPPING_SOURCE_TABLE_TARGET_REQUIRED" });
+            }
+
+            if (hasTargetTable && (string.IsNullOrWhiteSpace(targetBlockId) || string.IsNullOrWhiteSpace(targetColumnKey)))
+            {
+                throw AppExceptionFactory.BadRequest(
+                    AppErrorCode.COMMON_VALIDATION_FAILED,
+                    new { field = fieldName, reason = "DYNAMIC_FLOW_MAPPING_TARGET_TABLE_TARGET_REQUIRED" });
+            }
+
+            if (refs is not null)
+            {
+                if (hasSourceField)
+                    refs.EnsureFieldExists(fieldName, sourceFieldId, sourceFieldKey);
+                if (hasTargetField)
+                    refs.EnsureFieldExists(fieldName, targetFieldId, targetFieldKey);
+                if (hasSourceTable)
+                    refs.EnsureTableColumnExists(fieldName, sourceBlockId!, sourceColumnKey!);
+                if (hasTargetTable)
+                    refs.EnsureTableColumnExists(fieldName, targetBlockId!, targetColumnKey!);
+            }
+
+            EnsureStringInSetIfPresent(
+                rule,
+                fieldName,
+                "dataType",
+                "TEXT",
+                "NUMBER",
+                "BOOLEAN",
+                "DATE",
+                "FULL_DATE",
+                "SINGLE_SELECT",
+                "MULTI_SELECT",
+                "JSON");
+            EnsureStringInSetIfPresent(
+                rule,
+                fieldName,
+                "valueTransform",
+                "COPY",
+                "FIRST",
+                "FIRST_NON_BLANK",
+                "SUM",
+                "COUNT",
+                "TEXT_JOIN",
+                "JSON");
+            EnsureStringInSetIfPresent(
+                rule,
+                fieldName,
+                "conflictPolicy",
+                "OVERWRITE",
+                "SOURCE_WINS",
+                "TARGET_WINS",
+                "KEEP_TARGET",
+                "ERROR",
+                "ERROR_ON_CONFLICT",
+                "APPEND",
+                "MERGE");
+            EnsureStringInSetIfPresent(
+                rule,
+                fieldName,
+                "contributionPolicy",
+                "INCLUDE",
+                "EXCLUDE",
+                "SOURCE_ONLY",
+                "TARGET_ONLY",
+                "NON_CONTRIBUTING");
+
+            index++;
+        }
+    }
+
     private static void ValidateStepScope(
         JsonObject policy,
         DynamicFlowStepReferenceIndex stepRefs,
@@ -346,6 +499,37 @@ internal static class DynamicFlowPolicyValidator
                 AppErrorCode.COMMON_VALIDATION_FAILED,
                 new { field = $"{fieldName}.stepCode", stepCode, reason = "DYNAMIC_FLOW_POLICY_STEP_CODE_UNKNOWN" });
         }
+    }
+
+    private static void ValidateMappingStepScope(
+        JsonObject rule,
+        DynamicFlowStepReferenceIndex stepRefs,
+        string fieldName)
+    {
+        ValidateStepValue(rule, fieldName, "sourceStepId", stepRefs.StepIds, "DYNAMIC_FLOW_MAPPING_SOURCE_STEP_ID_UNKNOWN");
+        ValidateStepValue(rule, fieldName, "targetStepId", stepRefs.StepIds, "DYNAMIC_FLOW_MAPPING_TARGET_STEP_ID_UNKNOWN");
+        ValidateStepValue(rule, fieldName, "sourceStepCode", stepRefs.StepCodes, "DYNAMIC_FLOW_MAPPING_SOURCE_STEP_CODE_UNKNOWN");
+        ValidateStepValue(rule, fieldName, "targetStepCode", stepRefs.StepCodes, "DYNAMIC_FLOW_MAPPING_TARGET_STEP_CODE_UNKNOWN");
+    }
+
+    private static void ValidateStepValue(
+        JsonObject root,
+        string fieldName,
+        string propertyName,
+        HashSet<string> knownValues,
+        string reason)
+    {
+        var value = ReadString(root, propertyName);
+        if (string.IsNullOrWhiteSpace(value) ||
+            string.Equals(value, "*", StringComparison.Ordinal) ||
+            knownValues.Contains(value))
+        {
+            return;
+        }
+
+        throw AppExceptionFactory.BadRequest(
+            AppErrorCode.COMMON_VALIDATION_FAILED,
+            new { field = $"{fieldName}.{propertyName}", value, reason });
     }
 
     private static IEnumerable<JsonObject> ReadRequiredObjectArray(JsonObject root, string propertyName)
@@ -383,6 +567,34 @@ internal static class DynamicFlowPolicyValidator
         }
     }
 
+    private static void EnsureStringInSetIfPresent(
+        JsonObject root,
+        string fieldName,
+        string propertyName,
+        params string[] allowedValues)
+    {
+        if (!root.TryGetPropertyValue(propertyName, out var node) || node is null)
+            return;
+
+        if (node is not JsonValue value || !value.TryGetValue<string>(out var text))
+        {
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.COMMON_VALIDATION_FAILED,
+                new { field = $"{fieldName}.{propertyName}", reason = "DYNAMIC_FLOW_MAPPING_STRING_REQUIRED" });
+        }
+
+        var normalized = text.Trim().ToUpperInvariant();
+        if (string.IsNullOrWhiteSpace(normalized) ||
+            allowedValues.Contains(normalized, StringComparer.Ordinal))
+        {
+            return;
+        }
+
+        throw AppExceptionFactory.BadRequest(
+            AppErrorCode.COMMON_VALIDATION_FAILED,
+            new { field = $"{fieldName}.{propertyName}", value = text, allowedValues, reason = "DYNAMIC_FLOW_MAPPING_VALUE_UNSUPPORTED" });
+    }
+
     private static string? ReadString(JsonObject root, params string[] propertyNames)
     {
         foreach (var propertyName in propertyNames)
@@ -393,6 +605,27 @@ internal static class DynamicFlowPolicyValidator
                 !string.IsNullOrWhiteSpace(text))
             {
                 return text.Trim();
+            }
+        }
+
+        return null;
+    }
+
+    private static int? ReadInt(JsonObject root, params string[] propertyNames)
+    {
+        foreach (var propertyName in propertyNames)
+        {
+            if (root.TryGetPropertyValue(propertyName, out var node) &&
+                node is JsonValue value)
+            {
+                if (value.TryGetValue<int>(out var intValue))
+                    return intValue;
+                if (value.TryGetValue<long>(out var longValue) &&
+                    longValue >= int.MinValue &&
+                    longValue <= int.MaxValue)
+                {
+                    return (int)longValue;
+                }
             }
         }
 

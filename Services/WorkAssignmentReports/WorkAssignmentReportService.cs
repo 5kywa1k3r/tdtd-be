@@ -1682,6 +1682,527 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         return await MapToResponseAsync(entity, period, ct);
     }
 
+    public async Task<DynamicFlowMappingPreviewResponse> PreviewDynamicFlowMappingAsync(
+        string id,
+        DynamicFlowMappingRequest req,
+        string actorUserId,
+        CancellationToken ct = default)
+    {
+        var (entity, reportAccess, _) = await LoadDynamicFlowMappingDraftTargetAsync(id, req, actorUserId, ct);
+        return await BuildDynamicFlowMappingProjectionAsync(entity, reportAccess.assignment, req, actorUserId, ct);
+    }
+
+    public async Task<WorkAssignmentReportResponse> ApplyDynamicFlowMappingAsync(
+        string id,
+        DynamicFlowMappingRequest req,
+        string actorUserId,
+        CancellationToken ct = default)
+    {
+        var (entity, reportAccess, period) = await LoadDynamicFlowMappingDraftTargetAsync(id, req, actorUserId, ct);
+        await EnsureReportMutationScopeOpenAsync(reportAccess.assignment, actorUserId, ct);
+
+        var projection = await BuildDynamicFlowMappingProjectionAsync(entity, reportAccess.assignment, req, actorUserId, ct);
+        if (projection.HasBlockingConflicts)
+        {
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_VALUES_INVALID,
+                new
+                {
+                    reportId = entity.Id,
+                    workAssignmentId = entity.WorkAssignmentId,
+                    actorUserId,
+                    reason = "DYNAMIC_FLOW_MAPPING_CONFLICT",
+                    conflicts = projection.Changes
+                        .Where(x => string.Equals(x.Status, "CONFLICT", StringComparison.Ordinal))
+                        .Take(20)
+                        .ToList()
+                });
+        }
+
+        var now = DateTime.UtcNow;
+        var fromStatus = entity.Status;
+        var values = Values1DCompression.DeserializeObjects(entity.Values1DJson, _jsonOptions);
+        await ValidateRuntimeRowLabelsAsync(entity, projection.TableValuesJson, ct);
+        await ValidateRuntimeDataPayloadAsync(
+            entity,
+            values,
+            projection.FieldValuesJson,
+            projection.TableValuesJson,
+            validateRequiredFields: false,
+            ct);
+
+        var completedDatePolicy = ResolveReportCompletedDatePolicy(reportAccess.assignment, entity, period, now);
+        var isHistoricalData = IsHistoricalReportData(entity, period, completedDatePolicy);
+        var startedDate = ResolveServerReportStartedDate(entity, period);
+        var completedDate = ValidateReportCompletedDateInput(
+            completedDatePolicy,
+            entity.CompletedDate,
+            ReportDetails(entity, actorUserId),
+            requireWhenMissing: false);
+        EnsureReportDateRange(startedDate, completedDate, "StartedDate", "CompletedDate");
+        var effectiveDueAtUtc = ResolveEffectiveReportDueAtUtc(entity.DueAtUtc ?? period?.DueAtUtc, reportAccess.assignment);
+        var tableValuesJson = Values1DCompression.CompressTableValuesJson(projection.TableValuesJson, _jsonOptions);
+        var sourceSnapshot = ExtractAggregateSourceSnapshot(projection.SummarySourceJson);
+
+        var payloadResult = await _payloadWriter.SaveReportPayloadAsync(
+            entity,
+            entity.Values1DJson,
+            projection.FieldValuesJson,
+            tableValuesJson,
+            projection.SummarySourceJson,
+            actorUserId,
+            now,
+            ct);
+
+        await _ctx.WorkAssignmentReports.UpdateOneAsync(
+            x => x.Id == entity.Id && !x.IsDeleted,
+            ApplyPayloadHeaderUpdate(
+                Builders<WorkAssignmentReport>.Update,
+                payloadResult,
+                now)
+                .Set(x => x.DataOrigin, projection.DataOrigin)
+                .Set(x => x.CumulativeContributionMode, projection.CumulativeContributionMode)
+                .Set(x => x.CumulativeContributionPolicyJson, projection.CumulativeContributionPolicyJson)
+                .Set(x => x.AggregateSourceReportIds, sourceSnapshot.ReportIds)
+                .Set(x => x.AggregateSourceAssignmentIds, sourceSnapshot.AssignmentIds)
+                .Set(x => x.AggregateSourceUpdatedAtUtc, now)
+                .Set(x => x.AggregateSnapshotDirty, false)
+                .Set(x => x.AggregateSnapshotDirtyAtUtc, (DateTime?)null)
+                .Set(x => x.AggregateSnapshotRefreshedAtUtc, now)
+                .Set(x => x.AggregateRefreshError, (string?)null)
+                .Set(x => x.StartedDate, startedDate)
+                .Set(x => x.CompletedDate, completedDate)
+                .Set(x => x.IsHistoricalData, isHistoricalData)
+                .Set(x => x.DueAtUtc, effectiveDueAtUtc)
+                .Set(x => x.Status, WorkAssignmentReportStatus.Draft)
+                .Set(x => x.CreatedByUserId, string.IsNullOrWhiteSpace(entity.CreatedByUserId) ? actorUserId : entity.CreatedByUserId)
+                .Set(x => x.UpdatedAtUtc, now)
+                .Set(x => x.UpdatedByUserId, actorUserId),
+            cancellationToken: ct);
+
+        entity.FieldValuesJson = projection.FieldValuesJson;
+        entity.TableValuesJson = tableValuesJson;
+        ApplyPayloadMetadata(entity, payloadResult, now);
+        entity.DataOrigin = projection.DataOrigin;
+        entity.CumulativeContributionMode = projection.CumulativeContributionMode;
+        entity.CumulativeContributionPolicyJson = projection.CumulativeContributionPolicyJson;
+        entity.SummarySourceJson = projection.SummarySourceJson;
+        entity.AggregateSourceReportIds = sourceSnapshot.ReportIds;
+        entity.AggregateSourceAssignmentIds = sourceSnapshot.AssignmentIds;
+        entity.AggregateSourceUpdatedAtUtc = now;
+        entity.AggregateSnapshotDirty = false;
+        entity.AggregateSnapshotDirtyAtUtc = null;
+        entity.AggregateSnapshotRefreshedAtUtc = now;
+        entity.AggregateRefreshError = null;
+        entity.StartedDate = startedDate;
+        entity.CompletedDate = completedDate;
+        entity.IsHistoricalData = isHistoricalData;
+        entity.DueAtUtc = effectiveDueAtUtc;
+        entity.Status = WorkAssignmentReportStatus.Draft;
+        entity.CreatedByUserId = string.IsNullOrWhiteSpace(entity.CreatedByUserId) ? actorUserId : entity.CreatedByUserId;
+        entity.UpdatedAtUtc = now;
+        entity.UpdatedByUserId = actorUserId;
+
+        await UpsertReportSectionProjectionsAsync(
+            entity,
+            entity.FieldValuesJson,
+            entity.TableValuesJson,
+            actorUserId,
+            now,
+            ct);
+
+        if (period is not null)
+        {
+            var periodStatus = ResolveDraftPeriodStatus(isHistoricalData, completedDate, effectiveDueAtUtc, now);
+            await _ctx.WorkReportPeriods.UpdateOneAsync(
+                x => x.Id == period.Id && !x.IsDeleted,
+                Builders<WorkReportPeriod>.Update
+                    .Set(x => x.Status, periodStatus)
+                    .Set(x => x.IsOverdue, WorkReportPeriodStatusHelper.IsOverdue(periodStatus))
+                    .Set(x => x.LastDraftSavedAtUtc, now)
+                    .Set(x => x.StartedDate, startedDate)
+                    .Set(x => x.CompletedDate, completedDate)
+                    .Set(x => x.IsHistoricalData, isHistoricalData)
+                    .Set(x => x.DueAtUtc, effectiveDueAtUtc)
+                    .Set(x => x.UpdatedAtUtc, now)
+                    .Set(x => x.UpdatedByUserId, actorUserId),
+                cancellationToken: ct);
+
+            period.Status = periodStatus;
+            period.IsOverdue = WorkReportPeriodStatusHelper.IsOverdue(periodStatus);
+            period.LastDraftSavedAtUtc = now;
+            period.StartedDate = startedDate;
+            period.CompletedDate = completedDate;
+            period.IsHistoricalData = isHistoricalData;
+            period.DueAtUtc = effectiveDueAtUtc;
+            period.UpdatedAtUtc = now;
+            period.UpdatedByUserId = actorUserId;
+        }
+
+        await InsertLogAsync(
+            workId: entity.WorkId,
+            workAssignmentId: entity.WorkAssignmentId,
+            workReportPeriodId: entity.WorkReportPeriodId,
+            workAssignmentReportId: entity.Id,
+            action: "APPLY_DYNAMIC_FLOW_MAPPING",
+            fromStatus: fromStatus.ToString(),
+            toStatus: entity.Status.ToString(),
+            actionByUserId: actorUserId,
+            reason: null,
+            comment: null,
+            snapshotJson: projection.SummarySourceJson,
+            ct: ct);
+
+        if (period is not null)
+        {
+            await FinalizeReportStatusOperationAsync(
+                "APPLY_DYNAMIC_FLOW_MAPPING",
+                entity,
+                period,
+                fromStatus.ToString(),
+                entity.Status.ToString(),
+                actorUserId,
+                upsertQueue: true,
+                disableQueue: false,
+                rebuildProjection: true,
+                syncAssignment: true,
+                ct);
+        }
+
+        return await MapToResponseAsync(entity, period, ct);
+    }
+
+    private async Task<(WorkAssignmentReport entity, (WorkAssignment assignment, bool isOwner, bool isAssignee) reportAccess, WorkReportPeriod? period)>
+        LoadDynamicFlowMappingDraftTargetAsync(
+            string id,
+            DynamicFlowMappingRequest? req,
+            string actorUserId,
+            CancellationToken ct)
+    {
+        EnsureActor(actorUserId);
+
+        if (string.IsNullOrWhiteSpace(id))
+            throw ReportIdRequired(id);
+
+        req ??= new DynamicFlowMappingRequest();
+        var entity = await _ctx.WorkAssignmentReports
+            .Find(x => x.Id == id && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct);
+
+        if (entity is null)
+            throw ReportNotFound(id);
+        EnsureReportIsActive(entity);
+        await HydrateReportPayloadAsync(entity, ct);
+
+        var reportAccess = await EnsureReportAccessAsync(entity, actorUserId, ct);
+        if (!reportAccess.isAssignee || entity.AssigneeUserId != actorUserId)
+            throw AppExceptionFactory.Forbidden(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_SAVE_FORBIDDEN,
+                ReportDetails(entity, actorUserId));
+
+        if (entity.Status != WorkAssignmentReportStatus.Draft)
+            throw InvalidReportStatus(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_SAVE_STATUS_INVALID,
+                entity,
+                WorkAssignmentReportStatus.Draft,
+                actorUserId);
+
+        if (string.IsNullOrWhiteSpace(entity.DynamicFormTemplateId))
+        {
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_AGGREGATE_DRAFT_TEMPLATE_MISMATCH,
+                ReportDetails(entity, actorUserId));
+        }
+
+        var period = await _ctx.WorkReportPeriods
+            .Find(x => x.Id == entity.WorkReportPeriodId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct);
+
+        return (entity, reportAccess, period);
+    }
+
+    private async Task<DynamicFlowMappingPreviewResponse> BuildDynamicFlowMappingProjectionAsync(
+        WorkAssignmentReport entity,
+        WorkAssignment assignment,
+        DynamicFlowMappingRequest? req,
+        string actorUserId,
+        CancellationToken ct)
+    {
+        req ??= new DynamicFlowMappingRequest();
+        var rules = await ResolveDynamicFlowMappingRulesAsync(assignment, req, ct);
+        var sources = await ResolveDynamicFlowMappingSourceReportsAsync(entity, assignment, req, actorUserId, ct);
+        if (sources.Count == 0 && req.RequireSourceReport != false)
+        {
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_VALUES_INVALID,
+                new
+                {
+                    reportId = entity.Id,
+                    workAssignmentId = entity.WorkAssignmentId,
+                    actorUserId,
+                    reason = "DYNAMIC_FLOW_MAPPING_SOURCE_REPORT_NOT_FOUND"
+                });
+        }
+
+        var projection = DynamicFlowMappingEngine.Preview(
+            entity,
+            sources,
+            rules,
+            req.ConflictPolicy,
+            req.ContributionPolicy,
+            DateTime.UtcNow);
+
+        return projection;
+    }
+
+    private async Task<List<DynamicFlowMappingRuleDto>> ResolveDynamicFlowMappingRulesAsync(
+        WorkAssignment assignment,
+        DynamicFlowMappingRequest req,
+        CancellationToken ct)
+    {
+        var rules = req.MappingRules is { Count: > 0 }
+            ? req.MappingRules
+            : DynamicFlowMappingEngine.ReadRulesFromJson(req.MappingRulesJson);
+
+        if (rules.Count == 0)
+        {
+            var version = await ResolveDynamicFlowMappingTemplateVersionAsync(assignment, req, ct);
+            if (version is not null)
+                rules = DynamicFlowMappingEngine.ReadRulesFromPayloadJson(version.PayloadJson);
+        }
+
+        ValidateDynamicFlowMappingRules(rules);
+        return rules;
+    }
+
+    private async Task<DynamicFlowTemplateVersion?> ResolveDynamicFlowMappingTemplateVersionAsync(
+        WorkAssignment assignment,
+        DynamicFlowMappingRequest req,
+        CancellationToken ct)
+    {
+        if (!string.IsNullOrWhiteSpace(req.FlowTemplateVersionId))
+        {
+            var versionId = NormalizeObjectIdOrValidation(req.FlowTemplateVersionId, "flowTemplateVersionId");
+            return await _ctx.DynamicFlowTemplateVersions
+                .Find(x => x.Id == versionId && !x.IsDeleted)
+                .FirstOrDefaultAsync(ct)
+                ?? throw AppExceptionFactory.NotFound(
+                    AppErrorCode.COMMON_NOT_FOUND,
+                    new { flowTemplateVersionId = versionId, reason = "DYNAMIC_FLOW_TEMPLATE_VERSION_NOT_FOUND" });
+        }
+
+        var templateId = NormalizeOptionalTextOrNull(req.FlowTemplateId) ?? NormalizeOptionalTextOrNull(assignment.FlowTemplateId);
+        var versionNo = req.FlowTemplateVersionNo ?? assignment.FlowTemplateVersionNo;
+        if (string.IsNullOrWhiteSpace(templateId) || !versionNo.HasValue)
+            return null;
+
+        return await _ctx.DynamicFlowTemplateVersions
+            .Find(x => x.TemplateId == templateId &&
+                       x.VersionNo == versionNo.Value &&
+                       !x.IsDeleted)
+            .FirstOrDefaultAsync(ct);
+    }
+
+    private static void ValidateDynamicFlowMappingRules(IReadOnlyCollection<DynamicFlowMappingRuleDto> rules)
+    {
+        if (rules.Count == 0)
+        {
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.COMMON_VALIDATION_FAILED,
+                new { field = "mappingRules", reason = "DYNAMIC_FLOW_MAPPING_RULES_REQUIRED" });
+        }
+
+        var ids = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var rule in rules)
+        {
+            if (string.IsNullOrWhiteSpace(rule.MappingId))
+            {
+                throw AppExceptionFactory.BadRequest(
+                    AppErrorCode.COMMON_VALIDATION_FAILED,
+                    new { field = "mappingRules.mappingId", reason = "DYNAMIC_FLOW_MAPPING_ID_REQUIRED" });
+            }
+
+            if (!ids.Add(rule.MappingId.Trim()))
+            {
+                throw AppExceptionFactory.BadRequest(
+                    AppErrorCode.COMMON_VALIDATION_FAILED,
+                    new { field = "mappingRules.mappingId", mappingId = rule.MappingId, reason = "DYNAMIC_FLOW_MAPPING_ID_DUPLICATE" });
+            }
+        }
+    }
+
+    private async Task<List<DynamicFlowMappingSourceReport>> ResolveDynamicFlowMappingSourceReportsAsync(
+        WorkAssignmentReport targetReport,
+        WorkAssignment targetAssignment,
+        DynamicFlowMappingRequest req,
+        string actorUserId,
+        CancellationToken ct)
+    {
+        var explicitIds = (req.SourceReportIds ?? new List<string>())
+            .Select(x => NormalizeOptionalTextOrNull(x))
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Select(x => x!)
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+        if (explicitIds.Count > 0)
+            return await LoadDynamicFlowMappingSourceReportsByIdsAsync(explicitIds, actorUserId, ct);
+
+        var sourceMode = NormalizeDynamicFlowMappingSourceMode(req.SourceMode, targetAssignment);
+        return sourceMode switch
+        {
+            "PREVIOUS_PERIOD" => await LoadPreviousPeriodDynamicFlowMappingSourceReportAsync(targetReport, actorUserId, ct),
+            _ => await LoadChildFlowDynamicFlowMappingSourceReportsAsync(targetReport, targetAssignment, actorUserId, ct)
+        };
+    }
+
+    private async Task<List<DynamicFlowMappingSourceReport>> LoadDynamicFlowMappingSourceReportsByIdsAsync(
+        IReadOnlyCollection<string> sourceReportIds,
+        string actorUserId,
+        CancellationToken ct)
+    {
+        var ids = sourceReportIds
+            .Select(x => NormalizeObjectIdOrValidation(x, "sourceReportIds"))
+            .ToList();
+        var reports = await _ctx.WorkAssignmentReports
+            .Find(x => ids.Contains(x.Id) && !x.IsDeleted)
+            .ToListAsync(ct);
+        var byId = reports.ToDictionary(x => x.Id, StringComparer.Ordinal);
+        var result = new List<DynamicFlowMappingSourceReport>();
+
+        foreach (var id in ids)
+        {
+            if (!byId.TryGetValue(id, out var report))
+                throw ReportNotFound(id);
+            EnsureReportIsActive(report);
+            result.Add(await ToDynamicFlowMappingSourceReportAsync(report, actorUserId, ct));
+        }
+
+        return result;
+    }
+
+    private async Task<List<DynamicFlowMappingSourceReport>> LoadChildFlowDynamicFlowMappingSourceReportsAsync(
+        WorkAssignmentReport targetReport,
+        WorkAssignment targetAssignment,
+        string actorUserId,
+        CancellationToken ct)
+    {
+        var childFilter = Builders<WorkAssignment>.Filter.Eq(x => x.ParentAssignmentId, targetAssignment.Id)
+                          & Builders<WorkAssignment>.Filter.Eq(x => x.WorkId, targetAssignment.WorkId)
+                          & Builders<WorkAssignment>.Filter.Eq(x => x.IsActive, true)
+                          & Builders<WorkAssignment>.Filter.Eq(x => x.IsDeleted, false);
+        if (!string.IsNullOrWhiteSpace(targetAssignment.FlowInstanceId))
+            childFilter &= Builders<WorkAssignment>.Filter.Eq(x => x.FlowInstanceId, targetAssignment.FlowInstanceId);
+
+        var childAssignments = await _ctx.WorkAssignments
+            .Find(childFilter)
+            .ToListAsync(ct);
+        if (childAssignments.Count == 0)
+            return new List<DynamicFlowMappingSourceReport>();
+
+        var childIds = childAssignments.Select(x => x.Id).ToList();
+        var reports = await _ctx.WorkAssignmentReports
+            .Find(x => childIds.Contains(x.WorkAssignmentId) &&
+                       x.WorkId == targetReport.WorkId &&
+                       x.PeriodInstanceKey == targetReport.PeriodInstanceKey &&
+                       x.IsCurrent &&
+                       x.IsActive &&
+                       x.Status == WorkAssignmentReportStatus.Approved &&
+                       !x.IsDeleted)
+            .ToListAsync(ct);
+        var assignmentById = childAssignments.ToDictionary(x => x.Id, StringComparer.Ordinal);
+
+        var result = new List<DynamicFlowMappingSourceReport>();
+        foreach (var report in reports.OrderBy(x => assignmentById.TryGetValue(x.WorkAssignmentId, out var a) ? a.FlowStepOrder ?? 0 : 0)
+                                      .ThenBy(x => x.WorkAssignmentId, StringComparer.Ordinal))
+        {
+            result.Add(await ToDynamicFlowMappingSourceReportAsync(report, actorUserId, ct));
+        }
+
+        return result;
+    }
+
+    private async Task<List<DynamicFlowMappingSourceReport>> LoadPreviousPeriodDynamicFlowMappingSourceReportAsync(
+        WorkAssignmentReport targetReport,
+        string actorUserId,
+        CancellationToken ct)
+    {
+        var candidates = await _ctx.WorkAssignmentReports
+            .Find(x => x.WorkAssignmentId == targetReport.WorkAssignmentId &&
+                       x.Id != targetReport.Id &&
+                       x.IsCurrent &&
+                       x.IsActive &&
+                       x.Status == WorkAssignmentReportStatus.Approved &&
+                       !x.IsDeleted)
+            .ToListAsync(ct);
+
+        var previous = candidates
+            .Where(x => IsBeforeTargetPeriod(x, targetReport))
+            .OrderByDescending(x => x.PeriodStart ?? x.ReportDate ?? x.StartedDate ?? DateTime.MinValue)
+            .ThenByDescending(x => x.PeriodInstanceKey, StringComparer.Ordinal)
+            .FirstOrDefault();
+        if (previous is null)
+            return new List<DynamicFlowMappingSourceReport>();
+
+        return new List<DynamicFlowMappingSourceReport>
+        {
+            await ToDynamicFlowMappingSourceReportAsync(previous, actorUserId, ct)
+        };
+    }
+
+    private async Task<DynamicFlowMappingSourceReport> ToDynamicFlowMappingSourceReportAsync(
+        WorkAssignmentReport report,
+        string actorUserId,
+        CancellationToken ct)
+    {
+        await HydrateReportPayloadAsync(report, ct);
+        var access = await EnsureReportAccessAsync(report, actorUserId, ct);
+        return new DynamicFlowMappingSourceReport(
+            report,
+            access.assignment.FlowStepId,
+            access.assignment.FlowStepCode,
+            report.FieldValuesJson,
+            report.TableValuesJson);
+    }
+
+    private static bool IsBeforeTargetPeriod(WorkAssignmentReport candidate, WorkAssignmentReport target)
+    {
+        var candidateStart = candidate.PeriodStart ?? candidate.ReportDate ?? candidate.StartedDate;
+        var targetStart = target.PeriodStart ?? target.ReportDate ?? target.StartedDate;
+        if (candidateStart.HasValue && targetStart.HasValue)
+            return candidateStart.Value < targetStart.Value;
+
+        return string.Compare(
+            NormalizeOptionalTextOrNull(candidate.PeriodInstanceKey),
+            NormalizeOptionalTextOrNull(target.PeriodInstanceKey),
+            StringComparison.Ordinal) < 0;
+    }
+
+    private static string NormalizeDynamicFlowMappingSourceMode(string? value, WorkAssignment targetAssignment)
+    {
+        var mode = value?.Trim().ToUpperInvariant();
+        if (mode is "PREVIOUS_PERIOD" or "PREVIOUS" or "PREVIOUS_REPORT")
+            return "PREVIOUS_PERIOD";
+        if (mode is "CHILD_FLOW" or "CHILD" or "CHILD_RESULT")
+            return "CHILD_FLOW";
+
+        return DynamicFlowBranchVisibility.IsFlowAssignment(targetAssignment)
+            ? "CHILD_FLOW"
+            : "PREVIOUS_PERIOD";
+    }
+
+    private static string NormalizeObjectIdOrValidation(string? value, string field)
+    {
+        value = NormalizeOptionalTextOrNull(value);
+        if (string.IsNullOrWhiteSpace(value) || !ObjectId.TryParse(value, out _))
+        {
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.COMMON_VALIDATION_FAILED,
+                new { field, value, reason = "OBJECT_ID_INVALID" });
+        }
+
+        return value;
+    }
+
     private async Task<DynamicFormAggregateDraftProjection> BuildDynamicFormAggregateDraftProjectionAsync(
         WorkAssignmentReport entity,
         ApplyDynamicFormAggregateDraftRequest req,
@@ -7403,8 +7924,11 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                 return new AggregateSourceSnapshot(false, new List<string>(), new List<string>());
 
             var kind = ReadJsonString(doc.RootElement, "kind");
-            if (!string.Equals(kind, "DYNAMIC_FORM_AGGREGATE_DRAFT", StringComparison.Ordinal))
+            if (!string.Equals(kind, "DYNAMIC_FORM_AGGREGATE_DRAFT", StringComparison.Ordinal) &&
+                !string.Equals(kind, "DYNAMIC_FLOW_MAPPING", StringComparison.Ordinal))
+            {
                 return new AggregateSourceSnapshot(false, new List<string>(), new List<string>());
+            }
 
             return new AggregateSourceSnapshot(
                 true,
