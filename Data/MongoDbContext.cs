@@ -69,6 +69,7 @@ namespace tdtd_be.Data
         public IMongoCollection<WorkReportFieldStatValue> WorkReportFieldStatValues { get; }
         public IMongoCollection<WorkReportFieldStatAggregate> WorkReportFieldStatAggregates { get; }
         public IMongoCollection<WorkReportStatisticRebuildJob> WorkReportStatisticRebuildJobs { get; }
+        public IMongoCollection<WorkReportStatisticDiffConfig> WorkReportStatisticDiffConfigs { get; }
         public IMongoCollection<UserNotification> Notifications { get; }
         public MongoDbContext(IOptions<MongoOptions> opt)
         {
@@ -135,6 +136,7 @@ namespace tdtd_be.Data
             WorkReportFieldStatValues = Db.GetCollection<WorkReportFieldStatValue>(o.WorkReportFieldStatValueCollection);
             WorkReportFieldStatAggregates = Db.GetCollection<WorkReportFieldStatAggregate>(o.WorkReportFieldStatAggregateCollection);
             WorkReportStatisticRebuildJobs = Db.GetCollection<WorkReportStatisticRebuildJob>(o.WorkReportStatisticRebuildJobCollection);
+            WorkReportStatisticDiffConfigs = Db.GetCollection<WorkReportStatisticDiffConfig>(o.WorkReportStatisticDiffConfigCollection);
             Notifications = Db.GetCollection<UserNotification>(o.NotificationCollection);
         }
     }

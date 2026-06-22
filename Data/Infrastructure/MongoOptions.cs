@@ -64,6 +64,7 @@
         public string WorkReportFieldStatValueCollection { get; set; } = "work_report_field_stat_values";
         public string WorkReportFieldStatAggregateCollection { get; set; } = "work_report_field_stat_aggregates";
         public string WorkReportStatisticRebuildJobCollection { get; set; } = "work_report_statistic_rebuild_jobs";
+        public string WorkReportStatisticDiffConfigCollection { get; set; } = "work_report_statistic_diff_configs";
         public string NotificationCollection { get; set; } = "notifications";
     }
 }

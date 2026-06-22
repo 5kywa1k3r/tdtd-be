@@ -235,6 +235,9 @@
             var statisticRebuildJobs = db.GetCollection<WorkReportStatisticRebuildJob>(opt.WorkReportStatisticRebuildJobCollection);
             await EnsureWorkReportStatisticRebuildJobsAsync(statisticRebuildJobs, ct);
 
+            var statisticDiffConfigs = db.GetCollection<WorkReportStatisticDiffConfig>(opt.WorkReportStatisticDiffConfigCollection);
+            await EnsureWorkReportStatisticDiffConfigsAsync(statisticDiffConfigs, ct);
+
             // NOTIFICATIONS
             var notifications = db.GetCollection<UserNotification>(opt.NotificationCollection);
             await EnsureNotificationsAsync(notifications, ct);
@@ -3138,6 +3141,29 @@
                     { "periodInstanceKey", 1 },
                     { "dynamicFormTemplateId", 1 },
                     { "status", 1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
+        }
+
+        private static async Task EnsureWorkReportStatisticDiffConfigsAsync(
+            IMongoCollection<WorkReportStatisticDiffConfig> col,
+            CancellationToken ct)
+        {
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(
+                col,
+                new IndexSpec("ix_workReportStatisticDiffConfigs_isDeleted", new BsonDocument("isDeleted", 1)),
+                ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_workReportStatisticDiffConfigs_work_assignment_template",
+                key: new BsonDocument
+                {
+                    { "workId", 1 },
+                    { "assignmentId", 1 },
+                    { "dynamicFormTemplateId", 1 },
+                    { "isActive", 1 },
+                    { "updatedAtUtc", -1 },
                     { "isDeleted", 1 }
                 }
             ), ct);

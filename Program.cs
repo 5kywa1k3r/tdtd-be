@@ -243,6 +243,7 @@ builder.Services.AddScoped<IWorkReportLabelStatisticsService, WorkReportLabelSta
 builder.Services.AddScoped<IWorkReportTableStatisticsService, WorkReportTableStatisticsService>();
 builder.Services.AddScoped<IWorkReportFieldStatisticsService, WorkReportFieldStatisticsService>();
 builder.Services.AddScoped<IWorkReportStatisticRebuildJobService, WorkReportStatisticRebuildJobService>();
+builder.Services.AddScoped<IWorkReportStatisticDiffService, WorkReportStatisticDiffService>();
 
 builder.Services.AddScoped<IWorkAssignmentProgressService, WorkAssignmentProgressService>();
 builder.Services.AddScoped<IWorkAssignmentReviewService, WorkAssignmentReviewService>();

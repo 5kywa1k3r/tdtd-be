@@ -4,6 +4,7 @@ using tdtd_be.DTOs.Auth;
 using tdtd_be.DTOs.DynamicFlows;
 using tdtd_be.DTOs.DynamicExcel;
 using tdtd_be.DTOs.Operations;
+using tdtd_be.DTOs.Statistics;
 using tdtd_be.DTOs.WorkAssignments;
 using tdtd_be.DTOs.WorkAssignments.AggregateTable;
 using tdtd_be.DTOs.WorkAssignments.BasicSummary;
@@ -129,6 +130,10 @@ var tests = new (string Name, Action Run)[]
     ("basic summary compact snapshot round-trips", BasicSummaryCompactSnapshotRoundTrips),
     ("basic summary respects compressed table null runs", BasicSummaryRespectsCompressedTableNullRuns),
     ("summary source scope normalizes flow modes", SummarySourceScopeNormalizesFlowModes),
+    ("statistic diff previous period resolves key formats", StatisticDiffPreviousPeriodResolvesKeyFormats),
+    ("statistic diff row join requires table identity", StatisticDiffRowJoinRequiresTableIdentity),
+    ("statistic diff compatibility rejects concept mismatch", StatisticDiffCompatibilityRejectsConceptMismatch),
+    ("statistic diff compatibility rejects data category mismatch", StatisticDiffCompatibilityRejectsDataCategoryMismatch),
     ("advanced summary config hash includes source scope", AdvancedSummaryConfigHashIncludesSourceScope),
     ("advanced summary config normalizes object json", AdvancedSummaryConfigNormalizesObjectJson),
     ("advanced summary preview blocks unsupported range condition", AdvancedSummaryPreviewBlocksUnsupportedRangeCondition),
@@ -4543,6 +4548,87 @@ static void SummarySourceScopeNormalizesFlowModes()
     AssertEqual<string?>(null, GetReflectedProperty<string?>(finalScope, "FlowStepId"), "FLOW_FINAL should ignore irrelevant step id input");
     AssertEqual<string?>(null, GetReflectedProperty<string?>(finalScope, "FlowBranchId"), "FLOW_FINAL should ignore irrelevant branch id input");
     AssertEqual<string?>(null, GetReflectedProperty<string?>(finalScope, "FlowEffectiveStatus"), "ANY should remove the effective-status filter");
+}
+
+static void StatisticDiffPreviousPeriodResolvesKeyFormats()
+{
+    var serviceType = typeof(WorkReportStatisticDiffService);
+
+    AssertEqual(
+        "20240621",
+        InvokePrivateStatic<string>(serviceType, "ResolveComparisonPeriodKey", "20240622", "PREVIOUS_PERIOD"),
+        "compact day period should subtract one day");
+    AssertEqual(
+        "2024-05",
+        InvokePrivateStatic<string>(serviceType, "ResolveComparisonPeriodKey", "2024-06", "PREVIOUS_PERIOD"),
+        "month period should subtract one month");
+    AssertEqual(
+        "2023",
+        InvokePrivateStatic<string>(serviceType, "ResolveComparisonPeriodKey", "2024", "PREVIOUS_PERIOD"),
+        "year period should subtract one year");
+    AssertEqual(
+        "20240622",
+        InvokePrivateStatic<string>(serviceType, "ResolveComparisonPeriodKey", "20240622", "SAME_PERIOD"),
+        "same-period compare should keep the current period");
+}
+
+static void StatisticDiffRowJoinRequiresTableIdentity()
+{
+    var serviceType = typeof(WorkReportStatisticDiffService);
+    var field = new WorkReportStatisticDiffTargetDto { SourceKind = "FIELD", DynamicFormTemplateId = ObjectId(81), FieldId = "score" };
+    var table = new WorkReportStatisticDiffTargetDto { SourceKind = "TABLE", DynamicFormTemplateId = ObjectId(81), BlockId = "b1", MetricKey = "score" };
+
+    AssertThrowsFromReflection(
+        AppErrorCode.WORK_REPORT_STATISTIC_DIFF_ROW_JOIN_REQUIRED,
+        () => InvokePrivateStatic<object?>(
+            serviceType,
+            "EnsureRowJoinCompatible",
+            field,
+            table,
+            "ROW_KEY"));
+
+    InvokePrivateStatic<object?>(
+        serviceType,
+        "EnsureRowJoinCompatible",
+        table,
+        table,
+        "ROW_KEY");
+}
+
+static void StatisticDiffCompatibilityRejectsConceptMismatch()
+{
+    AssertThrowsFromReflection(
+        AppErrorCode.WORK_REPORT_STATISTIC_DIFF_INCOMPATIBLE,
+        () => InvokePrivateStatic<object?>(
+            typeof(WorkReportStatisticDiffService),
+            "EnsureConceptCompatible",
+            "PLAN_SCORE",
+            "FINAL_SCORE",
+            true));
+
+    InvokePrivateStatic<object?>(
+        typeof(WorkReportStatisticDiffService),
+        "EnsureConceptCompatible",
+        "PLAN_SCORE",
+        "FINAL_SCORE",
+        false);
+}
+
+static void StatisticDiffCompatibilityRejectsDataCategoryMismatch()
+{
+    AssertThrowsFromReflection(
+        AppErrorCode.WORK_REPORT_STATISTIC_DIFF_INCOMPATIBLE,
+        () => InvokePrivateStatic<object?>(
+            typeof(WorkReportStatisticDiffService),
+            "EnsureDataCategoryCompatible",
+            "NUMBER",
+            "BUCKET"));
+
+    InvokePrivateStatic<object?>(
+        typeof(WorkReportStatisticDiffService),
+        "EnsureDataCategoryCompatible",
+        "NUMBER",
+        "NUMBER");
 }
 
 static void AdvancedSummaryConfigHashIncludesSourceScope()
