@@ -425,6 +425,9 @@ public sealed class DynamicFlowRuntimeService : IDynamicFlowRuntimeService
         var reports = await _ctx.WorkAssignmentReports
             .Find(reportFilter)
             .ToListAsync(ct);
+        var affectedAssignments = await _ctx.WorkAssignments
+            .Find(x => x.WorkId == workId && assignmentIds.Contains(x.Id) && !x.IsDeleted)
+            .ToListAsync(ct);
 
         var reportUpdateResult = await _ctx.WorkAssignmentReports.UpdateManyAsync(
             reportFilter,
@@ -436,7 +439,7 @@ public sealed class DynamicFlowRuntimeService : IDynamicFlowRuntimeService
                 .Set(x => x.UpdatedByUserId, actorUserId),
             cancellationToken: ct);
 
-        await MarkBasicSummarySnapshotsDirtyAsync(workId, assignmentIds, actorUserId, now, ct);
+        await MarkBasicSummarySnapshotsDirtyAsync(workId, assignmentIds, affectedAssignments, actorUserId, now, ct);
 
         foreach (var report in reports)
         {
@@ -455,13 +458,28 @@ public sealed class DynamicFlowRuntimeService : IDynamicFlowRuntimeService
     private async Task MarkBasicSummarySnapshotsDirtyAsync(
         string workId,
         IReadOnlyCollection<string> assignmentIds,
+        IReadOnlyCollection<WorkAssignment> affectedAssignments,
         string actorUserId,
         DateTime now,
         CancellationToken ct)
     {
         var fb = Builders<WorkAssignmentBasicSummarySnapshot>.Filter;
+        var sourceFilters = new List<FilterDefinition<WorkAssignmentBasicSummarySnapshot>>
+        {
+            fb.AnyIn(x => x.SourceAssignmentIds, assignmentIds)
+        };
+        var flowInstanceIds = affectedAssignments
+            .Select(x => x.FlowInstanceId)
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Select(x => x!)
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+
+        if (flowInstanceIds.Count > 0)
+            sourceFilters.Add(fb.In(x => x.SourceFlowInstanceId, flowInstanceIds));
+
         var filter = fb.Eq(x => x.WorkId, workId)
-                     & fb.AnyIn(x => x.SourceAssignmentIds, assignmentIds)
+                     & fb.Or(sourceFilters)
                      & fb.Eq(x => x.IsDeleted, false);
 
         await _ctx.WorkAssignmentBasicSummarySnapshots.UpdateManyAsync(

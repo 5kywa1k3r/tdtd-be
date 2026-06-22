@@ -30,6 +30,23 @@ public sealed class WorkAssignmentAdvancedSummaryConfig : BaseEntity
     [BsonElement("sectionTitle")]
     public string? SectionTitle { get; set; }
 
+    [BsonElement("sourceScopeMode")]
+    public string SourceScopeMode { get; set; } = "DIRECT_CHILDREN_OR_SELF";
+
+    [BsonElement("sourceFlowInstanceId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? SourceFlowInstanceId { get; set; }
+
+    [BsonElement("sourceFlowStepId")]
+    public string? SourceFlowStepId { get; set; }
+
+    [BsonElement("sourceFlowBranchId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? SourceFlowBranchId { get; set; }
+
+    [BsonElement("sourceFlowEffectiveStatus")]
+    public string? SourceFlowEffectiveStatus { get; set; }
+
     [BsonElement("status")]
     public string Status { get; set; } = WorkAssignmentAdvancedSummaryConfigStatuses.Draft;
 

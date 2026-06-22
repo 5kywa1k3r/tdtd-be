@@ -3,6 +3,7 @@ using tdtd_be.Data;
 using tdtd_be.Models;
 using tdtd_be.Models.Enums;
 using tdtd_be.Services.Common;
+using tdtd_be.Services.WorkAssignments.Internal;
 
 namespace tdtd_be.Services.WorkAssignments.AdvancedSummary;
 
@@ -76,7 +77,7 @@ public sealed class WorkAssignmentAdvancedSummaryDirtyService : IWorkAssignmentA
             .Find(x => x.Id == report.WorkAssignmentId && !x.IsDeleted)
             .FirstOrDefaultAsync(ct);
         var scopeAssignmentIds = BuildCandidateScopeAssignmentIds(report.WorkAssignmentId, assignment?.ParentAssignmentId);
-        var configs = await LoadAffectedLockedConfigsAsync(report, scopeAssignmentIds, ct);
+        var configs = await LoadAffectedLockedConfigsAsync(report, assignment, scopeAssignmentIds, ct);
         var dirtyDayCount = 0L;
         var dirtyMonthCount = 0L;
         var dirtyYearCount = 0L;
@@ -119,22 +120,57 @@ public sealed class WorkAssignmentAdvancedSummaryDirtyService : IWorkAssignmentA
 
     private async Task<List<WorkAssignmentAdvancedSummaryConfig>> LoadAffectedLockedConfigsAsync(
         WorkAssignmentReport report,
+        WorkAssignment? assignment,
         IReadOnlyCollection<string> scopeAssignmentIds,
         CancellationToken ct)
     {
-        if (scopeAssignmentIds.Count == 0 || string.IsNullOrWhiteSpace(report.DynamicFormTemplateId))
+        if (string.IsNullOrWhiteSpace(report.DynamicFormTemplateId))
             return new List<WorkAssignmentAdvancedSummaryConfig>();
 
         var fb = Builders<WorkAssignmentAdvancedSummaryConfig>.Filter;
+        var sourceFilters = new List<FilterDefinition<WorkAssignmentAdvancedSummaryConfig>>();
+        if (scopeAssignmentIds.Count > 0)
+            sourceFilters.Add(fb.In(x => x.AssignmentId, scopeAssignmentIds));
+        if (!string.IsNullOrWhiteSpace(assignment?.FlowInstanceId))
+            sourceFilters.Add(fb.Eq(x => x.SourceFlowInstanceId, assignment.FlowInstanceId));
+
+        if (sourceFilters.Count == 0)
+            return new List<WorkAssignmentAdvancedSummaryConfig>();
+
         var filter = fb.Eq(x => x.WorkId, report.WorkId)
                      & fb.Eq(x => x.DynamicFormTemplateId, report.DynamicFormTemplateId)
                      & fb.Eq(x => x.Status, WorkAssignmentAdvancedSummaryConfigStatuses.Locked)
                      & fb.Eq(x => x.IsDeleted, false)
-                     & fb.In(x => x.AssignmentId, scopeAssignmentIds);
+                     & fb.Or(sourceFilters);
 
-        return await _ctx.WorkAssignmentAdvancedSummaryConfigs
+        var configs = await _ctx.WorkAssignmentAdvancedSummaryConfigs
             .Find(filter)
             .ToListAsync(ct);
+
+        if (assignment is null)
+            return configs;
+
+        var configScopeIds = configs
+            .Select(x => x.AssignmentId)
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+        var configScopes = configScopeIds.Count == 0
+            ? new Dictionary<string, WorkAssignment>(StringComparer.Ordinal)
+            : (await _ctx.WorkAssignments
+                .Find(x => configScopeIds.Contains(x.Id) && !x.IsDeleted)
+                .ToListAsync(ct))
+                .GroupBy(x => x.Id, StringComparer.Ordinal)
+                .ToDictionary(x => x.Key, x => x.First(), StringComparer.Ordinal);
+
+        return configs
+            .Where(config =>
+                scopeAssignmentIds.Contains(config.AssignmentId) ||
+                configScopes.TryGetValue(config.AssignmentId, out var scope) &&
+                ConfigSourceMayIncludeAssignment(config, scope, assignment))
+            .GroupBy(x => x.Id, StringComparer.Ordinal)
+            .Select(x => x.First())
+            .ToList();
     }
 
     private async Task<long> MarkDayNodeDirtyAsync(
@@ -226,6 +262,61 @@ public sealed class WorkAssignmentAdvancedSummaryDirtyService : IWorkAssignmentA
         }
 
         return output;
+    }
+
+    private static bool ConfigSourceMayIncludeAssignment(
+        WorkAssignmentAdvancedSummaryConfig config,
+        WorkAssignment scope,
+        WorkAssignment assignment)
+    {
+        var sourceScope = WorkAssignmentSummarySourceScope.Normalize(
+            scope,
+            config.SourceScopeMode,
+            config.SourceFlowInstanceId,
+            config.SourceFlowStepId,
+            config.SourceFlowBranchId,
+            config.SourceFlowEffectiveStatus);
+
+        if (sourceScope.Mode == WorkAssignmentSummarySourceScope.DirectChildrenOrSelf ||
+            sourceScope.Mode == WorkAssignmentSummarySourceScope.DirectChildren)
+        {
+            return string.Equals(assignment.ParentAssignmentId, scope.Id, StringComparison.Ordinal);
+        }
+
+        if (sourceScope.Mode == WorkAssignmentSummarySourceScope.Self)
+            return string.Equals(assignment.Id, scope.Id, StringComparison.Ordinal);
+
+        if (!WorkAssignmentSummarySourceScope.IsFlowMode(sourceScope.Mode) ||
+            string.IsNullOrWhiteSpace(sourceScope.FlowInstanceId) ||
+            !string.Equals(sourceScope.FlowInstanceId, assignment.FlowInstanceId, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        return sourceScope.Mode switch
+        {
+            WorkAssignmentSummarySourceScope.FlowBranch =>
+                string.Equals(sourceScope.FlowBranchId, assignment.FlowBranchId, StringComparison.Ordinal) ||
+                string.Equals(scope.Id, assignment.Id, StringComparison.Ordinal) ||
+                IsSameOrDescendantAssignment(scope, assignment),
+            WorkAssignmentSummarySourceScope.FlowStep =>
+                string.Equals(sourceScope.FlowStepId, assignment.FlowStepId, StringComparison.Ordinal),
+            WorkAssignmentSummarySourceScope.FlowEffectivePath => true,
+            WorkAssignmentSummarySourceScope.FlowFinal => assignment.IsFlowFinalNode == true,
+            _ => false
+        };
+    }
+
+    private static bool IsSameOrDescendantAssignment(WorkAssignment scope, WorkAssignment assignment)
+    {
+        if (string.Equals(scope.Id, assignment.Id, StringComparison.Ordinal))
+            return true;
+
+        var scopePath = scope.Path?.Trim();
+        var assignmentPath = assignment.Path?.Trim();
+        return !string.IsNullOrWhiteSpace(scopePath) &&
+               !string.IsNullOrWhiteSpace(assignmentPath) &&
+               assignmentPath.StartsWith($"{scopePath}/", StringComparison.Ordinal);
     }
 
     private static bool ShouldDirtyForStatusMutation(

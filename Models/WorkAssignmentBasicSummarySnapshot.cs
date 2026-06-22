@@ -30,6 +30,23 @@ public sealed class WorkAssignmentBasicSummarySnapshot : BaseEntity
     [BsonElement("requestJson")]
     public string RequestJson { get; set; } = "{}";
 
+    [BsonElement("sourceScopeMode")]
+    public string SourceScopeMode { get; set; } = "DIRECT_CHILDREN_OR_SELF";
+
+    [BsonElement("sourceFlowInstanceId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? SourceFlowInstanceId { get; set; }
+
+    [BsonElement("sourceFlowStepId")]
+    public string? SourceFlowStepId { get; set; }
+
+    [BsonElement("sourceFlowBranchId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? SourceFlowBranchId { get; set; }
+
+    [BsonElement("sourceFlowEffectiveStatus")]
+    public string? SourceFlowEffectiveStatus { get; set; }
+
     [BsonElement("sourceAssignmentIds")]
     [BsonRepresentation(BsonType.ObjectId)]
     public List<string> SourceAssignmentIds { get; set; } = new();

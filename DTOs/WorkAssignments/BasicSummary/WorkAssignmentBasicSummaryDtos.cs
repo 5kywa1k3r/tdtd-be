@@ -9,6 +9,11 @@ public sealed class WorkAssignmentBasicSummaryRequest
     public string? PeriodKey { get; set; }
     public string? PeriodKeyFrom { get; set; }
     public string? PeriodKeyTo { get; set; }
+    public string? SourceScopeMode { get; set; }
+    public string? SourceFlowInstanceId { get; set; }
+    public string? SourceFlowStepId { get; set; }
+    public string? SourceFlowBranchId { get; set; }
+    public string? SourceFlowEffectiveStatus { get; set; }
     public WorkAssignmentBasicSummaryDefaultMethodsDto? DefaultMethods { get; set; }
     public List<WorkAssignmentBasicSummaryRuleDto>? Rules { get; set; }
     public WorkAssignmentBasicSummarySourceViewRequestDto? SourceView { get; set; }
@@ -98,6 +103,11 @@ public sealed class WorkAssignmentBasicSummaryMetaDto
     public string? PeriodKey { get; set; }
     public string? PeriodKeyFrom { get; set; }
     public string? PeriodKeyTo { get; set; }
+    public string SourceScopeMode { get; set; } = "DIRECT_CHILDREN_OR_SELF";
+    public string? SourceFlowInstanceId { get; set; }
+    public string? SourceFlowStepId { get; set; }
+    public string? SourceFlowBranchId { get; set; }
+    public string? SourceFlowEffectiveStatus { get; set; }
     public int SourceAssignmentCount { get; set; }
     public int SourceReportCount { get; set; }
     public bool FromSnapshot { get; set; }

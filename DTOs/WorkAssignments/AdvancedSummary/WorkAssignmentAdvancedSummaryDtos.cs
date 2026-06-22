@@ -8,6 +8,11 @@ public sealed class WorkAssignmentAdvancedSummaryConfigDto
     public string DynamicFormTemplateId { get; set; } = string.Empty;
     public string SectionId { get; set; } = string.Empty;
     public string? SectionTitle { get; set; }
+    public string SourceScopeMode { get; set; } = "DIRECT_CHILDREN_OR_SELF";
+    public string? SourceFlowInstanceId { get; set; }
+    public string? SourceFlowStepId { get; set; }
+    public string? SourceFlowBranchId { get; set; }
+    public string? SourceFlowEffectiveStatus { get; set; }
     public string Status { get; set; } = "DRAFT";
     public int VersionNo { get; set; }
     public int DraftRevision { get; set; }
@@ -41,6 +46,11 @@ public sealed class WorkAssignmentAdvancedSummaryConfigDto
 public sealed class SaveWorkAssignmentAdvancedSummaryDraftRequest
 {
     public string ConfigJson { get; set; } = "{}";
+    public string? SourceScopeMode { get; set; }
+    public string? SourceFlowInstanceId { get; set; }
+    public string? SourceFlowStepId { get; set; }
+    public string? SourceFlowBranchId { get; set; }
+    public string? SourceFlowEffectiveStatus { get; set; }
 }
 
 public sealed class LockWorkAssignmentAdvancedSummaryConfigRequest

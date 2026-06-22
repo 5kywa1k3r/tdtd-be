@@ -13,6 +13,7 @@ using tdtd_be.Models;
 using tdtd_be.Models.Enums;
 using tdtd_be.Services.Notifications;
 using tdtd_be.Services.WorkAssignmentReports.Payloads;
+using tdtd_be.Services.WorkAssignments.Internal;
 using tdtd_be.Services.WorkAssignments.SummaryTokens;
 
 namespace tdtd_be.Services.WorkAssignments.AdvancedSummary;
@@ -98,7 +99,14 @@ public sealed class WorkAssignmentAdvancedSummaryConfigService : IWorkAssignment
         EnsureActor(actorUserId);
         var context = await LoadContextAsync(assignmentId, dynamicFormTemplateId, sectionId, actorUserId, ct);
         var configJson = NormalizeConfigJson(req?.ConfigJson);
-        var configHash = Sha256(configJson);
+        var sourceScope = WorkAssignmentSummarySourceScope.Normalize(
+            context.Scope,
+            req?.SourceScopeMode,
+            req?.SourceFlowInstanceId,
+            req?.SourceFlowStepId,
+            req?.SourceFlowBranchId,
+            req?.SourceFlowEffectiveStatus);
+        var configHash = BuildConfigHash(configJson, sourceScope);
         var gate = await BuildFieldGateInfoAsync(context.Template, context.Section.Id, configJson, ct);
         EnsureFieldGateAllowsAdvanced(gate);
         var now = DateTime.UtcNow;
@@ -127,6 +135,11 @@ public sealed class WorkAssignmentAdvancedSummaryConfigService : IWorkAssignment
         };
 
         entity.SectionTitle = context.Section.Title;
+        entity.SourceScopeMode = sourceScope.Mode;
+        entity.SourceFlowInstanceId = sourceScope.FlowInstanceId;
+        entity.SourceFlowStepId = sourceScope.FlowStepId;
+        entity.SourceFlowBranchId = sourceScope.FlowBranchId;
+        entity.SourceFlowEffectiveStatus = sourceScope.FlowEffectiveStatus;
         entity.Status = WorkAssignmentAdvancedSummaryConfigStatuses.Draft;
         entity.VersionNo = existing is null ? versionNo : existing.VersionNo;
         entity.DraftRevision = existing is null ? 1 : existing.DraftRevision + 1;
@@ -452,6 +465,7 @@ public sealed class WorkAssignmentAdvancedSummaryConfigService : IWorkAssignment
             throw UnsupportedPreviewConfig(configAnalysis.UnsupportedFeatures);
 
         var sourceAssignments = await LoadPreviewSourceAssignmentsAsync(
+            config,
             context.Scope,
             context.Template.Id,
             ct);
@@ -594,6 +608,11 @@ public sealed class WorkAssignmentAdvancedSummaryConfigService : IWorkAssignment
             DynamicFormTemplateId = config.DynamicFormTemplateId,
             SectionId = config.SectionId,
             SectionTitle = config.SectionTitle,
+            SourceScopeMode = config.SourceScopeMode,
+            SourceFlowInstanceId = config.SourceFlowInstanceId,
+            SourceFlowStepId = config.SourceFlowStepId,
+            SourceFlowBranchId = config.SourceFlowBranchId,
+            SourceFlowEffectiveStatus = config.SourceFlowEffectiveStatus,
             PeriodKeys = periodKeys,
             SourceAssignmentCount = sourceAssignments.Count,
             SourceReportCount = previewReports.Count,
@@ -612,32 +631,23 @@ public sealed class WorkAssignmentAdvancedSummaryConfigService : IWorkAssignment
     }
 
     private async Task<List<WorkAssignment>> LoadPreviewSourceAssignmentsAsync(
+        WorkAssignmentAdvancedSummaryConfig config,
         WorkAssignment scope,
         string dynamicFormTemplateId,
         CancellationToken ct)
-    {
-        var fb = Builders<WorkAssignment>.Filter;
-        var sourceAssignmentTypes = ResolveSourceAssignmentTypes(scope.AssignmentType);
-        var filter = fb.Eq(x => x.WorkId, scope.WorkId)
-                     & fb.Eq(x => x.ParentAssignmentId, scope.Id)
-                     & fb.Eq(x => x.DynamicFormTemplateId, dynamicFormTemplateId)
-                     & fb.In(x => x.AssignmentType, sourceAssignmentTypes)
-                     & fb.Eq(x => x.IsDeleted, false)
-                     & fb.Eq(x => x.IsActive, true);
-
-        var directChildren = await _ctx.WorkAssignments
-            .Find(filter)
-            .SortBy(x => x.Path)
-            .ThenBy(x => x.Code)
-            .ToListAsync(ct);
-
-        if (directChildren.Count > 0)
-            return directChildren;
-
-        return IsActiveAssignmentForTemplate(scope, dynamicFormTemplateId, sourceAssignmentTypes)
-            ? new List<WorkAssignment> { scope }
-            : new List<WorkAssignment>();
-    }
+        => await WorkAssignmentSummarySourceScope.LoadAssignmentsAsync(
+            _ctx.WorkAssignments,
+            scope,
+            dynamicFormTemplateId,
+            Array.Empty<string>(),
+            WorkAssignmentSummarySourceScope.Normalize(
+                scope,
+                config.SourceScopeMode,
+                config.SourceFlowInstanceId,
+                config.SourceFlowStepId,
+                config.SourceFlowBranchId,
+                config.SourceFlowEffectiveStatus),
+            ct);
 
     private static FilterDefinition<WorkAssignmentReport> BuildPreviewReportFilter(
         List<string> sourceAssignmentIds,
@@ -1309,20 +1319,6 @@ public sealed class WorkAssignmentAdvancedSummaryConfigService : IWorkAssignment
         return null;
     }
 
-    private static string[] ResolveSourceAssignmentTypes(string? scopeAssignmentType)
-        => string.Equals(scopeAssignmentType, WorkAssignmentTypes.PeriodicReport, StringComparison.OrdinalIgnoreCase)
-            ? new[] { WorkAssignmentTypes.PeriodicReport }
-            : new[] { WorkAssignmentTypes.Once };
-
-    private static bool IsActiveAssignmentForTemplate(
-        WorkAssignment assignment,
-        string dynamicFormTemplateId,
-        string[] supportedAssignmentTypes)
-        => assignment.IsActive &&
-           !assignment.IsDeleted &&
-           supportedAssignmentTypes.Contains(assignment.AssignmentType, StringComparer.OrdinalIgnoreCase) &&
-           string.Equals(assignment.DynamicFormTemplateId?.Trim(), dynamicFormTemplateId, StringComparison.Ordinal);
-
     private async Task MarkPreviewRunningAsync(
         string configId,
         string expectedConfigHash,
@@ -1515,6 +1511,11 @@ public sealed class WorkAssignmentAdvancedSummaryConfigService : IWorkAssignment
             DynamicFormTemplateId = x.DynamicFormTemplateId,
             SectionId = x.SectionId,
             SectionTitle = x.SectionTitle,
+            SourceScopeMode = x.SourceScopeMode,
+            SourceFlowInstanceId = x.SourceFlowInstanceId,
+            SourceFlowStepId = x.SourceFlowStepId,
+            SourceFlowBranchId = x.SourceFlowBranchId,
+            SourceFlowEffectiveStatus = x.SourceFlowEffectiveStatus,
             Status = x.Status,
             VersionNo = x.VersionNo,
             DraftRevision = x.DraftRevision,
@@ -1597,6 +1598,17 @@ public sealed class WorkAssignmentAdvancedSummaryConfigService : IWorkAssignment
                 new { field = "configJson", reason = "ADVANCED_SUMMARY_CONFIG_JSON_INVALID", ex.Message });
         }
     }
+
+    private static string BuildConfigHash(string configJson, NormalizedSummarySourceScope sourceScope)
+        => Sha256(JsonSerializer.Serialize(new
+        {
+            configJson,
+            sourceScopeMode = sourceScope.Mode,
+            sourceFlowInstanceId = sourceScope.FlowInstanceId,
+            sourceFlowStepId = sourceScope.FlowStepId,
+            sourceFlowBranchId = sourceScope.FlowBranchId,
+            sourceFlowEffectiveStatus = sourceScope.FlowEffectiveStatus
+        }, JsonOptions));
 
     private static string Sha256(string value)
     {
@@ -1834,6 +1846,11 @@ public sealed class WorkAssignmentAdvancedSummaryConfigService : IWorkAssignment
         public string DynamicFormTemplateId { get; set; } = string.Empty;
         public string SectionId { get; set; } = string.Empty;
         public string? SectionTitle { get; set; }
+        public string SourceScopeMode { get; set; } = WorkAssignmentSummarySourceScope.DirectChildrenOrSelf;
+        public string? SourceFlowInstanceId { get; set; }
+        public string? SourceFlowStepId { get; set; }
+        public string? SourceFlowBranchId { get; set; }
+        public string? SourceFlowEffectiveStatus { get; set; }
         public List<string> PeriodKeys { get; set; } = new();
         public int SourceAssignmentCount { get; set; }
         public int SourceReportCount { get; set; }

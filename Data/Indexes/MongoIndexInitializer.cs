@@ -1806,6 +1806,18 @@
                     { "isDeleted", 1 }
                 }
             ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_workAssignmentBasicSummarySnapshots_flow_scope",
+                key: new BsonDocument
+                {
+                    { "workId", 1 },
+                    { "sourceFlowInstanceId", 1 },
+                    { "sourceScopeMode", 1 },
+                    { "sourceFlowEffectiveStatus", 1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
         }
 
         private static async Task EnsureWorkAssignmentBasicSummaryConfigsAsync(
@@ -1906,6 +1918,19 @@
                 key: new BsonDocument
                 {
                     { "previewCorrelationId", 1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_workAssignmentAdvancedSummaryConfigs_flow_source",
+                key: new BsonDocument
+                {
+                    { "workId", 1 },
+                    { "dynamicFormTemplateId", 1 },
+                    { "sourceFlowInstanceId", 1 },
+                    { "sourceScopeMode", 1 },
+                    { "status", 1 },
                     { "isDeleted", 1 }
                 }
             ), ct);

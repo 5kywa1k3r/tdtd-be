@@ -128,12 +128,15 @@ var tests = new (string Name, Action Run)[]
     ("basic summary merges period snapshots by typed method", BasicSummaryMergesPeriodSnapshotsByTypedMethod),
     ("basic summary compact snapshot round-trips", BasicSummaryCompactSnapshotRoundTrips),
     ("basic summary respects compressed table null runs", BasicSummaryRespectsCompressedTableNullRuns),
+    ("summary source scope normalizes flow modes", SummarySourceScopeNormalizesFlowModes),
+    ("advanced summary config hash includes source scope", AdvancedSummaryConfigHashIncludesSourceScope),
     ("advanced summary config normalizes object json", AdvancedSummaryConfigNormalizesObjectJson),
     ("advanced summary preview blocks unsupported range condition", AdvancedSummaryPreviewBlocksUnsupportedRangeCondition),
     ("advanced summary field gate enforces section limits", AdvancedSummaryFieldGateEnforcesSectionLimits),
     ("advanced summary hierarchy keys roll up day month year", AdvancedSummaryHierarchyKeysRollUpDayMonthYear),
     ("advanced summary day node source day uses completed date first", AdvancedSummaryDayNodeSourceDayUsesCompletedDateFirst),
     ("advanced summary dirty scopes include self and parent assignments", AdvancedSummaryDirtyScopesIncludeSelfAndParentAssignments),
+    ("advanced summary dirty flow branch scope includes descendants", AdvancedSummaryDirtyFlowBranchScopeIncludesDescendants),
     ("advanced summary dirty status mutation rules cover approved and active changes", AdvancedSummaryDirtyStatusMutationRulesCoverApprovedAndActiveChanges),
     ("advanced summary hierarchy rollup merges child fields", AdvancedSummaryHierarchyRollupMergesChildFields),
     ("advanced summary hierarchy rollup requires clean children", AdvancedSummaryHierarchyRollupRequiresCleanChildren),
@@ -4507,6 +4510,67 @@ static void BasicSummaryRespectsCompressedTableNullRuns()
     AssertEqual(0, skipped.Count, "compressed null-run fixture should stay below direct aggregate limit");
 }
 
+static void SummarySourceScopeNormalizesFlowModes()
+{
+    var scope = new WorkAssignment
+    {
+        Id = ObjectId(70),
+        WorkId = ObjectId(71),
+        Path = $"/{ObjectId(70)}",
+        FlowInstanceId = ObjectId(72),
+        FlowStepId = "review",
+        FlowBranchId = ObjectId(73)
+    };
+
+    var stepScope = NormalizeSummarySourceScope(scope, " flow_step ", null, null, ObjectId(74), null);
+    AssertEqual("FLOW_STEP", GetReflectedProperty<string>(stepScope, "Mode"), "source scope mode should normalize to uppercase");
+    AssertEqual(scope.FlowInstanceId, GetReflectedProperty<string>(stepScope, "FlowInstanceId"), "source scope should inherit flow instance from scope assignment");
+    AssertEqual(scope.FlowStepId, GetReflectedProperty<string>(stepScope, "FlowStepId"), "FLOW_STEP should inherit step id from scope assignment");
+    AssertEqual<string?>(null, GetReflectedProperty<string?>(stepScope, "FlowBranchId"), "FLOW_STEP should ignore irrelevant branch id input");
+    AssertEqual(
+        DynamicFlowEffectiveStatuses.Effective,
+        GetReflectedProperty<string>(stepScope, "FlowEffectiveStatus"),
+        "flow source scopes should default to effective data");
+
+    var finalScope = NormalizeSummarySourceScope(
+        scope,
+        "FLOW_FINAL",
+        null,
+        "ignored-step",
+        ObjectId(75),
+        "any");
+    AssertEqual("FLOW_FINAL", GetReflectedProperty<string>(finalScope, "Mode"), "final mode should be preserved");
+    AssertEqual<string?>(null, GetReflectedProperty<string?>(finalScope, "FlowStepId"), "FLOW_FINAL should ignore irrelevant step id input");
+    AssertEqual<string?>(null, GetReflectedProperty<string?>(finalScope, "FlowBranchId"), "FLOW_FINAL should ignore irrelevant branch id input");
+    AssertEqual<string?>(null, GetReflectedProperty<string?>(finalScope, "FlowEffectiveStatus"), "ANY should remove the effective-status filter");
+}
+
+static void AdvancedSummaryConfigHashIncludesSourceScope()
+{
+    var scope = new WorkAssignment
+    {
+        Id = ObjectId(76),
+        WorkId = ObjectId(77),
+        Path = $"/{ObjectId(76)}",
+        FlowInstanceId = ObjectId(78),
+        FlowStepId = "review",
+        FlowBranchId = ObjectId(79)
+    };
+    var configJson = """{"targets":[{"fieldRef":"score","method":"SUM"}]}""";
+    var buildHash = typeof(WorkAssignmentAdvancedSummaryConfigService).GetMethod(
+        "BuildConfigHash",
+        BindingFlags.NonPublic | BindingFlags.Static)
+        ?? throw new MissingMethodException(nameof(WorkAssignmentAdvancedSummaryConfigService), "BuildConfigHash");
+
+    var stepScope = NormalizeSummarySourceScope(scope, "FLOW_STEP", null, null, null, null);
+    var branchScope = NormalizeSummarySourceScope(scope, "FLOW_BRANCH", null, null, null, null);
+
+    var stepHash = (string)buildHash.Invoke(null, new object?[] { configJson, stepScope })!;
+    var branchHash = (string)buildHash.Invoke(null, new object?[] { configJson, branchScope })!;
+
+    AssertTrue(!string.Equals(stepHash, branchHash, StringComparison.Ordinal), "advanced config hash should change when source scope changes");
+}
+
 static void AdvancedSummaryConfigNormalizesObjectJson()
 {
     var normalized = InvokePrivateStatic<string>(
@@ -4653,6 +4717,55 @@ static void AdvancedSummaryDirtyScopesIncludeSelfAndParentAssignments()
         new[] { "child" },
         selfOnly,
         "dirty scope should not duplicate the same assignment id");
+}
+
+static void AdvancedSummaryDirtyFlowBranchScopeIncludesDescendants()
+{
+    var workId = ObjectId(80);
+    var flowInstanceId = ObjectId(81);
+    var rootBranchId = ObjectId(82);
+
+    var scope = new WorkAssignment
+    {
+        Id = ObjectId(83),
+        WorkId = workId,
+        Path = $"/{ObjectId(83)}",
+        FlowInstanceId = flowInstanceId,
+        FlowBranchId = rootBranchId,
+        FlowEffectiveStatus = DynamicFlowEffectiveStatuses.Effective
+    };
+    var descendant = new WorkAssignment
+    {
+        Id = ObjectId(84),
+        WorkId = workId,
+        ParentAssignmentId = scope.Id,
+        Path = $"{scope.Path}/{ObjectId(84)}",
+        FlowInstanceId = flowInstanceId,
+        FlowBranchId = ObjectId(85),
+        ParentFlowBranchId = rootBranchId,
+        FlowEffectiveStatus = DynamicFlowEffectiveStatuses.Invalidated
+    };
+    var config = new WorkAssignmentAdvancedSummaryConfig
+    {
+        Id = ObjectId(86),
+        WorkId = workId,
+        AssignmentId = scope.Id,
+        DynamicFormTemplateId = ObjectId(87),
+        SectionId = "main",
+        SourceScopeMode = "FLOW_BRANCH",
+        SourceFlowInstanceId = flowInstanceId,
+        SourceFlowBranchId = rootBranchId,
+        SourceFlowEffectiveStatus = DynamicFlowEffectiveStatuses.Effective
+    };
+
+    var matcher = typeof(WorkAssignmentAdvancedSummaryDirtyService).GetMethod(
+        "ConfigSourceMayIncludeAssignment",
+        BindingFlags.NonPublic | BindingFlags.Static)
+        ?? throw new MissingMethodException(nameof(WorkAssignmentAdvancedSummaryDirtyService), "ConfigSourceMayIncludeAssignment");
+
+    AssertTrue(
+        (bool)matcher.Invoke(null, new object?[] { config, scope, descendant })!,
+        "FLOW_BRANCH dirty matcher should include descendant assignment paths even after status changes");
 }
 
 static void AdvancedSummaryDirtyStatusMutationRulesCoverApprovedAndActiveChanges()
@@ -5312,6 +5425,33 @@ static T InvokePrivateStaticGeneric<T>(Type type, string name, Type[] genericTyp
 
     var result = method.MakeGenericMethod(genericTypes).Invoke(null, args);
     return result is null ? default! : (T)result;
+}
+
+static object NormalizeSummarySourceScope(
+    WorkAssignment scope,
+    string? sourceScopeMode,
+    string? sourceFlowInstanceId,
+    string? sourceFlowStepId,
+    string? sourceFlowBranchId,
+    string? sourceFlowEffectiveStatus)
+{
+    var type = typeof(WorkAssignmentBasicSummaryService).Assembly.GetType(
+        "tdtd_be.Services.WorkAssignments.Internal.WorkAssignmentSummarySourceScope")
+        ?? throw new InvalidOperationException("WorkAssignmentSummarySourceScope helper type was not found.");
+    var method = type.GetMethod("Normalize", BindingFlags.Static | BindingFlags.Public)
+        ?? throw new InvalidOperationException($"{type.Name}.Normalize helper method was not found.");
+
+    return method.Invoke(
+        null,
+        new object?[]
+        {
+            scope,
+            sourceScopeMode,
+            sourceFlowInstanceId,
+            sourceFlowStepId,
+            sourceFlowBranchId,
+            sourceFlowEffectiveStatus
+        })!;
 }
 
 static T? GetReflectedProperty<T>(object source, string name)

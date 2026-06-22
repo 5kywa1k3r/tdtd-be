@@ -16,6 +16,7 @@ using tdtd_be.Models.Enums;
 using tdtd_be.Services;
 using tdtd_be.Services.Notifications;
 using tdtd_be.Services.WorkAssignmentReports.Payloads;
+using tdtd_be.Services.WorkAssignments.Internal;
 
 namespace tdtd_be.Services.WorkAssignments.BasicSummary;
 
@@ -157,6 +158,7 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
 
         var normalized = await NormalizeRequestAsync(req, ct);
         var scope = await LoadScopeAssignmentAsync(normalized.ScopeAssignmentId, ct);
+        normalized = AttachSourceScope(scope, normalized);
 
         if (!CanReadAssignment(scope, actorUserId))
         {
@@ -182,7 +184,7 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
         var sourceAssignments = await LoadSourceAssignmentsAsync(
             scope,
             dynamicFormTemplateId,
-            normalized.SelectedUnitIds,
+            normalized,
             ct);
 
         if (IsPeriodicAssignment(scope) && normalized.PeriodScopeMode == "PERIOD_RANGE")
@@ -241,6 +243,7 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
 
             var normalized = await NormalizeRequestAsync(req, ct);
             var scope = await LoadScopeAssignmentAsync(normalized.ScopeAssignmentId, ct);
+            normalized = AttachSourceScope(scope, normalized);
             notifyScope = scope;
 
             if (!CanReadAssignment(scope, actorUserId))
@@ -271,7 +274,7 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
             var sourceAssignments = await LoadSourceAssignmentsAsync(
                 scope,
                 dynamicFormTemplateId,
-                normalized.SelectedUnitIds,
+                normalized,
                 ct);
             var sourceReports = await LoadSourceReportsAsync(
                 sourceAssignments.Select(x => x.Id).ToList(),
@@ -407,6 +410,7 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
                 normalized.PeriodKey,
                 normalized.PeriodKeyFrom,
                 normalized.PeriodKeyTo,
+                normalized.SourceScope,
                 sourceAssignments.Count,
                 sourceReports.Count,
                 fromSnapshot: true,
@@ -522,6 +526,11 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
             .Set(x => x.DynamicFormTemplateId, dynamicFormTemplateId)
             .Set(x => x.RequestHash, requestHash)
             .Set(x => x.RequestJson, requestJson)
+            .Set(x => x.SourceScopeMode, req.SourceScope?.Mode ?? ScopeMode)
+            .Set(x => x.SourceFlowInstanceId, req.SourceScope?.FlowInstanceId)
+            .Set(x => x.SourceFlowStepId, req.SourceScope?.FlowStepId)
+            .Set(x => x.SourceFlowBranchId, req.SourceScope?.FlowBranchId)
+            .Set(x => x.SourceFlowEffectiveStatus, req.SourceScope?.FlowEffectiveStatus)
             .Set(x => x.SourceAssignmentIds, sourceAssignments.Select(x => x.Id).ToList())
             .Set(x => x.SourceReportIds, sourceReports.Select(x => x.Id).ToList())
             .Set(x => x.SourceSignatureHash, sourceSignatureHash)
@@ -609,6 +618,7 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
             normalized.PeriodKey,
             normalized.PeriodKeyFrom,
             normalized.PeriodKeyTo,
+            normalized.SourceScope,
             sourceAssignments.Count,
             sourceReports.Count,
             fromSnapshot: staleSnapshot is not null,
@@ -869,6 +879,7 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
             req.PeriodKey,
             req.PeriodKeyFrom,
             req.PeriodKeyTo,
+            req.SourceScope,
             sourceAssignments.Count,
             sources.Count,
             fromSnapshot: periodResponses.Count > 0 && periodResponses.All(x => x.Meta.FromSnapshot),
@@ -1228,10 +1239,28 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
             NormalizeDayKey(req.PeriodKey),
             NormalizeDayKey(req.PeriodKeyFrom),
             NormalizeDayKey(req.PeriodKeyTo),
+            string.IsNullOrWhiteSpace(req.SourceScopeMode) ? null : req.SourceScopeMode.Trim(),
+            string.IsNullOrWhiteSpace(req.SourceFlowInstanceId) ? null : req.SourceFlowInstanceId.Trim(),
+            string.IsNullOrWhiteSpace(req.SourceFlowStepId) ? null : req.SourceFlowStepId.Trim(),
+            string.IsNullOrWhiteSpace(req.SourceFlowBranchId) ? null : req.SourceFlowBranchId.Trim(),
+            string.IsNullOrWhiteSpace(req.SourceFlowEffectiveStatus) ? null : req.SourceFlowEffectiveStatus.Trim(),
+            null,
             req.ForceRefresh,
             req.IncludeSourceRows,
             Math.Clamp(req.MaxTextChars <= 0 ? DefaultMaxTextChars : req.MaxTextChars, 1000, MaxTextCharsLimit));
     }
+
+    private static NormalizedRequest AttachSourceScope(WorkAssignment scope, NormalizedRequest req)
+        => req with
+        {
+            SourceScope = WorkAssignmentSummarySourceScope.Normalize(
+                scope,
+                req.SourceScopeMode,
+                req.SourceFlowInstanceId,
+                req.SourceFlowStepId,
+                req.SourceFlowBranchId,
+                req.SourceFlowEffectiveStatus)
+        };
 
     private async Task<WorkAssignment> LoadScopeAssignmentAsync(string scopeAssignmentId, CancellationToken ct)
         => await _ctx.WorkAssignments
@@ -1244,60 +1273,15 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
     private async Task<List<WorkAssignment>> LoadSourceAssignmentsAsync(
         WorkAssignment scope,
         string dynamicFormTemplateId,
-        List<string> selectedUnitIds,
+        NormalizedRequest req,
         CancellationToken ct)
-    {
-        var fb = Builders<WorkAssignment>.Filter;
-        var sourceAssignmentTypes = ResolveSourceAssignmentTypes(scope.AssignmentType);
-        var filter = fb.Eq(x => x.WorkId, scope.WorkId)
-                     & fb.Eq(x => x.ParentAssignmentId, scope.Id)
-                     & fb.Eq(x => x.DynamicFormTemplateId, dynamicFormTemplateId)
-                     & fb.In(x => x.AssignmentType, sourceAssignmentTypes)
-                     & fb.Eq(x => x.IsDeleted, false)
-                     & fb.Eq(x => x.IsActive, true);
-
-        if (selectedUnitIds.Count > 0)
-            filter &= fb.ElemMatch(x => x.Assignees, a => a.UnitId != null && selectedUnitIds.Contains(a.UnitId));
-
-        var directChildren = await _ctx.WorkAssignments
-            .Find(filter)
-            .SortBy(x => x.Path)
-            .ThenBy(x => x.Code)
-            .ToListAsync(ct);
-
-        if (directChildren.Count > 0)
-            return directChildren;
-
-        if (IsActiveAssignmentForTemplate(scope, dynamicFormTemplateId, sourceAssignmentTypes) &&
-            AssignmentMatchesSelectedUnits(scope, selectedUnitIds))
-        {
-            return new List<WorkAssignment> { scope };
-        }
-
-        return directChildren;
-    }
-
-    private static bool IsActiveAssignmentForTemplate(
-        WorkAssignment assignment,
-        string dynamicFormTemplateId,
-        string[] supportedAssignmentTypes)
-        => assignment.IsActive &&
-           !assignment.IsDeleted &&
-           supportedAssignmentTypes.Contains(assignment.AssignmentType, StringComparer.OrdinalIgnoreCase) &&
-           string.Equals(assignment.DynamicFormTemplateId?.Trim(), dynamicFormTemplateId, StringComparison.Ordinal);
-
-    private static bool AssignmentMatchesSelectedUnits(
-        WorkAssignment assignment,
-        List<string> selectedUnitIds)
-        => selectedUnitIds.Count == 0 ||
-           assignment.Assignees.Any(a =>
-               !string.IsNullOrWhiteSpace(a.UnitId) &&
-               selectedUnitIds.Contains(a.UnitId));
-
-    private static string[] ResolveSourceAssignmentTypes(string? scopeAssignmentType)
-        => string.Equals(scopeAssignmentType, WorkAssignmentTypes.PeriodicReport, StringComparison.OrdinalIgnoreCase)
-            ? new[] { WorkAssignmentTypes.PeriodicReport }
-            : new[] { WorkAssignmentTypes.Once };
+        => await WorkAssignmentSummarySourceScope.LoadAssignmentsAsync(
+            _ctx.WorkAssignments,
+            scope,
+            dynamicFormTemplateId,
+            req.SelectedUnitIds,
+            req.SourceScope ?? throw new InvalidOperationException("Basic summary source scope was not normalized."),
+            ct);
 
     private static bool IsPeriodicAssignment(WorkAssignment assignment)
         => string.Equals(assignment.AssignmentType, WorkAssignmentTypes.PeriodicReport, StringComparison.OrdinalIgnoreCase);
@@ -1522,6 +1506,7 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
             req.PeriodKey,
             req.PeriodKeyFrom,
             req.PeriodKeyTo,
+            req.SourceScope,
             sourceAssignments.Count,
             sourceReports.Count,
             fromSnapshot: false,
@@ -1715,6 +1700,11 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
             .Set(x => x.DynamicFormTemplateId, dynamicFormTemplateId)
             .Set(x => x.RequestHash, requestHash)
             .Set(x => x.RequestJson, requestJson)
+            .Set(x => x.SourceScopeMode, req.SourceScope?.Mode ?? ScopeMode)
+            .Set(x => x.SourceFlowInstanceId, req.SourceScope?.FlowInstanceId)
+            .Set(x => x.SourceFlowStepId, req.SourceScope?.FlowStepId)
+            .Set(x => x.SourceFlowBranchId, req.SourceScope?.FlowBranchId)
+            .Set(x => x.SourceFlowEffectiveStatus, req.SourceScope?.FlowEffectiveStatus)
             .Set(x => x.SourceAssignmentIds, sourceAssignments.Select(x => x.Id).ToList())
             .Set(x => x.SourceReportIds, sourceReports.Select(x => x.Id).ToList())
             .Set(x => x.SourceSignatureHash, sourceSignatureHash)
@@ -1749,6 +1739,11 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
             periodKey = req.PeriodKey,
             periodKeyFrom = req.PeriodKeyFrom,
             periodKeyTo = req.PeriodKeyTo,
+            sourceScopeMode = req.SourceScope?.Mode,
+            sourceFlowInstanceId = req.SourceScope?.FlowInstanceId,
+            sourceFlowStepId = req.SourceScope?.FlowStepId,
+            sourceFlowBranchId = req.SourceScope?.FlowBranchId,
+            sourceFlowEffectiveStatus = req.SourceScope?.FlowEffectiveStatus,
             selectedUnitIds = req.SelectedUnitIds,
             defaultMethods = req.DefaultMethods,
             rules = req.Rules,
@@ -1776,6 +1771,11 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
             PeriodKey = stored.PeriodKey,
             PeriodKeyFrom = stored.PeriodKeyFrom,
             PeriodKeyTo = stored.PeriodKeyTo,
+            SourceScopeMode = stored.SourceScopeMode,
+            SourceFlowInstanceId = stored.SourceFlowInstanceId,
+            SourceFlowStepId = stored.SourceFlowStepId,
+            SourceFlowBranchId = stored.SourceFlowBranchId,
+            SourceFlowEffectiveStatus = stored.SourceFlowEffectiveStatus,
             DefaultMethods = stored.DefaultMethods,
             Rules = stored.Rules,
             ForceRefresh = true,
@@ -2147,6 +2147,7 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
         string? periodKey,
         string? periodKeyFrom,
         string? periodKeyTo,
+        NormalizedSummarySourceScope? sourceScope,
         int sourceAssignmentCount,
         int sourceReportCount,
         bool fromSnapshot,
@@ -2170,7 +2171,7 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
             SnapshotPayloadKind = SnapshotPayloadKind,
             SnapshotId = snapshotId,
             ScopeAssignmentId = scope.Id,
-            ScopeMode = ScopeMode,
+            ScopeMode = sourceScope?.Mode ?? ScopeMode,
             AssignmentType = scope.AssignmentType,
             DynamicFormTemplateId = template.Id,
             DynamicFormTemplateCode = template.Code,
@@ -2180,6 +2181,11 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
             PeriodKey = periodKey,
             PeriodKeyFrom = periodKeyFrom,
             PeriodKeyTo = periodKeyTo,
+            SourceScopeMode = sourceScope?.Mode ?? ScopeMode,
+            SourceFlowInstanceId = sourceScope?.FlowInstanceId,
+            SourceFlowStepId = sourceScope?.FlowStepId,
+            SourceFlowBranchId = sourceScope?.FlowBranchId,
+            SourceFlowEffectiveStatus = sourceScope?.FlowEffectiveStatus,
             SourceAssignmentCount = sourceAssignmentCount,
             SourceReportCount = sourceReportCount,
             FromSnapshot = fromSnapshot,
@@ -2550,7 +2556,12 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
             FeatureVersion,
             scopeAssignmentId,
             dynamicFormTemplateId,
-            scopeMode = ScopeMode,
+            scopeMode = req.SourceScope?.Mode ?? ScopeMode,
+            sourceScopeMode = req.SourceScope?.Mode ?? ScopeMode,
+            sourceFlowInstanceId = req.SourceScope?.FlowInstanceId,
+            sourceFlowStepId = req.SourceScope?.FlowStepId,
+            sourceFlowBranchId = req.SourceScope?.FlowBranchId,
+            sourceFlowEffectiveStatus = req.SourceScope?.FlowEffectiveStatus,
             periodScopeMode = req.PeriodScopeMode,
             periodKey = req.PeriodKey,
             periodKeyFrom = req.PeriodKeyFrom,
@@ -3923,6 +3934,11 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
         public string? PeriodKey { get; set; }
         public string? PeriodKeyFrom { get; set; }
         public string? PeriodKeyTo { get; set; }
+        public string? SourceScopeMode { get; set; }
+        public string? SourceFlowInstanceId { get; set; }
+        public string? SourceFlowStepId { get; set; }
+        public string? SourceFlowBranchId { get; set; }
+        public string? SourceFlowEffectiveStatus { get; set; }
         public List<string>? SelectedUnitIds { get; set; }
         public WorkAssignmentBasicSummaryDefaultMethodsDto? DefaultMethods { get; set; }
         public List<WorkAssignmentBasicSummaryRuleDto>? Rules { get; set; }
@@ -3945,6 +3961,12 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
         string? PeriodKey,
         string? PeriodKeyFrom,
         string? PeriodKeyTo,
+        string? SourceScopeMode,
+        string? SourceFlowInstanceId,
+        string? SourceFlowStepId,
+        string? SourceFlowBranchId,
+        string? SourceFlowEffectiveStatus,
+        NormalizedSummarySourceScope? SourceScope,
         bool ForceRefresh,
         bool IncludeSourceRows,
         int MaxTextChars);

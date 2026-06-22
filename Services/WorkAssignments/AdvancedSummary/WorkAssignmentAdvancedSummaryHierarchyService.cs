@@ -13,6 +13,7 @@ using tdtd_be.Models;
 using tdtd_be.Models.Enums;
 using tdtd_be.Services.Notifications;
 using tdtd_be.Services.WorkAssignmentReports.Payloads;
+using tdtd_be.Services.WorkAssignments.Internal;
 
 namespace tdtd_be.Services.WorkAssignments.AdvancedSummary;
 
@@ -699,7 +700,14 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
         var warnings = new List<string>();
         warnings.AddRange(configAnalysis.UnknownFieldRefs.Select(x => $"Unknown field target ignored: {x}"));
         var targetFields = ResolveTargets(configAnalysis, sectionFields, warnings);
-        var sourceAssignments = await LoadSourceAssignmentsAsync(context.Scope, config.DynamicFormTemplateId, ct);
+        var sourceScope = WorkAssignmentSummarySourceScope.Normalize(
+            context.Scope,
+            config.SourceScopeMode,
+            config.SourceFlowInstanceId,
+            config.SourceFlowStepId,
+            config.SourceFlowBranchId,
+            config.SourceFlowEffectiveStatus);
+        var sourceAssignments = await LoadSourceAssignmentsAsync(config, context.Scope, sourceScope, ct);
         var sourceReports = await LoadDaySourceReportsAsync(
             sourceAssignments.Select(x => x.Id).ToList(),
             config.DynamicFormTemplateId,
@@ -777,6 +785,11 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
             YearKey = AdvancedSummaryHierarchyKeyHelper.ToYearKeyFromDay(dayKey),
             WindowStartUtc = startUtc,
             WindowEndExclusiveUtc = endExclusiveUtc,
+            SourceScopeMode = sourceScope.Mode,
+            SourceFlowInstanceId = sourceScope.FlowInstanceId,
+            SourceFlowStepId = sourceScope.FlowStepId,
+            SourceFlowBranchId = sourceScope.FlowBranchId,
+            SourceFlowEffectiveStatus = sourceScope.FlowEffectiveStatus,
             SourceAssignmentCount = sourceAssignments.Count,
             SourceReportCount = sourceReports.Count,
             SectionReportCount = sectionRows.Count,
@@ -1101,6 +1114,11 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
             YearKey = yearKey,
             WindowStartUtc = windowStartUtc,
             WindowEndExclusiveUtc = windowEndExclusiveUtc,
+            SourceScopeMode = childValues.FirstOrDefault()?.SourceScopeMode ?? WorkAssignmentSummarySourceScope.DirectChildrenOrSelf,
+            SourceFlowInstanceId = childValues.FirstOrDefault()?.SourceFlowInstanceId,
+            SourceFlowStepId = childValues.FirstOrDefault()?.SourceFlowStepId,
+            SourceFlowBranchId = childValues.FirstOrDefault()?.SourceFlowBranchId,
+            SourceFlowEffectiveStatus = childValues.FirstOrDefault()?.SourceFlowEffectiveStatus,
             SourceAssignmentCount = childValues.Count == 0 ? 0 : childValues.Max(x => x.SourceAssignmentCount),
             SourceReportCount = orderedChildren.Sum(x => x.SourceReportCount),
             SectionReportCount = childValues.Sum(x => x.SectionReportCount),
@@ -1658,32 +1676,17 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
     }
 
     private async Task<List<WorkAssignment>> LoadSourceAssignmentsAsync(
+        WorkAssignmentAdvancedSummaryConfig config,
         WorkAssignment scope,
-        string dynamicFormTemplateId,
+        NormalizedSummarySourceScope sourceScope,
         CancellationToken ct)
-    {
-        var fb = Builders<WorkAssignment>.Filter;
-        var sourceAssignmentTypes = ResolveSourceAssignmentTypes(scope.AssignmentType);
-        var filter = fb.Eq(x => x.WorkId, scope.WorkId)
-                     & fb.Eq(x => x.ParentAssignmentId, scope.Id)
-                     & fb.Eq(x => x.DynamicFormTemplateId, dynamicFormTemplateId)
-                     & fb.In(x => x.AssignmentType, sourceAssignmentTypes)
-                     & fb.Eq(x => x.IsDeleted, false)
-                     & fb.Eq(x => x.IsActive, true);
-
-        var directChildren = await _ctx.WorkAssignments
-            .Find(filter)
-            .SortBy(x => x.Path)
-            .ThenBy(x => x.Code)
-            .ToListAsync(ct);
-
-        if (directChildren.Count > 0)
-            return directChildren;
-
-        return IsActiveAssignmentForTemplate(scope, dynamicFormTemplateId, sourceAssignmentTypes)
-            ? new List<WorkAssignment> { scope }
-            : new List<WorkAssignment>();
-    }
+        => await WorkAssignmentSummarySourceScope.LoadAssignmentsAsync(
+            _ctx.WorkAssignments,
+            scope,
+            config.DynamicFormTemplateId,
+            Array.Empty<string>(),
+            sourceScope,
+            ct);
 
     private async Task<List<FieldDefinition>> LoadSectionFieldsAsync(
         DynamicFormTemplate template,
@@ -2890,20 +2893,6 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
     private static string? PickNonBlank(params string?[] values)
         => values.FirstOrDefault(x => !string.IsNullOrWhiteSpace(x))?.Trim();
 
-    private static string[] ResolveSourceAssignmentTypes(string? scopeAssignmentType)
-        => string.Equals(scopeAssignmentType, WorkAssignmentTypes.PeriodicReport, StringComparison.OrdinalIgnoreCase)
-            ? new[] { WorkAssignmentTypes.PeriodicReport }
-            : new[] { WorkAssignmentTypes.Once };
-
-    private static bool IsActiveAssignmentForTemplate(
-        WorkAssignment assignment,
-        string dynamicFormTemplateId,
-        string[] supportedAssignmentTypes)
-        => assignment.IsActive &&
-           !assignment.IsDeleted &&
-           supportedAssignmentTypes.Contains(assignment.AssignmentType, StringComparer.OrdinalIgnoreCase) &&
-           string.Equals(assignment.DynamicFormTemplateId?.Trim(), dynamicFormTemplateId, StringComparison.Ordinal);
-
     private static bool CanReadAssignment(WorkAssignment assignment, string actorUserId)
     {
         if (string.IsNullOrWhiteSpace(actorUserId))
@@ -3322,6 +3311,11 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
         public string? YearKey { get; set; }
         public DateTime WindowStartUtc { get; set; }
         public DateTime WindowEndExclusiveUtc { get; set; }
+        public string SourceScopeMode { get; set; } = WorkAssignmentSummarySourceScope.DirectChildrenOrSelf;
+        public string? SourceFlowInstanceId { get; set; }
+        public string? SourceFlowStepId { get; set; }
+        public string? SourceFlowBranchId { get; set; }
+        public string? SourceFlowEffectiveStatus { get; set; }
         public int SourceAssignmentCount { get; set; }
         public long SourceReportCount { get; set; }
         public long SectionReportCount { get; set; }
@@ -3345,6 +3339,11 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
         public string? YearKey { get; set; }
         public DateTime WindowStartUtc { get; set; }
         public DateTime WindowEndExclusiveUtc { get; set; }
+        public string SourceScopeMode { get; set; } = WorkAssignmentSummarySourceScope.DirectChildrenOrSelf;
+        public string? SourceFlowInstanceId { get; set; }
+        public string? SourceFlowStepId { get; set; }
+        public string? SourceFlowBranchId { get; set; }
+        public string? SourceFlowEffectiveStatus { get; set; }
         public int SourceAssignmentCount { get; set; }
         public long SourceReportCount { get; set; }
         public long SectionReportCount { get; set; }
