@@ -1,5 +1,7 @@
 ﻿using tdtd_be.Models.Enums;
 
+using tdtd_be.DTOs.DynamicFlows;
+
 namespace tdtd_be.DTOs.WorkAssignmentReports;
 
 /// <summary>
@@ -90,6 +92,7 @@ public sealed class WorkAssignmentReportResponse
     public string Values1DJson { get; set; } = string.Empty;
     public string? FieldValuesJson { get; set; }
     public string? TableValuesJson { get; set; }
+    public DynamicFlowPolicyEvaluationResult? DynamicFlowPermissions { get; set; }
     public string DataOrigin { get; set; } = string.Empty;
     public string CumulativeContributionMode { get; set; } = string.Empty;
     public string? CumulativeContributionPolicyJson { get; set; }

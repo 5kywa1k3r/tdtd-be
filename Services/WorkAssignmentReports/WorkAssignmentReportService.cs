@@ -11,6 +11,7 @@ using tdtd_be.Common.Errors;
 using tdtd_be.Common.Time;
 using tdtd_be.Data;
 using tdtd_be.DTOs.Common;
+using tdtd_be.DTOs.DynamicFlows;
 using tdtd_be.DTOs.DynamicExcel;
 using tdtd_be.DTOs.Operations;
 using tdtd_be.DTOs.WorkAssignments.AggregateTable;
@@ -65,6 +66,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
     private readonly IAggregateTableService _aggregateTableService;
     private readonly ILabelEnumCatalogService _enumCatalogs;
     private readonly IWorkAssignmentAdvancedSummaryDirtyService _advancedSummaryDirty;
+    private readonly IDynamicFlowPolicyEvaluator _dynamicFlowPolicyEvaluator;
     private readonly ILogger<WorkAssignmentReportService> _log;
 
     private static readonly JsonSerializerOptions _jsonOptions = new(JsonSerializerDefaults.Web)
@@ -108,6 +110,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         IAggregateTableService aggregateTableService,
         ILabelEnumCatalogService enumCatalogs,
         IWorkAssignmentAdvancedSummaryDirtyService advancedSummaryDirty,
+        IDynamicFlowPolicyEvaluator dynamicFlowPolicyEvaluator,
         ILogger<WorkAssignmentReportService> log)
     {
         _ctx = ctx;
@@ -126,6 +129,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         _aggregateTableService = aggregateTableService;
         _enumCatalogs = enumCatalogs;
         _advancedSummaryDirty = advancedSummaryDirty;
+        _dynamicFlowPolicyEvaluator = dynamicFlowPolicyEvaluator;
         _log = log;
     }
 
@@ -1322,6 +1326,15 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         var isStackedAggregatePayload = IsStackedAggregateSummary(nextSummarySourceJson);
         var requestValues1D = req.Values1D ?? new List<object?>();
 
+        if (acceptsReportDataPayload && !isStackedAggregatePayload)
+            await EnsureDynamicFlowReportWriteAllowedAsync(
+                reportAccess.assignment,
+                entity,
+                req.FieldValuesJson,
+                req.TableValuesJson,
+                actorUserId,
+                ct);
+
         await ValidateRuntimeRowLabelsAsync(
             entity,
             acceptsReportDataPayload ? req.TableValuesJson : entity.TableValuesJson,
@@ -1948,6 +1961,15 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         var nextAggregateSources = ExtractAggregateSourceSnapshot(nextSummarySourceJson);
         var acceptsReportDataPayload = ShouldAcceptReportDataPayload(entity, nextDataOrigin, nextSummarySourceJson);
         var isStackedAggregatePayload = IsStackedAggregateSummary(nextSummarySourceJson);
+
+        if (acceptsReportDataPayload && !isStackedAggregatePayload)
+            await EnsureDynamicFlowReportWriteAllowedAsync(
+                reportAccess.assignment,
+                entity,
+                req.FieldValuesJson ?? entity.FieldValuesJson,
+                req.TableValuesJson ?? entity.TableValuesJson,
+                actorUserId,
+                ct);
 
         await ValidateRuntimeRowLabelsAsync(
             entity,
@@ -4884,6 +4906,84 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         return code;
     }
 
+    private async Task EnsureDynamicFlowReportWriteAllowedAsync(
+        WorkAssignment? assignment,
+        WorkAssignmentReport report,
+        string? nextFieldValuesJson,
+        string? nextTableValuesJson,
+        string actorUserId,
+        CancellationToken ct)
+    {
+        var permissions = await ResolveDynamicFlowReportPermissionsAsync(
+            assignment,
+            isAfterSubmit: false,
+            ct);
+        if (permissions is null)
+            return;
+
+        var violations = DynamicFlowReportPermissionEnforcer.FindWriteViolations(
+            permissions,
+            report.FieldValuesJson,
+            nextFieldValuesJson,
+            report.TableValuesJson,
+            nextTableValuesJson);
+        if (violations.Count == 0)
+            return;
+
+        throw AppExceptionFactory.BadRequest(
+            AppErrorCode.WORK_ASSIGNMENT_REPORT_VALUES_INVALID,
+            new
+            {
+                reportId = report.Id,
+                workAssignmentId = report.WorkAssignmentId,
+                actorUserId,
+                reason = "DYNAMIC_FLOW_REPORT_WRITE_FORBIDDEN",
+                violations = violations.Take(20).Select(x => new
+                {
+                    x.TargetKind,
+                    x.TargetKey,
+                    x.SourcePolicyId,
+                    x.Reason
+                }).ToList()
+            });
+    }
+
+    private async Task<DynamicFlowPolicyEvaluationResult?> ResolveDynamicFlowReportPermissionsAsync(
+        WorkAssignment? assignment,
+        bool isAfterSubmit,
+        CancellationToken ct)
+    {
+        if (assignment is null ||
+            !DynamicFlowBranchVisibility.IsFlowAssignment(assignment) ||
+            string.IsNullOrWhiteSpace(assignment.FlowTemplateId) ||
+            !assignment.FlowTemplateVersionNo.HasValue)
+        {
+            return null;
+        }
+
+        var flowTemplateId = assignment.FlowTemplateId.Trim();
+        var flowTemplateVersionNo = assignment.FlowTemplateVersionNo.Value;
+        var version = await _ctx.DynamicFlowTemplateVersions
+            .Find(x => x.TemplateId == flowTemplateId &&
+                       x.VersionNo == flowTemplateVersionNo &&
+                       !x.IsDeleted)
+            .FirstOrDefaultAsync(ct);
+        if (version is null)
+            return null;
+
+        return _dynamicFlowPolicyEvaluator.Evaluate(
+            version.PayloadJson,
+            new DynamicFlowPolicyEvaluationContext
+            {
+                StepId = assignment.FlowStepId,
+                StepCode = assignment.FlowStepCode,
+                ActorRole = string.IsNullOrWhiteSpace(assignment.FlowRole)
+                    ? "ASSIGNEE"
+                    : assignment.FlowRole.Trim(),
+                IsAfterSubmit = isAfterSubmit
+            });
+    }
+
     private async Task<WorkAssignmentReportResponse> MapToResponseAsync(
         WorkAssignmentReport x,
         WorkReportPeriod? period,
@@ -4917,6 +5017,10 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                                period?.IsHistoricalData == true ||
                                IsBackfillCompletedDatePolicy(completedDatePolicy);
         var payload = await _payloadReader.LoadReportPayloadAsync(x, ct);
+        var dynamicFlowPermissions = await ResolveDynamicFlowReportPermissionsAsync(
+            assignment,
+            isAfterSubmit: x.Status != WorkAssignmentReportStatus.Draft,
+            ct);
 
         return new WorkAssignmentReportResponse
         {
@@ -4970,6 +5074,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             Values1DJson = payload.Values1DJson,
             FieldValuesJson = payload.FieldValuesJson,
             TableValuesJson = payload.TableValuesJson,
+            DynamicFlowPermissions = dynamicFlowPermissions,
             DataOrigin = WorkReportDataOrigin.Normalize(x.DataOrigin),
             CumulativeContributionMode = WorkReportCumulativeContributionMode.Normalize(x.CumulativeContributionMode),
             CumulativeContributionPolicyJson = x.CumulativeContributionPolicyJson,

@@ -62,6 +62,8 @@ var tests = new (string Name, Action Run)[]
     ("dynamic flow template lock payload validates steps", DynamicFlowTemplateLockPayloadValidatesSteps),
     ("dynamic flow policy validation checks dynamic form references", DynamicFlowPolicyValidationChecksDynamicFormReferences),
     ("dynamic flow policy evaluator applies field and table permissions", DynamicFlowPolicyEvaluatorAppliesFieldAndTablePermissions),
+    ("dynamic flow report permissions reject field writes", DynamicFlowReportPermissionsRejectFieldWrites),
+    ("dynamic flow report permissions reject table column writes", DynamicFlowReportPermissionsRejectTableColumnWrites),
     ("dynamic flow runtime planner creates branch per target unit", DynamicFlowRuntimePlannerCreatesBranchPerTargetUnit),
     ("dynamic flow runtime planner rejects invalid launch inputs", DynamicFlowRuntimePlannerRejectsInvalidLaunchInputs),
     ("dynamic flow branch visibility inherits downstream units", DynamicFlowBranchVisibilityInheritsDownstreamUnits),
@@ -1061,6 +1063,69 @@ static void DynamicFlowPolicyEvaluatorAppliesFieldAndTablePermissions()
     AssertTrue(amount.Required, "locked table column should preserve required flag");
     AssertTrue(amount.Locked, "lockedAfterSubmit table column should lock after submit");
     AssertTrue(amount.LockedAfterSubmit, "table lockedAfterSubmit flag should be retained");
+}
+
+static void DynamicFlowReportPermissionsRejectFieldWrites()
+{
+    var permissions = new DynamicFlowPolicyEvaluationResult();
+    permissions.Fields["secret"] = new DynamicFlowFieldPermissionDto
+    {
+        TargetKey = "secret",
+        FieldId = "secret",
+        Write = false,
+        SourcePolicyId = "field-secret"
+    };
+
+    var unchanged = DynamicFlowReportPermissionEnforcer.FindWriteViolations(
+        permissions,
+        """{"values":{"secret":"old","note":"same"}}""",
+        """{"values":{"secret":"old","note":"changed"}}""",
+        null,
+        null);
+    AssertEqual(0, unchanged.Count, "unchanged denied field should not be rejected");
+
+    var changed = DynamicFlowReportPermissionEnforcer.FindWriteViolations(
+        permissions,
+        """{"values":{"secret":"old","note":"same"}}""",
+        """{"values":{"secret":"new","note":"same"}}""",
+        null,
+        null);
+    AssertEqual(1, changed.Count, "changed denied field should be rejected");
+    AssertEqual("FIELD", changed[0].TargetKind, "field violation target kind should be field");
+    AssertEqual("secret", changed[0].TargetKey, "field violation should identify the target key");
+    AssertEqual("field-secret", changed[0].SourcePolicyId, "field violation should keep source policy id");
+}
+
+static void DynamicFlowReportPermissionsRejectTableColumnWrites()
+{
+    var permissions = new DynamicFlowPolicyEvaluationResult();
+    permissions.TableColumns["b1:amount"] = new DynamicFlowTableColumnPermissionDto
+    {
+        TargetKey = "b1:amount",
+        BlockId = "b1",
+        ColumnKey = "amount",
+        Write = false,
+        SourcePolicyId = "column-amount"
+    };
+
+    var unchanged = DynamicFlowReportPermissionEnforcer.FindWriteViolations(
+        permissions,
+        null,
+        null,
+        """{"blocks":[{"blockId":"b1","rows":[{"cells":{"amount":1,"note":"old"}}]}]}""",
+        """{"blocks":[{"blockId":"b1","rows":[{"cells":{"amount":1,"note":"new"}}]}]}""");
+    AssertEqual(0, unchanged.Count, "changed allowed table column should not be rejected");
+
+    var changed = DynamicFlowReportPermissionEnforcer.FindWriteViolations(
+        permissions,
+        null,
+        null,
+        """{"blocks":[{"blockId":"b1","rows":[{"cells":{"amount":1,"note":"same"}}]}]}""",
+        """{"blocks":[{"blockId":"b1","rows":[{"cells":{"amount":2,"note":"same"}}]}]}""");
+    AssertEqual(1, changed.Count, "changed denied table column should be rejected");
+    AssertEqual("TABLE_COLUMN", changed[0].TargetKind, "table violation target kind should be table column");
+    AssertEqual("b1:amount", changed[0].TargetKey, "table violation should identify block and column");
+    AssertEqual("column-amount", changed[0].SourcePolicyId, "table violation should keep source policy id");
 }
 
 static void DynamicFlowRuntimePlannerCreatesBranchPerTargetUnit()
