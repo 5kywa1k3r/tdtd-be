@@ -1602,6 +1602,53 @@
             ), ct);
 
             await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_workAssignments_flow_instance_branch_deleted",
+                key: new BsonDocument
+                {
+                    { "workId", 1 },
+                    { "flowInstanceId", 1 },
+                    { "flowBranchId", 1 },
+                    { "isDeleted", 1 }
+                },
+                partial: new BsonDocument("flowInstanceId", new BsonDocument("$type", "objectId"))
+            ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_workAssignments_flow_parentBranch_deleted",
+                key: new BsonDocument
+                {
+                    { "workId", 1 },
+                    { "parentFlowBranchId", 1 },
+                    { "isDeleted", 1 }
+                },
+                partial: new BsonDocument("parentFlowBranchId", new BsonDocument("$type", "objectId"))
+            ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_workAssignments_flow_step_status_deleted",
+                key: new BsonDocument
+                {
+                    { "workId", 1 },
+                    { "flowStepId", 1 },
+                    { "flowEffectiveStatus", 1 },
+                    { "isDeleted", 1 }
+                },
+                partial: new BsonDocument("flowStepId", new BsonDocument("$type", "string"))
+            ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_workAssignments_root_flowStatus_deleted",
+                key: new BsonDocument
+                {
+                    { "workId", 1 },
+                    { "rootAssignmentId", 1 },
+                    { "flowEffectiveStatus", 1 },
+                    { "isDeleted", 1 }
+                },
+                partial: new BsonDocument("flowEffectiveStatus", new BsonDocument("$type", "string"))
+            ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
                 name: "ix_workAssignments_assignmentType_isDeleted",
                 key: new BsonDocument
                 {

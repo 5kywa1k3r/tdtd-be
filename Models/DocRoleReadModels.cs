@@ -104,6 +104,61 @@ public sealed class AssignmentListDocRole : DocRoleReadModelBase
     [BsonElement("path")]
     public string Path { get; set; } = string.Empty;
 
+    [BsonElement("flowTemplateId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? FlowTemplateId { get; set; }
+
+    [BsonElement("flowTemplateVersionNo")]
+    public int? FlowTemplateVersionNo { get; set; }
+
+    [BsonElement("flowInstanceId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? FlowInstanceId { get; set; }
+
+    [BsonElement("flowStepId")]
+    public string? FlowStepId { get; set; }
+
+    [BsonElement("flowStepCode")]
+    public string? FlowStepCode { get; set; }
+
+    [BsonElement("flowStepOrder")]
+    public int? FlowStepOrder { get; set; }
+
+    [BsonElement("flowBranchId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? FlowBranchId { get; set; }
+
+    [BsonElement("parentFlowBranchId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? ParentFlowBranchId { get; set; }
+
+    [BsonElement("flowAttemptNo")]
+    public int? FlowAttemptNo { get; set; }
+
+    [BsonElement("flowRole")]
+    public string? FlowRole { get; set; }
+
+    [BsonElement("flowEffectiveStatus")]
+    public string? FlowEffectiveStatus { get; set; }
+
+    [BsonElement("issuedByUnitId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? IssuedByUnitId { get; set; }
+
+    [BsonElement("targetUnitIds")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public List<string>? TargetUnitIds { get; set; }
+
+    [BsonElement("allowSubFlow")]
+    public bool? AllowSubFlow { get; set; }
+
+    [BsonElement("isFlowFinalNode")]
+    public bool? IsFlowFinalNode { get; set; }
+
+    [BsonElement("invalidatedByFlowEventId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? InvalidatedByFlowEventId { get; set; }
+
     [BsonElement("level")]
     public int Level { get; set; }
 

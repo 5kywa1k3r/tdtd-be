@@ -29,6 +29,7 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Options;
 using Hangfire;
 using MongoDB.Bson;
+using MongoDB.Bson.Serialization;
 using tdtd_be.Jobs;
 
 var tests = new (string Name, Action Run)[]
@@ -54,6 +55,7 @@ var tests = new (string Name, Action Run)[]
     ("missing assignment start defaults to current date", DefaultsMissingAssignmentStartToCurrentDate),
     ("root missing assignment due date defaults to work due date", DefaultsRootDueDateToWorkDueDate),
     ("child missing assignment due date defaults to parent assignment due date", DefaultsChildDueDateToParentDueDate),
+    ("non-flow assignment maps null dynamic flow metadata", MapsNonFlowAssignmentWithNullFlowMetadata),
     ("periodic assignment date range caps occurrence validation", ValidatesPeriodicAssignmentDateRange),
     ("materialize job backfills elapsed monthly periods before rolling future", MaterializeJobBackfillsElapsedMonthlyPeriodsBeforeRollingFuture),
     ("materialize job limits multi-day monthly schedules to exact occurrences", MaterializeJobLimitsMonthlyMultiDayScheduleToExactOccurrences),
@@ -784,6 +786,61 @@ static void DefaultsChildDueDateToParentDueDate()
 
     AssertEqual(parentDueDate, effective.DueDate, "child due date should default to parent assignment due date");
     AssertEqual<DateTime?>(null, effective.CompletedDate, "completion date should stay empty until explicit completion");
+}
+
+static void MapsNonFlowAssignmentWithNullFlowMetadata()
+{
+    var assignmentId = MongoDB.Bson.ObjectId.GenerateNewId();
+    var workId = MongoDB.Bson.ObjectId.GenerateNewId();
+    var rootAssignmentId = MongoDB.Bson.ObjectId.GenerateNewId();
+    var now = DateTime.UtcNow;
+
+    var assignment = BsonSerializer.Deserialize<WorkAssignment>(new BsonDocument
+    {
+        { "_id", assignmentId },
+        { "workId", workId },
+        { "rootAssignmentId", rootAssignmentId.ToString() },
+        { "level", 0 },
+        { "code", "A001" },
+        { "name", "Non-flow assignment" },
+        { "path", $"/{assignmentId}" },
+        { "assignmentType", WorkAssignmentTypes.Once },
+        { "aggregationType", WorkAggregationTypes.Matrix },
+        { "isActive", true },
+        { "createdAtUtc", now },
+        { "updatedAtUtc", now },
+        { "isDeleted", false }
+    });
+
+    var detail = WorkAssignmentResponseMapper.ToResponse(assignment, hasData: false);
+    AssertFlowMetadataNull(detail, "detail response");
+
+    var listDocRole = BsonSerializer.Deserialize<AssignmentListDocRole>(new BsonDocument
+    {
+        { "workId", workId },
+        { "assignmentId", assignmentId },
+        { "rootAssignmentId", rootAssignmentId },
+        { "level", 0 },
+        { "code", "A001" },
+        { "name", "Non-flow assignment" },
+        { "path", $"/{assignmentId}" },
+        { "assignmentType", WorkAssignmentTypes.Once },
+        { "aggregationType", WorkAggregationTypes.Matrix },
+        { "isActive", true },
+        { "assignmentCreatedAtUtc", now },
+        { "assignmentUpdatedAtUtc", now },
+        { "isDeleted", false }
+    });
+
+    var listMethod = typeof(tdtd_be.Services.WorkAssignments.WorkAssignmentService)
+        .GetMethods(BindingFlags.Static | BindingFlags.NonPublic)
+        .Single(x =>
+            x.Name == "ToListResponse" &&
+            x.GetParameters().Length == 1 &&
+            x.GetParameters()[0].ParameterType == typeof(AssignmentListDocRole));
+
+    var list = (WorkAssignmentListResponse)listMethod.Invoke(null, new object?[] { listDocRole })!;
+    AssertFlowMetadataNull(list, "list response");
 }
 
 static void ValidatesPeriodicAssignmentDateRange()
@@ -4263,6 +4320,26 @@ static void AssertThrowsFromReflection(AppErrorCode expectedCode, Action action)
     }
 
     throw new InvalidOperationException($"Expected {expectedCode}, but no exception was thrown.");
+}
+
+static void AssertFlowMetadataNull(object value, string scope)
+{
+    AssertEqual<string?>(null, GetReflectedProperty<string?>(value, "FlowTemplateId"), $"{scope} flow template should be null");
+    AssertEqual<int?>(null, GetReflectedProperty<int?>(value, "FlowTemplateVersionNo"), $"{scope} flow template version should be null");
+    AssertEqual<string?>(null, GetReflectedProperty<string?>(value, "FlowInstanceId"), $"{scope} flow instance should be null");
+    AssertEqual<string?>(null, GetReflectedProperty<string?>(value, "FlowStepId"), $"{scope} flow step id should be null");
+    AssertEqual<string?>(null, GetReflectedProperty<string?>(value, "FlowStepCode"), $"{scope} flow step code should be null");
+    AssertEqual<int?>(null, GetReflectedProperty<int?>(value, "FlowStepOrder"), $"{scope} flow step order should be null");
+    AssertEqual<string?>(null, GetReflectedProperty<string?>(value, "FlowBranchId"), $"{scope} flow branch should be null");
+    AssertEqual<string?>(null, GetReflectedProperty<string?>(value, "ParentFlowBranchId"), $"{scope} parent flow branch should be null");
+    AssertEqual<int?>(null, GetReflectedProperty<int?>(value, "FlowAttemptNo"), $"{scope} flow attempt should be null");
+    AssertEqual<string?>(null, GetReflectedProperty<string?>(value, "FlowRole"), $"{scope} flow role should be null");
+    AssertEqual<string?>(null, GetReflectedProperty<string?>(value, "FlowEffectiveStatus"), $"{scope} flow effective status should be null");
+    AssertEqual<string?>(null, GetReflectedProperty<string?>(value, "IssuedByUnitId"), $"{scope} issuer unit should be null");
+    AssertEqual<List<string>?>(null, GetReflectedProperty<List<string>?>(value, "TargetUnitIds"), $"{scope} target units should be null");
+    AssertEqual<bool?>(null, GetReflectedProperty<bool?>(value, "AllowSubFlow"), $"{scope} allow sub-flow should be null");
+    AssertEqual<bool?>(null, GetReflectedProperty<bool?>(value, "IsFlowFinalNode"), $"{scope} final node should be null");
+    AssertEqual<string?>(null, GetReflectedProperty<string?>(value, "InvalidatedByFlowEventId"), $"{scope} invalidating event should be null");
 }
 
 static T InvokePrivateStatic<T>(Type type, string name, params object?[] args)

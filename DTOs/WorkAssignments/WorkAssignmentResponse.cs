@@ -52,6 +52,22 @@ public class WorkAssignmentResponse
     public int Level { get; set; }
     public string Code { get; set; } = default!;
     public string Path { get; set; } = default!;
+    public string? FlowTemplateId { get; set; }
+    public int? FlowTemplateVersionNo { get; set; }
+    public string? FlowInstanceId { get; set; }
+    public string? FlowStepId { get; set; }
+    public string? FlowStepCode { get; set; }
+    public int? FlowStepOrder { get; set; }
+    public string? FlowBranchId { get; set; }
+    public string? ParentFlowBranchId { get; set; }
+    public int? FlowAttemptNo { get; set; }
+    public string? FlowRole { get; set; }
+    public string? FlowEffectiveStatus { get; set; }
+    public string? IssuedByUnitId { get; set; }
+    public List<string>? TargetUnitIds { get; set; }
+    public bool? AllowSubFlow { get; set; }
+    public bool? IsFlowFinalNode { get; set; }
+    public string? InvalidatedByFlowEventId { get; set; }
     public string? EvaluationCode { get; set; }
     public string? EvaluationLabel { get; set; }
     public string? EvaluationTemplateId { get; set; }
