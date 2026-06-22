@@ -145,6 +145,12 @@
             var workSummaryTokenLedgers = db.GetCollection<WorkSummaryTokenLedger>(opt.WorkSummaryTokenLedgerCollection);
             await EnsureWorkSummaryTokenLedgersAsync(workSummaryTokenLedgers, ct);
 
+            var dynamicFlowTemplates = db.GetCollection<DynamicFlowTemplate>(opt.DynamicFlowTemplateCollection);
+            await EnsureDynamicFlowTemplatesAsync(dynamicFlowTemplates, ct);
+
+            var dynamicFlowTemplateVersions = db.GetCollection<DynamicFlowTemplateVersion>(opt.DynamicFlowTemplateVersionCollection);
+            await EnsureDynamicFlowTemplateVersionsAsync(dynamicFlowTemplateVersions, ct);
+
             // WORK TEMPLATE ASSIGNEES
             var workTemplateAssignees = db.GetCollection<WorkTemplateAssignee>(opt.WorkTemplateAssigneeCollection);
             await EnsureWorkTemplateAssigneesAsync(workTemplateAssignees, ct);
@@ -1981,6 +1987,77 @@
                 {
                     { "actorUserId", 1 },
                     { "createdAtUtc", -1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
+        }
+
+        private static async Task EnsureDynamicFlowTemplatesAsync(
+            IMongoCollection<DynamicFlowTemplate> col,
+            CancellationToken ct)
+        {
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ux_dynamicFlowTemplates_code_active",
+                key: new BsonDocument
+                {
+                    { "code", 1 }
+                },
+                unique: true,
+                partial: new BsonDocument("isDeleted", false)
+            ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_dynamicFlowTemplates_status_updated",
+                key: new BsonDocument
+                {
+                    { "status", 1 },
+                    { "updatedAtUtc", -1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_dynamicFlowTemplates_currentVersion",
+                key: new BsonDocument
+                {
+                    { "currentVersionId", 1 },
+                    { "currentVersionNo", 1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
+        }
+
+        private static async Task EnsureDynamicFlowTemplateVersionsAsync(
+            IMongoCollection<DynamicFlowTemplateVersion> col,
+            CancellationToken ct)
+        {
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ux_dynamicFlowTemplateVersions_template_version_active",
+                key: new BsonDocument
+                {
+                    { "templateId", 1 },
+                    { "versionNo", 1 }
+                },
+                unique: true,
+                partial: new BsonDocument("isDeleted", false)
+            ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_dynamicFlowTemplateVersions_template_status_updated",
+                key: new BsonDocument
+                {
+                    { "templateId", 1 },
+                    { "status", 1 },
+                    { "updatedAtUtc", -1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_dynamicFlowTemplateVersions_hash",
+                key: new BsonDocument
+                {
+                    { "payloadHash", 1 },
                     { "isDeleted", 1 }
                 }
             ), ct);

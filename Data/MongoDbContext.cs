@@ -35,6 +35,8 @@ namespace tdtd_be.Data
         public IMongoCollection<WorkAssignmentAdvancedSummaryMonthNode> WorkAssignmentAdvancedSummaryMonthNodes { get; }
         public IMongoCollection<WorkAssignmentAdvancedSummaryYearNode> WorkAssignmentAdvancedSummaryYearNodes { get; }
         public IMongoCollection<WorkSummaryTokenLedger> WorkSummaryTokenLedgers { get; }
+        public IMongoCollection<DynamicFlowTemplate> DynamicFlowTemplates { get; }
+        public IMongoCollection<DynamicFlowTemplateVersion> DynamicFlowTemplateVersions { get; }
         public IMongoCollection<WorkTemplateAssignee> WorkTemplateAssignees { get; }
         public IMongoCollection<DocRole> DocRoles { get; }
         public IMongoCollection<WorkListDocRole> WorkListDocRoles { get; }
@@ -98,6 +100,8 @@ namespace tdtd_be.Data
             WorkAssignmentAdvancedSummaryMonthNodes = Db.GetCollection<WorkAssignmentAdvancedSummaryMonthNode>(o.WorkAssignmentAdvancedSummaryMonthNodeCollection);
             WorkAssignmentAdvancedSummaryYearNodes = Db.GetCollection<WorkAssignmentAdvancedSummaryYearNode>(o.WorkAssignmentAdvancedSummaryYearNodeCollection);
             WorkSummaryTokenLedgers = Db.GetCollection<WorkSummaryTokenLedger>(o.WorkSummaryTokenLedgerCollection);
+            DynamicFlowTemplates = Db.GetCollection<DynamicFlowTemplate>(o.DynamicFlowTemplateCollection);
+            DynamicFlowTemplateVersions = Db.GetCollection<DynamicFlowTemplateVersion>(o.DynamicFlowTemplateVersionCollection);
             WorkTemplateAssignees = Db.GetCollection<WorkTemplateAssignee>(o.WorkTemplateAssigneeCollection);
             DocRoles = Db.GetCollection<DocRole>(o.DocRoleCollection);
             WorkListDocRoles = Db.GetCollection<WorkListDocRole>(o.WorkListDocRoleCollection);

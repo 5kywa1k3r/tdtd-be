@@ -10,6 +10,7 @@ using tdtd_be.Enum;
 using tdtd_be.Models;
 using tdtd_be.Models.Enums;
 using tdtd_be.Services;
+using tdtd_be.Services.DynamicFlows;
 using tdtd_be.Services.WorkAssignmentReports;
 using tdtd_be.Services.WorkAssignmentReports.Payloads;
 using tdtd_be.Services.WorkAssignmentReports.Statistics;
@@ -56,6 +57,8 @@ var tests = new (string Name, Action Run)[]
     ("root missing assignment due date defaults to work due date", DefaultsRootDueDateToWorkDueDate),
     ("child missing assignment due date defaults to parent assignment due date", DefaultsChildDueDateToParentDueDate),
     ("non-flow assignment maps null dynamic flow metadata", MapsNonFlowAssignmentWithNullFlowMetadata),
+    ("dynamic flow template payload normalizes defaults", DynamicFlowTemplatePayloadNormalizesDefaults),
+    ("dynamic flow template lock payload validates steps", DynamicFlowTemplateLockPayloadValidatesSteps),
     ("periodic assignment date range caps occurrence validation", ValidatesPeriodicAssignmentDateRange),
     ("materialize job backfills elapsed monthly periods before rolling future", MaterializeJobBackfillsElapsedMonthlyPeriodsBeforeRollingFuture),
     ("materialize job limits multi-day monthly schedules to exact occurrences", MaterializeJobLimitsMonthlyMultiDayScheduleToExactOccurrences),
@@ -841,6 +844,68 @@ static void MapsNonFlowAssignmentWithNullFlowMetadata()
 
     var list = (WorkAssignmentListResponse)listMethod.Invoke(null, new object?[] { listDocRole })!;
     AssertFlowMetadataNull(list, "list response");
+}
+
+static void DynamicFlowTemplatePayloadNormalizesDefaults()
+{
+    var normalized = DynamicFlowTemplateService.NormalizePayloadJson(
+        """{ "steps": [] }""",
+        requireLockable: false);
+
+    using var doc = JsonDocument.Parse(normalized);
+    foreach (var property in new[]
+    {
+        "steps",
+        "transitions",
+        "actorPolicies",
+        "fieldPolicies",
+        "tableColumnPolicies",
+        "mappingRules"
+    })
+    {
+        AssertEqual(JsonValueKind.Array, doc.RootElement.GetProperty(property).ValueKind, $"{property} should be an array");
+    }
+
+    AssertEqual(JsonValueKind.Object, doc.RootElement.GetProperty("rollbackPolicy").ValueKind, "rollbackPolicy should default to object");
+    AssertEqual(JsonValueKind.Object, doc.RootElement.GetProperty("finalResultPolicy").ValueKind, "finalResultPolicy should default to object");
+    AssertEqual(JsonValueKind.Object, doc.RootElement.GetProperty("statisticProfile").ValueKind, "statisticProfile should default to object");
+}
+
+static void DynamicFlowTemplateLockPayloadValidatesSteps()
+{
+    AssertThrows(
+        AppErrorCode.COMMON_VALIDATION_FAILED,
+        () => DynamicFlowTemplateService.NormalizePayloadJson("{}", requireLockable: true));
+
+    AssertThrows(
+        AppErrorCode.COMMON_VALIDATION_FAILED,
+        () => DynamicFlowTemplateService.NormalizePayloadJson(
+            """
+            {
+              "steps": [
+                { "stepId": "self", "stepCode": "SELF" },
+                { "stepId": "self", "stepCode": "REVIEW" }
+              ]
+            }
+            """,
+            requireLockable: true));
+
+    var normalized = DynamicFlowTemplateService.NormalizePayloadJson(
+        """
+        {
+          "steps": [
+            { "stepId": "self", "stepCode": "SELF" },
+            { "stepId": "review", "stepCode": "REVIEW" }
+          ],
+          "transitions": [
+            { "fromStepId": "self", "toStepId": "review" }
+          ]
+        }
+        """,
+        requireLockable: true);
+
+    using var doc = JsonDocument.Parse(normalized);
+    AssertEqual(2, doc.RootElement.GetProperty("steps").GetArrayLength(), "lockable payload should keep valid steps");
 }
 
 static void ValidatesPeriodicAssignmentDateRange()
