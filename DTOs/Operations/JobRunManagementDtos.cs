@@ -74,6 +74,12 @@ public sealed class StatisticRebuildJobRow
     public string DynamicFormTemplateId { get; init; } = string.Empty;
     public string? DynamicFormTemplateCode { get; init; }
     public string? DynamicFormTemplateName { get; init; }
+    public string ScopeKind { get; init; } = string.Empty;
+    public string? WorkId { get; init; }
+    public string? WorkAssignmentId { get; init; }
+    public string? FlowInstanceId { get; init; }
+    public string? FlowEffectiveStatus { get; init; }
+    public string? PeriodInstanceKey { get; init; }
     public string Status { get; init; } = string.Empty;
     public string RequestedByUserId { get; init; } = string.Empty;
     public string Priority { get; init; } = string.Empty;

@@ -8,6 +8,16 @@ public sealed record StatisticRebuildJobEnqueueResult(
     DateTime? ScheduledAtUtc,
     bool RunsImmediately);
 
+public sealed class StatisticRebuildScopeRequest
+{
+    public string DynamicFormTemplateId { get; init; } = string.Empty;
+    public string? WorkId { get; init; }
+    public string? WorkAssignmentId { get; init; }
+    public string? FlowInstanceId { get; init; }
+    public string? FlowEffectiveStatus { get; init; }
+    public string? PeriodInstanceKey { get; init; }
+}
+
 public interface IWorkReportStatisticRebuildJobService
 {
     Task<StatisticRebuildJobEnqueueResult> EnqueueForTemplateStatisticConfigAsync(
@@ -18,6 +28,12 @@ public interface IWorkReportStatisticRebuildJobService
 
     Task<IReadOnlyList<StatisticRebuildJobEnqueueResult>> EnqueueForLabelChangeAsync(
         LabelCatalogItem label,
+        string requestedByUserId,
+        bool highPriority,
+        CancellationToken ct = default);
+
+    Task<StatisticRebuildJobEnqueueResult> EnqueueForBoundedScopeAsync(
+        StatisticRebuildScopeRequest scope,
         string requestedByUserId,
         bool highPriority,
         CancellationToken ct = default);

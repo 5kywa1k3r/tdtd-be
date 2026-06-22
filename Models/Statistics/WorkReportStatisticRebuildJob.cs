@@ -25,6 +25,27 @@ public sealed class WorkReportStatisticRebuildJob : BaseEntity
     [BsonElement("dynamicFormTemplateName")]
     public string? DynamicFormTemplateName { get; set; }
 
+    [BsonElement("scopeKind")]
+    public string ScopeKind { get; set; } = WorkReportStatisticRebuildJobScopeKinds.Template;
+
+    [BsonElement("workId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? WorkId { get; set; }
+
+    [BsonElement("workAssignmentId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? WorkAssignmentId { get; set; }
+
+    [BsonElement("flowInstanceId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? FlowInstanceId { get; set; }
+
+    [BsonElement("flowEffectiveStatus")]
+    public string? FlowEffectiveStatus { get; set; }
+
+    [BsonElement("periodInstanceKey")]
+    public string? PeriodInstanceKey { get; set; }
+
     [BsonElement("status")]
     public string Status { get; set; } = WorkReportStatisticRebuildJobStatuses.Pending;
 
@@ -94,4 +115,10 @@ public static class WorkReportStatisticRebuildJobPriorities
 {
     public const string Normal = "NORMAL";
     public const string High = "HIGH";
+}
+
+public static class WorkReportStatisticRebuildJobScopeKinds
+{
+    public const string Template = "TEMPLATE";
+    public const string Bounded = "BOUNDED";
 }

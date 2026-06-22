@@ -3101,6 +3101,21 @@
                     { "isDeleted", 1 }
                 }
             ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_workReportStatisticRebuildJobs_scope_status",
+                key: new BsonDocument
+                {
+                    { "scopeKind", 1 },
+                    { "workId", 1 },
+                    { "workAssignmentId", 1 },
+                    { "flowInstanceId", 1 },
+                    { "periodInstanceKey", 1 },
+                    { "dynamicFormTemplateId", 1 },
+                    { "status", 1 },
+                    { "isDeleted", 1 }
+                }
+            ), ct);
         }
 
         private static async Task EnsureWorkReportLabelStatValuesAsync(
@@ -3355,6 +3370,24 @@
             ), ct);
 
             await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_workReportTableStatValues_flow_period_metric_concept",
+                key: new BsonDocument
+                {
+                    { "workId", 1 },
+                    { "flowInstanceId", 1 },
+                    { "flowEffectiveStatus", 1 },
+                    { "periodInstanceKey", 1 },
+                    { "dynamicFormTemplateId", 1 },
+                    { "blockId", 1 },
+                    { "metricKey", 1 },
+                    { "conceptCode", 1 },
+                    { "reportStatus", 1 },
+                    { "isDeleted", 1 }
+                },
+                partial: new BsonDocument("flowInstanceId", new BsonDocument("$type", "objectId"))
+            ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
                 name: "ix_workReportTableStatValues_payload_freshness",
                 key: new BsonDocument
                 {
@@ -3534,6 +3567,24 @@
                     { "reportStatus", 1 },
                     { "isDeleted", 1 }
                 }
+            ), ct);
+
+            await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(
+                name: "ix_workReportFieldStatValues_flow_period_field_concept",
+                key: new BsonDocument
+                {
+                    { "workId", 1 },
+                    { "flowInstanceId", 1 },
+                    { "flowEffectiveStatus", 1 },
+                    { "periodInstanceKey", 1 },
+                    { "dynamicFormTemplateId", 1 },
+                    { "fieldId", 1 },
+                    { "conceptCode", 1 },
+                    { "bucketKey", 1 },
+                    { "reportStatus", 1 },
+                    { "isDeleted", 1 }
+                },
+                partial: new BsonDocument("flowInstanceId", new BsonDocument("$type", "objectId"))
             ), ct);
 
             await MongoIndexEnsureHelper.EnsureBySpecAsync(col, new IndexSpec(

@@ -124,6 +124,7 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
             var ancestorAssignmentIds = ExtractAncestorAssignmentIds(assignment, report.WorkAssignmentId);
             var sourceWindow = WorkAssignmentReportTemporalPolicy.ResolveSourceWindow(report);
             var projectionContext = WorkReportStatisticProjectionContextBuilder.From(report, assignment, period, payload);
+            var conceptMap = WorkReportStatisticConceptMapBuilder.From(report);
 
             var rows = values.Select(value => new WorkReportFieldStatValue
             {
@@ -136,6 +137,18 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
                 ReportIsActive = projectionContext.ReportIsActive,
                 RootAssignmentId = assignment?.RootAssignmentId,
                 AncestorAssignmentIds = ancestorAssignmentIds,
+                FlowTemplateId = projectionContext.FlowTemplateId,
+                FlowTemplateVersionNo = projectionContext.FlowTemplateVersionNo,
+                FlowInstanceId = projectionContext.FlowInstanceId,
+                FlowStepId = projectionContext.FlowStepId,
+                FlowStepCode = projectionContext.FlowStepCode,
+                FlowStepOrder = projectionContext.FlowStepOrder,
+                FlowBranchId = projectionContext.FlowBranchId,
+                ParentFlowBranchId = projectionContext.ParentFlowBranchId,
+                FlowAttemptNo = projectionContext.FlowAttemptNo,
+                FlowRole = projectionContext.FlowRole,
+                FlowEffectiveStatus = projectionContext.FlowEffectiveStatus,
+                InvalidatedByFlowEventId = projectionContext.InvalidatedByFlowEventId,
                 WorkReportPeriodId = report.WorkReportPeriodId,
                 WorkAssignmentReportId = report.Id,
                 DynamicFormTemplateId = dynamicFormTemplateId,
@@ -145,6 +158,7 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
                 FieldKey = value.Field.FieldKey,
                 FieldLabel = value.Field.FieldLabel,
                 FieldType = value.Field.FieldType,
+                ConceptCode = value.Field.ConceptCode ?? conceptMap.ResolveField(value.Field.FieldId, value.Field.FieldKey),
                 ShowInTree = value.Field.ShowInTree,
                 ShowInDetail = value.Field.ShowInDetail,
                 BucketKey = value.BucketKey,
@@ -1298,6 +1312,8 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
         var fieldType = NormalizeFieldType(field.Type);
         var fieldKey = string.IsNullOrWhiteSpace(field.Key) ? fieldId : field.Key.Trim();
         var label = ResolveFieldDisplayName(field) ?? fieldKey;
+        var conceptCode = WorkReportStatisticConceptMap.NormalizeConceptCode(
+            PickNonBlank(field.ConceptCode, field.Statistic?.ConceptCode));
 
         var options = (field.Options ?? new List<DynamicFormFieldOption>())
             .Select(x => new FieldOption(
@@ -1313,6 +1329,7 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
             fieldKey,
             label,
             fieldType,
+            conceptCode,
             field.Statistic?.ShowInTree ?? false,
             field.Statistic?.ShowInDetail ?? true,
             options);
@@ -1753,6 +1770,7 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
         public string? DisplayName { get; set; }
         public string? Label { get; set; }
         public string? Type { get; set; }
+        public string? ConceptCode { get; set; }
         public bool IsStatistic { get; set; }
         public DynamicFormStatisticDefinition? Statistic { get; set; }
         public List<DynamicFormFieldOption>? Options { get; set; }
@@ -1760,6 +1778,7 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
 
     private sealed class DynamicFormStatisticDefinition
     {
+        public string? ConceptCode { get; set; }
         public bool ShowInDetail { get; set; } = true;
         public bool ShowInTree { get; set; }
     }
@@ -1777,6 +1796,7 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
         string FieldKey,
         string FieldLabel,
         string FieldType,
+        string? ConceptCode,
         bool ShowInTree,
         bool ShowInDetail,
         List<FieldOption> Options);

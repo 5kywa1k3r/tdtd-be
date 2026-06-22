@@ -2,6 +2,7 @@ using Microsoft.Extensions.Configuration;
 using MongoDB.Bson;
 using MongoDB.Driver;
 using System.Text.RegularExpressions;
+using tdtd_be.Common.Errors;
 using tdtd_be.Common.Time;
 using tdtd_be.Data;
 using tdtd_be.Models;
@@ -43,16 +44,52 @@ public sealed class WorkReportStatisticRebuildJobService : IWorkReportStatisticR
         string requestedByUserId,
         bool highPriority,
         CancellationToken ct = default)
+        => await EnqueueForScopeAsync(
+            template,
+            new StatisticRebuildScopeRequest { DynamicFormTemplateId = template.Id },
+            WorkReportStatisticRebuildJobScopeKinds.Template,
+            requestedByUserId,
+            highPriority,
+            ct);
+
+    public async Task<StatisticRebuildJobEnqueueResult> EnqueueForBoundedScopeAsync(
+        StatisticRebuildScopeRequest scope,
+        string requestedByUserId,
+        bool highPriority,
+        CancellationToken ct = default)
+    {
+        var normalized = NormalizeScope(scope);
+        var template = await _ctx.DynamicFormTemplates
+            .Find(x => x.Id == normalized.DynamicFormTemplateId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct)
+            ?? throw AppExceptionFactory.NotFound(
+                AppErrorCode.DYNAMIC_FORM_TEMPLATE_NOT_FOUND,
+                new { dynamicFormTemplateId = normalized.DynamicFormTemplateId });
+
+        return await EnqueueForScopeAsync(
+            template,
+            normalized,
+            WorkReportStatisticRebuildJobScopeKinds.Bounded,
+            requestedByUserId,
+            highPriority,
+            ct);
+    }
+
+    private async Task<StatisticRebuildJobEnqueueResult> EnqueueForScopeAsync(
+        DynamicFormTemplate template,
+        StatisticRebuildScopeRequest scope,
+        string scopeKind,
+        string requestedByUserId,
+        bool highPriority,
+        CancellationToken ct)
     {
         var now = _time.UtcNow;
+        var reportFilter = await BuildReportScopeFilterAsync(scope, lastReportId: null, ct);
         var totalReports = await _ctx.WorkAssignmentReports.CountDocumentsAsync(
-            Builders<WorkAssignmentReport>.Filter.Eq(x => x.DynamicFormTemplateId, template.Id)
-            & Builders<WorkAssignmentReport>.Filter.Eq(x => x.IsCurrent, true)
-            & Builders<WorkAssignmentReport>.Filter.Ne(x => x.IsActive, false)
-            & Builders<WorkAssignmentReport>.Filter.Eq(x => x.IsDeleted, false),
+            reportFilter,
             cancellationToken: ct);
         var scheduledAtUtc = highPriority ? now : _time.NextLocalMidnightUtc(now);
-        var dedupeKey = $"dynamic-form-statistic-rebuild:{template.Id}";
+        var dedupeKey = BuildDedupeKey(scopeKind, scope);
         var priority = highPriority
             ? WorkReportStatisticRebuildJobPriorities.High
             : WorkReportStatisticRebuildJobPriorities.Normal;
@@ -69,6 +106,12 @@ public sealed class WorkReportStatisticRebuildJobService : IWorkReportStatisticR
             .Set(x => x.DynamicFormTemplateId, template.Id)
             .Set(x => x.DynamicFormTemplateCode, template.Code)
             .Set(x => x.DynamicFormTemplateName, template.Name)
+            .Set(x => x.ScopeKind, scopeKind)
+            .Set(x => x.WorkId, scope.WorkId)
+            .Set(x => x.WorkAssignmentId, scope.WorkAssignmentId)
+            .Set(x => x.FlowInstanceId, scope.FlowInstanceId)
+            .Set(x => x.FlowEffectiveStatus, scope.FlowEffectiveStatus)
+            .Set(x => x.PeriodInstanceKey, scope.PeriodInstanceKey)
             .Set(x => x.RequestedByUserId, requestedByUserId)
             .Set(x => x.Priority, priority)
             .Set(x => x.Status, WorkReportStatisticRebuildJobStatuses.Pending)
@@ -215,14 +258,7 @@ public sealed class WorkReportStatisticRebuildJobService : IWorkReportStatisticR
         int batchSize,
         CancellationToken ct)
     {
-        var fb = Builders<WorkAssignmentReport>.Filter;
-        var filter = fb.Eq(x => x.DynamicFormTemplateId, job.DynamicFormTemplateId)
-            & fb.Eq(x => x.IsCurrent, true)
-            & fb.Ne(x => x.IsActive, false)
-            & fb.Eq(x => x.IsDeleted, false);
-
-        if (!string.IsNullOrWhiteSpace(job.LastReportId))
-            filter &= fb.Gt(x => x.Id, job.LastReportId);
+        var filter = await BuildReportScopeFilterAsync(ToScopeRequest(job), job.LastReportId, ct);
 
         var reports = await _ctx.WorkAssignmentReports
             .Find(filter)
@@ -305,6 +341,158 @@ public sealed class WorkReportStatisticRebuildJobService : IWorkReportStatisticR
 
         if (completed)
             await NotifyCompletedAsync(job, ct);
+    }
+
+    private async Task<FilterDefinition<WorkAssignmentReport>> BuildReportScopeFilterAsync(
+        StatisticRebuildScopeRequest scope,
+        string? lastReportId,
+        CancellationToken ct)
+    {
+        scope = NormalizeScope(scope);
+
+        var fb = Builders<WorkAssignmentReport>.Filter;
+        var filter = fb.Eq(x => x.DynamicFormTemplateId, scope.DynamicFormTemplateId)
+            & fb.Eq(x => x.IsCurrent, true)
+            & fb.Ne(x => x.IsActive, false)
+            & fb.Eq(x => x.IsDeleted, false);
+
+        if (!string.IsNullOrWhiteSpace(scope.WorkId))
+            filter &= fb.Eq(x => x.WorkId, scope.WorkId);
+
+        if (!string.IsNullOrWhiteSpace(scope.WorkAssignmentId))
+            filter &= fb.Eq(x => x.WorkAssignmentId, scope.WorkAssignmentId);
+
+        if (!string.IsNullOrWhiteSpace(scope.PeriodInstanceKey))
+            filter &= fb.Eq(x => x.PeriodInstanceKey, scope.PeriodInstanceKey);
+
+        if (HasFlowScope(scope))
+        {
+            var assignmentIds = await ResolveFlowScopeAssignmentIdsAsync(scope, ct);
+            filter &= assignmentIds.Count == 0
+                ? fb.Eq(x => x.WorkAssignmentId, ObjectId.Empty.ToString())
+                : fb.In(x => x.WorkAssignmentId, assignmentIds);
+        }
+
+        if (!string.IsNullOrWhiteSpace(lastReportId))
+            filter &= fb.Gt(x => x.Id, lastReportId);
+
+        return filter;
+    }
+
+    private async Task<List<string>> ResolveFlowScopeAssignmentIdsAsync(
+        StatisticRebuildScopeRequest scope,
+        CancellationToken ct)
+    {
+        var fb = Builders<WorkAssignment>.Filter;
+        var filter = fb.Eq(x => x.IsDeleted, false);
+
+        if (!string.IsNullOrWhiteSpace(scope.WorkId))
+            filter &= fb.Eq(x => x.WorkId, scope.WorkId);
+
+        if (!string.IsNullOrWhiteSpace(scope.FlowInstanceId))
+            filter &= fb.Eq(x => x.FlowInstanceId, scope.FlowInstanceId);
+
+        if (!string.IsNullOrWhiteSpace(scope.FlowEffectiveStatus))
+            filter &= fb.Eq(x => x.FlowEffectiveStatus, scope.FlowEffectiveStatus);
+
+        if (!string.IsNullOrWhiteSpace(scope.WorkAssignmentId))
+            filter &= fb.Eq(x => x.Id, scope.WorkAssignmentId);
+
+        return await _ctx.WorkAssignments
+            .Find(filter)
+            .Project(x => x.Id)
+            .ToListAsync(ct);
+    }
+
+    private static bool HasFlowScope(StatisticRebuildScopeRequest scope)
+        => !string.IsNullOrWhiteSpace(scope.FlowInstanceId) ||
+           !string.IsNullOrWhiteSpace(scope.FlowEffectiveStatus);
+
+    private static StatisticRebuildScopeRequest ToScopeRequest(WorkReportStatisticRebuildJob job)
+        => new()
+        {
+            DynamicFormTemplateId = job.DynamicFormTemplateId,
+            WorkId = job.WorkId,
+            WorkAssignmentId = job.WorkAssignmentId,
+            FlowInstanceId = job.FlowInstanceId,
+            FlowEffectiveStatus = job.FlowEffectiveStatus,
+            PeriodInstanceKey = job.PeriodInstanceKey
+        };
+
+    private static StatisticRebuildScopeRequest NormalizeScope(StatisticRebuildScopeRequest? scope)
+    {
+        scope ??= new StatisticRebuildScopeRequest();
+        var dynamicFormTemplateId = NormalizeRequiredObjectId(scope.DynamicFormTemplateId, "dynamicFormTemplateId");
+        return new StatisticRebuildScopeRequest
+        {
+            DynamicFormTemplateId = dynamicFormTemplateId,
+            WorkId = NormalizeOptionalObjectId(scope.WorkId, "workId"),
+            WorkAssignmentId = NormalizeOptionalObjectId(scope.WorkAssignmentId, "workAssignmentId"),
+            FlowInstanceId = NormalizeOptionalObjectId(scope.FlowInstanceId, "flowInstanceId"),
+            FlowEffectiveStatus = NormalizeOptionalText(scope.FlowEffectiveStatus)?.ToUpperInvariant(),
+            PeriodInstanceKey = NormalizeOptionalText(scope.PeriodInstanceKey)
+        };
+    }
+
+    private static string BuildDedupeKey(string scopeKind, StatisticRebuildScopeRequest scope)
+    {
+        if (scopeKind == WorkReportStatisticRebuildJobScopeKinds.Template &&
+            string.IsNullOrWhiteSpace(scope.WorkId) &&
+            string.IsNullOrWhiteSpace(scope.WorkAssignmentId) &&
+            string.IsNullOrWhiteSpace(scope.FlowInstanceId) &&
+            string.IsNullOrWhiteSpace(scope.FlowEffectiveStatus) &&
+            string.IsNullOrWhiteSpace(scope.PeriodInstanceKey))
+        {
+            return $"dynamic-form-statistic-rebuild:{scope.DynamicFormTemplateId}";
+        }
+
+        return string.Join(
+            ";",
+            $"dynamic-form-statistic-rebuild:{scope.DynamicFormTemplateId}",
+            $"scope={scopeKind}",
+            $"work={scope.WorkId ?? "*"}",
+            $"assignment={scope.WorkAssignmentId ?? "*"}",
+            $"flow={scope.FlowInstanceId ?? "*"}",
+            $"flowStatus={scope.FlowEffectiveStatus ?? "*"}",
+            $"period={scope.PeriodInstanceKey ?? "*"}");
+    }
+
+    private static string NormalizeRequiredObjectId(string? value, string field)
+    {
+        value = value?.Trim();
+        if (string.IsNullOrWhiteSpace(value))
+            throw AppExceptionFactory.BadRequest(AppErrorCode.COMMON_ARGUMENT_REQUIRED, new { field });
+
+        if (!ObjectId.TryParse(value, out _))
+        {
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.COMMON_VALIDATION_FAILED,
+                new { field, reason = "OBJECT_ID_INVALID" });
+        }
+
+        return value;
+    }
+
+    private static string? NormalizeOptionalObjectId(string? value, string field)
+    {
+        value = value?.Trim();
+        if (string.IsNullOrWhiteSpace(value))
+            return null;
+
+        if (!ObjectId.TryParse(value, out _))
+        {
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.COMMON_VALIDATION_FAILED,
+                new { field, reason = "OBJECT_ID_INVALID" });
+        }
+
+        return value;
+    }
+
+    private static string? NormalizeOptionalText(string? value)
+    {
+        value = value?.Trim();
+        return string.IsNullOrWhiteSpace(value) ? null : value;
     }
 
     private async Task CompleteJobAsync(WorkReportStatisticRebuildJob job, CancellationToken ct)

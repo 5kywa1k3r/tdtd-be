@@ -130,6 +130,7 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
             var ancestorAssignmentIds = ExtractAncestorAssignmentIds(assignment, report.WorkAssignmentId);
             var sourceWindow = WorkAssignmentReportTemporalPolicy.ResolveSourceWindow(report);
             var projectionContext = WorkReportStatisticProjectionContextBuilder.From(report, assignment, period, payload);
+            var conceptMap = WorkReportStatisticConceptMapBuilder.From(report);
 
             var rows = metricValues.Select(value => new WorkReportTableStatValue
             {
@@ -142,6 +143,18 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
                 ReportIsActive = projectionContext.ReportIsActive,
                 RootAssignmentId = assignment?.RootAssignmentId,
                 AncestorAssignmentIds = ancestorAssignmentIds,
+                FlowTemplateId = projectionContext.FlowTemplateId,
+                FlowTemplateVersionNo = projectionContext.FlowTemplateVersionNo,
+                FlowInstanceId = projectionContext.FlowInstanceId,
+                FlowStepId = projectionContext.FlowStepId,
+                FlowStepCode = projectionContext.FlowStepCode,
+                FlowStepOrder = projectionContext.FlowStepOrder,
+                FlowBranchId = projectionContext.FlowBranchId,
+                ParentFlowBranchId = projectionContext.ParentFlowBranchId,
+                FlowAttemptNo = projectionContext.FlowAttemptNo,
+                FlowRole = projectionContext.FlowRole,
+                FlowEffectiveStatus = projectionContext.FlowEffectiveStatus,
+                InvalidatedByFlowEventId = projectionContext.InvalidatedByFlowEventId,
                 WorkReportPeriodId = report.WorkReportPeriodId,
                 WorkAssignmentReportId = report.Id,
                 DynamicFormTemplateId = NormalizeObjectIdOrNull(report.DynamicFormTemplateId),
@@ -156,6 +169,7 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
                     out var metricLabelCode)
                     ? metricLabelCode
                     : null,
+                ConceptCode = value.ConceptCode ?? conceptMap.ResolveTable(value.BlockId, value.ColumnKey, value.MetricKey),
                 RowKey = value.RowKey,
                 ColumnKey = value.ColumnKey,
                 SourceKey = value.SourceKey,
@@ -1008,6 +1022,7 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
                    columnKey,
                    $"table:{blockId}.column:{columnKey}",
                    "NUMBER",
+                   null,
                    Array.Empty<MetricOption>());
     }
 
@@ -1024,6 +1039,7 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
                    "APPEND_COLUMNS",
                    $"table:{blockId}.row:{rowKey}",
                    "NUMBER",
+                   null,
                    Array.Empty<MetricOption>());
     }
 
@@ -1042,6 +1058,7 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
                    columnKey,
                    metricKey,
                    "NUMBER",
+                   null,
                    Array.Empty<MetricOption>());
     }
 
@@ -1177,6 +1194,7 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
             metric.ColumnKey,
             sourceKey,
             NormalizeDataType(metric.DataType),
+            metric.ConceptCode,
             numberValue,
             textValue,
             booleanValue,
@@ -1208,6 +1226,7 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
                     columnKey,
                     metricKey,
                     NormalizeDataType(item.DataType),
+                    WorkReportStatisticConceptMap.NormalizeConceptCode(item.ConceptCode),
                     NormalizeMetricOptions(item.Options));
             })
             .GroupBy(x => tableMode == "APPEND_ROWS"
@@ -1244,6 +1263,7 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
                     columnKey,
                     metricKey,
                     "NUMBER",
+                    WorkReportStatisticConceptMap.NormalizeConceptCode(item.ConceptCode),
                     Array.Empty<MetricOption>());
             })
             .GroupBy(x => x.MetricKey, StringComparer.Ordinal)
@@ -1291,6 +1311,7 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
                 columnKey,
                 BuildMetricKey(blockId, rowKey, columnKey),
                 "NUMBER",
+                null,
                 Array.Empty<MetricOption>()));
         }
 
@@ -1739,6 +1760,7 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
         public string? RowKey { get; set; }
         public string? ColumnKey { get; set; }
         public string? MetricKey { get; set; }
+        public string? ConceptCode { get; set; }
     }
 
     private sealed class TableMetricDefinition
@@ -1748,6 +1770,7 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
         public string? RowKey { get; set; }
         public string? ColumnKey { get; set; }
         public string? DataType { get; set; }
+        public string? ConceptCode { get; set; }
         public List<TableMetricOption>? Options { get; set; }
     }
 
@@ -1798,6 +1821,7 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
         string ColumnKey,
         string SourceKey,
         string DataType,
+        string? ConceptCode,
         decimal? NumberValue,
         string? TextValue,
         bool? BooleanValue,
@@ -1811,6 +1835,7 @@ public sealed class WorkReportTableStatisticsService : IWorkReportTableStatistic
         string ColumnKey,
         string MetricKey,
         string DataType,
+        string? ConceptCode,
         MetricOption[] Options);
 
     private sealed record MetricOption(

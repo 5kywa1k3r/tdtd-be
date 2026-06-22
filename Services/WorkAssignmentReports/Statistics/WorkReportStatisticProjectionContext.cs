@@ -9,6 +9,18 @@ internal sealed record WorkReportStatisticProjectionContext(
     string? AssigneeUnitId,
     bool AssignmentIsActive,
     bool ReportIsActive,
+    string? FlowTemplateId,
+    int? FlowTemplateVersionNo,
+    string? FlowInstanceId,
+    string? FlowStepId,
+    string? FlowStepCode,
+    int? FlowStepOrder,
+    string? FlowBranchId,
+    string? ParentFlowBranchId,
+    int? FlowAttemptNo,
+    string? FlowRole,
+    string? FlowEffectiveStatus,
+    string? InvalidatedByFlowEventId,
     int SourcePayloadRevision,
     string? SourcePayloadHash);
 
@@ -28,10 +40,25 @@ internal static class WorkReportStatisticProjectionContextBuilder
             NormalizeObjectIdOrNull(period?.AssigneeUnitId ?? assignee?.UnitId),
             assignment?.IsActive == true,
             report.IsActive != false,
+            NormalizeObjectIdOrNull(assignment?.FlowTemplateId),
+            assignment?.FlowTemplateVersionNo,
+            NormalizeObjectIdOrNull(assignment?.FlowInstanceId),
+            NormalizeTextOrNull(assignment?.FlowStepId),
+            NormalizeTextOrNull(assignment?.FlowStepCode),
+            assignment?.FlowStepOrder,
+            NormalizeObjectIdOrNull(assignment?.FlowBranchId),
+            NormalizeObjectIdOrNull(assignment?.ParentFlowBranchId),
+            assignment?.FlowAttemptNo,
+            NormalizeTextOrNull(assignment?.FlowRole),
+            NormalizeTextOrNull(assignment?.FlowEffectiveStatus),
+            NormalizeObjectIdOrNull(assignment?.InvalidatedByFlowEventId),
             payload.PayloadRevision,
             payload.PayloadHash);
     }
 
     private static string? NormalizeObjectIdOrNull(string? value)
         => ObjectId.TryParse(value, out _) ? value : null;
+
+    private static string? NormalizeTextOrNull(string? value)
+        => string.IsNullOrWhiteSpace(value) ? null : value.Trim();
 }

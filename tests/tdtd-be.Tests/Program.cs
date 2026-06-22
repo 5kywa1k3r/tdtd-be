@@ -71,6 +71,9 @@ var tests = new (string Name, Action Run)[]
     ("dynamic flow branch mutation planner invalidates downstream branches", DynamicFlowBranchMutationPlannerInvalidatesDownstreamBranches),
     ("dynamic flow branch visibility inherits downstream units", DynamicFlowBranchVisibilityInheritsDownstreamUnits),
     ("dynamic flow branch visibility hides sibling branches", DynamicFlowBranchVisibilityHidesSiblingBranches),
+    ("statistic projection context captures dynamic flow metadata", StatisticProjectionContextCapturesDynamicFlowMetadata),
+    ("statistic concept map resolves dynamic flow mapping targets", StatisticConceptMapResolvesDynamicFlowMappingTargets),
+    ("statistic rebuild job dedupe key includes bounded flow scope", StatisticRebuildJobDedupeKeyIncludesBoundedFlowScope),
     ("periodic assignment date range caps occurrence validation", ValidatesPeriodicAssignmentDateRange),
     ("materialize job backfills elapsed monthly periods before rolling future", MaterializeJobBackfillsElapsedMonthlyPeriodsBeforeRollingFuture),
     ("materialize job limits multi-day monthly schedules to exact occurrences", MaterializeJobLimitsMonthlyMultiDayScheduleToExactOccurrences),
@@ -1664,6 +1667,132 @@ static void DynamicFlowBranchVisibilityHidesSiblingBranches()
     AssertTrue(
         DynamicFlowBranchVisibility.CanUnitRead(branchB, issuerUnitId),
         "issuer unit should see branches it created");
+}
+
+static void StatisticProjectionContextCapturesDynamicFlowMetadata()
+{
+    var report = ReadyPayloadReport();
+    report.AssigneeUserId = UserId(21);
+    var period = new WorkReportPeriod
+    {
+        Id = ObjectId(41),
+        AssigneeUserId = report.AssigneeUserId,
+        AssigneeUnitId = ObjectId(42)
+    };
+    var assignment = new WorkAssignment
+    {
+        Id = report.WorkAssignmentId,
+        WorkId = report.WorkId,
+        IsActive = true,
+        Assignees = new List<UserRef>
+        {
+            new() { UserId = report.AssigneeUserId, UnitId = ObjectId(43) }
+        },
+        FlowTemplateId = ObjectId(44),
+        FlowTemplateVersionNo = 5,
+        FlowInstanceId = ObjectId(45),
+        FlowStepId = "review",
+        FlowStepCode = "REVIEW",
+        FlowStepOrder = 2,
+        FlowBranchId = ObjectId(46),
+        ParentFlowBranchId = ObjectId(47),
+        FlowAttemptNo = 3,
+        FlowRole = "ASSIGNEE",
+        FlowEffectiveStatus = DynamicFlowEffectiveStatuses.Effective,
+        InvalidatedByFlowEventId = ObjectId(48)
+    };
+
+    var context = WorkReportStatisticProjectionContextBuilder.From(
+        report,
+        assignment,
+        period,
+        MatchingPayloadSnapshot(report, isExternalPayload: true, payloadHashVerified: true));
+
+    AssertEqual(period.AssigneeUnitId, context.AssigneeUnitId, "period unit should override assignment assignee unit");
+    AssertEqual(assignment.FlowTemplateId, context.FlowTemplateId, "flow template should be projected");
+    AssertEqual(assignment.FlowTemplateVersionNo, context.FlowTemplateVersionNo, "flow template version should be projected");
+    AssertEqual(assignment.FlowInstanceId, context.FlowInstanceId, "flow instance should be projected");
+    AssertEqual(assignment.FlowStepId, context.FlowStepId, "flow step id should be projected");
+    AssertEqual(assignment.FlowStepCode, context.FlowStepCode, "flow step code should be projected");
+    AssertEqual(assignment.FlowStepOrder, context.FlowStepOrder, "flow step order should be projected");
+    AssertEqual(assignment.FlowBranchId, context.FlowBranchId, "flow branch should be projected");
+    AssertEqual(assignment.ParentFlowBranchId, context.ParentFlowBranchId, "parent flow branch should be projected");
+    AssertEqual(assignment.FlowAttemptNo, context.FlowAttemptNo, "flow attempt should be projected");
+    AssertEqual(assignment.FlowRole, context.FlowRole, "flow role should be projected");
+    AssertEqual(assignment.FlowEffectiveStatus, context.FlowEffectiveStatus, "flow status should be projected");
+    AssertEqual(assignment.InvalidatedByFlowEventId, context.InvalidatedByFlowEventId, "invalidation event should be projected");
+}
+
+static void StatisticConceptMapResolvesDynamicFlowMappingTargets()
+{
+    var report = ReadyPayloadReport();
+    report.SummarySourceJson = """
+    {
+      "kind": "DYNAMIC_FLOW_MAPPING",
+      "mappingRules": [
+        {
+          "targetFieldId": "f_total",
+          "targetFieldKey": "total",
+          "conceptCode": "total"
+        },
+        {
+          "targetBlockId": "b1",
+          "targetColumnKey": "amount",
+          "conceptCode": "amount"
+        }
+      ],
+      "changes": [
+        {
+          "targetKind": "FIELD",
+          "targetKey": "f_note",
+          "conceptCode": "note"
+        },
+        {
+          "targetKind": "TABLE",
+          "targetKey": "b1:count",
+          "conceptCode": "count"
+        }
+      ]
+    }
+    """;
+
+    var map = WorkReportStatisticConceptMapBuilder.From(report);
+
+    AssertEqual("TOTAL", map.ResolveField("f_total", "total"), "field concept should resolve from mapping rule");
+    AssertEqual("NOTE", map.ResolveField("f_note", null), "field concept should resolve from mapping change");
+    AssertEqual("AMOUNT", map.ResolveTable("b1", "amount", null), "table concept should resolve by block and column");
+    AssertEqual("COUNT", map.ResolveTable("b1", "count", null), "table concept should resolve from target key");
+}
+
+static void StatisticRebuildJobDedupeKeyIncludesBoundedFlowScope()
+{
+    var scope = new StatisticRebuildScopeRequest
+    {
+        DynamicFormTemplateId = ObjectId(55),
+        WorkId = ObjectId(56),
+        WorkAssignmentId = ObjectId(57),
+        FlowInstanceId = ObjectId(58),
+        FlowEffectiveStatus = "effective",
+        PeriodInstanceKey = "2026-06"
+    };
+
+    var normalized = InvokePrivateStatic<StatisticRebuildScopeRequest>(
+        typeof(WorkReportStatisticRebuildJobService),
+        "NormalizeScope",
+        scope);
+    var dedupeKey = InvokePrivateStatic<string>(
+        typeof(WorkReportStatisticRebuildJobService),
+        "BuildDedupeKey",
+        tdtd_be.Models.Statistics.WorkReportStatisticRebuildJobScopeKinds.Bounded,
+        normalized);
+
+    AssertEqual("EFFECTIVE", normalized.FlowEffectiveStatus, "flow status should normalize for bounded job scope");
+    AssertTrue(dedupeKey.Contains($"dynamic-form-statistic-rebuild:{scope.DynamicFormTemplateId}"), "dedupe key should include template");
+    AssertTrue(dedupeKey.Contains($"work={scope.WorkId}"), "dedupe key should include work scope");
+    AssertTrue(dedupeKey.Contains($"assignment={scope.WorkAssignmentId}"), "dedupe key should include assignment scope");
+    AssertTrue(dedupeKey.Contains($"flow={scope.FlowInstanceId}"), "dedupe key should include flow scope");
+    AssertTrue(dedupeKey.Contains("flowStatus=EFFECTIVE"), "dedupe key should include normalized flow status");
+    AssertTrue(dedupeKey.Contains("period=2026-06"), "dedupe key should include period scope");
 }
 
 static void ValidatesPeriodicAssignmentDateRange()
