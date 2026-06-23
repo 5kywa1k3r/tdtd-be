@@ -2882,6 +2882,7 @@ public sealed class DynamicFormService : IDynamicFormService
             "fullDate" => LabelDataTypes.Date,
             "boolean" => LabelDataTypes.Boolean,
             "longText" => LabelDataTypes.StringList,
+            "richText" => LabelDataTypes.StringList,
             "stringList" => LabelDataTypes.StringList,
             "singleSelect" => LabelDataTypes.ShortText,
             "multiSelect" => LabelDataTypes.ShortText,

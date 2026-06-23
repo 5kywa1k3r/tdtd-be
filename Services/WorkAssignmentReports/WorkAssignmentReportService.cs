@@ -4641,6 +4641,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             "fullDate" => RuntimeDataTypeFullDate,
             "boolean" => RuntimeDataTypeBoolean,
             "longText" => RuntimeDataTypeStringList,
+            "richText" => RuntimeDataTypeStringList,
             "stringList" => RuntimeDataTypeStringList,
             "singleSelect" => RuntimeDataTypeShortText,
             "multiSelect" => RuntimeDataTypeShortTextList,

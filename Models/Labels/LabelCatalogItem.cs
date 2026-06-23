@@ -108,6 +108,8 @@ public static class LabelDataTypes
             "MULTISELECT" => ShortText,
             "LONGDATE" => StringList,
             "LONGTEXT" => StringList,
+            "RICH_TEXT" => StringList,
+            "RICHTEXT" => StringList,
             _ => Number
         };
     }

@@ -432,8 +432,19 @@ public sealed class WorkDocumentsController : ControllerBase
     private static string BuildAssignmentLabel(WorkAssignment assignment)
     {
         var code = string.IsNullOrWhiteSpace(assignment.Code) ? assignment.Id : assignment.Code;
-        var name = assignment.DynamicFormTemplateName;
-        return string.IsNullOrWhiteSpace(name) ? code : $"{code} - {name}";
+        var name = assignment.Name;
+        if (string.IsNullOrWhiteSpace(name))
+            name = assignment.DynamicFormTemplateName;
+
+        return string.IsNullOrWhiteSpace(name)
+            ? LimitSummaryText(code)
+            : LimitSummaryText(name);
+    }
+
+    private static string LimitSummaryText(string value)
+    {
+        var trimmed = value.Trim();
+        return trimmed.Length <= 5000 ? trimmed : trimmed[..5000];
     }
 
     private static string? NormalizeScope(string? value)

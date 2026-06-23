@@ -1752,6 +1752,7 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
             "boolean" => "boolean",
             "stringList" => "stringList",
             "longText" => "stringList",
+            "richText" => "stringList",
             _ => "shortText"
         };
     }

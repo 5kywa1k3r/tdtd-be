@@ -376,6 +376,7 @@ public static class WorkAssignmentAutoApproveConditionNormalizer
             "boolean" => "boolean",
             "shortText" => "shortText",
             "longText" => "longText",
+            "richText" => "stringList",
             "stringList" => "stringList",
             "singleSelect" => "singleSelect",
             "multiSelect" => "multiSelect",

@@ -2591,7 +2591,7 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
             "boolean" => "BOOLEAN",
             "singleSelect" => "SINGLE_SELECT",
             "multiSelect" => "MULTI_SELECT",
-            "stringList" => "STRING_LIST",
+            "stringList" or "richText" => "STRING_LIST",
             _ => "TEXT"
         };
 
@@ -2652,7 +2652,7 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
 
     private static List<string> ReadDisplayValues(JsonElement value, FieldDefinition field)
     {
-        if (field.FieldType == "multiSelect" || field.FieldType == "stringList")
+        if (field.FieldType == "multiSelect" || field.FieldType == "stringList" || field.FieldType == "richText")
             return ReadStringListValues(value)
                 .Select(x => ResolveOptionLabel(field.Options, x))
                 .Where(x => !string.IsNullOrWhiteSpace(x))

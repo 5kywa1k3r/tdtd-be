@@ -2465,26 +2465,24 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
 
     private static string BuildNodeSummaryText(WorkAssignment assignment)
     {
-        var parts = new List<string>();
+        var text = FirstNonBlank(
+            assignment.Name,
+            assignment.DynamicFormTemplateName,
+            assignment.DynamicExcelName,
+            assignment.Description,
+            assignment.Code,
+            assignment.Id);
 
-        if (assignment.Assignees is { Count: > 0 })
-            parts.Add($"{assignment.Assignees.Count} người phụ trách");
+        return LimitSummaryText(text);
+    }
 
-        if (assignment.ActiveChildCount > 0)
-            parts.Add($"{assignment.ActiveChildCount} nhánh con");
+    private static string FirstNonBlank(params string?[] values)
+        => values.FirstOrDefault(value => !string.IsNullOrWhiteSpace(value))?.Trim() ?? string.Empty;
 
-        if (assignment.HasOverduePeriod)
-            parts.Add("có báo cáo chậm");
-        else if (assignment.HasAnyDuePeriod)
-            parts.Add("có kỳ báo cáo");
-
-        if (!string.IsNullOrWhiteSpace(assignment.LatestPeriodKey))
-            parts.Add($"kỳ gần nhất {assignment.LatestPeriodKey}");
-
-        if (!string.IsNullOrWhiteSpace(assignment.Description))
-            parts.Add(assignment.Description.Trim());
-
-        return string.Join("; ", parts);
+    private static string LimitSummaryText(string value)
+    {
+        var trimmed = value.Trim();
+        return trimmed.Length <= 5000 ? trimmed : trimmed[..5000];
     }
 
     private static DashboardMindMapCoverageDto BuildCoverage(

@@ -3659,7 +3659,7 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
             "singleSelect" => "singleSelect",
             "multiSelect" => "multiSelect",
             "boolean" => "boolean",
-            "stringList" or "longText" => "stringList",
+            "stringList" or "longText" or "richText" => "stringList",
             _ => "shortText"
         };
     }
