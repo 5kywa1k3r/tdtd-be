@@ -11,10 +11,30 @@ public interface IWorkReportTableStatisticsService
         string? actorUserId,
         CancellationToken ct = default);
 
+    Task<ReportStatisticAggregateKey?> StageGenerationValuesForReportAsync(
+        string reportId,
+        WorkReportDirectGenerationContext generation,
+        string? actorUserId,
+        CancellationToken ct = default);
+
+    Task StageGenerationValuesForReportsAsync(
+        IReadOnlyCollection<string> reportIds,
+        WorkReportDirectGenerationContext generation,
+        string? actorUserId,
+        CancellationToken ct = default);
+
     Task RebuildAggregatesForWorkPeriodAsync(
         string workId,
         string? periodInstanceKey,
         string? dynamicFormTemplateId,
+        string? actorUserId,
+        CancellationToken ct = default);
+
+    Task StageGenerationAggregatesForWorkPeriodAsync(
+        string workId,
+        string? periodInstanceKey,
+        string? dynamicFormTemplateId,
+        WorkReportDirectGenerationContext generation,
         string? actorUserId,
         CancellationToken ct = default);
 

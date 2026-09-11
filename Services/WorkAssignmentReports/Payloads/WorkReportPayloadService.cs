@@ -107,12 +107,187 @@ public sealed class WorkReportPayloadService : IWorkReportPayloadReader, IWorkRe
         string? summarySourceJson,
         string? actorUserId,
         DateTime now,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        IClientSessionHandle? session = null)
     {
         if (string.IsNullOrWhiteSpace(report.Id))
             report.Id = ObjectId.GenerateNewId().ToString();
 
-        var revision = Math.Max(0, report.PayloadRevision) + 1;
+        var plan = PrepareReportPayload(
+            report.Id,
+            report.PayloadRevision,
+            values1DJson,
+            fieldValuesJson,
+            tableValuesJson,
+            summarySourceJson);
+        PreflightPreparedPayload(plan, actorUserId, now);
+
+        var payloadFilter = Builders<WorkReportPayload>.Filter.Where(
+            x => x.ReportId == report.Id && !x.IsDeleted);
+        var existingPayloadId = session is null
+            ? await _ctx.WorkReportPayloads
+                .Find(payloadFilter)
+                .Project(x => x.Id)
+                .FirstOrDefaultAsync(ct)
+            : await _ctx.WorkReportPayloads
+                .Find(session, payloadFilter)
+                .Project(x => x.Id)
+                .FirstOrDefaultAsync(ct);
+        var existingBlockIds = await LoadExistingTableBlockIdsAsync(
+            report.Id,
+            ct,
+            session);
+
+        var payload = BuildPayloadDocument(plan, existingPayloadId, actorUserId, now);
+        var tableRows = BuildTableBlockDocuments(plan, existingBlockIds, actorUserId, now);
+        PreflightMongoDocuments(payload, tableRows);
+
+        if (session is null)
+        {
+            await _ctx.WorkReportPayloads.ReplaceOneAsync(
+                payloadFilter,
+                payload,
+                new ReplaceOptions { IsUpsert = true },
+                ct);
+        }
+        else
+        {
+            await _ctx.WorkReportPayloads.ReplaceOneAsync(
+                session,
+                payloadFilter,
+                payload,
+                new ReplaceOptions { IsUpsert = true },
+                ct);
+        }
+
+        await SaveTableBlocksAsync(
+            report.Id,
+            tableRows,
+            actorUserId,
+            now,
+            ct,
+            session);
+
+        return plan.Result;
+    }
+
+    public static WorkReportPayloadWriteResult PreflightReportPayload(
+        WorkAssignmentReport report,
+        string values1DJson,
+        string? fieldValuesJson,
+        string? tableValuesJson,
+        string? summarySourceJson,
+        string? actorUserId,
+        DateTime now)
+    {
+        var reportId = string.IsNullOrWhiteSpace(report.Id)
+            ? ObjectId.Empty.ToString()
+            : report.Id;
+        var plan = PrepareReportPayload(
+            reportId,
+            report.PayloadRevision,
+            values1DJson,
+            fieldValuesJson,
+            tableValuesJson,
+            summarySourceJson);
+
+        PreflightPreparedPayload(plan, actorUserId, now);
+        return plan.Result;
+    }
+
+    private async Task SaveTableBlocksAsync(
+        string reportId,
+        IReadOnlyList<WorkReportTableValue> rows,
+        string? actorUserId,
+        DateTime now,
+        CancellationToken ct,
+        IClientSessionHandle? session)
+    {
+        foreach (var row in rows)
+        {
+            var rowFilter = Builders<WorkReportTableValue>.Filter.Where(
+                x => x.ReportId == reportId &&
+                     x.BlockId == row.BlockId &&
+                     !x.IsDeleted);
+            if (session is null)
+            {
+                await _ctx.WorkReportTableValues.ReplaceOneAsync(
+                    rowFilter,
+                    row,
+                    new ReplaceOptions { IsUpsert = true },
+                    ct);
+            }
+            else
+            {
+                await _ctx.WorkReportTableValues.ReplaceOneAsync(
+                    session,
+                    rowFilter,
+                    row,
+                    new ReplaceOptions { IsUpsert = true },
+                    ct);
+            }
+        }
+
+        var fb = Builders<WorkReportTableValue>.Filter;
+        var staleFilter = fb.Eq(x => x.ReportId, reportId) & fb.Eq(x => x.IsDeleted, false);
+        var currentBlockIds = rows.Select(x => x.BlockId).ToList();
+        if (currentBlockIds.Count > 0)
+            staleFilter &= fb.Nin(x => x.BlockId, currentBlockIds);
+
+        var staleUpdate = Builders<WorkReportTableValue>.Update
+            .Set(x => x.IsDeleted, true)
+            .Set(x => x.DeletedAtUtc, now)
+            .Set(x => x.DeletedByUserId, actorUserId)
+            .Set(x => x.UpdatedAtUtc, now)
+            .Set(x => x.UpdatedByUserId, actorUserId);
+        if (session is null)
+        {
+            await _ctx.WorkReportTableValues.UpdateManyAsync(
+                staleFilter,
+                staleUpdate,
+                cancellationToken: ct);
+        }
+        else
+        {
+            await _ctx.WorkReportTableValues.UpdateManyAsync(
+                session,
+                staleFilter,
+                staleUpdate,
+                cancellationToken: ct);
+        }
+    }
+
+    private async Task<IReadOnlyDictionary<string, string>> LoadExistingTableBlockIdsAsync(
+        string reportId,
+        CancellationToken ct,
+        IClientSessionHandle? session)
+    {
+        var filter = Builders<WorkReportTableValue>.Filter.Where(
+            x => x.ReportId == reportId && !x.IsDeleted);
+        var existingIds = session is null
+            ? await _ctx.WorkReportTableValues
+                .Find(filter)
+                .Project(x => new { x.Id, x.BlockId })
+                .ToListAsync(ct)
+            : await _ctx.WorkReportTableValues
+                .Find(session, filter)
+                .Project(x => new { x.Id, x.BlockId })
+                .ToListAsync(ct);
+
+        return existingIds
+            .GroupBy(x => x.BlockId, StringComparer.Ordinal)
+            .ToDictionary(x => x.Key, x => x.First().Id, StringComparer.Ordinal);
+    }
+
+    private static PreparedPayloadWrite PrepareReportPayload(
+        string reportId,
+        int currentRevision,
+        string values1DJson,
+        string? fieldValuesJson,
+        string? tableValuesJson,
+        string? summarySourceJson)
+    {
+        var revision = Math.Max(0, currentRevision) + 1;
         var tableParts = SplitTableValues(tableValuesJson);
         var payloadHash = WorkReportPayloadHash.Compute(
             values1DJson,
@@ -125,24 +300,62 @@ public sealed class WorkReportPayloadService : IWorkReportPayloadReader, IWorkRe
             + Utf8Size(tableParts.RootJson)
             + Utf8Size(summarySourceJson);
 
-        GuardPayloadSize("reportPayload", report.Id, payloadSizeBytes, PayloadTargetBytes);
+        GuardPayloadSize("reportPayload", reportId, payloadSizeBytes, PayloadTargetBytes);
+        foreach (var block in tableParts.Blocks)
+        {
+            GuardPayloadSize(
+                "reportTableBlock",
+                $"{reportId}:{block.BlockId}",
+                block.SizeBytes,
+                TableBlockTargetBytes);
+        }
 
-        var existingPayloadId = await _ctx.WorkReportPayloads
-            .Find(x => x.ReportId == report.Id && !x.IsDeleted)
-            .Project(x => x.Id)
-            .FirstOrDefaultAsync(ct);
+        return new PreparedPayloadWrite(
+            reportId,
+            revision,
+            values1DJson,
+            fieldValuesJson,
+            tableParts,
+            summarySourceJson,
+            payloadHash,
+            payloadSizeBytes,
+            new WorkReportPayloadWriteResult(
+                revision,
+                payloadHash,
+                payloadSizeBytes + tableParts.Blocks.Sum(x => x.SizeBytes),
+                WorkReportPayloadStatus.Ready));
+    }
 
-        var payload = new WorkReportPayload
+    private static void PreflightPreparedPayload(
+        PreparedPayloadWrite plan,
+        string? actorUserId,
+        DateTime now)
+    {
+        var placeholderId = ObjectId.Empty.ToString();
+        var payload = BuildPayloadDocument(plan, placeholderId, actorUserId, now);
+        var tableRows = plan.TableParts.Blocks
+            .Select(block => BuildTableBlockDocument(plan, block, placeholderId, actorUserId, now))
+            .ToList();
+
+        PreflightMongoDocuments(payload, tableRows);
+    }
+
+    private static WorkReportPayload BuildPayloadDocument(
+        PreparedPayloadWrite plan,
+        string? existingPayloadId,
+        string? actorUserId,
+        DateTime now)
+        => new()
         {
             Id = string.IsNullOrWhiteSpace(existingPayloadId) ? ObjectId.GenerateNewId().ToString() : existingPayloadId,
-            ReportId = report.Id,
-            PayloadRevision = revision,
-            Values1DJson = values1DJson,
-            FieldValuesJson = fieldValuesJson,
-            TableValuesRootJson = tableParts.RootJson,
-            SummarySourceJson = summarySourceJson,
-            PayloadHash = payloadHash,
-            PayloadSizeBytes = payloadSizeBytes,
+            ReportId = plan.ReportId,
+            PayloadRevision = plan.Revision,
+            Values1DJson = plan.Values1DJson,
+            FieldValuesJson = plan.FieldValuesJson,
+            TableValuesRootJson = plan.TableParts.RootJson,
+            SummarySourceJson = plan.SummarySourceJson,
+            PayloadHash = plan.PayloadHash,
+            PayloadSizeBytes = plan.PayloadSizeBytes,
             Status = WorkReportPayloadStatus.Ready,
             CreatedAtUtc = now,
             UpdatedAtUtc = now,
@@ -151,84 +364,62 @@ public sealed class WorkReportPayloadService : IWorkReportPayloadReader, IWorkRe
             IsDeleted = false
         };
 
-        await _ctx.WorkReportPayloads.ReplaceOneAsync(
-            x => x.ReportId == report.Id && !x.IsDeleted,
-            payload,
-            new ReplaceOptions { IsUpsert = true },
-            ct);
-
-        await SaveTableBlocksAsync(report.Id, revision, tableParts.Blocks, actorUserId, now, ct);
-
-        return new WorkReportPayloadWriteResult(
-            revision,
-            payloadHash,
-            payloadSizeBytes + tableParts.Blocks.Sum(x => x.SizeBytes),
-            WorkReportPayloadStatus.Ready);
-    }
-
-    private async Task SaveTableBlocksAsync(
-        string reportId,
-        int revision,
-        IReadOnlyList<TableBlockPayload> blocks,
+    private static IReadOnlyList<WorkReportTableValue> BuildTableBlockDocuments(
+        PreparedPayloadWrite plan,
+        IReadOnlyDictionary<string, string> existingByBlockId,
         string? actorUserId,
-        DateTime now,
-        CancellationToken ct)
+        DateTime now)
     {
-        var existingIds = await _ctx.WorkReportTableValues
-            .Find(x => x.ReportId == reportId && !x.IsDeleted)
-            .Project(x => new { x.Id, x.BlockId })
-            .ToListAsync(ct);
-        var existingByBlockId = existingIds
-            .GroupBy(x => x.BlockId, StringComparer.Ordinal)
-            .ToDictionary(x => x.Key, x => x.First().Id, StringComparer.Ordinal);
-
-        foreach (var block in blocks)
+        var rows = new List<WorkReportTableValue>(plan.TableParts.Blocks.Count);
+        foreach (var block in plan.TableParts.Blocks)
         {
-            GuardPayloadSize("reportTableBlock", $"{reportId}:{block.BlockId}", block.SizeBytes, TableBlockTargetBytes);
             existingByBlockId.TryGetValue(block.BlockId, out var existingId);
-            var row = new WorkReportTableValue
-            {
-                Id = string.IsNullOrWhiteSpace(existingId) ? ObjectId.GenerateNewId().ToString() : existingId,
-                ReportId = reportId,
-                BlockId = block.BlockId,
-                PayloadRevision = revision,
-                BlockOrder = block.BlockOrder,
-                TableMode = block.TableMode,
-                ValuesJson = block.ValuesJson,
-                RowCount = block.RowCount,
-                ColumnCount = block.ColumnCount,
-                SizeBytes = block.SizeBytes,
-                PayloadHash = block.PayloadHash,
-                Status = WorkReportPayloadStatus.Ready,
-                CreatedAtUtc = now,
-                UpdatedAtUtc = now,
-                CreatedByUserId = actorUserId,
-                UpdatedByUserId = actorUserId,
-                IsDeleted = false
-            };
-
-            await _ctx.WorkReportTableValues.ReplaceOneAsync(
-                x => x.ReportId == reportId && x.BlockId == block.BlockId && !x.IsDeleted,
-                row,
-                new ReplaceOptions { IsUpsert = true },
-                ct);
+            rows.Add(BuildTableBlockDocument(plan, block, existingId, actorUserId, now));
         }
 
-        var fb = Builders<WorkReportTableValue>.Filter;
-        var staleFilter = fb.Eq(x => x.ReportId, reportId) & fb.Eq(x => x.IsDeleted, false);
-        var currentBlockIds = blocks.Select(x => x.BlockId).ToList();
-        if (currentBlockIds.Count > 0)
-            staleFilter &= fb.Nin(x => x.BlockId, currentBlockIds);
+        return rows;
+    }
 
-        await _ctx.WorkReportTableValues.UpdateManyAsync(
-            staleFilter,
-            Builders<WorkReportTableValue>.Update
-                .Set(x => x.IsDeleted, true)
-                .Set(x => x.DeletedAtUtc, now)
-                .Set(x => x.DeletedByUserId, actorUserId)
-                .Set(x => x.UpdatedAtUtc, now)
-                .Set(x => x.UpdatedByUserId, actorUserId),
-            cancellationToken: ct);
+    private static WorkReportTableValue BuildTableBlockDocument(
+        PreparedPayloadWrite plan,
+        TableBlockPayload block,
+        string? existingId,
+        string? actorUserId,
+        DateTime now)
+        => new()
+        {
+            Id = string.IsNullOrWhiteSpace(existingId) ? ObjectId.GenerateNewId().ToString() : existingId,
+            ReportId = plan.ReportId,
+            BlockId = block.BlockId,
+            PayloadRevision = plan.Revision,
+            BlockOrder = block.BlockOrder,
+            TableMode = block.TableMode,
+            ValuesJson = block.ValuesJson,
+            RowCount = block.RowCount,
+            ColumnCount = block.ColumnCount,
+            SizeBytes = block.SizeBytes,
+            PayloadHash = block.PayloadHash,
+            Status = WorkReportPayloadStatus.Ready,
+            CreatedAtUtc = now,
+            UpdatedAtUtc = now,
+            CreatedByUserId = actorUserId,
+            UpdatedByUserId = actorUserId,
+            IsDeleted = false
+        };
+
+    private static void PreflightMongoDocuments(
+        WorkReportPayload payload,
+        IReadOnlyList<WorkReportTableValue> tableRows)
+    {
+        GuardMongoDocumentSize("reportPayload", payload.ReportId, payload);
+        foreach (var row in tableRows)
+            GuardMongoDocumentSize("reportTableBlock", $"{row.ReportId}:{row.BlockId}", row);
+    }
+
+    private static void GuardMongoDocumentSize<T>(string kind, string id, T document)
+    {
+        var bsonBytes = document.ToBson();
+        GuardPayloadSize(kind, id, bsonBytes.LongLength, MongoHardGuardBytes);
     }
 
     private async Task<WorkReportPayloadSnapshot?> TryLoadExternalPayloadAsync(
@@ -487,6 +678,17 @@ public sealed class WorkReportPayloadService : IWorkReportPayloadReader, IWorkRe
 
         return 0;
     }
+
+    private sealed record PreparedPayloadWrite(
+        string ReportId,
+        int Revision,
+        string Values1DJson,
+        string? FieldValuesJson,
+        TablePayloadParts TableParts,
+        string? SummarySourceJson,
+        string PayloadHash,
+        long PayloadSizeBytes,
+        WorkReportPayloadWriteResult Result);
 
     private sealed record TablePayloadParts(
         string? RootJson,

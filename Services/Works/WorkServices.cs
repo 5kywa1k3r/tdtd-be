@@ -136,7 +136,15 @@ namespace tdtd_be.Services.Works
                 doc.UpdatedAtUtc = DateTime.UtcNow;
                 doc.UpdatedByUserId = byUserId;
 
-                await _ctx.Works.ReplaceOneAsync(x => x.Id == doc.Id, doc, cancellationToken: ct);
+                await _ctx.Works.UpdateOneAsync(
+                    x => x.Id == doc.Id && !x.IsDeleted,
+                    Builders<Work>.Update
+                        .Set(x => x.Owner, doc.Owner)
+                        .Set(x => x.LeaderDirective, doc.LeaderDirective)
+                        .Set(x => x.LeaderWatch, doc.LeaderWatch)
+                        .Set(x => x.UpdatedAtUtc, doc.UpdatedAtUtc)
+                        .Set(x => x.UpdatedByUserId, doc.UpdatedByUserId),
+                    cancellationToken: ct);
                 await _docRole.UpsertWorkRootRolesAsync(doc, ct);
             }
 
@@ -427,7 +435,28 @@ namespace tdtd_be.Services.Works
                 if (needRebuildRoot || await NeedsBackfillSnapshotAsync(doc, ct))
                     await RebuildRootSnapshotAsync(doc, ct);
 
-                await _ctx.Works.ReplaceOneAsync(x => x.Id == id, doc, cancellationToken: ct);
+                await _ctx.Works.UpdateOneAsync(
+                    x => x.Id == id && !x.IsDeleted,
+                    Builders<Work>.Update
+                        .Set(x => x.Name, doc.Name)
+                        .Set(x => x.Description, doc.Description)
+                        .Set(x => x.Note, doc.Note)
+                        .Set(x => x.Code, doc.Code)
+                        .Set(x => x.EvaluationTemplateId, doc.EvaluationTemplateId)
+                        .Set(x => x.EvaluationTemplateCode, doc.EvaluationTemplateCode)
+                        .Set(x => x.EvaluationTemplateLabel, doc.EvaluationTemplateLabel)
+                        .Set(x => x.LeaderDirectiveUserId, doc.LeaderDirectiveUserId)
+                        .Set(x => x.LeaderWatchUserIds, doc.LeaderWatchUserIds)
+                        .Set(x => x.Owner, doc.Owner)
+                        .Set(x => x.LeaderDirective, doc.LeaderDirective)
+                        .Set(x => x.LeaderWatch, doc.LeaderWatch)
+                        .Set(x => x.StartDate, doc.StartDate)
+                        .Set(x => x.EndDate, doc.EndDate)
+                        .Set(x => x.DueDate, doc.DueDate)
+                        .Set(x => x.Priority, doc.Priority)
+                        .Set(x => x.UpdatedAtUtc, doc.UpdatedAtUtc)
+                        .Set(x => x.UpdatedByUserId, doc.UpdatedByUserId),
+                    cancellationToken: ct);
                 await _docRole.UpsertWorkRootRolesAsync(doc, ct);
 
                 await _history.AppendAsync(
@@ -457,6 +486,23 @@ namespace tdtd_be.Services.Works
                     throw AppExceptionFactory.NotFound(AppErrorCode.WORK_NOT_FOUND, new { workId = id });
 
                 await _permission.EnsureCanUpdateRootAsync(id, me.Id, ct);
+                var flowInstanceId = await _ctx.DynamicFlowInstances
+                    .Find(x => x.WorkId == id && !x.IsDeleted)
+                    .Project(x => x.Id)
+                    .FirstOrDefaultAsync(ct);
+                if (!string.IsNullOrWhiteSpace(flowInstanceId))
+                {
+                    throw AppExceptionFactory.Create(
+                        AppErrorCode.DYNAMIC_FLOW_EXECUTION_BLOCKED_UNTIL_TARGET_PHASE,
+                        new
+                        {
+                            workId = id,
+                            flowInstanceId,
+                            command = "COMPLETE_WORK",
+                            reason = "DYNAMIC_FLOW_FINALIZE_BLOCKED_UNTIL_P6",
+                            blockedUntilPhase = "P6"
+                        });
+                }
 
                 var now = DateTime.UtcNow;
                 var completedDate = (req?.CompletedDate ?? now).Date;
@@ -469,10 +515,34 @@ namespace tdtd_be.Services.Works
                     .Set(x => x.UpdatedAtUtc, now)
                     .Set(x => x.UpdatedByUserId, me.Id);
 
-                await _ctx.Works.UpdateOneAsync(
-                    x => x.Id == id && !x.IsDeleted,
+                var workFilter = Builders<Work>.Filter;
+                var noRuntimeOwner =
+                    workFilter.Eq(x => x.DynamicFlowRuntimeInstanceId, null) |
+                    workFilter.Exists(x => x.DynamicFlowRuntimeInstanceId, false);
+                var nonFlowTopology =
+                    workFilter.Ne(
+                        x => x.AssignmentTopologyOwner,
+                        WorkAssignmentTopologyOwners.P5FlowRuntime) |
+                    workFilter.Exists(x => x.AssignmentTopologyOwner, false);
+                var completionResult = await _ctx.Works.UpdateOneAsync(
+                    workFilter.Eq(x => x.Id, id) &
+                    workFilter.Eq(x => x.IsDeleted, false) &
+                    noRuntimeOwner &
+                    nonFlowTopology,
                     update,
                     cancellationToken: ct);
+                if (completionResult.MatchedCount != 1)
+                {
+                    throw AppExceptionFactory.Create(
+                        AppErrorCode.DYNAMIC_FLOW_EXECUTION_BLOCKED_UNTIL_TARGET_PHASE,
+                        new
+                        {
+                            workId = id,
+                            command = "COMPLETE_WORK",
+                            reason = "DYNAMIC_FLOW_FINALIZE_BLOCKED_UNTIL_P6",
+                            blockedUntilPhase = "P6"
+                        });
+                }
 
                 doc.Status = WorkStatus.S3;
                 doc.CompletedDate = completedDate;
@@ -540,6 +610,23 @@ namespace tdtd_be.Services.Works
                     throw AppExceptionFactory.NotFound(AppErrorCode.WORK_NOT_FOUND, new { workId = id });
 
                 await _permission.EnsureCanDeleteRootAsync(id, me.Id, ct);
+                var flowInstanceId = await _ctx.DynamicFlowInstances
+                    .Find(x => x.WorkId == id && !x.IsDeleted)
+                    .Project(x => x.Id)
+                    .FirstOrDefaultAsync(ct);
+                if (!string.IsNullOrWhiteSpace(flowInstanceId))
+                {
+                    throw AppExceptionFactory.Create(
+                        AppErrorCode.DYNAMIC_FLOW_EXECUTION_BLOCKED_UNTIL_TARGET_PHASE,
+                        new
+                        {
+                            workId = id,
+                            flowInstanceId,
+                            command = "DELETE_WORK",
+                            reason = "DYNAMIC_FLOW_TERMINATE_BLOCKED_UNTIL_P6",
+                            blockedUntilPhase = "P6"
+                        });
+                }
 
                 var now = DateTime.UtcNow;
 
@@ -550,10 +637,34 @@ namespace tdtd_be.Services.Works
                     .Set(x => x.UpdatedAtUtc, now)
                     .Set(x => x.UpdatedByUserId, me.Id);
 
-                await _ctx.Works.UpdateOneAsync(
-                    filter: Builders<Work>.Filter.Where(x => x.Id == id && !x.IsDeleted),
+                var workFilter = Builders<Work>.Filter;
+                var noRuntimeOwner =
+                    workFilter.Eq(x => x.DynamicFlowRuntimeInstanceId, null) |
+                    workFilter.Exists(x => x.DynamicFlowRuntimeInstanceId, false);
+                var nonFlowTopology =
+                    workFilter.Ne(
+                        x => x.AssignmentTopologyOwner,
+                        WorkAssignmentTopologyOwners.P5FlowRuntime) |
+                    workFilter.Exists(x => x.AssignmentTopologyOwner, false);
+                var deletionResult = await _ctx.Works.UpdateOneAsync(
+                    filter: workFilter.Eq(x => x.Id, id) &
+                            workFilter.Eq(x => x.IsDeleted, false) &
+                            noRuntimeOwner &
+                            nonFlowTopology,
                     update: workUpdate,
                     cancellationToken: ct);
+                if (deletionResult.MatchedCount != 1)
+                {
+                    throw AppExceptionFactory.Create(
+                        AppErrorCode.DYNAMIC_FLOW_EXECUTION_BLOCKED_UNTIL_TARGET_PHASE,
+                        new
+                        {
+                            workId = id,
+                            command = "DELETE_WORK",
+                            reason = "DYNAMIC_FLOW_TERMINATE_BLOCKED_UNTIL_P6",
+                            blockedUntilPhase = "P6"
+                        });
+                }
 
                 var fileFb = Builders<FileDoc>.Filter;
                 var fileFilter = fileFb.And(

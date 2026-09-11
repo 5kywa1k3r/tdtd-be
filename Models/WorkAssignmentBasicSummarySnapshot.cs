@@ -58,6 +58,44 @@ public sealed class WorkAssignmentBasicSummarySnapshot : BaseEntity
     [BsonElement("sourceSignatureHash")]
     public string SourceSignatureHash { get; set; } = default!;
 
+    [BsonElement("configId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string ConfigId { get; set; } = default!;
+
+    [BsonElement("configVersionId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string ConfigVersionId { get; set; } = default!;
+
+    [BsonElement("configVersionNo")]
+    public int ConfigVersionNo { get; set; }
+
+    [BsonElement("configRevision")]
+    public long ConfigRevision { get; set; }
+
+    [BsonElement("configHash")]
+    public string ConfigHash { get; set; } = default!;
+
+    [BsonElement("configDependencyPins")]
+    public List<string> ConfigDependencyPins { get; set; } = new();
+
+    [BsonElement("candidateChainId")]
+    public string CandidateChainId { get; set; } = default!;
+
+    [BsonElement("candidatePromptId")]
+    public string CandidatePromptId { get; set; } = default!;
+
+    [BsonElement("candidateStage")]
+    public int CandidateStage { get; set; }
+
+    [BsonElement("candidateCatalogRawSha256")]
+    public string CandidateCatalogRawSha256 { get; set; } = default!;
+
+    [BsonElement("candidateCatalogSemanticSha256")]
+    public string CandidateCatalogSemanticSha256 { get; set; } = default!;
+
+    [BsonElement("candidateStageLockSha256")]
+    public string CandidateStageLockSha256 { get; set; } = default!;
+
     [BsonElement("snapshotJson")]
     public string SnapshotJson { get; set; } = "{}";
 

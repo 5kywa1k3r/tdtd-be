@@ -148,6 +148,9 @@ public sealed class WorkAssignmentRuntimeMaterializeService : IWorkAssignmentRun
                         DynamicFormTemplateId = assignment.DynamicFormTemplateId,
                         DynamicFormTemplateCode = assignment.DynamicFormTemplateCode,
                         DynamicFormTemplateName = assignment.DynamicFormTemplateName,
+                        DynamicFormFamilyId = assignment.DynamicFormFamilyId,
+                        DynamicFormVersionNo = assignment.DynamicFormVersionNo,
+                        DynamicFormSchemaHash = assignment.DynamicFormSchemaHash,
                         AssigneeUserId = assignee.UserId,
                         AssigneeUnitId = assignee.UnitId,
                         PeriodKey = item.PeriodKey,
@@ -202,9 +205,6 @@ public sealed class WorkAssignmentRuntimeMaterializeService : IWorkAssignmentRun
                             .Set(x => x.WorkTemplateAssigneeId, binding.Id!)
                             .Set(x => x.IsActive, true)
                             .Set(x => x.DueAtUtc, item.DueAtUtc)
-                            .Set(x => x.DynamicFormTemplateId, assignment.DynamicFormTemplateId)
-                            .Set(x => x.DynamicFormTemplateCode, assignment.DynamicFormTemplateCode)
-                            .Set(x => x.DynamicFormTemplateName, assignment.DynamicFormTemplateName)
                             .Set(x => x.PeriodInstanceKey, string.IsNullOrWhiteSpace(existed.PeriodInstanceKey) ? existed.PeriodKey : existed.PeriodInstanceKey)
                             .Set(x => x.PeriodKind, WorkReportPeriodKind.Scheduled)
                             .Set(x => x.ReportDate, periodDate)

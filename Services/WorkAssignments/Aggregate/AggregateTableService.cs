@@ -10,6 +10,7 @@ using tdtd_be.Models;
 using tdtd_be.Models.Enums;
 using tdtd_be.Models.Statistics;
 using tdtd_be.Services;
+using tdtd_be.Services.StatisticsConfiguration;
 using tdtd_be.Services.WorkAssignments.Internal;
 using tdtd_be.Services.WorkAssignmentReports.Payloads;
 
@@ -53,6 +54,7 @@ public sealed class AggregateTableService : IAggregateTableService
         AggregateTableRequest req,
         CancellationToken ct)
     {
+        StatConfigPhaseBarrier.Reject(StatConfigPhaseBarrierEntries.P9Result);
         var me = _me.RequireMe();
         var normalized = NormalizeRequest(req);
 
@@ -90,6 +92,7 @@ public sealed class AggregateTableService : IAggregateTableService
         DynamicFormAggregateRequest req,
         CancellationToken ct)
     {
+        StatConfigPhaseBarrier.Reject(StatConfigPhaseBarrierEntries.P9Result);
         var me = _me.RequireMe();
         var normalized = NormalizeDynamicFormRequest(req);
 
@@ -1054,7 +1057,8 @@ public sealed class AggregateTableService : IAggregateTableService
                      & fb.Eq(x => x.TableMode, contract.TableMode)
                      & fb.In(x => x.MetricKey, metricKeys)
                      & fb.Eq(x => x.DataType, "NUMBER")
-                     & fb.Eq(x => x.IsDeleted, false);
+                     & fb.Eq(x => x.IsDeleted, false)
+                     & fb.Eq(x => x.DirectProjection, null);
 
         var values = await _ctx.WorkReportTableStatValues
             .Find(filter)
@@ -1130,7 +1134,8 @@ public sealed class AggregateTableService : IAggregateTableService
                      & fb.Eq(x => x.BlockId, layout.SourceBlockId)
                      & fb.In(x => x.MetricKey, metricKeys)
                      & fb.Eq(x => x.DataType, "NUMBER")
-                     & fb.Eq(x => x.IsDeleted, false);
+                     & fb.Eq(x => x.IsDeleted, false)
+                     & fb.Eq(x => x.DirectProjection, null);
 
         if (!string.IsNullOrWhiteSpace(layout.SourceTableMode))
             filter &= fb.Eq(x => x.TableMode, layout.SourceTableMode);
@@ -1238,10 +1243,12 @@ public sealed class AggregateTableService : IAggregateTableService
                     RowsPerGroup = layout.RowsPerGroup,
                     ReportCount = bucket?.ReportCount ?? 0,
                     Count = ToSafeInt(bucket?.ValueCount ?? 0),
-                    Sum = bucket is { ValueCount: > 0 } ? bucket.Sum : null,
+                    Sum = bucket is { NumericValueCount: > 0 } ? bucket.Sum : null,
                     Min = bucket?.Min,
                     Max = bucket?.Max,
-                    Average = bucket is { ValueCount: > 0 } ? bucket.Sum / bucket.ValueCount : null,
+                    Average = bucket is { NumericValueCount: > 0 }
+                        ? bucket.Sum / bucket.NumericValueCount
+                        : null,
                 });
             }
         }
@@ -2945,6 +2952,7 @@ public sealed class AggregateTableService : IAggregateTableService
 
         public MetricContract Metric { get; }
         public long ValueCount { get; private set; }
+        public long NumericValueCount { get; private set; }
         public long ReportCount { get; private set; }
         public decimal Sum { get; private set; }
         public decimal? Min { get; private set; }
@@ -2953,6 +2961,7 @@ public sealed class AggregateTableService : IAggregateTableService
         public void Add(WorkReportTableStatAggregate row)
         {
             ValueCount += row.ValueCount;
+            NumericValueCount += row.NumericValueCount;
             ReportCount += row.ReportCount;
             Sum += row.Sum;
 

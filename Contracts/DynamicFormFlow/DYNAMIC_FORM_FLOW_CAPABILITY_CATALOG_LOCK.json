@@ -1,0 +1,61 @@
+{
+  "lockVersion": 1,
+  "publishedCatalogs": [
+    {
+      "catalogVersion": "1.0",
+      "catalogFile": "DYNAMIC_FORM_FLOW_CAPABILITY_CATALOG_V1.json",
+      "schemaFile": "DYNAMIC_FORM_FLOW_CAPABILITY_CATALOG_V1.schema.json",
+      "catalogSha256": "835c32490da5c1df0b326d71c3fc060d033f0528d1a171ff7c49dfe8e8889053",
+      "schemaSha256": "4dc2509bc50877810087ba87da44973b9caa86496793ee775472cfbc99e26431"
+    },
+    {
+      "catalogVersion": "1.1",
+      "catalogFile": "DYNAMIC_FORM_FLOW_CAPABILITY_CATALOG_V1_1.json",
+      "schemaFile": "DYNAMIC_FORM_FLOW_CAPABILITY_CATALOG_V1_1.schema.json",
+      "catalogSha256": "e8a0b15bb5c7cab81ed49ec5c213105366a1194faa2d78168a46226d9cc505cf",
+      "schemaSha256": "1783a21e1edb731002d5907a3405c829cdd00ec9f9e496264ff8543dc8f95bf8"
+    },
+    {
+      "catalogVersion": "1.2",
+      "catalogFile": "DYNAMIC_FORM_FLOW_CAPABILITY_CATALOG_V1_2.json",
+      "schemaFile": "DYNAMIC_FORM_FLOW_CAPABILITY_CATALOG_V1_2.schema.json",
+      "catalogSha256": "b26549d5de7a3d93bd6fc9bab7bfdfbdaffb66a01347039b2c3629692b60068f",
+      "schemaSha256": "c0c9463c9813ee9d2dd718919aa2a0176c360303cc48b710154a525a56bac12a"
+    },
+    {
+      "catalogVersion": "1.3",
+      "catalogFile": "DYNAMIC_FORM_FLOW_CAPABILITY_CATALOG_V1_3.json",
+      "schemaFile": "DYNAMIC_FORM_FLOW_CAPABILITY_CATALOG_V1_3.schema.json",
+      "catalogSha256": "55cfa0a4420e01db6707011ffc7a0271088c5b01b63edb8f2d21978edd3e2497",
+      "schemaSha256": "6487e3a3fe36082dafc9bb6bd162bce2f364f6404f50c0ef0fcf40949ecb3643"
+    },
+    {
+      "catalogVersion": "1.4",
+      "catalogFile": "DYNAMIC_FORM_FLOW_CAPABILITY_CATALOG_V1_4.json",
+      "schemaFile": "DYNAMIC_FORM_FLOW_CAPABILITY_CATALOG_V1_4.schema.json",
+      "catalogSha256": "d2ca56a4745380688e24c6926752643d2b023b2d47bc1578d3b3e2f9379457ee",
+      "schemaSha256": "c91abd87727e25bb62a7ecb9de939d85a747ecc131e7bd9dad695c45217014a1"
+    },
+    {
+      "catalogVersion": "1.5",
+      "catalogFile": "DYNAMIC_FORM_FLOW_CAPABILITY_CATALOG_V1_5.json",
+      "schemaFile": "DYNAMIC_FORM_FLOW_CAPABILITY_CATALOG_V1_5.schema.json",
+      "catalogSha256": "e3c335617721bbf8cd09c62c5e76377f23f3d024b20c848bf66c8c539f0c9d2f",
+      "schemaSha256": "9bab8219c4c097977de2417885206caacec9bca5a188a588d0d1a96063b84477"
+    },
+    {
+      "catalogVersion": "1.6",
+      "catalogFile": "DYNAMIC_FORM_FLOW_CAPABILITY_CATALOG_V1_6.json",
+      "schemaFile": "DYNAMIC_FORM_FLOW_CAPABILITY_CATALOG_V1_6.schema.json",
+      "catalogSha256": "39cdb98dda168f5901f48a94640fe5d50943c5bd78ed32d5e05e8b719b23d13b",
+      "schemaSha256": "da0c80f265845f24aaf282e0a0369272273b1986520dae07171cda85b28b3fed"
+    },
+    {
+      "catalogVersion": "1.7",
+      "catalogFile": "DYNAMIC_FORM_FLOW_CAPABILITY_CATALOG_V1_7.json",
+      "schemaFile": "DYNAMIC_FORM_FLOW_CAPABILITY_CATALOG_V1_7.schema.json",
+      "catalogSha256": "ccb28afafc068ac1b720c046a25276a35d9d828b14f9cc9c9bc690077ca204c1",
+      "schemaSha256": "5842baf176bf1eec453b718d07e50da55a417aa9036f4f097ccfbb6fc58c1978"
+    }
+  ]
+}

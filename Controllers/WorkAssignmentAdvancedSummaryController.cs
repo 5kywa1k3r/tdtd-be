@@ -1,8 +1,11 @@
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using System.Security.Claims;
+using System.Text.Json;
 using tdtd_be.Common.Errors;
 using tdtd_be.DTOs.WorkAssignments.AdvancedSummary;
+using tdtd_be.Services.StatisticsConfiguration;
+using tdtd_be.Services.StatisticsRun;
 using tdtd_be.Services.WorkAssignments.AdvancedSummary;
 
 namespace tdtd_be.Controllers;
@@ -14,14 +17,111 @@ public sealed class WorkAssignmentAdvancedSummaryController : ControllerBase
 {
     private readonly IWorkAssignmentAdvancedSummaryConfigService _configs;
     private readonly IWorkAssignmentAdvancedSummaryHierarchyService _hierarchy;
+    private readonly IStatRunCandidateActivation _candidateActivation;
 
     public WorkAssignmentAdvancedSummaryController(
         IWorkAssignmentAdvancedSummaryConfigService configs,
-        IWorkAssignmentAdvancedSummaryHierarchyService hierarchy)
+        IWorkAssignmentAdvancedSummaryHierarchyService hierarchy,
+        IStatRunCandidateActivation candidateActivation)
     {
         _configs = configs;
         _hierarchy = hierarchy;
+        _candidateActivation = candidateActivation;
     }
+
+    [HttpGet("assignments/{assignmentId}/templates/{dynamicFormTemplateId}/sections/{sectionId}/config")]
+    public async Task<IActionResult> GetConfig(
+        [FromRoute] string assignmentId,
+        [FromRoute] string dynamicFormTemplateId,
+        [FromRoute] string sectionId,
+        CancellationToken ct)
+        => Ok(await _configs.GetP8ConfigAsync(
+            assignmentId,
+            dynamicFormTemplateId,
+            sectionId,
+            ct));
+
+    [HttpGet("assignments/{assignmentId}/templates/{dynamicFormTemplateId}/sections/{sectionId}/config/versions")]
+    public async Task<IActionResult> ListConfigVersions(
+        [FromRoute] string assignmentId,
+        [FromRoute] string dynamicFormTemplateId,
+        [FromRoute] string sectionId,
+        CancellationToken ct)
+        => Ok(await _configs.ListP8ConfigVersionsAsync(
+            assignmentId,
+            dynamicFormTemplateId,
+            sectionId,
+            ct));
+
+    [HttpGet("assignments/{assignmentId}/templates/{dynamicFormTemplateId}/sections/{sectionId}/config/versions/{versionNo:int}")]
+    public async Task<IActionResult> GetConfigVersion(
+        [FromRoute] string assignmentId,
+        [FromRoute] string dynamicFormTemplateId,
+        [FromRoute] string sectionId,
+        [FromRoute] int versionNo,
+        CancellationToken ct)
+        => Ok(await _configs.GetP8ConfigVersionAsync(
+            assignmentId,
+            dynamicFormTemplateId,
+            sectionId,
+            versionNo,
+            ct));
+
+    [HttpPut("assignments/{assignmentId}/templates/{dynamicFormTemplateId}/sections/{sectionId}/config")]
+    public async Task<IActionResult> PutConfig(
+        [FromRoute] string assignmentId,
+        [FromRoute] string dynamicFormTemplateId,
+        [FromRoute] string sectionId,
+        [FromBody] JsonElement body,
+        CancellationToken ct)
+        => Ok(await _configs.PutP8ConfigAsync(
+            assignmentId,
+            dynamicFormTemplateId,
+            sectionId,
+            body,
+            ct));
+
+    [HttpPost("assignments/{assignmentId}/templates/{dynamicFormTemplateId}/sections/{sectionId}/config/lock")]
+    public async Task<IActionResult> LockP8Config(
+        [FromRoute] string assignmentId,
+        [FromRoute] string dynamicFormTemplateId,
+        [FromRoute] string sectionId,
+        [FromBody] JsonElement body,
+        CancellationToken ct)
+        => Ok(await _configs.LockP8ConfigAsync(
+            assignmentId,
+            dynamicFormTemplateId,
+            sectionId,
+            body,
+            ct));
+
+    [HttpPost("assignments/{assignmentId}/templates/{dynamicFormTemplateId}/sections/{sectionId}/config/next-draft")]
+    public async Task<IActionResult> CreateNextDraft(
+        [FromRoute] string assignmentId,
+        [FromRoute] string dynamicFormTemplateId,
+        [FromRoute] string sectionId,
+        [FromBody] JsonElement body,
+        CancellationToken ct)
+        => Ok(await _configs.CreateNextP8DraftAsync(
+            assignmentId,
+            dynamicFormTemplateId,
+            sectionId,
+            body,
+            ct));
+
+    [HttpPost("assignments/{assignmentId}/templates/{dynamicFormTemplateId}/sections/{sectionId}/config/archive")]
+    public async Task<IActionResult> ArchiveConfig(
+        [FromRoute] string assignmentId,
+        [FromRoute] string dynamicFormTemplateId,
+        [FromRoute] string sectionId,
+        [FromBody] JsonElement body,
+        CancellationToken ct)
+        => Ok(await _configs.ArchiveP8ConfigAsync(
+            assignmentId,
+            dynamicFormTemplateId,
+            sectionId,
+            body,
+            ct));
 
     [HttpGet("assignments/{assignmentId}/templates/{dynamicFormTemplateId}/sections/{sectionId}/configs")]
     public async Task<IActionResult> ListConfigs(
@@ -30,9 +130,13 @@ public sealed class WorkAssignmentAdvancedSummaryController : ControllerBase
         [FromRoute] string sectionId,
         CancellationToken ct)
     {
-        var actorUserId = GetActorUserId();
-        var result = await _configs.ListConfigsAsync(assignmentId, dynamicFormTemplateId, sectionId, actorUserId, ct);
-        return Ok(result);
+        _ = GetActorUserId();
+        throw AppExceptionFactory.Create(
+            AppErrorCode.STAT_CONFIG_CAS_CONFLICT,
+            new
+            {
+                reason = "ADVANCED_SUMMARY_LEGACY_CONFIG_ROUTE_BLOCKED"
+            });
     }
 
     [HttpPut("assignments/{assignmentId}/templates/{dynamicFormTemplateId}/sections/{sectionId}/draft")]
@@ -43,9 +147,13 @@ public sealed class WorkAssignmentAdvancedSummaryController : ControllerBase
         [FromBody] SaveWorkAssignmentAdvancedSummaryDraftRequest req,
         CancellationToken ct)
     {
-        var actorUserId = GetActorUserId();
-        var result = await _configs.SaveDraftAsync(assignmentId, dynamicFormTemplateId, sectionId, req, actorUserId, ct);
-        return Ok(result);
+        _ = GetActorUserId();
+        throw AppExceptionFactory.Create(
+            AppErrorCode.STAT_CONFIG_CAS_CONFLICT,
+            new
+            {
+                reason = "ADVANCED_SUMMARY_LEGACY_MUTATION_BLOCKED_USE_CAS_CONFIG_ROUTE"
+            });
     }
 
     [HttpPost("configs/{configId}/lock")]
@@ -54,9 +162,13 @@ public sealed class WorkAssignmentAdvancedSummaryController : ControllerBase
         [FromBody] LockWorkAssignmentAdvancedSummaryConfigRequest req,
         CancellationToken ct)
     {
-        var actorUserId = GetActorUserId();
-        var result = await _configs.LockConfigAsync(configId, req, actorUserId, ct);
-        return Ok(result);
+        _ = GetActorUserId();
+        throw AppExceptionFactory.Create(
+            AppErrorCode.STAT_CONFIG_CAS_CONFLICT,
+            new
+            {
+                reason = "ADVANCED_SUMMARY_LEGACY_MUTATION_BLOCKED_USE_CAS_CONFIG_ROUTE"
+            });
     }
 
     [HttpPost("configs/{configId}/preview")]
@@ -65,9 +177,15 @@ public sealed class WorkAssignmentAdvancedSummaryController : ControllerBase
         [FromBody] PreviewWorkAssignmentAdvancedSummaryConfigRequest req,
         CancellationToken ct)
     {
-        var actorUserId = GetActorUserId();
-        var result = await _configs.RequestPreviewAsync(configId, req ?? new PreviewWorkAssignmentAdvancedSummaryConfigRequest(), actorUserId, ct);
-        return Ok(result);
+        _candidateActivation.RequireCapability(
+            StatRunCapabilities.AdvancedSummary,
+            StatRunRouteRegistry.AdvancedBuild);
+        var result = await _configs.RequestPreviewAsync(
+            configId,
+            req,
+            GetActorUserId(),
+            ct);
+        return Accepted(result);
     }
 
     [HttpPost("configs/{configId}/hierarchy/day/{dayKey}/build")]
@@ -77,9 +195,16 @@ public sealed class WorkAssignmentAdvancedSummaryController : ControllerBase
         [FromBody] BuildWorkAssignmentAdvancedSummaryDayNodeRequest req,
         CancellationToken ct)
     {
-        var actorUserId = GetActorUserId();
-        var result = await _hierarchy.RequestDayNodeBuildAsync(configId, dayKey, req ?? new BuildWorkAssignmentAdvancedSummaryDayNodeRequest(), actorUserId, ct);
-        return Ok(result);
+        _candidateActivation.RequireCapability(
+            StatRunCapabilities.AdvancedSummary,
+            StatRunRouteRegistry.AdvancedBuild);
+        var result = await _hierarchy.RequestDayNodeBuildAsync(
+            configId,
+            dayKey,
+            req,
+            GetActorUserId(),
+            ct);
+        return Accepted(result);
     }
 
     [HttpPost("configs/{configId}/hierarchy/month/{monthKey}/build")]
@@ -89,9 +214,16 @@ public sealed class WorkAssignmentAdvancedSummaryController : ControllerBase
         [FromBody] BuildWorkAssignmentAdvancedSummaryMonthNodeRequest req,
         CancellationToken ct)
     {
-        var actorUserId = GetActorUserId();
-        var result = await _hierarchy.RequestMonthNodeBuildAsync(configId, monthKey, req ?? new BuildWorkAssignmentAdvancedSummaryMonthNodeRequest(), actorUserId, ct);
-        return Ok(result);
+        _candidateActivation.RequireCapability(
+            StatRunCapabilities.AdvancedSummary,
+            StatRunRouteRegistry.AdvancedBuild);
+        var result = await _hierarchy.RequestMonthNodeBuildAsync(
+            configId,
+            monthKey,
+            req,
+            GetActorUserId(),
+            ct);
+        return Accepted(result);
     }
 
     [HttpPost("configs/{configId}/hierarchy/year/{yearKey}/build")]
@@ -101,9 +233,16 @@ public sealed class WorkAssignmentAdvancedSummaryController : ControllerBase
         [FromBody] BuildWorkAssignmentAdvancedSummaryYearNodeRequest req,
         CancellationToken ct)
     {
-        var actorUserId = GetActorUserId();
-        var result = await _hierarchy.RequestYearNodeBuildAsync(configId, yearKey, req ?? new BuildWorkAssignmentAdvancedSummaryYearNodeRequest(), actorUserId, ct);
-        return Ok(result);
+        _candidateActivation.RequireCapability(
+            StatRunCapabilities.AdvancedSummary,
+            StatRunRouteRegistry.AdvancedBuild);
+        var result = await _hierarchy.RequestYearNodeBuildAsync(
+            configId,
+            yearKey,
+            req,
+            GetActorUserId(),
+            ct);
+        return Accepted(result);
     }
 
     [HttpPost("configs/{configId}/hierarchy/query")]
@@ -112,8 +251,14 @@ public sealed class WorkAssignmentAdvancedSummaryController : ControllerBase
         [FromBody] QueryWorkAssignmentAdvancedSummaryHierarchyRequest req,
         CancellationToken ct)
     {
-        var actorUserId = GetActorUserId();
-        var result = await _hierarchy.QueryHierarchyAsync(configId, req ?? new QueryWorkAssignmentAdvancedSummaryHierarchyRequest(), actorUserId, ct);
+        _candidateActivation.RequireCapability(
+            StatRunCapabilities.AdvancedSummary,
+            StatRunRouteRegistry.AdvancedResult);
+        var result = await _hierarchy.QueryHierarchyAsync(
+            configId,
+            req,
+            GetActorUserId(),
+            ct);
         return Ok(result);
     }
 

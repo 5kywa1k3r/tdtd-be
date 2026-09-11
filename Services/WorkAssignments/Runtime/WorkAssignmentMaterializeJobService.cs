@@ -12,6 +12,8 @@ using tdtd_be.Models;
 using tdtd_be.Models.Enums;
 using tdtd_be.Services.Common;
 using tdtd_be.Services.Common.Time;
+using tdtd_be.Services.DynamicFlows;
+using tdtd_be.Services.WorkAssignmentReports.Runtime;
 using tdtd_be.Services.WorkAssignments.Internal;
 
 namespace tdtd_be.Services.WorkAssignments.Runtime;
@@ -19,6 +21,7 @@ namespace tdtd_be.Services.WorkAssignments.Runtime;
 public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMaterializeJobService
 {
     private readonly MongoDbContext _ctx;
+    private readonly IDynamicFlowDefinitionTransactionRunner _transactions;
     private readonly IWorkAssignmentStatusSyncService _sync;
     private readonly IDocRoleReadModelProjectionService _docRoleReadModelProjection;
     private readonly IWorkStatusOperationLogService _statusLog;
@@ -27,6 +30,7 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
 
     public WorkAssignmentMaterializeJobService(
         MongoDbContext ctx,
+        IDynamicFlowDefinitionTransactionRunner transactions,
         IWorkAssignmentStatusSyncService sync,
         IDocRoleReadModelProjectionService docRoleReadModelProjection,
         IWorkStatusOperationLogService statusLog,
@@ -34,6 +38,7 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
         IConfiguration cfg)
     {
         _ctx = ctx;
+        _transactions = transactions;
         _sync = sync;
         _docRoleReadModelProjection = docRoleReadModelProjection;
         _statusLog = statusLog;
@@ -55,6 +60,14 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
             throw AppExceptionFactory.BadRequest(
                 AppErrorCode.WORK_ASSIGNMENT_ID_REQUIRED,
                 new { assignment.WorkId });
+
+        // P5 runtime outbox/reconcile exclusively owns period materialization
+        // for flow assignments. A legacy job must never race that ownership.
+        if (!string.IsNullOrWhiteSpace(assignment.FlowInstanceId))
+        {
+            await DisableByAssignmentIdAsync(assignment.Id, actorUserId, ct);
+            return;
+        }
 
         var now = DateTime.UtcNow;
 
@@ -242,7 +255,9 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
             .Find(x => x.Id == job.WorkAssignmentId && !x.IsDeleted)
             .FirstOrDefaultAsync(ct);
 
-        if (assignment is null || !assignment.IsActive)
+        if (assignment is null ||
+            !assignment.IsActive ||
+            !string.IsNullOrWhiteSpace(assignment.FlowInstanceId))
         {
             await CompleteJobAsync(job.Id!, ct);
             return;
@@ -337,9 +352,22 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
             }
         }
 
-        var changed = targets.Count == 0
-            ? new MaterializeBatchResult(0, 0, 0, 0)
-            : await ApplyMaterializeBatchAsync(assignment, targets, ct);
+        var reachedEnd = dueIndex >= dueItems.Count;
+        var continueRolling = reachedEnd &&
+                              ShouldContinueRolling(
+                                  assignment,
+                                  work,
+                                  parent,
+                                  DateTime.UtcNow);
+        var changed = await ApplyMaterializeBatchAndAdvanceJobAsync(
+            assignment,
+            job,
+            targets,
+            assigneeIndex,
+            dueIndex,
+            dueItems.Count,
+            continueRolling,
+            ct);
 
         if (targets.Count > 0)
         {
@@ -355,30 +383,80 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
                 targetBatchSize);
         }
 
-        if (dueIndex >= dueItems.Count)
-        {
-            if (changed.ChangedCount > 0)
-            {
-                await _sync.SyncFromAssignmentAsync(assignment.Id, ct);
-            }
-
-            if (ShouldContinueRolling(assignment, work, parent, DateTime.UtcNow))
-                await RequeueNextRollingOccurrenceWindowAsync(job.Id!, ct);
-            else
-                await CompleteJobAsync(job.Id!, ct);
-
-            return;
-        }
-
         if (changed.ChangedCount > 0)
-        {
             await _sync.SyncFromAssignmentAsync(assignment.Id, ct);
-        }
 
-        await RequeueQuickAsync(job.Id!, assigneeIndex, dueIndex, ct);
+        foreach (var periodId in changed.RebuildPeriodIds)
+            await _docRoleReadModelProjection.RebuildReportPeriodAsync(
+                periodId,
+                "system",
+                ct);
+    }
+
+    private async Task<MaterializeBatchResult> ApplyMaterializeBatchAndAdvanceJobAsync(
+        WorkAssignment assignment,
+        WorkAssignmentMaterializeJobs job,
+        IReadOnlyList<MaterializeTarget> targets,
+        int nextAssigneeIndex,
+        int nextDueIndex,
+        int dueItemCount,
+        bool continueRolling,
+        CancellationToken ct)
+    {
+        return await _transactions.ExecuteAsync(
+            async (session, transactionCt) =>
+            {
+                // The schedule/binding targets were prepared before the
+                // transaction. Revalidate the assignment snapshot so a stale
+                // legacy batch fails closed rather than rewriting a newer
+                // owner state.
+                var currentAssignment = await _ctx.WorkAssignments
+                    .Find(
+                        session,
+                        x => x.Id == assignment.Id &&
+                             x.WorkId == assignment.WorkId &&
+                             x.UpdatedAtUtc == assignment.UpdatedAtUtc &&
+                             x.IsActive &&
+                             !x.IsDeleted &&
+                             x.FlowInstanceId == null)
+                    .FirstOrDefaultAsync(transactionCt);
+                if (currentAssignment is null)
+                {
+                    throw new InvalidOperationException(
+                        "P9_MATERIALIZE_ASSIGNMENT_CAS_LOST");
+                }
+
+                var result = await ApplyMaterializeBatchAsync(
+                    session,
+                    currentAssignment,
+                    targets,
+                    transactionCt);
+
+                if (result.ChangedCount > 0)
+                {
+                    await WorkDirectSourceRevisionFence.IncrementAsync(
+                        _ctx,
+                        session,
+                        currentAssignment.WorkId,
+                        transactionCt);
+                }
+
+                await AdvanceClaimedJobAsync(
+                    session,
+                    job,
+                    nextAssigneeIndex,
+                    nextDueIndex,
+                    dueItemCount,
+                    continueRolling,
+                    transactionCt);
+
+                return result;
+            },
+            ct);
     }
 
     private async Task<MaterializeBatchResult> ApplyMaterializeBatchAsync(
+        IClientSessionHandle session,
         WorkAssignment assignment,
         IReadOnlyList<MaterializeTarget> targets,
         CancellationToken ct)
@@ -394,21 +472,44 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
             .Where(x => !string.IsNullOrWhiteSpace(x))
             .Distinct(StringComparer.Ordinal)
             .ToList();
+        var bindingIds = targets
+            .Select(x => x.Binding.Id)
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+
+        var currentBindings = await _ctx.WorkTemplateAssignees
+            .Find(
+                session,
+                x => bindingIds.Contains(x.Id) &&
+                     x.WorkId == assignment.WorkId &&
+                     x.WorkAssignmentId == assignment.Id &&
+                     x.IsActive &&
+                     !x.IsDeleted)
+            .ToListAsync(ct);
+        var currentBindingById = currentBindings
+            .ToDictionary(x => x.Id, x => x, StringComparer.Ordinal);
 
         var existingPeriods = await _ctx.WorkReportPeriods
-            .Find(x =>
-                x.WorkAssignmentId == assignment.Id &&
-                assigneeUserIds.Contains(x.AssigneeUserId) &&
-                periodKeys.Contains(x.PeriodKey) &&
-                (x.PeriodKind == null || x.PeriodKind == WorkReportPeriodKind.Scheduled) &&
-                !x.IsDeleted)
+            .Find(
+                session,
+                x => x.WorkAssignmentId == assignment.Id &&
+                     assigneeUserIds.Contains(x.AssigneeUserId) &&
+                     periodKeys.Contains(x.PeriodKey) &&
+                     (x.PeriodKind == null || x.PeriodKind == WorkReportPeriodKind.Scheduled) &&
+                     !x.IsDeleted)
             .ToListAsync(ct);
 
         var existingByAssigneeAndKey = existingPeriods
             .GroupBy(x => PeriodLookupKey(x.AssigneeUserId, x.PeriodKey), StringComparer.Ordinal)
             .ToDictionary(
                 x => x.Key,
-                x => x.OrderByDescending(p => p.UpdatedAtUtc).First(),
+                // Corrupt/legacy duplicates fail closed: if any row carries
+                // lifecycle authority, select it so this target is skipped.
+                x => x
+                    .OrderByDescending(HasLifecycleAuthority)
+                    .ThenByDescending(p => p.UpdatedAtUtc)
+                    .First(),
                 StringComparer.Ordinal);
 
         var periodWrites = new List<WriteModel<WorkReportPeriod>>();
@@ -420,7 +521,21 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
 
         foreach (var target in targets)
         {
-            var binding = target.Binding;
+            if (string.IsNullOrWhiteSpace(target.Binding.Id) ||
+                !currentBindingById.TryGetValue(target.Binding.Id, out var binding) ||
+                !string.Equals(
+                    binding.AssigneeUserId,
+                    target.Binding.AssigneeUserId,
+                    StringComparison.Ordinal) ||
+                !string.Equals(
+                    binding.AssigneeUnitId,
+                    target.Binding.AssigneeUnitId,
+                    StringComparison.Ordinal))
+            {
+                skipped++;
+                continue;
+            }
+
             var item = target.DueItem;
             var assigneeUserId = binding.AssigneeUserId;
 
@@ -455,6 +570,9 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
                     DynamicFormTemplateId = assignment.DynamicFormTemplateId,
                     DynamicFormTemplateCode = assignment.DynamicFormTemplateCode,
                     DynamicFormTemplateName = assignment.DynamicFormTemplateName,
+                    DynamicFormFamilyId = assignment.DynamicFormFamilyId,
+                    DynamicFormVersionNo = assignment.DynamicFormVersionNo,
+                    DynamicFormSchemaHash = assignment.DynamicFormSchemaHash,
                     AssigneeUserId = assigneeUserId,
                     AssigneeUnitId = binding.AssigneeUnitId,
                     PeriodKey = item.PeriodKey,
@@ -491,6 +609,15 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
                 continue;
             }
 
+            // P9 lifecycle owns these rows. A legacy materializer must not
+            // rewrite their status, visibility, time window, form pin, or
+            // queue state even when its pre-read saw an older Pending row.
+            if (HasLifecycleAuthority(existed))
+            {
+                skipped++;
+                continue;
+            }
+
             var updatedIsHistoricalData = existed.IsHistoricalData || isHistoricalData;
             var updatedStatus = existed.Status;
             var updatedIsOverdue = existed.IsOverdue;
@@ -517,32 +644,30 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
                     updatedPeriodIsActive,
                     updatedIsHistoricalData))
             {
-                if (updatedIsHistoricalData)
-                {
-                    queueWrites.Add(BuildQueueUpsert(
-                        existed.WorkId,
-                        existed.WorkAssignmentId,
-                        existed.AssigneeUserId,
-                        existed.PeriodKey,
-                        item.DueAtUtc,
-                        updatedStatus,
-                        isActive: false,
-                        now));
-                }
-
                 skipped++;
                 continue;
             }
 
+            var periodFilter = Builders<WorkReportPeriod>.Filter;
             periodWrites.Add(new UpdateOneModel<WorkReportPeriod>(
-                Builders<WorkReportPeriod>.Filter.Eq(x => x.Id, existed.Id),
+                periodFilter.Eq(x => x.Id, existed.Id) &
+                periodFilter.Eq(x => x.WorkAssignmentId, assignment.Id) &
+                periodFilter.Eq(x => x.UpdatedAtUtc, existed.UpdatedAtUtc) &
+                periodFilter.Eq(x => x.IsDeleted, false) &
+                periodFilter.Ne(x => x.Status, WorkReportPeriodStatus.Approved) &
+                periodFilter.Ne(x => x.Status, WorkReportPeriodStatus.OverdueApproved) &
+                periodFilter.Eq(x => x.CurrentReportId, null) &
+                periodFilter.Eq(x => x.SourceLifecycleReportId, null) &
+                (periodFilter.Eq(x => x.SourceLifecycleRevision, 0) |
+                 periodFilter.Exists(x => x.SourceLifecycleRevision, false)) &
+                periodFilter.Eq(x => x.SourceLifecycleAppliedAtUtc, null) &
+                (periodFilter.Eq(x => x.HistoricalDataApproved, false) |
+                 periodFilter.Exists(x => x.HistoricalDataApproved, false)) &
+                periodFilter.Eq(x => x.HistoricalDataApprovedAtUtc, null),
                 Builders<WorkReportPeriod>.Update
                     .Set(x => x.WorkTemplateAssigneeId, binding.Id!)
                     .Set(x => x.IsActive, updatedPeriodIsActive)
                     .Set(x => x.DueAtUtc, item.DueAtUtc)
-                    .Set(x => x.DynamicFormTemplateId, assignment.DynamicFormTemplateId)
-                    .Set(x => x.DynamicFormTemplateCode, assignment.DynamicFormTemplateCode)
-                    .Set(x => x.DynamicFormTemplateName, assignment.DynamicFormTemplateName)
                     .Set(x => x.PeriodInstanceKey, string.IsNullOrWhiteSpace(existed.PeriodInstanceKey) ? existed.PeriodKey : existed.PeriodInstanceKey)
                     .Set(x => x.PeriodKind, WorkReportPeriodKind.Scheduled)
                     .Set(x => x.ReportDate, target.PeriodDate)
@@ -569,24 +694,121 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
 
         if (periodWrites.Count > 0)
         {
-            await _ctx.WorkReportPeriods.BulkWriteAsync(
+            var result = await _ctx.WorkReportPeriods.BulkWriteAsync(
+                session,
                 periodWrites,
                 new BulkWriteOptions { IsOrdered = false },
                 ct);
+            if (result.InsertedCount != created ||
+                result.MatchedCount != updated ||
+                result.ModifiedCount != updated)
+            {
+                throw new InvalidOperationException(
+                    "P9_MATERIALIZE_PERIOD_CAS_LOST");
+            }
         }
 
         if (queueWrites.Count > 0)
         {
             await _ctx.WorkAssignmentQueueItems.BulkWriteAsync(
+                session,
                 queueWrites,
                 new BulkWriteOptions { IsOrdered = false },
                 ct);
         }
 
-        foreach (var periodId in rebuildPeriodIds.Distinct(StringComparer.Ordinal))
-            await _docRoleReadModelProjection.RebuildReportPeriodAsync(periodId, "system", ct);
+        return new MaterializeBatchResult(
+            created,
+            updated,
+            skipped,
+            created + updated,
+            rebuildPeriodIds
+                .Distinct(StringComparer.Ordinal)
+                .ToArray());
+    }
 
-        return new MaterializeBatchResult(created, updated, skipped, created + updated);
+    private static bool HasLifecycleAuthority(WorkReportPeriod period)
+        => period.Status is WorkReportPeriodStatus.Approved or
+                            WorkReportPeriodStatus.OverdueApproved ||
+           !string.IsNullOrWhiteSpace(period.CurrentReportId) ||
+           !string.IsNullOrWhiteSpace(period.SourceLifecycleReportId) ||
+           period.SourceLifecycleRevision > 0 ||
+           period.SourceLifecycleAppliedAtUtc.HasValue ||
+           period.HistoricalDataApproved ||
+           period.HistoricalDataApprovedAtUtc.HasValue;
+
+    private async Task AdvanceClaimedJobAsync(
+        IClientSessionHandle session,
+        WorkAssignmentMaterializeJobs job,
+        int nextAssigneeIndex,
+        int nextDueIndex,
+        int dueItemCount,
+        bool continueRolling,
+        CancellationToken ct)
+    {
+        var now = DateTime.UtcNow;
+        var reachedEnd = nextDueIndex >= dueItemCount;
+        UpdateDefinition<WorkAssignmentMaterializeJobs> update;
+
+        if (reachedEnd && continueRolling)
+        {
+            var nextRunAt = now
+                .AddDays(1)
+                .AddMinutes(Random.Shared.Next(0, 31));
+            update = Builders<WorkAssignmentMaterializeJobs>.Update
+                .Set(x => x.Status, MaterializeJobStatuses.Pending)
+                .Set(x => x.CursorAssigneeIndex, 0)
+                .Set(x => x.CursorDueIndex, 0)
+                .Set(x => x.IsActive, true)
+                .Set(x => x.LeaseUntilUtc, null)
+                .Set(x => x.LastHeartbeatAtUtc, now)
+                .Set(x => x.NextRetryAtUtc, nextRunAt)
+                .Set(x => x.CompletedAtUtc, null)
+                .Set(x => x.UpdatedAtUtc, now)
+                .Set(x => x.UpdatedByUserId, null);
+        }
+        else if (reachedEnd)
+        {
+            update = Builders<WorkAssignmentMaterializeJobs>.Update
+                .Set(x => x.Status, MaterializeJobStatuses.Completed)
+                .Set(x => x.IsActive, false)
+                .Set(x => x.LeaseUntilUtc, null)
+                .Set(x => x.NextRetryAtUtc, null)
+                .Set(x => x.CompletedAtUtc, now)
+                .Set(x => x.UpdatedAtUtc, now)
+                .Set(x => x.UpdatedByUserId, null);
+        }
+        else
+        {
+            update = Builders<WorkAssignmentMaterializeJobs>.Update
+                .Set(x => x.Status, MaterializeJobStatuses.Pending)
+                .Set(x => x.CursorAssigneeIndex, nextAssigneeIndex)
+                .Set(x => x.CursorDueIndex, nextDueIndex)
+                .Set(x => x.LeaseUntilUtc, null)
+                .Set(x => x.LastHeartbeatAtUtc, now)
+                .Set(x => x.NextRetryAtUtc, now)
+                .Set(x => x.UpdatedAtUtc, now)
+                .Set(x => x.UpdatedByUserId, null);
+        }
+
+        var result = await _ctx.WorkAssignmentMaterializeJobs.UpdateOneAsync(
+            session,
+            x => x.Id == job.Id &&
+                 x.WorkId == job.WorkId &&
+                 x.WorkAssignmentId == job.WorkAssignmentId &&
+                 x.Status == MaterializeJobStatuses.Running &&
+                 x.IsActive &&
+                 !x.IsDeleted &&
+                 x.LeaseUntilUtc == job.LeaseUntilUtc &&
+                 x.CursorAssigneeIndex == job.CursorAssigneeIndex &&
+                 x.CursorDueIndex == job.CursorDueIndex,
+            update,
+            cancellationToken: ct);
+        if (result.MatchedCount != 1 || result.ModifiedCount != 1)
+        {
+            throw new InvalidOperationException(
+                "P9_MATERIALIZE_JOB_CAS_LOST");
+        }
     }
 
     private static UpdateOneModel<WorkAssignmentQueueItem> BuildQueueUpsert(
@@ -990,5 +1212,6 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
         int CreatedCount,
         int UpdatedCount,
         int SkippedCount,
-        int ChangedCount);
+        int ChangedCount,
+        IReadOnlyList<string> RebuildPeriodIds);
 }

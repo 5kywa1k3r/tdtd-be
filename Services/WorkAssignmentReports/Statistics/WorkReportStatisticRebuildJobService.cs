@@ -8,6 +8,7 @@ using tdtd_be.Data;
 using tdtd_be.Models;
 using tdtd_be.Models.Statistics;
 using tdtd_be.Services.Notifications;
+using tdtd_be.Services.StatisticsConfiguration;
 
 namespace tdtd_be.Services.WorkAssignmentReports.Statistics;
 
@@ -44,13 +45,18 @@ public sealed class WorkReportStatisticRebuildJobService : IWorkReportStatisticR
         string requestedByUserId,
         bool highPriority,
         CancellationToken ct = default)
-        => await EnqueueForScopeAsync(
+    {
+        StatConfigPhaseBarrier.Reject(StatConfigPhaseBarrierEntries.P9Projection);
+        StatConfigIsolationGuard.ThrowIfConfigurationMutationActive(
+            nameof(EnqueueForTemplateStatisticConfigAsync));
+        return await EnqueueForScopeAsync(
             template,
             new StatisticRebuildScopeRequest { DynamicFormTemplateId = template.Id },
             WorkReportStatisticRebuildJobScopeKinds.Template,
             requestedByUserId,
             highPriority,
             ct);
+    }
 
     public async Task<StatisticRebuildJobEnqueueResult> EnqueueForBoundedScopeAsync(
         StatisticRebuildScopeRequest scope,
@@ -58,6 +64,9 @@ public sealed class WorkReportStatisticRebuildJobService : IWorkReportStatisticR
         bool highPriority,
         CancellationToken ct = default)
     {
+        StatConfigPhaseBarrier.Reject(StatConfigPhaseBarrierEntries.P9Projection);
+        StatConfigIsolationGuard.ThrowIfConfigurationMutationActive(
+            nameof(EnqueueForBoundedScopeAsync));
         var normalized = NormalizeScope(scope);
         var template = await _ctx.DynamicFormTemplates
             .Find(x => x.Id == normalized.DynamicFormTemplateId && !x.IsDeleted)
@@ -150,6 +159,9 @@ public sealed class WorkReportStatisticRebuildJobService : IWorkReportStatisticR
         bool highPriority,
         CancellationToken ct = default)
     {
+        StatConfigPhaseBarrier.Reject(StatConfigPhaseBarrierEntries.P9Projection);
+        StatConfigIsolationGuard.ThrowIfConfigurationMutationActive(
+            nameof(EnqueueForLabelChangeAsync));
         if (label is null || string.IsNullOrWhiteSpace(label.Code))
             return Array.Empty<StatisticRebuildJobEnqueueResult>();
 
@@ -197,6 +209,7 @@ public sealed class WorkReportStatisticRebuildJobService : IWorkReportStatisticR
         int batchSize = 25,
         CancellationToken ct = default)
     {
+        StatConfigPhaseBarrier.Reject(StatConfigPhaseBarrierEntries.P9Projection);
         maxJobs = Math.Clamp(maxJobs, 1, 20);
         batchSize = Math.Clamp(batchSize, 1, 100);
         var processedJobs = 0;
@@ -228,6 +241,9 @@ public sealed class WorkReportStatisticRebuildJobService : IWorkReportStatisticR
         var fb = Builders<WorkReportStatisticRebuildJob>.Filter;
         var filter = fb.Eq(x => x.IsActive, true)
             & fb.Eq(x => x.IsDeleted, false)
+            // P9 foundation jobs have their own token/owner/state-CAS worker and
+            // must never enter the legacy projection worker before P9-02.
+            & fb.Eq(x => x.ReceiptId, null)
             & (fb.Eq(x => x.Status, WorkReportStatisticRebuildJobStatuses.Pending)
                | fb.Eq(x => x.Status, WorkReportStatisticRebuildJobStatuses.RetryWaiting)
                | (fb.Eq(x => x.Status, WorkReportStatisticRebuildJobStatuses.Running)

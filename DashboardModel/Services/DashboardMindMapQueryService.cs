@@ -13,6 +13,7 @@ using tdtd_be.Models.Enums;
 using tdtd_be.Models.Statistics;
 using tdtd_be.Services.Common;
 using tdtd_be.Services.Common.Time;
+using tdtd_be.Services.StatisticsConfiguration;
 
 namespace tdtd_be.DashboardModel.Services;
 
@@ -638,6 +639,7 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
         DashboardMindMapScopeRequest? scope,
         CancellationToken ct = default)
     {
+        StatConfigPhaseBarrier.Reject(StatConfigPhaseBarrierEntries.P9Result);
         var me = _me.RequireMe();
         var node = await LoadAccessibleAssignmentAsync(assignmentId, me.Id, ct);
         var normalizedScope = NormalizeScope(scope);
@@ -679,7 +681,8 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
         var filter = fb.Eq(x => x.WorkId, node.WorkId)
             & fb.Eq(x => x.ScopeType, "ASSIGNMENT")
             & fb.Eq(x => x.ScopeId, node.Id)
-            & fb.Eq(x => x.IsDeleted, false);
+            & fb.Eq(x => x.IsDeleted, false)
+            & fb.Eq(x => x.DirectProjection, null);
 
         if (scope.HasFilters)
         {
@@ -775,7 +778,8 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
         var filter = fb.Eq(x => x.WorkId, node.WorkId)
             & fb.Eq(x => x.ScopeType, "ASSIGNMENT")
             & fb.Eq(x => x.ScopeId, node.Id)
-            & fb.Eq(x => x.IsDeleted, false);
+            & fb.Eq(x => x.IsDeleted, false)
+            & fb.Eq(x => x.DirectProjection, null);
 
         if (scope.HasFilters)
         {
@@ -874,7 +878,8 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
             & fb.Eq(x => x.ScopeType, "ASSIGNMENT")
             & fb.Eq(x => x.ScopeId, node.Id)
             & fb.Eq(x => x.ShowInTree, true)
-            & fb.Eq(x => x.IsDeleted, false);
+            & fb.Eq(x => x.IsDeleted, false)
+            & fb.Eq(x => x.DirectProjection, null);
 
         if (scope.HasFilters)
         {
@@ -1079,6 +1084,7 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
         DashboardMindMapTableMetricReportsSearchRequest? req,
         CancellationToken ct = default)
     {
+        StatConfigPhaseBarrier.Reject(StatConfigPhaseBarrierEntries.P9Result);
         var me = _me.RequireMe();
         req ??= new DashboardMindMapTableMetricReportsSearchRequest();
 
@@ -1218,6 +1224,7 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
         DashboardMindMapFieldMetricReportsSearchRequest? req,
         CancellationToken ct = default)
     {
+        StatConfigPhaseBarrier.Reject(StatConfigPhaseBarrierEntries.P9Result);
         var me = _me.RequireMe();
         req ??= new DashboardMindMapFieldMetricReportsSearchRequest();
 
@@ -1383,6 +1390,7 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
         DashboardMindMapLabelReportsSearchRequest? req,
         CancellationToken ct = default)
     {
+        StatConfigPhaseBarrier.Reject(StatConfigPhaseBarrierEntries.P9Result);
         var me = _me.RequireMe();
         req ??= new DashboardMindMapLabelReportsSearchRequest();
 
@@ -1531,6 +1539,7 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
         var fb = Builders<WorkReportTableStatValue>.Filter;
         var filter = fb.Eq(x => x.WorkId, workId)
             & fb.Eq(x => x.IsDeleted, false)
+            & fb.Eq(x => x.DirectProjection, null)
             & fb.In(x => x.WorkAssignmentId, assignmentIds)
             & fb.Eq(x => x.MetricKey, req.MetricKey.Trim());
 
@@ -1564,6 +1573,7 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
         var fb = Builders<WorkReportLabelStatValue>.Filter;
         var filter = fb.Eq(x => x.WorkId, workId)
             & fb.Eq(x => x.IsDeleted, false)
+            & fb.Eq(x => x.DirectProjection, null)
             & fb.In(x => x.WorkAssignmentId, assignmentIds)
             & fb.Eq(x => x.LabelCode, NormalizeLabelCode(req.LabelCode));
 
@@ -1605,6 +1615,7 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
         var fb = Builders<WorkReportFieldStatValue>.Filter;
         var filter = fb.Eq(x => x.WorkId, workId)
             & fb.Eq(x => x.IsDeleted, false)
+            & fb.Eq(x => x.DirectProjection, null)
             & fb.In(x => x.WorkAssignmentId, assignmentIds)
             & fb.Eq(x => x.FieldId, req.FieldId.Trim());
 

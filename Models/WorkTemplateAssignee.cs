@@ -39,6 +39,21 @@ public sealed class WorkTemplateAssignee : BaseEntity
     [BsonElement("dynamicFormTemplateName")]
     public string? DynamicFormTemplateName { get; set; }
 
+    [BsonRepresentation(BsonType.ObjectId)]
+    [BsonElement("dynamicFormFamilyId")]
+    public string? DynamicFormFamilyId { get; set; }
+
+    [BsonElement("dynamicFormVersionNo")]
+    public int? DynamicFormVersionNo { get; set; }
+
+    [BsonElement("dynamicFormSchemaHash")]
+    public string? DynamicFormSchemaHash { get; set; }
+
+    [BsonRepresentation(BsonType.ObjectId)]
+    [BsonElement("dynamicFlowSupplementalStepId")]
+    [BsonIgnoreIfNull]
+    public string? DynamicFlowSupplementalStepId { get; set; }
+
     [BsonElement("dynamicFormDataSourceRulesJson")]
     public string? DynamicFormDataSourceRulesJson { get; set; }
 

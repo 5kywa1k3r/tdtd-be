@@ -4,7 +4,7 @@ using tdtd_be.DTOs.Auth;
 
 namespace tdtd_be.Common.Cache
 {
-    public sealed class RedisUserCache
+    public sealed class RedisUserCache : IUserSessionCache
     {
         private readonly IDatabase _db;
         private readonly IConfiguration _cfg;

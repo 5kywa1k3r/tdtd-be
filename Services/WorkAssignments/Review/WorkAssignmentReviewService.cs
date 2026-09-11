@@ -7,6 +7,7 @@ using tdtd_be.Common.Errors;
 using tdtd_be.Data;
 using tdtd_be.DTOs.Common;
 using tdtd_be.DTOs.Operations;
+using tdtd_be.DTOs.WorkAssignmentReports;
 using tdtd_be.DTOs.WorkAssignments.Review;
 using tdtd_be.Enum;
 using tdtd_be.Models;
@@ -15,6 +16,7 @@ using tdtd_be.Services.Common;
 using tdtd_be.Services.DynamicFlows;
 using tdtd_be.Services.WorkAssignmentReports;
 using tdtd_be.Services.WorkAssignmentReports.Payloads;
+using tdtd_be.Services.WorkAssignmentReports.Runtime;
 using tdtd_be.Services.WorkAssignmentReports.Statistics;
 using tdtd_be.Services.WorkAssignments.AdvancedSummary;
 using tdtd_be.Services.WorkAssignments.Domain;
@@ -35,8 +37,13 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
     private readonly IWorkReportLabelStatisticsService _labelStatistics;
     private readonly IWorkReportTableStatisticsService _tableStatistics;
     private readonly IWorkReportFieldStatisticsService _fieldStatistics;
-    private readonly IWorkAssignmentReportService _reportService;
+    private readonly IWorkReportPayloadReader _payloadReader;
+    private readonly IWorkReportAggregateDependentRecoveryService _aggregateDependentRecovery;
     private readonly IWorkAssignmentAdvancedSummaryDirtyService _advancedSummaryDirty;
+    private readonly IWorkReportLifecycleProjectionReconciler _lifecycleProjectionReconciler;
+    private readonly IWorkReportLifecycleSeriesLockService _lifecycleSeriesLock;
+    private readonly IDynamicFlowRuntimeActivationPolicy _runtimeActivation;
+    private readonly IDynamicFlowDefinitionTransactionRunner _transactions;
     private readonly MeAccessor _me;
     private readonly ILogger<WorkAssignmentReviewService> _log;
 
@@ -50,8 +57,13 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
         IWorkReportLabelStatisticsService labelStatistics,
         IWorkReportTableStatisticsService tableStatistics,
         IWorkReportFieldStatisticsService fieldStatistics,
-        IWorkAssignmentReportService reportService,
+        IWorkReportPayloadReader payloadReader,
+        IWorkReportAggregateDependentRecoveryService aggregateDependentRecovery,
         IWorkAssignmentAdvancedSummaryDirtyService advancedSummaryDirty,
+        IWorkReportLifecycleProjectionReconciler lifecycleProjectionReconciler,
+        IWorkReportLifecycleSeriesLockService lifecycleSeriesLock,
+        IDynamicFlowRuntimeActivationPolicy runtimeActivation,
+        IDynamicFlowDefinitionTransactionRunner transactions,
         MeAccessor me,
         ILogger<WorkAssignmentReviewService> log)
     {
@@ -64,8 +76,13 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
         _labelStatistics = labelStatistics;
         _tableStatistics = tableStatistics;
         _fieldStatistics = fieldStatistics;
-        _reportService = reportService;
+        _payloadReader = payloadReader;
+        _aggregateDependentRecovery = aggregateDependentRecovery;
         _advancedSummaryDirty = advancedSummaryDirty;
+        _lifecycleProjectionReconciler = lifecycleProjectionReconciler;
+        _lifecycleSeriesLock = lifecycleSeriesLock;
+        _runtimeActivation = runtimeActivation;
+        _transactions = transactions;
         _me = me;
         _log = log;
     }
@@ -231,7 +248,7 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
             fb.Regex("assignees.userId", qRegex));
     }
 
-    public async Task ApproveReportAsync(string reportId, ApproveReportRequest req, CancellationToken ct)
+    public async Task<WorkReportLifecycleCommitResponse> ApproveReportAsync(string reportId, ApproveReportRequest req, CancellationToken ct)
     {
         var me = _me.RequireMe();
         req ??= new ApproveReportRequest();
@@ -241,11 +258,47 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
             .FirstOrDefaultAsync(ct)
             ?? throw ReportNotFound(reportId);
 
+        var assignment = await _ctx.WorkAssignments
+            .Find(x => x.Id == report.WorkAssignmentId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct)
+            ?? throw ReportAssignmentNotFound(report);
+
+        await EnsureCanReviewReportAsync(assignment, me.Id, ct);
         EnsureReportIsActive(report);
         EnsureNotSelfReview(report, me.Id);
 
         var confirmsAutoApproval = report.Status == WorkAssignmentReportStatus.Approved &&
                                    WorkAssignmentAutoApprovalState.CanReporterWithdraw(report);
+        var approveOperation = ResolveApproveLifecycleOperation(report, req.CommandId, confirmsAutoApproval);
+        var approveCommandHash = WorkReportLifecycleCommandContract.ComputeHash(approveOperation, req);
+        var (lifecycleCommand, lifecycleResolution) = WorkReportLifecycleCommandContract.Resolve(
+            report,
+            req.ExpectedLifecycleRevision,
+            req.ExpectedPayloadRevision,
+            req.CommandId,
+            approveOperation,
+            approveCommandHash);
+        if (lifecycleResolution == WorkReportLifecycleCommandResolution.CompletedReplay)
+        {
+            return await ResolveLifecycleCommitResponseAsync(report.Id, replay: true);
+        }
+
+        await DynamicFlowMappingLifecycleContract.ValidateAsync(
+            _ctx,
+            report,
+            DynamicFlowMappingLifecycleContract
+                .AllowsHistoricalLifecycleTransition(lifecycleCommand.Operation)
+                ? DynamicFlowMappingIntegrityMode.AllowHistorical
+                : DynamicFlowMappingIntegrityMode.RequireCurrent,
+            ct,
+            canLifecycleMapping:
+                _runtimeActivation.P7MappingLifecycleExecutionEnabled,
+            lifecycleOperation: lifecycleCommand.Operation);
+
+        await using var lifecycleSeriesLease = await _lifecycleSeriesLock.AcquireAsync(
+            report.WorkAssignmentId,
+            lifecycleCommand.Operation,
+            ct);
 
         if (report.Status != WorkAssignmentReportStatus.Submitted && !confirmsAutoApproval)
             throw InvalidReportStatus(
@@ -253,14 +306,8 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
                 report,
                 WorkAssignmentReportStatus.Submitted);
 
-        WorkReportPayloadConsistency.EnsureReadyForStatisticProjection(report);
-
-        var assignment = await _ctx.WorkAssignments
-            .Find(x => x.Id == report.WorkAssignmentId && !x.IsDeleted)
-            .FirstOrDefaultAsync(ct)
-            ?? throw ReportAssignmentNotFound(report);
-
-        await EnsureCanReviewReportAsync(assignment, me.Id, ct);
+        var payload = await _payloadReader.LoadReportPayloadAsync(report, ct);
+        WorkReportPayloadConsistency.EnsureSnapshotFreshForStatisticProjection(report, payload);
 
         var period = await _ctx.WorkReportPeriods
             .Find(x => x.Id == report.WorkReportPeriodId && !x.IsDeleted)
@@ -274,8 +321,11 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
                 ? report.ReviewerComment
                 : req.Comment.Trim();
 
-            await _ctx.WorkAssignmentReports.UpdateOneAsync(
-                x => x.Id == report.Id,
+            var committed = await TryCommitLifecycleCommandAsync(
+                report,
+                lifecycleCommand,
+                WorkAssignmentReportStatus.Approved,
+                expectedIsActive: true,
                 Builders<WorkAssignmentReport>.Update
                     .Set(x => x.ReviewerComment, reviewerComment)
                     .Set(x => x.ApprovedAtUtc, now)
@@ -284,78 +334,18 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
                     .Set(x => x.AutoApprovalConfirmedByUserId, me.Id)
                     .Set(x => x.UpdatedAtUtc, now)
                     .Set(x => x.UpdatedByUserId, me.Id),
-                cancellationToken: ct);
+                WorkAssignmentReportStatus.Approved,
+                resultIsActive: true,
+                actorUserId: me.Id,
+                committedAtUtc: now,
+                lifecycleSeriesLease: lifecycleSeriesLease,
+                ct: ct,
+                businessReason: "AUTO_APPROVE_CONFIRMED",
+                businessComment: reviewerComment);
+            if (!committed)
+                return await ResolveLifecycleCommitResponseAsync(report.Id, replay: true);
 
-            report.ReviewerComment = reviewerComment;
-            report.ApprovedAtUtc = now;
-            report.ApprovedByUserId = me.Id;
-            report.AutoApprovalConfirmedAtUtc = now;
-            report.AutoApprovalConfirmedByUserId = me.Id;
-            report.UpdatedAtUtc = now;
-            report.UpdatedByUserId = me.Id;
-
-            if (period is not null)
-            {
-                await _ctx.WorkReportPeriods.UpdateOneAsync(
-                    x => x.Id == period.Id && !x.IsDeleted,
-                    Builders<WorkReportPeriod>.Update
-                        .Set(x => x.LastReviewedAtUtc, now)
-                        .Set(x => x.ReviewerComment, reviewerComment)
-                        .Set(x => x.UpdatedAtUtc, now)
-                        .Set(x => x.UpdatedByUserId, me.Id),
-                    cancellationToken: ct);
-
-                period.LastReviewedAtUtc = now;
-                period.ReviewerComment = reviewerComment;
-                period.UpdatedAtUtc = now;
-                period.UpdatedByUserId = me.Id;
-
-                await FinalizeReviewReportStatusOperationAsync(
-                    "REVIEW_CONFIRM_AUTO_APPROVE",
-                    report,
-                    period,
-                    WorkAssignmentReportStatus.Approved.ToString(),
-                    WorkAssignmentReportStatus.Approved.ToString(),
-                    me.Id,
-                    upsertQueue: false,
-                    disableQueue: true,
-                    ct);
-            }
-
-            await InsertReportLogAsync(
-                report.WorkId,
-                report.WorkAssignmentId,
-                report.WorkReportPeriodId,
-                report.Id,
-                "Xác nhận tự duyệt",
-                WorkAssignmentReportStatus.Approved.ToString(),
-                WorkAssignmentReportStatus.Approved.ToString(),
-                me.Id,
-                "AUTO_APPROVE_CONFIRMED",
-                reviewerComment,
-                ct);
-
-            await _userActionLog.RecordAsync(new UserActionLogSeed
-            {
-                Action = UserActionLogActions.ReportApproved,
-                Scope = "report",
-                ActorUserId = me.Id,
-                WorkId = report.WorkId,
-                WorkAssignmentId = report.WorkAssignmentId,
-                WorkReportPeriodId = report.WorkReportPeriodId,
-                WorkAssignmentReportId = report.Id,
-                TargetUserId = report.AssigneeUserId,
-                Summary = $"Confirmed auto approved report {report.PeriodInstanceKey}",
-                Data = new Dictionary<string, string>
-                {
-                    { "fromStatus", WorkAssignmentReportStatus.Approved.ToString() },
-                    { "toStatus", WorkAssignmentReportStatus.Approved.ToString() },
-                    { "autoApprovalConfirmed", true.ToString() }
-                },
-                OccurredAtUtc = now
-            }, CancellationToken.None);
-
-            return;
+            return await ResolveLifecycleCommitResponseAsync(report.Id, replay: false);
         }
 
         var isHistoricalApproval = report.IsHistoricalData;
@@ -366,8 +356,11 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
                 AppErrorCode.WORK_ASSIGNMENT_REPORT_HISTORICAL_APPROVAL_CONFIRMATION_REQUIRED,
                 new { reportId = report.Id, workReportPeriodId = report.WorkReportPeriodId });
 
-        await _ctx.WorkAssignmentReports.UpdateOneAsync(
-            x => x.Id == report.Id,
+        var approveCommitted = await TryCommitLifecycleCommandAsync(
+            report,
+            lifecycleCommand,
+            WorkAssignmentReportStatus.Submitted,
+            expectedIsActive: true,
             Builders<WorkAssignmentReport>.Update
                 .Set(x => x.Status, WorkAssignmentReportStatus.Approved)
                 .Set(x => x.ReviewerComment, req.Comment)
@@ -380,120 +373,28 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
                 .Set(x => x.AutoApprovalConfirmedByUserId, confirmsPreviouslyAutoApprovedReport ? me.Id : report.AutoApprovalConfirmedByUserId)
                 .Set(x => x.UpdatedAtUtc, now)
                 .Set(x => x.UpdatedByUserId, me.Id),
-            cancellationToken: ct);
+            WorkAssignmentReportStatus.Approved,
+            resultIsActive: true,
+            actorUserId: me.Id,
+            committedAtUtc: now,
+            lifecycleSeriesLease: lifecycleSeriesLease,
+            ct: ct,
+            businessComment: req.Comment);
+        if (!approveCommitted)
+            return await ResolveLifecycleCommitResponseAsync(report.Id, replay: true);
 
-        report.Status = WorkAssignmentReportStatus.Approved;
-        report.ReviewerComment = req.Comment;
-        if (isHistoricalApproval)
-        {
-            report.HistoricalDataApproved = true;
-            report.HistoricalDataApprovedAtUtc = now;
-            report.HistoricalDataApprovedByUserId = me.Id;
-        }
-        report.ApprovedAtUtc = now;
-        report.ApprovedByUserId = me.Id;
-        if (confirmsPreviouslyAutoApprovedReport)
-        {
-            report.AutoApprovalConfirmedAtUtc = now;
-            report.AutoApprovalConfirmedByUserId = me.Id;
-        }
-        report.UpdatedAtUtc = now;
-        report.UpdatedByUserId = me.Id;
-
-        if (period is not null)
-        {
-            var nextPeriodStatus = ResolveApprovedPeriodStatus(period, report, now);
-
-            await _ctx.WorkReportPeriods.UpdateOneAsync(
-                x => x.Id == period.Id && !x.IsDeleted,
-                Builders<WorkReportPeriod>.Update
-                    .Set(x => x.Status, nextPeriodStatus)
-                    .Set(x => x.IsOverdue, WorkReportPeriodStatusHelper.IsOverdue(nextPeriodStatus))
-                    .Set(x => x.LastReviewedAtUtc, now)
-                    .Set(x => x.ReviewerComment, req.Comment)
-                    .Set(x => x.HistoricalDataApproved, isHistoricalApproval ? true : period.HistoricalDataApproved)
-                    .Set(x => x.HistoricalDataApprovedAtUtc, isHistoricalApproval ? now : period.HistoricalDataApprovedAtUtc)
-                    .Set(x => x.HistoricalDataApprovedByUserId, isHistoricalApproval ? me.Id : period.HistoricalDataApprovedByUserId)
-                    .Set(x => x.UpdatedAtUtc, now)
-                    .Set(x => x.UpdatedByUserId, me.Id),
-                cancellationToken: ct);
-
-            period.Status = nextPeriodStatus;
-            period.IsOverdue = WorkReportPeriodStatusHelper.IsOverdue(nextPeriodStatus);
-            period.LastReviewedAtUtc = now;
-            period.ReviewerComment = req.Comment;
-            period.UpdatedAtUtc = now;
-            period.UpdatedByUserId = me.Id;
-
-            await FinalizeReviewReportStatusOperationAsync(
-                "REVIEW_APPROVE",
-                report,
-                period,
-                WorkAssignmentReportStatus.Submitted.ToString(),
-                WorkAssignmentReportStatus.Approved.ToString(),
-                me.Id,
-                upsertQueue: false,
-                disableQueue: true,
-                ct);
-        }
-
-        await InsertReportLogAsync(
-            report.WorkId,
-            report.WorkAssignmentId,
-            report.WorkReportPeriodId,
-            report.Id,
-            "Duyệt",
-            WorkAssignmentReportStatus.Submitted.ToString(),
-            WorkAssignmentReportStatus.Approved.ToString(),
-            me.Id,
-            null,
-            req.Comment,
-            ct);
-
-        WorkAssignmentReportLogHelper.AppendApproveLog(report, me.Id, me.FullName ?? string.Empty);
-
-        await _userActionLog.RecordAsync(new UserActionLogSeed
-        {
-            Action = UserActionLogActions.ReportApproved,
-            Scope = "report",
-            ActorUserId = me.Id,
-            WorkId = report.WorkId,
-            WorkAssignmentId = report.WorkAssignmentId,
-            WorkReportPeriodId = report.WorkReportPeriodId,
-            WorkAssignmentReportId = report.Id,
-            TargetUserId = report.AssigneeUserId,
-            Summary = $"Approved report {report.PeriodInstanceKey}",
-            Data = new Dictionary<string, string>
-            {
-                { "fromStatus", WorkAssignmentReportStatus.Submitted.ToString() },
-                { "toStatus", WorkAssignmentReportStatus.Approved.ToString() }
-            },
-            OccurredAtUtc = now
-        }, CancellationToken.None);
-
-        await RefreshAggregateDependentsAfterReviewAsync(report.Id, me.Id, ct);
+        return await ResolveLifecycleCommitResponseAsync(report.Id, replay: false);
     }
 
-    public async Task ReturnReportAsync(string reportId, ReturnReportRequest req, CancellationToken ct)
+    public async Task<WorkReportLifecycleCommitResponse> ReturnReportAsync(string reportId, ReturnReportRequest req, CancellationToken ct)
     {
         var me = _me.RequireMe();
-
-        if (string.IsNullOrWhiteSpace(req.Comment))
-            throw AppExceptionFactory.BadRequest(AppErrorCode.WORK_ASSIGNMENT_REPORT_RETURN_COMMENT_REQUIRED);
+        req ??= new ReturnReportRequest();
 
         var report = await _ctx.WorkAssignmentReports
             .Find(x => x.Id == reportId && !x.IsDeleted)
             .FirstOrDefaultAsync(ct)
             ?? throw ReportNotFound(reportId);
-
-        EnsureReportIsActive(report);
-        EnsureNotSelfReview(report, me.Id);
-
-        if (report.Status != WorkAssignmentReportStatus.Submitted)
-            throw InvalidReportStatus(
-                AppErrorCode.WORK_ASSIGNMENT_REPORT_RETURN_STATUS_INVALID,
-                report,
-                WorkAssignmentReportStatus.Submitted);
 
         var assignment = await _ctx.WorkAssignments
             .Find(x => x.Id == report.WorkAssignmentId && !x.IsDeleted)
@@ -501,11 +402,44 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
             ?? throw ReportAssignmentNotFound(report);
 
         await EnsureCanReviewReportAsync(assignment, me.Id, ct);
+        EnsureReportIsActive(report);
+        EnsureNotSelfReview(report, me.Id);
+
+        if (string.IsNullOrWhiteSpace(req.Comment))
+            throw AppExceptionFactory.BadRequest(AppErrorCode.WORK_ASSIGNMENT_REPORT_RETURN_COMMENT_REQUIRED);
+
+        const string returnOperation = "REVIEW_RETURN";
+        var returnCommandHash = WorkReportLifecycleCommandContract.ComputeHash(returnOperation, req);
+        var (lifecycleCommand, lifecycleResolution) = WorkReportLifecycleCommandContract.Resolve(
+            report,
+            req.ExpectedLifecycleRevision,
+            req.ExpectedPayloadRevision,
+            req.CommandId,
+            returnOperation,
+            returnCommandHash);
+        if (lifecycleResolution == WorkReportLifecycleCommandResolution.CompletedReplay)
+        {
+            return await ResolveLifecycleCommitResponseAsync(report.Id, replay: true);
+        }
+
+        await using var lifecycleSeriesLease = await _lifecycleSeriesLock.AcquireAsync(
+            report.WorkAssignmentId,
+            lifecycleCommand.Operation,
+            ct);
+
+        if (report.Status != WorkAssignmentReportStatus.Submitted)
+            throw InvalidReportStatus(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_RETURN_STATUS_INVALID,
+                report,
+                WorkAssignmentReportStatus.Submitted);
 
         var now = DateTime.UtcNow;
 
-        await _ctx.WorkAssignmentReports.UpdateOneAsync(
-            x => x.Id == report.Id,
+        var returnCommitted = await TryCommitLifecycleCommandAsync(
+            report,
+            lifecycleCommand,
+            WorkAssignmentReportStatus.Submitted,
+            expectedIsActive: true,
             Builders<WorkAssignmentReport>.Update
                 .Set(x => x.Status, WorkAssignmentReportStatus.Draft)
                 .Set(x => x.ReturnReason, req.Comment)
@@ -520,116 +454,29 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
                 .Set(x => x.AutoApprovalConfirmedByUserId, (string?)null)
                 .Set(x => x.UpdatedAtUtc, now)
                 .Set(x => x.UpdatedByUserId, me.Id),
-            cancellationToken: ct);
+            WorkAssignmentReportStatus.Draft,
+            resultIsActive: true,
+            actorUserId: me.Id,
+            committedAtUtc: now,
+            lifecycleSeriesLease: lifecycleSeriesLease,
+            ct: ct,
+            businessReason: req.Comment,
+            businessComment: req.Comment);
+        if (!returnCommitted)
+            return await ResolveLifecycleCommitResponseAsync(report.Id, replay: true);
 
-        report.Status = WorkAssignmentReportStatus.Draft;
-        report.ReturnReason = req.Comment;
-        report.ReturnedAtUtc = now;
-        report.ReturnedByUserId = me.Id;
-        report.ApprovedAtUtc = null;
-        report.ApprovedByUserId = null;
-        report.AutoApprovedAtUtc = null;
-        report.AutoApprovedByUserId = null;
-        report.AutoApproveConditionSnapshotJson = null;
-        report.AutoApprovalConfirmedAtUtc = null;
-        report.AutoApprovalConfirmedByUserId = null;
-        report.UpdatedAtUtc = now;
-        report.UpdatedByUserId = me.Id;
-
-        var period = await _ctx.WorkReportPeriods
-            .Find(x => x.Id == report.WorkReportPeriodId && !x.IsDeleted)
-            .FirstOrDefaultAsync(ct);
-
-        if (period is not null)
-        {
-            var periodStatus = ResolveDraftPeriodStatus(period, report, now);
-
-            await _ctx.WorkReportPeriods.UpdateOneAsync(
-                x => x.Id == period.Id && !x.IsDeleted,
-                Builders<WorkReportPeriod>.Update
-                    .Set(x => x.Status, periodStatus)
-                    .Set(x => x.IsOverdue, WorkReportPeriodStatusHelper.IsOverdue(periodStatus))
-                    .Set(x => x.LastReviewedAtUtc, now)
-                    .Set(x => x.ReturnReason, req.Comment)
-                    .Set(x => x.ReviewerComment, req.Comment)
-                    .Set(x => x.UpdatedAtUtc, now)
-                    .Set(x => x.UpdatedByUserId, me.Id),
-                cancellationToken: ct);
-
-            period.Status = periodStatus;
-            period.IsOverdue = WorkReportPeriodStatusHelper.IsOverdue(periodStatus);
-            period.LastReviewedAtUtc = now;
-            period.ReturnReason = req.Comment;
-            period.ReviewerComment = req.Comment;
-            period.UpdatedAtUtc = now;
-            period.UpdatedByUserId = me.Id;
-
-            await FinalizeReviewReportStatusOperationAsync(
-                "REVIEW_RETURN",
-                report,
-                period,
-                WorkAssignmentReportStatus.Submitted.ToString(),
-                WorkAssignmentReportStatus.Draft.ToString(),
-                me.Id,
-                upsertQueue: true,
-                disableQueue: false,
-                ct);
-        }
-
-        await InsertReportLogAsync(
-            report.WorkId,
-            report.WorkAssignmentId,
-            report.WorkReportPeriodId,
-            report.Id,
-            "Trả lại",
-            WorkAssignmentReportStatus.Submitted.ToString(),
-            WorkAssignmentReportStatus.Draft.ToString(),
-            me.Id,
-            req.Comment,
-            req.Comment,
-            ct);
-
-        WorkAssignmentReportLogHelper.AppendReturnLog(report, me.Id, me.FullName ?? string.Empty, req.Comment);
-
-        await _userActionLog.RecordAsync(new UserActionLogSeed
-        {
-            Action = UserActionLogActions.ReportReturned,
-            Scope = "report",
-            ActorUserId = me.Id,
-            WorkId = report.WorkId,
-            WorkAssignmentId = report.WorkAssignmentId,
-            WorkReportPeriodId = report.WorkReportPeriodId,
-            WorkAssignmentReportId = report.Id,
-            TargetUserId = report.AssigneeUserId,
-            Summary = $"Returned report {report.PeriodInstanceKey}",
-            Data = new Dictionary<string, string>
-            {
-                { "fromStatus", WorkAssignmentReportStatus.Submitted.ToString() },
-                { "toStatus", WorkAssignmentReportStatus.Draft.ToString() }
-            },
-            OccurredAtUtc = now
-        }, CancellationToken.None);
+        return await ResolveLifecycleCommitResponseAsync(report.Id, replay: false);
     }
 
-    public async Task RecallApprovedReportAsync(string reportId, ReturnReportRequest req, CancellationToken ct)
+    public async Task<WorkReportLifecycleCommitResponse> RecallApprovedReportAsync(string reportId, ReturnReportRequest req, CancellationToken ct)
     {
         var me = _me.RequireMe();
-
-        if (string.IsNullOrWhiteSpace(req.Comment))
-            throw AppExceptionFactory.BadRequest(AppErrorCode.WORK_ASSIGNMENT_REPORT_RECALL_COMMENT_REQUIRED);
+        req ??= new ReturnReportRequest();
 
         var report = await _ctx.WorkAssignmentReports
             .Find(x => x.Id == reportId && !x.IsDeleted)
             .FirstOrDefaultAsync(ct)
             ?? throw ReportNotFound(reportId);
-
-        if (report.Status != WorkAssignmentReportStatus.Approved)
-            throw InvalidReportStatus(
-                AppErrorCode.WORK_ASSIGNMENT_REPORT_RECALL_STATUS_INVALID,
-                report,
-                WorkAssignmentReportStatus.Approved);
-
-        EnsureReportIsActive(report);
 
         var assignment = await _ctx.WorkAssignments
             .Find(x => x.Id == report.WorkAssignmentId && !x.IsDeleted)
@@ -637,6 +484,35 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
             ?? throw ReportAssignmentNotFound(report);
 
         await EnsureCanReviewReportAsync(assignment, me.Id, ct);
+        EnsureReportIsActive(report);
+
+        if (string.IsNullOrWhiteSpace(req.Comment))
+            throw AppExceptionFactory.BadRequest(AppErrorCode.WORK_ASSIGNMENT_REPORT_RECALL_COMMENT_REQUIRED);
+
+        const string recallOperation = "REVIEW_RECALL_APPROVED";
+        var recallCommandHash = WorkReportLifecycleCommandContract.ComputeHash(recallOperation, req);
+        var (lifecycleCommand, lifecycleResolution) = WorkReportLifecycleCommandContract.Resolve(
+            report,
+            req.ExpectedLifecycleRevision,
+            req.ExpectedPayloadRevision,
+            req.CommandId,
+            recallOperation,
+            recallCommandHash);
+        if (lifecycleResolution == WorkReportLifecycleCommandResolution.CompletedReplay)
+        {
+            return await ResolveLifecycleCommitResponseAsync(report.Id, replay: true);
+        }
+
+        await using var lifecycleSeriesLease = await _lifecycleSeriesLock.AcquireAsync(
+            report.WorkAssignmentId,
+            lifecycleCommand.Operation,
+            ct);
+
+        if (report.Status != WorkAssignmentReportStatus.Approved)
+            throw InvalidReportStatus(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_RECALL_STATUS_INVALID,
+                report,
+                WorkAssignmentReportStatus.Approved);
 
         var period = await _ctx.WorkReportPeriods
             .Find(x => x.Id == report.WorkReportPeriodId && !x.IsDeleted)
@@ -651,8 +527,11 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
             "REVIEW_RECALL_APPROVED",
             now);
 
-        await _ctx.WorkAssignmentReports.UpdateOneAsync(
-            x => x.Id == report.Id,
+        var recallCommitted = await TryCommitLifecycleCommandAsync(
+            report,
+            lifecycleCommand,
+            WorkAssignmentReportStatus.Approved,
+            expectedIsActive: true,
             Builders<WorkAssignmentReport>.Update
                 .Set(x => x.Status, WorkAssignmentReportStatus.Submitted)
                 .Set(x => x.ReturnReason, req.Comment)
@@ -663,71 +542,21 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
                 .Set(x => x.AutoApprovalConfirmedByUserId, (string?)null)
                 .Set(x => x.UpdatedAtUtc, now)
                 .Set(x => x.UpdatedByUserId, me.Id),
-            cancellationToken: ct);
+            WorkAssignmentReportStatus.Submitted,
+            resultIsActive: true,
+            actorUserId: me.Id,
+            committedAtUtc: now,
+            lifecycleSeriesLease: lifecycleSeriesLease,
+            ct: ct,
+            businessReason: req.Comment,
+            businessComment: req.Comment);
+        if (!recallCommitted)
+            return await ResolveLifecycleCommitResponseAsync(report.Id, replay: true);
 
-        report.Status = WorkAssignmentReportStatus.Submitted;
-        report.ReturnReason = req.Comment;
-        report.ReviewerComment = req.Comment;
-        report.ApprovedAtUtc = null;
-        report.ApprovedByUserId = null;
-        report.AutoApprovalConfirmedAtUtc = null;
-        report.AutoApprovalConfirmedByUserId = null;
-        report.UpdatedAtUtc = now;
-        report.UpdatedByUserId = me.Id;
-
-        if (period is not null)
-        {
-            var nextPeriodStatus = ResolveSubmittedPeriodStatus(period, report, now);
-
-            await _ctx.WorkReportPeriods.UpdateOneAsync(
-                x => x.Id == period.Id && !x.IsDeleted,
-                Builders<WorkReportPeriod>.Update
-                    .Set(x => x.Status, nextPeriodStatus)
-                    .Set(x => x.IsOverdue, WorkReportPeriodStatusHelper.IsOverdue(nextPeriodStatus))
-                    .Set(x => x.LastReviewedAtUtc, now)
-                    .Set(x => x.ReturnReason, req.Comment)
-                    .Set(x => x.ReviewerComment, req.Comment)
-                    .Set(x => x.UpdatedAtUtc, now)
-                    .Set(x => x.UpdatedByUserId, me.Id),
-                cancellationToken: ct);
-
-            period.Status = nextPeriodStatus;
-            period.IsOverdue = WorkReportPeriodStatusHelper.IsOverdue(nextPeriodStatus);
-            period.LastReviewedAtUtc = now;
-            period.ReturnReason = req.Comment;
-            period.ReviewerComment = req.Comment;
-            period.UpdatedAtUtc = now;
-            period.UpdatedByUserId = me.Id;
-
-            await FinalizeReviewReportStatusOperationAsync(
-                "REVIEW_RECALL_APPROVED",
-                report,
-                period,
-                WorkAssignmentReportStatus.Approved.ToString(),
-                WorkAssignmentReportStatus.Submitted.ToString(),
-                me.Id,
-                upsertQueue: true,
-                disableQueue: false,
-                ct);
-        }
-
-        await InsertReportLogAsync(
-            report.WorkId,
-            report.WorkAssignmentId,
-            report.WorkReportPeriodId,
-            report.Id,
-            "Thu hồi duyệt",
-            WorkAssignmentReportStatus.Approved.ToString(),
-            WorkAssignmentReportStatus.Submitted.ToString(),
-            me.Id,
-            req.Comment,
-            req.Comment,
-            ct);
-
-        await RefreshAggregateDependentsAfterReviewAsync(report.Id, me.Id, ct);
+        return await ResolveLifecycleCommitResponseAsync(report.Id, replay: false);
     }
 
-    public async Task DeactivateReportAsync(string reportId, ReportActiveRequest req, CancellationToken ct)
+    public async Task<WorkReportLifecycleCommitResponse> DeactivateReportAsync(string reportId, ReportActiveRequest req, CancellationToken ct)
     {
         var me = _me.RequireMe();
         req ??= new ReportActiveRequest();
@@ -744,8 +573,27 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
 
         await EnsureCanReviewReportAsync(assignment, me.Id, ct);
 
+        const string deactivateOperation = "REVIEW_DEACTIVATE_REPORT";
+        var deactivateCommandHash = WorkReportLifecycleCommandContract.ComputeHash(deactivateOperation, req);
+        var (lifecycleCommand, lifecycleResolution) = WorkReportLifecycleCommandContract.Resolve(
+            report,
+            req.ExpectedLifecycleRevision,
+            req.ExpectedPayloadRevision,
+            req.CommandId,
+            deactivateOperation,
+            deactivateCommandHash);
+        if (lifecycleResolution == WorkReportLifecycleCommandResolution.CompletedReplay)
+        {
+            return await ResolveLifecycleCommitResponseAsync(report.Id, replay: true);
+        }
+
+        await using var lifecycleSeriesLease = await _lifecycleSeriesLock.AcquireAsync(
+            report.WorkAssignmentId,
+            lifecycleCommand.Operation,
+            ct);
+
         if (report.IsActive == false)
-            return;
+            return BuildNoChangeLifecycleResponse(report);
 
         var period = await _ctx.WorkReportPeriods
             .Find(x => x.Id == report.WorkReportPeriodId && !x.IsDeleted)
@@ -768,8 +616,11 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
         var comment = NormalizeOptionalText(req.Comment);
         var wasCurrent = report.IsCurrent || string.Equals(period?.CurrentReportId, report.Id, StringComparison.Ordinal);
 
-        await _ctx.WorkAssignmentReports.UpdateOneAsync(
-            x => x.Id == report.Id && !x.IsDeleted,
+        var deactivateCommitted = await TryCommitLifecycleCommandAsync(
+            report,
+            lifecycleCommand,
+            report.Status,
+            expectedIsActive: true,
             Builders<WorkAssignmentReport>.Update
                 .Set(x => x.IsActive, false)
                 .Set(x => x.IsCurrent, false)
@@ -778,106 +629,21 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
                 .Set(x => x.DeactivationReason, comment)
                 .Set(x => x.UpdatedAtUtc, now)
                 .Set(x => x.UpdatedByUserId, me.Id),
-            cancellationToken: ct);
+            report.Status,
+            resultIsActive: false,
+            actorUserId: me.Id,
+            committedAtUtc: now,
+            lifecycleSeriesLease: lifecycleSeriesLease,
+            ct: ct,
+            businessReason: comment,
+            businessComment: comment);
+        if (!deactivateCommitted)
+            return await ResolveLifecycleCommitResponseAsync(report.Id, replay: true);
 
-        report.IsActive = false;
-        report.IsCurrent = false;
-        report.DeactivatedAtUtc = now;
-        report.DeactivatedByUserId = me.Id;
-        report.DeactivationReason = comment;
-        report.UpdatedAtUtc = now;
-        report.UpdatedByUserId = me.Id;
-
-        if (period is not null && wasCurrent)
-        {
-            var nextPeriodStatus = WorkReportPeriodStatusHelper.ResolveInitialStatus(period.DueAtUtc, now);
-            var update = Builders<WorkReportPeriod>.Update
-                .Set(x => x.CurrentReportId, (string?)null)
-                .Set(x => x.Status, nextPeriodStatus)
-                .Set(x => x.IsOverdue, WorkReportPeriodStatusHelper.IsOverdue(nextPeriodStatus))
-                .Set(x => x.LastDraftSavedAtUtc, (DateTime?)null)
-                .Set(x => x.LastSubmittedAtUtc, (DateTime?)null)
-                .Set(x => x.LastReviewedAtUtc, (DateTime?)null)
-                .Set(x => x.LateReason, null)
-                .Set(x => x.ReviewerComment, null)
-                .Set(x => x.ReturnReason, null)
-                .Set(x => x.UpdatedAtUtc, now)
-                .Set(x => x.UpdatedByUserId, me.Id);
-
-            await _ctx.WorkReportPeriods.UpdateOneAsync(
-                x => x.Id == period.Id && !x.IsDeleted,
-                update,
-                cancellationToken: ct);
-
-            period.CurrentReportId = null;
-            period.Status = nextPeriodStatus;
-            period.IsOverdue = WorkReportPeriodStatusHelper.IsOverdue(nextPeriodStatus);
-            period.LastDraftSavedAtUtc = null;
-            period.LastSubmittedAtUtc = null;
-            period.LastReviewedAtUtc = null;
-            period.LateReason = null;
-            period.ReviewerComment = null;
-            period.ReturnReason = null;
-            period.UpdatedAtUtc = now;
-            period.UpdatedByUserId = me.Id;
-        }
-
-        if (period is not null)
-        {
-            await FinalizeReviewReportStatusOperationAsync(
-                "REVIEW_DEACTIVATE_REPORT",
-                report,
-                period,
-                "ACTIVE",
-                "INACTIVE",
-                me.Id,
-                upsertQueue: period.IsActive && WorkReportPeriodStatusHelper.ShouldKeepQueueActive(period.Status),
-                disableQueue: !period.IsActive || !WorkReportPeriodStatusHelper.ShouldKeepQueueActive(period.Status),
-                ct,
-                forceRebuildStatistics: true);
-        }
-        else
-        {
-            await RebuildReportStatisticsAsync(report, me.Id, ct);
-            await _statusSync.SyncFromAssignmentAsync(report.WorkAssignmentId, ct);
-        }
-
-        await RefreshAggregateDependentsAfterReviewAsync(report.Id, me.Id, ct);
-
-        await InsertReportLogAsync(
-            report.WorkId,
-            report.WorkAssignmentId,
-            report.WorkReportPeriodId,
-            report.Id,
-            "Deactivate",
-            "ACTIVE",
-            "INACTIVE",
-            me.Id,
-            comment,
-            comment,
-            ct);
-
-        await _userActionLog.RecordAsync(new UserActionLogSeed
-        {
-            Action = UserActionLogActions.ReportDeactivated,
-            Scope = "report",
-            ActorUserId = me.Id,
-            WorkId = report.WorkId,
-            WorkAssignmentId = report.WorkAssignmentId,
-            WorkReportPeriodId = report.WorkReportPeriodId,
-            WorkAssignmentReportId = report.Id,
-            TargetUserId = report.AssigneeUserId,
-            Summary = $"Deactivated report {report.PeriodInstanceKey}",
-            Data = new Dictionary<string, string>
-            {
-                { "fromActive", "true" },
-                { "toActive", "false" }
-            },
-            OccurredAtUtc = now
-        }, CancellationToken.None);
+        return await ResolveLifecycleCommitResponseAsync(report.Id, replay: false);
     }
 
-    public async Task ReactivateReportAsync(string reportId, ReportActiveRequest req, CancellationToken ct)
+    public async Task<WorkReportLifecycleCommitResponse> ReactivateReportAsync(string reportId, ReportActiveRequest req, CancellationToken ct)
     {
         var me = _me.RequireMe();
         req ??= new ReportActiveRequest();
@@ -894,8 +660,27 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
 
         await EnsureCanReviewReportAsync(assignment, me.Id, ct);
 
+        const string reactivateOperation = "REVIEW_REACTIVATE_REPORT";
+        var reactivateCommandHash = WorkReportLifecycleCommandContract.ComputeHash(reactivateOperation, req);
+        var (lifecycleCommand, lifecycleResolution) = WorkReportLifecycleCommandContract.Resolve(
+            report,
+            req.ExpectedLifecycleRevision,
+            req.ExpectedPayloadRevision,
+            req.CommandId,
+            reactivateOperation,
+            reactivateCommandHash);
+        if (lifecycleResolution == WorkReportLifecycleCommandResolution.CompletedReplay)
+        {
+            return await ResolveLifecycleCommitResponseAsync(report.Id, replay: true);
+        }
+
+        await using var lifecycleSeriesLease = await _lifecycleSeriesLock.AcquireAsync(
+            report.WorkAssignmentId,
+            lifecycleCommand.Operation,
+            ct);
+
         if (report.IsActive != false)
-            return;
+            return BuildNoChangeLifecycleResponse(report);
 
         var period = await _ctx.WorkReportPeriods
             .Find(x => x.Id == report.WorkReportPeriodId && !x.IsDeleted)
@@ -935,101 +720,40 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
         var comment = NormalizeOptionalText(req.Comment);
         var nextPeriodStatus = ResolvePeriodStatusFromReport(period, report, now);
 
-        await _ctx.WorkAssignmentReports.UpdateOneAsync(
-            x => x.Id == report.Id && !x.IsDeleted,
-            Builders<WorkAssignmentReport>.Update
-                .Set(x => x.IsActive, true)
-                .Set(x => x.IsCurrent, true)
-                .Set(x => x.ReactivatedAtUtc, now)
-                .Set(x => x.ReactivatedByUserId, me.Id)
-                .Set(x => x.UpdatedAtUtc, now)
-                .Set(x => x.UpdatedByUserId, me.Id),
-            cancellationToken: ct);
-
-        report.IsActive = true;
-        report.IsCurrent = true;
-        report.ReactivatedAtUtc = now;
-        report.ReactivatedByUserId = me.Id;
-        report.UpdatedAtUtc = now;
-        report.UpdatedByUserId = me.Id;
-
-        await _ctx.WorkReportPeriods.UpdateOneAsync(
-            x => x.Id == period.Id && !x.IsDeleted,
-            Builders<WorkReportPeriod>.Update
-                .Set(x => x.IsActive, true)
-                .Set(x => x.CurrentReportId, report.Id)
-                .Set(x => x.Status, nextPeriodStatus)
-                .Set(x => x.IsOverdue, WorkReportPeriodStatusHelper.IsOverdue(nextPeriodStatus))
-                .Set(x => x.LastDraftSavedAtUtc, report.Status == WorkAssignmentReportStatus.Draft ? (DateTime?)report.UpdatedAtUtc : null)
-                .Set(x => x.LastSubmittedAtUtc, report.SubmittedAtUtc)
-                .Set(x => x.LastReviewedAtUtc, report.ApprovedAtUtc)
-                .Set(x => x.LateReason, report.LateReason)
-                .Set(x => x.ReviewerComment, report.ReviewerComment)
-                .Set(x => x.ReturnReason, report.ReturnReason)
-                .Set(x => x.RequiresLateReason, report.IsLateSubmission)
-                .Set(x => x.UpdatedAtUtc, now)
-                .Set(x => x.UpdatedByUserId, me.Id),
-            cancellationToken: ct);
-
-        period.IsActive = true;
-        period.CurrentReportId = report.Id;
-        period.Status = nextPeriodStatus;
-        period.IsOverdue = WorkReportPeriodStatusHelper.IsOverdue(nextPeriodStatus);
-        period.LastDraftSavedAtUtc = report.Status == WorkAssignmentReportStatus.Draft ? report.UpdatedAtUtc : null;
-        period.LastSubmittedAtUtc = report.SubmittedAtUtc;
-        period.LastReviewedAtUtc = report.ApprovedAtUtc;
-        period.LateReason = report.LateReason;
-        period.ReviewerComment = report.ReviewerComment;
-        period.ReturnReason = report.ReturnReason;
-        period.RequiresLateReason = report.IsLateSubmission;
-        period.UpdatedAtUtc = now;
-        period.UpdatedByUserId = me.Id;
-
-        await FinalizeReviewReportStatusOperationAsync(
-            "REVIEW_REACTIVATE_REPORT",
-            report,
-            period,
-            "INACTIVE",
-            "ACTIVE",
-            me.Id,
-            upsertQueue: WorkReportPeriodStatusHelper.ShouldKeepQueueActive(period.Status),
-            disableQueue: !WorkReportPeriodStatusHelper.ShouldKeepQueueActive(period.Status),
-            ct,
-            forceRebuildStatistics: true);
-
-        await RefreshAggregateDependentsAfterReviewAsync(report.Id, me.Id, ct);
-
-        await InsertReportLogAsync(
-            report.WorkId,
-            report.WorkAssignmentId,
-            report.WorkReportPeriodId,
-            report.Id,
-            "Reactivate",
-            "INACTIVE",
-            "ACTIVE",
-            me.Id,
-            comment,
-            comment,
-            ct);
-
-        await _userActionLog.RecordAsync(new UserActionLogSeed
+        bool reactivateCommitted;
+        try
         {
-            Action = UserActionLogActions.ReportReactivated,
-            Scope = "report",
-            ActorUserId = me.Id,
-            WorkId = report.WorkId,
-            WorkAssignmentId = report.WorkAssignmentId,
-            WorkReportPeriodId = report.WorkReportPeriodId,
-            WorkAssignmentReportId = report.Id,
-            TargetUserId = report.AssigneeUserId,
-            Summary = $"Reactivated report {report.PeriodInstanceKey}",
-            Data = new Dictionary<string, string>
-            {
-                { "fromActive", "false" },
-                { "toActive", "true" }
-            },
-            OccurredAtUtc = now
-        }, CancellationToken.None);
+            reactivateCommitted = await TryCommitLifecycleCommandAsync(
+                report,
+                lifecycleCommand,
+                report.Status,
+                expectedIsActive: false,
+                Builders<WorkAssignmentReport>.Update
+                    .Set(x => x.IsActive, true)
+                    .Set(x => x.IsCurrent, true)
+                    .Set(x => x.ReactivatedAtUtc, now)
+                    .Set(x => x.ReactivatedByUserId, me.Id)
+                    .Set(x => x.UpdatedAtUtc, now)
+                    .Set(x => x.UpdatedByUserId, me.Id),
+                report.Status,
+                resultIsActive: true,
+                actorUserId: me.Id,
+                committedAtUtc: now,
+                lifecycleSeriesLease: lifecycleSeriesLease,
+                ct: ct,
+                businessReason: comment,
+                businessComment: comment);
+        }
+        catch (MongoWriteException ex) when (ex.WriteError?.Category == ServerErrorCategory.DuplicateKey)
+        {
+            throw AppExceptionFactory.Create(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_CURRENT_CONFLICT,
+                ReportDetails(report));
+        }
+        if (!reactivateCommitted)
+            return await ResolveLifecycleCommitResponseAsync(report.Id, replay: true);
+
+        return await ResolveLifecycleCommitResponseAsync(report.Id, replay: false);
     }
 
     public async Task<PagedResult<ReviewReportFlatRowDto>> SearchReportsForReviewAsync(
@@ -1226,6 +950,211 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
         };
     }
 
+    private static string ResolveApproveLifecycleOperation(
+        WorkAssignmentReport report,
+        string? commandId,
+        bool confirmsAutoApproval)
+    {
+        var normalizedCommandId = commandId?.Trim();
+        if (!string.IsNullOrWhiteSpace(normalizedCommandId) &&
+            string.Equals(report.LastLifecycleCommandId, normalizedCommandId, StringComparison.Ordinal) &&
+            (string.Equals(report.LastLifecycleCommandOperation, "REVIEW_APPROVE", StringComparison.Ordinal) ||
+             string.Equals(report.LastLifecycleCommandOperation, "REVIEW_CONFIRM_AUTO_APPROVE", StringComparison.Ordinal)))
+        {
+            return report.LastLifecycleCommandOperation!;
+        }
+
+        return confirmsAutoApproval ? "REVIEW_CONFIRM_AUTO_APPROVE" : "REVIEW_APPROVE";
+    }
+
+    private async Task<WorkReportLifecycleCommitResponse> ResolveLifecycleCommitResponseAsync(
+        string reportId,
+        bool replay)
+    {
+        // Once the report CAS succeeds, request cancellation must not turn a durable commit into
+        // an ambiguous client-visible failure. Reconciliation is best effort here and durable
+        // outbox processing owns all remaining work.
+        await _lifecycleProjectionReconciler.ReconcileReportAsync(reportId, CancellationToken.None);
+        var current = await _ctx.WorkAssignmentReports
+            .Find(x => x.Id == reportId && !x.IsDeleted)
+            .FirstOrDefaultAsync(CancellationToken.None)
+            ?? throw ReportNotFound(reportId);
+        await DynamicFlowMappingLifecycleContract.ValidateAsync(
+            _ctx,
+            current,
+            DynamicFlowMappingLifecycleContract
+                .AllowsHistoricalLifecycleTransition(
+                    current.LastLifecycleCommandOperation)
+                ? DynamicFlowMappingIntegrityMode.AllowHistorical
+                : DynamicFlowMappingIntegrityMode.RequireCurrent,
+            CancellationToken.None);
+        var pending = HasPendingLifecycleProjection(current);
+
+        return new WorkReportLifecycleCommitResponse
+        {
+            ReportId = current.Id,
+            Committed = true,
+            Replay = replay,
+            LifecycleRevision = current.LifecycleRevision,
+            LifecycleProjectionPending = pending,
+            LifecycleCommitState = pending
+                ? WorkReportLifecycleCommitStates.CommittedPendingProjection
+                : WorkReportLifecycleCommitStates.Committed
+        };
+    }
+
+    private static WorkReportLifecycleCommitResponse BuildNoChangeLifecycleResponse(
+        WorkAssignmentReport report)
+    {
+        var pending = HasPendingLifecycleProjection(report);
+        return new WorkReportLifecycleCommitResponse
+        {
+            ReportId = report.Id,
+            Committed = false,
+            Replay = false,
+            LifecycleRevision = report.LifecycleRevision,
+            LifecycleProjectionPending = pending,
+            LifecycleCommitState = pending
+                ? WorkReportLifecycleCommitStates.CommittedPendingProjection
+                : WorkReportLifecycleCommitStates.NoChange
+        };
+    }
+
+    private static bool HasPendingLifecycleProjection(WorkAssignmentReport report)
+        => (report.LifecycleProjectionOutbox ?? new List<WorkReportLifecycleProjectionOutboxEntry>())
+            .Any(x => string.Equals(
+                x.State,
+                WorkReportLifecycleProjectionOutboxStates.Pending,
+                StringComparison.Ordinal));
+
+    private async Task<bool> TryCommitLifecycleCommandAsync(
+        WorkAssignmentReport report,
+        WorkReportLifecycleCommand command,
+        WorkAssignmentReportStatus expectedStatus,
+        bool expectedIsActive,
+        UpdateDefinition<WorkAssignmentReport> update,
+        WorkAssignmentReportStatus resultStatus,
+        bool resultIsActive,
+        string actorUserId,
+        DateTime committedAtUtc,
+        WorkReportLifecycleSeriesLease lifecycleSeriesLease,
+        CancellationToken ct,
+        string? businessReason = null,
+        string? businessComment = null,
+        string? businessSnapshotJson = null)
+    {
+        await DynamicFlowMappingLifecycleContract.ValidateAsync(
+            _ctx,
+            report,
+            DynamicFlowMappingLifecycleContract
+                .AllowsHistoricalLifecycleTransition(command.Operation)
+                ? DynamicFlowMappingIntegrityMode.AllowHistorical
+                : DynamicFlowMappingIntegrityMode.RequireCurrent,
+            ct,
+            canLifecycleMapping:
+                _runtimeActivation
+                    .P7MappingLifecycleExecutionEnabled,
+            lifecycleOperation: command.Operation);
+        await DynamicFlowMappingLifecycleContract
+            .EnsureSourceMutationPhaseAsync(
+                _ctx,
+                report.Id,
+                _runtimeActivation
+                    .P7MappingLifecycleExecutionEnabled,
+                ct);
+        var commitUpdate = WorkReportLifecycleCommandContract.ApplyCompletion(
+            update,
+            command,
+            resultStatus,
+            resultIsActive);
+        commitUpdate = WorkReportLifecycleOutboxContract.Append(
+            commitUpdate,
+            WorkReportLifecycleOutboxContract.FromCommand(
+                report,
+                command,
+                resultStatus,
+                resultIsActive,
+                actorUserId,
+                committedAtUtc,
+                report.PayloadHash,
+                businessReason,
+                businessComment,
+                businessSnapshotJson: businessSnapshotJson));
+        await lifecycleSeriesLease.RenewAsync(ct);
+        var committed = await _transactions.ExecuteAsync(
+            async (session, transactionCt) =>
+            {
+                var reportResult = await _ctx.WorkAssignmentReports.UpdateOneAsync(
+                    session,
+                    WorkReportLifecycleCommandContract.BuildCommitFilter(
+                        report,
+                        command,
+                        expectedStatus,
+                        expectedIsActive),
+                    commitUpdate,
+                    cancellationToken: transactionCt);
+                if (reportResult.ModifiedCount != 1)
+                    return false;
+
+                // The Work root is the shared membership fence. Keeping this increment
+                // in the source+outbox transaction makes a concurrent Direct publish
+                // conflict even when the newly approved report was not in its snapshot.
+                await WorkDirectSourceRevisionFence.IncrementAsync(
+                    _ctx,
+                    session,
+                    report.WorkId,
+                    transactionCt);
+
+                return true;
+            },
+            ct);
+
+        if (committed)
+        {
+            WorkReportLifecycleCommandContract.ApplyCompletionInMemory(
+                report,
+                command,
+                resultStatus,
+                resultIsActive);
+            return true;
+        }
+
+        var current = await _ctx.WorkAssignmentReports
+            .Find(x => x.Id == report.Id && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct)
+            ?? throw ReportNotFound(report.Id);
+        if (WorkReportLifecycleCommandContract.IsCompletedReplay(current, command))
+        {
+            await _lifecycleProjectionReconciler.ReconcileReportAsync(current.Id, CancellationToken.None);
+            return false;
+        }
+
+        throw WorkReportLifecycleCommandContract.Conflict(current, command);
+    }
+
+    private async Task SyncReportSectionsAfterLifecycleCommitAsync(
+        WorkAssignmentReport report,
+        string actorUserId,
+        DateTime committedAtUtc,
+        CancellationToken ct)
+    {
+        var fb = Builders<WorkAssignmentReportSection>.Filter;
+        var filter = fb.Eq(x => x.WorkAssignmentReportId, report.Id) &
+                     fb.Eq(x => x.IsDeleted, false) &
+                     fb.Eq(x => x.SourcePayloadRevision, report.PayloadRevision) &
+                     fb.Eq(x => x.SourcePayloadHash, report.PayloadHash) &
+                     (fb.Exists(x => x.SourceLifecycleRevision, false) |
+                      fb.Lte(x => x.SourceLifecycleRevision, report.LifecycleRevision));
+        var update = Builders<WorkAssignmentReportSection>.Update
+            .Set(x => x.Status, report.Status)
+            .Set(x => x.SourceLifecycleRevision, report.LifecycleRevision)
+            .Set(x => x.SourceReportUpdatedAtUtc, committedAtUtc)
+            .Set(x => x.UpdatedAtUtc, committedAtUtc)
+            .Set(x => x.UpdatedByUserId, actorUserId);
+
+        await _ctx.WorkAssignmentReportSections.UpdateManyAsync(filter, update, cancellationToken: ct);
+    }
+
     private static System.Linq.Expressions.Expression<Func<ReviewReportListDocRole, ReviewReportFlatRowDto>>
         MapToReviewReportFlatRowProjection()
         => x => new ReviewReportFlatRowDto
@@ -1260,6 +1189,8 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
 
             ReportId = x.CurrentReportId,
             ReportStatus = x.ReportStatus.HasValue ? (int)x.ReportStatus.Value : null,
+            PayloadRevision = x.PayloadRevision,
+            LifecycleRevision = x.LifecycleRevision,
             ReportIsActive = x.ReportIsActive,
             ReportDeactivatedAtUtc = x.ReportDeactivatedAtUtc,
             ReportDeactivationReason = x.ReportDeactivationReason,
@@ -2197,7 +2128,7 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
     {
         try
         {
-            await _reportService.RefreshDynamicFormAggregateDependentsAsync(reportId, actorUserId, ct);
+            await _aggregateDependentRecovery.RecoverPendingAsync(reportId, actorUserId, ct);
         }
         catch (Exception ex)
         {

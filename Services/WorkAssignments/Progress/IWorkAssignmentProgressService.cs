@@ -10,6 +10,9 @@ public interface IWorkAssignmentProgressService
     Task<List<ProgressRecomputeResult>> RecomputeParentChainAsync(string workAssignmentId, CancellationToken ct);
 
     Task<ProgressComputeResult> ComputeProgressAsync(WorkAssignment assignment, CancellationToken ct);
+    Task<ProgressProjectionResult> ComputeProjectionAsync(
+        WorkAssignment assignment,
+        CancellationToken ct);
     Task<ProgressComputeResult> ComputeLeafProgressAsync(WorkAssignment assignment, CancellationToken ct);
     Task<ProgressComputeResult> ComputeParentProgressAsync(WorkAssignment parent, List<WorkAssignment> directChildren, CancellationToken ct);
 }

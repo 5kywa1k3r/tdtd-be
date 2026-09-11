@@ -14,6 +14,8 @@ namespace tdtd_be.Services.WorkAssignments.Progress;
 
 public sealed class WorkAssignmentProgressService : IWorkAssignmentProgressService
 {
+    private const int MaxProgressCasAttempts = 5;
+
     private readonly MongoDbContext _ctx;
 
     public WorkAssignmentProgressService(MongoDbContext ctx)
@@ -40,6 +42,25 @@ public sealed class WorkAssignmentProgressService : IWorkAssignmentProgressServi
         }
 
         return await ComputeParentProgressAsync(assignment, children, ct);
+    }
+
+    public async Task<ProgressProjectionResult> ComputeProjectionAsync(
+        WorkAssignment assignment,
+        CancellationToken ct)
+    {
+        var computed = await ComputeProgressAsync(assignment, ct);
+        var worstFacts = await ComputeWorstFactsAsync(assignment, ct);
+        return new ProgressProjectionResult
+        {
+            ProgressStatus = computed.ProgressStatus,
+            HasAnyDuePeriod = computed.HasAnyDuePeriod,
+            HasOverduePeriod = computed.HasOverduePeriod,
+            LatestPeriodKey = computed.LatestPeriodKey,
+            LatestDueAtUtc = computed.LatestDueAtUtc,
+            WorstPeriodStatus = worstFacts.WorstPeriodStatus,
+            WorstOverdueReasonCode = worstFacts.WorstOverdueReasonCode,
+            WorstOverdueReasonLabel = worstFacts.WorstOverdueReasonLabel
+        };
     }
 
     public async Task<ProgressComputeResult> ComputeLeafProgressAsync(
@@ -197,24 +218,29 @@ public sealed class WorkAssignmentProgressService : IWorkAssignmentProgressServi
         WorkAssignment assignment,
         CancellationToken ct)
     {
-        var oldStatus = assignment.ProgressStatus;
-        var computed = await ComputeProgressAsync(assignment, ct);
-        var worstFacts = await ComputeWorstFactsAsync(assignment, ct);
+        ArgumentNullException.ThrowIfNull(assignment);
+        var current = assignment;
 
-        var changed =
-            assignment.ProgressStatus != computed.ProgressStatus ||
-            assignment.HasAnyDuePeriod != computed.HasAnyDuePeriod ||
-            assignment.HasOverduePeriod != computed.HasOverduePeriod ||
-            assignment.LatestPeriodKey != computed.LatestPeriodKey ||
-            assignment.LatestDueAtUtc != computed.LatestDueAtUtc ||
-            assignment.WorstPeriodStatus != worstFacts.WorstPeriodStatus ||
-            assignment.WorstOverdueReasonCode != worstFacts.WorstOverdueReasonCode ||
-            assignment.WorstOverdueReasonLabel != worstFacts.WorstOverdueReasonLabel;
-
-        if (changed)
+        for (var attempt = 1; attempt <= MaxProgressCasAttempts; attempt++)
         {
-            var now = DateTime.UtcNow;
+            ct.ThrowIfCancellationRequested();
+            var oldStatus = current.ProgressStatus;
+            var computed = await ComputeProgressAsync(current, ct);
+            var worstFacts = await ComputeWorstFactsAsync(current, ct);
+            var changed =
+                current.ProgressStatus != computed.ProgressStatus ||
+                current.HasAnyDuePeriod != computed.HasAnyDuePeriod ||
+                current.HasOverduePeriod != computed.HasOverduePeriod ||
+                current.LatestPeriodKey != computed.LatestPeriodKey ||
+                current.LatestDueAtUtc != computed.LatestDueAtUtc ||
+                current.WorstPeriodStatus != worstFacts.WorstPeriodStatus ||
+                current.WorstOverdueReasonCode != worstFacts.WorstOverdueReasonCode ||
+                current.WorstOverdueReasonLabel != worstFacts.WorstOverdueReasonLabel;
 
+            if (!changed)
+                return BuildRecomputeResult(current, oldStatus, computed, changed: false);
+
+            var now = DateTime.UtcNow;
             var update = Builders<WorkAssignment>.Update
                 .Set(x => x.ProgressStatus, computed.ProgressStatus)
                 .Set(x => x.ProgressStatusUpdatedAtUtc, now)
@@ -226,33 +252,51 @@ public sealed class WorkAssignmentProgressService : IWorkAssignmentProgressServi
                 .Set(x => x.WorstOverdueReasonCode, worstFacts.WorstOverdueReasonCode)
                 .Set(x => x.WorstOverdueReasonLabel, worstFacts.WorstOverdueReasonLabel);
 
-            await _ctx.WorkAssignments.UpdateOneAsync(
-                x => x.Id == assignment.Id,
+            var expectedCompletedAtUtc = current.CompletedAtUtc;
+            var expectedProgressStatusUpdatedAtUtc = current.ProgressStatusUpdatedAtUtc;
+            var expectedMaterializationRevision = current.DynamicFlowMaterializationRevision;
+            var expectedReportLifecycleSeriesRevision =
+                current.ReportLifecycleSeriesRevision;
+            var updateResult = await _ctx.WorkAssignments.UpdateOneAsync(
+                BuildObservedProgressCasFilter(
+                    current,
+                    expectedCompletedAtUtc,
+                    expectedProgressStatusUpdatedAtUtc,
+                    expectedMaterializationRevision,
+                    expectedReportLifecycleSeriesRevision),
                 update,
                 cancellationToken: ct);
+            if (updateResult.MatchedCount == 0)
+            {
+                if (attempt >= MaxProgressCasAttempts)
+                {
+                    throw new InvalidOperationException(
+                        $"WORK_ASSIGNMENT_PROGRESS_CAS_RETRY_EXHAUSTED assignmentId={current.Id};attempts={MaxProgressCasAttempts}");
+                }
 
-            assignment.ProgressStatus = computed.ProgressStatus;
-            assignment.ProgressStatusUpdatedAtUtc = now;
-            assignment.HasAnyDuePeriod = computed.HasAnyDuePeriod;
-            assignment.HasOverduePeriod = computed.HasOverduePeriod;
-            assignment.LatestPeriodKey = computed.LatestPeriodKey;
-            assignment.LatestDueAtUtc = computed.LatestDueAtUtc;
-            assignment.WorstPeriodStatus = worstFacts.WorstPeriodStatus;
-            assignment.WorstOverdueReasonCode = worstFacts.WorstOverdueReasonCode;
-            assignment.WorstOverdueReasonLabel = worstFacts.WorstOverdueReasonLabel;
+                current = await _ctx.WorkAssignments
+                    .Find(x => x.Id == current.Id && !x.IsDeleted)
+                    .FirstOrDefaultAsync(ct)
+                    ?? throw AppExceptionFactory.NotFound(
+                        AppErrorCode.WORK_ASSIGNMENT_NOT_FOUND,
+                        new { assignmentId = current.Id });
+                continue;
+            }
+
+            current.ProgressStatus = computed.ProgressStatus;
+            current.ProgressStatusUpdatedAtUtc = now;
+            current.HasAnyDuePeriod = computed.HasAnyDuePeriod;
+            current.HasOverduePeriod = computed.HasOverduePeriod;
+            current.LatestPeriodKey = computed.LatestPeriodKey;
+            current.LatestDueAtUtc = computed.LatestDueAtUtc;
+            current.WorstPeriodStatus = worstFacts.WorstPeriodStatus;
+            current.WorstOverdueReasonCode = worstFacts.WorstOverdueReasonCode;
+            current.WorstOverdueReasonLabel = worstFacts.WorstOverdueReasonLabel;
+            return BuildRecomputeResult(current, oldStatus, computed, changed: true);
         }
 
-        return new ProgressRecomputeResult
-        {
-            WorkAssignmentId = assignment.Id,
-            OldStatus = oldStatus,
-            NewStatus = computed.ProgressStatus,
-            Changed = changed,
-            HasAnyDuePeriod = computed.HasAnyDuePeriod,
-            HasOverduePeriod = computed.HasOverduePeriod,
-            LatestPeriodKey = computed.LatestPeriodKey,
-            LatestDueAtUtc = computed.LatestDueAtUtc
-        };
+        throw new InvalidOperationException(
+            $"WORK_ASSIGNMENT_PROGRESS_CAS_RETRY_EXHAUSTED assignmentId={current.Id};attempts={MaxProgressCasAttempts}");
     }
 
     public async Task<List<ProgressRecomputeResult>> RecomputeDirectChildrenAsync(
@@ -328,10 +372,29 @@ public sealed class WorkAssignmentProgressService : IWorkAssignmentProgressServi
                     .Set(x => x.WorstOverdueReasonCode, worstFacts.WorstOverdueReasonCode)
                     .Set(x => x.WorstOverdueReasonLabel, worstFacts.WorstOverdueReasonLabel);
 
-                await _ctx.WorkAssignments.UpdateOneAsync(
-                    x => x.Id == child.Id,
+                var expectedCompletedAtUtc = child.CompletedAtUtc;
+                var expectedProgressStatusUpdatedAtUtc = child.ProgressStatusUpdatedAtUtc;
+                var expectedMaterializationRevision = child.DynamicFlowMaterializationRevision;
+                var expectedReportLifecycleSeriesRevision =
+                    child.ReportLifecycleSeriesRevision;
+                var updateResult = await _ctx.WorkAssignments.UpdateOneAsync(
+                    BuildObservedProgressCasFilter(
+                        child,
+                        expectedCompletedAtUtc,
+                        expectedProgressStatusUpdatedAtUtc,
+                        expectedMaterializationRevision,
+                        expectedReportLifecycleSeriesRevision),
                     update,
                     cancellationToken: ct);
+                if (updateResult.MatchedCount == 0)
+                {
+                    var refreshed = await _ctx.WorkAssignments
+                        .Find(x => x.Id == child.Id && !x.IsDeleted)
+                        .FirstOrDefaultAsync(ct);
+                    if (refreshed is not null)
+                        results.Add(await RecomputeSingleAsync(refreshed, ct));
+                    continue;
+                }
 
                 child.ProgressStatus = computed.ProgressStatus;
                 child.ProgressStatusUpdatedAtUtc = now;
@@ -648,6 +711,76 @@ public sealed class WorkAssignmentProgressService : IWorkAssignmentProgressServi
             WorkReportPeriodStatus.OverdueApproved => ("OVERDUE_APPROVED", "Đã duyệt nhưng quá hạn"),
             _ => (null, null)
         };
+    }
+
+    private static ProgressRecomputeResult BuildRecomputeResult(
+        WorkAssignment assignment,
+        int oldStatus,
+        ProgressComputeResult computed,
+        bool changed)
+        => new()
+        {
+            WorkAssignmentId = assignment.Id,
+            OldStatus = oldStatus,
+            NewStatus = computed.ProgressStatus,
+            Changed = changed,
+            HasAnyDuePeriod = computed.HasAnyDuePeriod,
+            HasOverduePeriod = computed.HasOverduePeriod,
+            LatestPeriodKey = computed.LatestPeriodKey,
+            LatestDueAtUtc = computed.LatestDueAtUtc
+        };
+
+    private static FilterDefinition<WorkAssignment> BuildObservedProgressCasFilter(
+        WorkAssignment assignment,
+        DateTime? expectedCompletedAtUtc,
+        DateTime? expectedProgressStatusUpdatedAtUtc,
+        long expectedMaterializationRevision,
+        long expectedReportLifecycleSeriesRevision)
+    {
+        var filter = Builders<WorkAssignment>.Filter;
+        return filter.Eq(x => x.Id, assignment.Id) &
+               filter.Eq(x => x.IsDeleted, false) &
+               filter.Eq(x => x.IsActive, assignment.IsActive) &
+               filter.Eq(x => x.CompletedAtUtc, expectedCompletedAtUtc) &
+               filter.Eq(
+                   x => x.ProgressStatusUpdatedAtUtc,
+                   expectedProgressStatusUpdatedAtUtc) &
+               BuildDynamicFlowMaterializationRevisionFilter(
+                   expectedMaterializationRevision) &
+               BuildReportLifecycleSeriesRevisionFilter(
+                   expectedReportLifecycleSeriesRevision);
+    }
+
+    private static FilterDefinition<WorkAssignment>
+        BuildDynamicFlowMaterializationRevisionFilter(long expectedRevision)
+    {
+        var filter = Builders<WorkAssignment>.Filter;
+        var exact = filter.Eq(
+            x => x.DynamicFlowMaterializationRevision,
+            expectedRevision);
+        return expectedRevision == 0
+            ? filter.Or(
+                exact,
+                filter.Exists(
+                    x => x.DynamicFlowMaterializationRevision,
+                    false))
+            : exact;
+    }
+
+    private static FilterDefinition<WorkAssignment>
+        BuildReportLifecycleSeriesRevisionFilter(long expectedRevision)
+    {
+        var filter = Builders<WorkAssignment>.Filter;
+        var exact = filter.Eq(
+            x => x.ReportLifecycleSeriesRevision,
+            expectedRevision);
+        return expectedRevision == 0
+            ? filter.Or(
+                exact,
+                filter.Exists(
+                    x => x.ReportLifecycleSeriesRevision,
+                    false))
+            : exact;
     }
 
     private static AppException AssignmentWorkNotFound(WorkAssignment assignment)

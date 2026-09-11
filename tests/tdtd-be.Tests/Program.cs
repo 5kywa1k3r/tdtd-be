@@ -13,6 +13,7 @@ using tdtd_be.Models;
 using tdtd_be.Models.Enums;
 using tdtd_be.Models.Statistics;
 using tdtd_be.Services;
+using tdtd_be.Services.DynamicForms;
 using tdtd_be.Services.DynamicFlows;
 using tdtd_be.Services.WorkAssignmentReports;
 using tdtd_be.Services.WorkAssignmentReports.Payloads;
@@ -29,6 +30,7 @@ using tdtd_be.Services.Works;
 using tdtd_be.Uploads;
 using System.Reflection;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Options;
 using Hangfire;
@@ -60,14 +62,102 @@ var tests = new (string Name, Action Run)[]
     ("root missing assignment due date defaults to work due date", DefaultsRootDueDateToWorkDueDate),
     ("child missing assignment due date defaults to parent assignment due date", DefaultsChildDueDateToParentDueDate),
     ("non-flow assignment maps null dynamic flow metadata", MapsNonFlowAssignmentWithNullFlowMetadata),
+    ("P8 stat-config identity and label taxonomy contracts are strict", StatConfigLabelContractTests.Run),
+    ("P8 Dynamic Form field statistic metadata is typed and isolated", DynamicFormStatisticConfigContractTests.Run),
+    ("P8 Dynamic Form table statistic metadata uses stable typed identities", DynamicFormTableStatisticConfigContractTests.Run),
+    ("P8 Basic Summary config is strict, versioned, and executor-isolated", WorkAssignmentBasicSummaryConfigContractTests.Run),
+    ("P8 Advanced Summary config is strict, lifecycle-bound, and P9-isolated", WorkAssignmentAdvancedSummaryConfigContractTests.Run),
+    ("P8 Advanced Summary quota ledger is atomic and replay-safe", WorkSummaryTokenP805ContractTests.Run),
+    ("P8 Diff config is strict, versioned, dependency-bound, and P9-isolated", WorkReportStatisticDiffP806ContractTests.Run),
+    ("P8 Flow contribution versions bind exact P7 baselines and keep profiles blocked", DynamicFlowContributionP807ContractTests.Run),
+    ("P9 Direct results read only published generations with typed stable paging", P9DirectResultContractTests.Run),
+    ("P9 Basic summary uses locked config and four exact Flow scopes", P9BasicSummaryContractTests.Run),
+    ("P9 operations accepts published lifecycle prompt and rejects arbitrary prompts", P9OperationsLifecyclePromptContractTests.Run),
+    ("P10 evidence list, readback, and download re-authorize current assignment scope", StatisticReconciliationEvidenceControllerContractTests.Run),
+    ("P10 review drift recovery is opaque and recheck returns accepted", StatisticReconciliationRecoveryControllerContractTests.Run),
+    ("dual-role SYSTEM_ADMIN authority takes precedence over ADMIN-only user management", UserAdminRolePrecedenceContractTests.Run),
+    ("P8 operations readiness is no-dataset, redacted, authorized, and fail-closed", StatConfigOperationsP808ContractTests.Run),
+    ("P8 canonical bundle, empty readiness, freshness, and P9/P10 barriers are exact", StatConfigBundleP809ContractTests.Run),
+    ("P8 Basic Summary dependencies reject partial and untrusted state", WorkAssignmentBasicSummaryDependencyIntegrityContractTests.Run),
+    ("P8 Basic Summary ROW_LABEL binds exact label history", WorkAssignmentBasicSummaryRowLabelHistoryContractTests.Run),
+    ("dynamic form and flow capability catalog metadata is locked", DynamicFormFlowCapabilityCatalogContractTests.Run),
+    ("dynamic form and flow capability endpoint supports ETag negotiation", DynamicFormFlowCapabilityEndpointContractTests.Run),
+    ("dynamic form typed schema preserves legacy storage and OpenAPI contract", DynamicFormTypedSchemaContractTests.Run),
+    ("dynamic form published schema snapshot is canonical and version-bound", DynamicFormPublishedSchemaSnapshotIsCanonicalAndVersionBound),
+    ("dynamic form published schema integrity validation fails closed", DynamicFormPublishedSchemaIntegrityContractTests.Run),
+    ("dynamic form binding policy rejects hidden design-time use", DynamicFormBindingAccessPolicyContractTests.Run),
+    ("dynamic form version metadata backfill is bounded and idempotent", DynamicFormVersionMetadataBackfillContractTests.Run),
+    ("dynamic form core mutation contracts preserve CAS and fail-closed guards", DynamicFormCoreMutationContractTests.Run),
+    ("dynamic form runtime provenance backfill is bounded and fail closed", DynamicFormRuntimeProvenanceBackfillContractTests.Run),
+    ("dynamic form runtime field canonicalizer enforces ten strict types", DynamicFormRuntimeFieldCanonicalizerContractTests.Run),
+    ("dynamic form runtime persistence enforces sources, table modes, and payload CAS", DynamicFormRuntimePersistenceContractTests.Run),
+    ("work report lifecycle commands enforce reviewer CAS and exact replay", WorkReportLifecycleCommandContractTests.Run),
+    ("work report lifecycle projections use a durable monotonic outbox", WorkReportLifecycleProjectionOutboxContractTests.Run),
+    ("work report section projections create repair and verify exact current rows", WorkAssignmentReportSectionProjectionContractTests.Run),
+    ("work report raw GET hides report existence and identifiers", WorkAssignmentReportRawReadAccessContractTests.Run),
+    ("dynamic form section snapshots are deterministic and ordered", DynamicFormSectionSnapshotsAreDeterministicAndOrdered),
+    ("dynamic form section snapshots fail closed on malformed topology", DynamicFormSectionSnapshotsFailClosedOnMalformedTopology),
+    ("advanced summary section lookup uses exact form snapshots", AdvancedSummarySectionLookupUsesExactFormSnapshots),
+    ("dynamic flow template OpenAPI exposes typed response contracts", DynamicFlowTemplateOpenApiContractTests.Run),
+    ("dynamic flow schema v2 contract canonicalizes and validates strictly", DynamicFlowDefinitionPayloadContractTests.Run),
+    ("dynamic flow definition metadata backfill is bounded, idempotent, and fail closed", DynamicFlowDefinitionMetadataBackfillContractTests.Run),
+    ("dynamic flow form nodes bind canonical Dynamic Form versions", DynamicFlowFormNodeVersionContractTests.Run),
+    ("dynamic flow template reads are actor-scoped and fail closed", DynamicFlowTemplateReadAccessContractTests.Run),
+    ("dynamic flow definition mutations are transactional, idempotent, and runtime-blocked", DynamicFlowDefinitionMutationContractTests.Run),
+    ("locked dynamic flow snapshots fail closed on payload, catalog, family, and form pin drift", DynamicFlowLockedSnapshotIntegrityContractTests.Run),
+    ("dynamic flow runtime persistence freezes aggregate, CAS, event, receipt, outbox, and index contracts", DynamicFlowRuntimePersistenceContractTests.Run),
+    ("dynamic flow runtime preflight freezes typed API, auth, pins, replay, dedupe, and phase guards", DynamicFlowRuntimePreflightContractTests.Run),
+    ("dynamic flow sequential topology freezes candidate boundary, exact forms, edges, and identities", DynamicFlowSequentialTopologyContractTests.Run),
+    ("dynamic flow parallel fork freezes exact fan-out and deterministic branch identities", DynamicFlowParallelForkTopologyContractTests.Run),
+    ("dynamic flow JOIN ALL freezes versioned contributors, ledger identities, and release threshold", DynamicFlowJoinAllTopologyContractTests.Run),
+    ("dynamic flow JOIN quorum freezes ANY/N_OF_M, cancellation, late audit, and impossible detection", DynamicFlowJoinQuorumTopologyContractTests.Run),
+    ("dynamic flow typed conditional freezes authorized facts, truth tables, default order, and fail-closed errors", DynamicFlowTypedConditionalTopologyContractTests.Run),
+    ("dynamic flow review loop freezes exact target, bounded attempts, immutable lineage, and candidate barrier", DynamicFlowReviewLoopTopologyContractTests.Run),
+    ("dynamic flow subflow freezes exact child pins, blocking lineage, depth/cycle guards, and candidate barrier", DynamicFlowSubflowTopologyContractTests.Run),
+    ("dynamic flow periodic freezes schedule identity, timezone, leases, missed audit, and candidate barrier", DynamicFlowPeriodicTopologyContractTests.Run),
+    ("dynamic flow supplemental freezes server coordinator, exact allow-list, cap, completion policy, replay, and audit", DynamicFlowSupplementalTopologyContractTests.Run),
+    ("dynamic flow finalize freezes epoch commands, invalidation closure, deterministic replacement, replay, and P7/P8 barrier", DynamicFlowFinalizeTopologyContractTests.Run),
+    ("dynamic flow runtime materialization uses durable intent, leased recovery, exact pins, and scoped compensation", DynamicFlowRuntimeMaterializationContractTests.Run),
+    ("dynamic flow runtime state projection aggregates reports, guards transitions, and preserves deterministic replay", DynamicFlowRuntimeStateProjectionContractTests.Run),
+    ("dynamic flow runtime reads freeze cursor, visibility, capability, recovery, revision, sanitization, and typed route contracts", DynamicFlowRuntimeReadContractTests.Run),
+    ("dynamic flow mapping security freezes canonical signatures and scoped preview tokens", DynamicFlowMappingSecurityContractTests.Run),
+    ("dynamic flow mapping apply freezes transaction, replay, provenance, outbox, and tamper guards", DynamicFlowMappingApplyDurabilityContractTests.Run),
+    ("dynamic flow mapping P7-11 apply fault matrix is exact, Testing-only, and one-shot", DynamicFlowMappingP711ApplyFaultContractTests.Run),
+    ("dynamic flow mapping lifecycle and rerun contract covers MAP-RERUN-01..08", DynamicFlowMappingLifecycleRerunContractTests.Run),
     ("dynamic flow template payload normalizes defaults", DynamicFlowTemplatePayloadNormalizesDefaults),
+    ("dynamic flow template rejects statistic profiles without an executor", DynamicFlowTemplateRejectsUnexecutableStatisticProfile),
     ("dynamic flow template lock payload validates steps", DynamicFlowTemplateLockPayloadValidatesSteps),
+    ("dynamic flow topology anchors root forms and legacy mappings", DynamicFlowTopologyAnchorsRootFormsAndLegacyMappings),
     ("dynamic flow policy validation checks dynamic form references", DynamicFlowPolicyValidationChecksDynamicFormReferences),
     ("dynamic flow mapping validation checks schema and references", DynamicFlowMappingValidationChecksSchemaAndReferences),
+    ("dynamic flow structured mapping validates functions and unique targets", DynamicFlowStructuredMappingValidatesFunctionsAndUniqueTargets),
+    ("dynamic flow expressions evaluate named value operands", DynamicFlowExpressionsEvaluateNamedValueOperands),
+    ("dynamic flow P7 field evaluator freezes MAP-FIELD-01..20", DynamicFlowMappingFieldContractTests.Run),
+    ("dynamic flow P7 table engine freezes MAP-TABLE-01..20", DynamicFlowMappingTableContractTests.Run),
+    ("dynamic flow mapping authorization contract covers MAP-AUTH-01..12", DynamicFlowMappingAuthorizationContractTests.Run),
+    ("dynamic flow mapping staged activation keeps preview token and apply slices blocked until their prompts", DynamicFlowMappingActivationContractTests.Run),
+    ("dynamic flow mapping P7-08 barriers keep rerun, lifecycle, and invalidation closed until P7-09", DynamicFlowMappingP708BarrierContractTests.Run),
+    ("dynamic flow mapping canonical source contract covers P7-SOURCE-EXACT", DynamicFlowMappingCanonicalSourceContractTests.Run),
+    ("dynamic flow mapping runtime signature and parity contract covers P7-RUNTIME-01..12", DynamicFlowMappingRuntimeSignatureContractTests.Run),
+    ("dynamic flow structured mapping rejects collection copy and invalid literals", DynamicFlowStructuredMappingRejectsCollectionCopyAndInvalidLiterals),
     ("dynamic flow mapping engine projects values and provenance", DynamicFlowMappingEngineProjectsValuesAndProvenance),
+    ("dynamic flow mapping engine evaluates multiple inputs and fixed grid slots", DynamicFlowMappingEngineEvaluatesMultipleInputsAndFixedGridSlots),
+    ("dynamic flow mapping engine keeps table runtime projections aligned", DynamicFlowMappingEngineKeepsTableRuntimeProjectionsAligned),
+    ("dynamic flow mapping engine preserves sparse row coordinates", DynamicFlowMappingEnginePreservesSparseRowCoordinates),
+    ("dynamic flow mapping provenance excludes skipped null values", DynamicFlowMappingProvenanceExcludesSkippedNullValues),
+    ("dynamic flow mapping synchronizes top-level table values", DynamicFlowMappingSynchronizesTopLevelTableValues),
     ("dynamic flow policy evaluator applies field and table permissions", DynamicFlowPolicyEvaluatorAppliesFieldAndTablePermissions),
+    ("dynamic flow policy evaluator prefers specific scopes", DynamicFlowPolicyEvaluatorPrefersSpecificScopes),
     ("dynamic flow report permissions reject field writes", DynamicFlowReportPermissionsRejectFieldWrites),
     ("dynamic flow report permissions reject table column writes", DynamicFlowReportPermissionsRejectTableColumnWrites),
+    ("dynamic flow report permissions redact unreadable values", DynamicFlowReportPermissionsRedactUnreadableValues),
+    ("dynamic flow report permissions preserve unreadable round trips", DynamicFlowReportPermissionsPreserveUnreadableRoundTrips),
+    ("dynamic flow report permissions enforce required values", DynamicFlowReportPermissionsEnforceRequiredValues),
+    ("dynamic flow mapping preview redacts unreadable values", DynamicFlowMappingPreviewRedactsUnreadableValues),
+    ("dynamic flow mapping rejects ambiguous table row keys", DynamicFlowMappingRejectsAmbiguousTableRowKeys),
+    ("dynamic flow mapping provenance cannot be forged by report requests", DynamicFlowMappingProvenanceCannotBeForgedByReportRequests),
+    ("dynamic flow report actor roles follow assignment relationships", DynamicFlowReportActorRolesFollowAssignmentRelationships),
+    ("dynamic flow report lifecycle keeps post-submit locks", DynamicFlowReportLifecycleKeepsPostSubmitLocks),
     ("dynamic flow runtime planner creates branch per target unit", DynamicFlowRuntimePlannerCreatesBranchPerTargetUnit),
     ("dynamic flow runtime planner rejects invalid launch inputs", DynamicFlowRuntimePlannerRejectsInvalidLaunchInputs),
     ("dynamic flow branch mutation planner invalidates downstream branches", DynamicFlowBranchMutationPlannerInvalidatesDownstreamBranches),
@@ -106,14 +196,22 @@ var tests = new (string Name, Action Run)[]
     ("report contribution policy can exclude table metrics and labels", ExcludesMappedTableAndLabelTargetsOnly),
     ("aggregate draft partial mapping clears previous target cells", ClearsPreviousAggregateDraftTargetCells),
     ("dynamic form field display name is separated from statistic labels", ValidatesDynamicFormFieldDisplayName),
+    ("dynamic form field schema accepts all published types and value sources", AcceptsDynamicFormFieldSchemaContract),
+    ("dynamic form field schema rejects unknown types", RejectsUnknownDynamicFormFieldType),
+    ("dynamic form field schema rejects duplicate ids and orphan sections", RejectsDuplicateDynamicFormFieldIdsAndOrphanSections),
+    ("dynamic form field schema rejects duplicate and excessive options", RejectsDuplicateAndExcessiveDynamicFormFieldOptions),
+    ("dynamic form field schema rejects rich text statistics and invalid sources", RejectsRichTextStatisticsAndInvalidDynamicFormValueSources),
     ("dynamic form section title is required", BlocksBlankDynamicFormSectionTitle),
     ("dynamic form supports monthly BT 25 table blocks", SupportsMonthlyBtTwentyFiveTableBlocks),
     ("short text field statistics bucket by trimmed value", BucketsShortTextFieldStatistics),
+    ("table statistics keep metrics from eligible blocks", TableStatisticsKeepMetricsFromEligibleBlocks),
+    ("table statistics do not revive a canonical disabled block from legacy json", TableStatisticsDoNotReviveDisabledCanonicalBlockFromLegacyJson),
     ("stat projection accepts verified external payload snapshot", AcceptsVerifiedExternalPayloadForStatisticProjection),
     ("stat projection rejects embedded payload fallback", RejectsEmbeddedPayloadForStatisticProjection),
     ("stat projection rejects unverified external payload hash", RejectsUnverifiedExternalPayloadHashForStatisticProjection),
     ("form-only report can omit dynamic excel template id", AllowsFormOnlyReportWithoutDynamicExcelTemplate),
     ("report service resolves dynamic excel id from form blocks", ResolvesDynamicExcelIdFromFormBlocks),
+    ("report payload preflights every document before Mongo writes", WorkReportPayloadPreflightContractTests.Run),
     ("report payload header compaction clears embedded detail fields", CompactsReportPayloadHeader),
     ("auto approve condition normalizes and matches report fields", MatchesAutoApproveCondition),
     ("automatic child aggregation source rules normalize to manual", NormalizesAutomaticChildSourceRulesToManual),
@@ -124,6 +222,7 @@ var tests = new (string Name, Action Run)[]
     ("basic summary normalizes typed methods", BasicSummaryNormalizesTypedMethods),
     ("basic summary supports typed default methods", BasicSummarySupportsTypedDefaultMethods),
     ("basic summary rejects table method rules", BasicSummaryRejectsTableMethodRules),
+    ("basic summary rejects incompatible field method rules", BasicSummaryRejectsIncompatibleFieldMethodRules),
     ("basic summary refresh status controls enqueue", BasicSummaryRefreshStatusControlsEnqueue),
     ("basic summary reset request rebuilds from snapshot json", BasicSummaryResetRequestRebuildsFromSnapshotJson),
     ("basic summary extracts typed table values", BasicSummaryExtractsTypedTableValues),
@@ -135,6 +234,7 @@ var tests = new (string Name, Action Run)[]
     ("statistic diff row join requires table identity", StatisticDiffRowJoinRequiresTableIdentity),
     ("statistic diff compatibility rejects concept mismatch", StatisticDiffCompatibilityRejectsConceptMismatch),
     ("statistic diff compatibility rejects data category mismatch", StatisticDiffCompatibilityRejectsDataCategoryMismatch),
+    ("statistic diff accepts a field statistic label selector", StatisticDiffAcceptsFieldStatisticLabelSelector),
     ("advanced summary config hash includes source scope", AdvancedSummaryConfigHashIncludesSourceScope),
     ("advanced summary config normalizes object json", AdvancedSummaryConfigNormalizesObjectJson),
     ("advanced summary preview blocks unsupported range condition", AdvancedSummaryPreviewBlocksUnsupportedRangeCondition),
@@ -158,6 +258,7 @@ var tests = new (string Name, Action Run)[]
     ("upload endpoint uses public base url override", BuildsUploadEndpointFromPublicBaseUrl),
     ("upload endpoint falls back to forwarded request scheme and host", BuildsUploadEndpointFromForwardedRequest),
     ("recurring job runner methods prevent overlap", RecurringJobRunnerMethodsPreventOverlap),
+    ("dynamic form statistic recurring trigger is post-commit best effort", HangfireRecurringTriggerContractTests.Run),
     ("advanced summary operations normalize hierarchy grain", AdvancedSummaryOperationsNormalizeHierarchyGrain),
     ("advanced summary operations reset actor uses original requester", AdvancedSummaryOperationsResetActorUsesOriginalRequester),
     ("advanced summary operations cleanup limit is bounded", AdvancedSummaryOperationsCleanupLimitIsBounded),
@@ -934,6 +1035,7 @@ static void DynamicFlowTemplatePayloadNormalizesDefaults()
     using var doc = JsonDocument.Parse(normalized);
     foreach (var property in new[]
     {
+        "formNodes",
         "steps",
         "transitions",
         "actorPolicies",
@@ -948,6 +1050,39 @@ static void DynamicFlowTemplatePayloadNormalizesDefaults()
     AssertEqual(JsonValueKind.Object, doc.RootElement.GetProperty("rollbackPolicy").ValueKind, "rollbackPolicy should default to object");
     AssertEqual(JsonValueKind.Object, doc.RootElement.GetProperty("finalResultPolicy").ValueKind, "finalResultPolicy should default to object");
     AssertEqual(JsonValueKind.Object, doc.RootElement.GetProperty("statisticProfile").ValueKind, "statisticProfile should default to object");
+}
+
+static void DynamicFlowTemplateRejectsUnexecutableStatisticProfile()
+{
+    var normalized = DynamicFlowTemplateService.NormalizePayloadJson(
+        """
+        {
+          "steps": [],
+          "statisticProfile": { "diffMode": "NONE" }
+        }
+        """,
+        requireLockable: false);
+
+    using (var doc = JsonDocument.Parse(normalized))
+    {
+        AssertEqual(
+            0,
+            doc.RootElement.GetProperty("statisticProfile").EnumerateObject().Count(),
+            "legacy no-op statistic profile should normalize to an empty object");
+    }
+
+    AssertThrows(
+        AppErrorCode.COMMON_VALIDATION_FAILED,
+        () => DynamicFlowTemplateService.NormalizePayloadJson(
+            """
+            {
+              "statisticProfile": {
+                "diffMode": "ROW_COMPARE",
+                "currentField": "score"
+              }
+            }
+            """,
+            requireLockable: true));
 }
 
 static void DynamicFlowTemplateLockPayloadValidatesSteps()
@@ -972,9 +1107,13 @@ static void DynamicFlowTemplateLockPayloadValidatesSteps()
     var normalized = DynamicFlowTemplateService.NormalizePayloadJson(
         """
         {
+          "rootDynamicFormTemplateId": "100000000000000000000088",
+          "formNodes": [
+            { "formNodeId": "root", "role": "ROOT", "dynamicFormTemplateId": "100000000000000000000088" }
+          ],
           "steps": [
-            { "stepId": "self", "stepCode": "SELF" },
-            { "stepId": "review", "stepCode": "REVIEW" }
+            { "stepId": "self", "stepCode": "SELF", "dynamicFormTemplateId": "100000000000000000000088" },
+            { "stepId": "review", "stepCode": "REVIEW", "dynamicFormTemplateId": "100000000000000000000088" }
           ],
           "transitions": [
             { "fromStepId": "self", "toStepId": "review" }
@@ -985,6 +1124,244 @@ static void DynamicFlowTemplateLockPayloadValidatesSteps()
 
     using var doc = JsonDocument.Parse(normalized);
     AssertEqual(2, doc.RootElement.GetProperty("steps").GetArrayLength(), "lockable payload should keep valid steps");
+}
+
+static void DynamicFlowTopologyAnchorsRootFormsAndLegacyMappings()
+{
+    var rootForm = new DynamicFormTemplate
+    {
+        Id = ObjectId(73),
+        Code = "DF_FLOW_ROOT",
+        Name = "Flow root",
+        FieldsJson = """[{ "id": "f_total", "key": "total", "type": "NUMBER" }]""",
+        BlocksJson = "[]"
+    };
+    var childForm = new DynamicFormTemplate
+    {
+        Id = ObjectId(74),
+        Code = "DF_FLOW_CHILD",
+        Name = "Flow child",
+        FieldsJson = """[{ "id": "f_amount", "key": "amount", "type": "NUMBER" }]""",
+        BlocksJson = "[]"
+    };
+    var forms = new Dictionary<string, DynamicFormTemplate>(StringComparer.Ordinal)
+    {
+        [rootForm.Id] = rootForm,
+        [childForm.Id] = childForm
+    };
+
+    var normalized = DynamicFlowTemplateService.NormalizePayloadJson(
+        $$"""
+        {
+          "rootDynamicFormTemplateId": "{{rootForm.Id}}",
+          "formNodes": [
+            { "formNodeId": "root_form", "role": "ROOT", "dynamicFormTemplateId": "{{rootForm.Id}}" },
+            { "formNodeId": "child_form", "role": "CHILD", "dynamicFormTemplateId": "{{childForm.Id}}" }
+          ],
+          "steps": [
+            { "stepId": "root", "stepCode": "ROOT", "formNodeId": "root_form", "dynamicFormTemplateId": "{{rootForm.Id}}" },
+            { "stepId": "child", "stepCode": "CHILD", "formNodeId": "child_form", "dynamicFormTemplateId": "{{childForm.Id}}" }
+          ],
+          "transitions": [{ "fromStepId": "root", "toStepId": "child" }],
+          "mappingRules": [{
+            "mappingId": "legacy_child_total",
+            "sourceStepId": "child",
+            "targetStepId": "root",
+            "sourceFieldKey": "amount",
+            "targetFieldKey": "total",
+            "valueTransform": "SUM"
+          }]
+        }
+        """,
+        requireLockable: true,
+        rootForm.Id,
+        forms);
+
+    using (var doc = JsonDocument.Parse(normalized))
+    {
+        var rule = doc.RootElement.GetProperty("mappingRules")[0];
+        AssertEqual(childForm.Id, rule.GetProperty("sourceDynamicFormTemplateId").GetString(),
+            "legacy source form should be canonicalized from its step");
+        AssertEqual(rootForm.Id, rule.GetProperty("targetDynamicFormTemplateId").GetString(),
+            "legacy target form should be canonicalized from its step");
+        AssertEqual("CHILD", rule.GetProperty("sourceStepCode").GetString(),
+            "legacy source step code should be canonicalized");
+        AssertEqual("ROOT", rule.GetProperty("targetStepCode").GetString(),
+            "legacy target step code should be canonicalized");
+    }
+
+    AssertThrows(
+        AppErrorCode.COMMON_VALIDATION_FAILED,
+        () => DynamicFlowTemplateService.NormalizePayloadJson(
+            $$"""
+            {
+              "rootDynamicFormTemplateId": "{{rootForm.Id}}",
+              "formNodes": [
+                { "formNodeId": "root_form", "role": "ROOT", "dynamicFormTemplateId": "{{rootForm.Id}}" },
+                { "formNodeId": "child_form", "role": "CHILD", "dynamicFormTemplateId": "{{childForm.Id}}" }
+              ],
+              "steps": [
+                { "stepId": "wrong_root", "stepCode": "WRONG_ROOT", "dynamicFormTemplateId": "{{childForm.Id}}" },
+                { "stepId": "declared_root", "stepCode": "DECLARED_ROOT", "dynamicFormTemplateId": "{{rootForm.Id}}" }
+              ],
+              "transitions": [{ "fromStepId": "wrong_root", "toStepId": "declared_root" }]
+            }
+            """,
+            requireLockable: true,
+            rootForm.Id,
+            forms));
+
+    AssertThrows(
+        AppErrorCode.COMMON_VALIDATION_FAILED,
+        () => DynamicFlowTemplateService.NormalizePayloadJson(
+            $$"""
+            {
+              "rootDynamicFormTemplateId": "{{rootForm.Id}}",
+              "formNodes": [
+                { "formNodeId": "root_form", "role": "ROOT", "dynamicFormTemplateId": "{{rootForm.Id}}" },
+                { "formNodeId": "root_form_copy", "role": "CHILD", "dynamicFormTemplateId": "{{rootForm.Id}}" }
+              ],
+              "steps": [{ "stepId": "root", "stepCode": "ROOT", "dynamicFormTemplateId": "{{rootForm.Id}}" }]
+            }
+            """,
+            requireLockable: true,
+            rootForm.Id,
+            forms));
+
+    AssertThrows(
+        AppErrorCode.COMMON_VALIDATION_FAILED,
+        () => DynamicFlowTemplateService.NormalizePayloadJson(
+            $$"""
+            {
+              "rootDynamicFormTemplateId": "{{rootForm.Id}}",
+              "formNodes": [
+                { "formNodeId": "root_form", "role": "ROOT", "dynamicFormTemplateId": "{{rootForm.Id}}" },
+                { "formNodeId": "child_form", "role": "ROOT", "dynamicFormTemplateId": "{{childForm.Id}}" }
+              ],
+              "steps": [{ "stepId": "root", "stepCode": "ROOT", "dynamicFormTemplateId": "{{rootForm.Id}}" }]
+            }
+            """,
+            requireLockable: true,
+            rootForm.Id,
+            forms));
+
+    AssertThrows(
+        AppErrorCode.COMMON_VALIDATION_FAILED,
+        () => DynamicFlowTemplateService.NormalizePayloadJson(
+            $$"""
+            {
+              "rootDynamicFormTemplateId": "{{rootForm.Id}}",
+              "formNodes": [
+                { "formNodeId": "root_form", "role": "ROOT", "dynamicFormTemplateId": "{{rootForm.Id}}" }
+              ],
+              "steps": [{
+                "stepId": "root",
+                "stepCode": "ROOT",
+                "formNodeId": "missing_form_node",
+                "dynamicFormTemplateId": "{{rootForm.Id}}"
+              }]
+            }
+            """,
+            requireLockable: true,
+            rootForm.Id,
+            forms));
+
+    AssertThrows(
+        AppErrorCode.COMMON_VALIDATION_FAILED,
+        () => DynamicFlowTemplateService.NormalizePayloadJson(
+            $$"""
+            {
+              "rootDynamicFormTemplateId": "{{rootForm.Id}}",
+              "formNodes": [
+                { "formNodeId": "same", "role": "ROOT", "dynamicFormTemplateId": "{{rootForm.Id}}" },
+                { "formNodeId": "same", "role": "CHILD", "dynamicFormTemplateId": "{{childForm.Id}}" }
+              ],
+              "steps": [{ "stepId": "root", "stepCode": "ROOT", "dynamicFormTemplateId": "{{rootForm.Id}}" }]
+            }
+            """,
+            requireLockable: true,
+            rootForm.Id,
+            forms));
+
+    AssertThrows(
+        AppErrorCode.COMMON_VALIDATION_FAILED,
+        () => DynamicFlowTemplateService.NormalizePayloadJson(
+            $$"""
+            {
+              "rootDynamicFormTemplateId": "{{rootForm.Id}}",
+              "formNodes": [
+                { "formNodeId": "root_form", "role": "ROOT", "dynamicFormTemplateId": "{{rootForm.Id}}" },
+                { "formNodeId": "child_form", "role": "CHILD", "dynamicFormTemplateId": "{{childForm.Id}}" }
+              ],
+              "steps": [{
+                "stepId": "root",
+                "stepCode": "ROOT",
+                "formNodeId": "root_form",
+                "dynamicFormTemplateId": "{{childForm.Id}}"
+              }]
+            }
+            """,
+            requireLockable: true,
+            rootForm.Id,
+            forms));
+
+    AssertThrows(
+        AppErrorCode.COMMON_VALIDATION_FAILED,
+        () => DynamicFlowTemplateService.NormalizePayloadJson(
+            $$"""
+            {
+              "rootDynamicFormTemplateId": "{{rootForm.Id}}",
+              "formNodes": [
+                { "formNodeId": "root_form", "role": "ROOT", "dynamicFormTemplateId": "{{rootForm.Id}}" },
+                { "formNodeId": "child_form", "role": "CHILD", "dynamicFormTemplateId": "{{childForm.Id}}" }
+              ],
+              "steps": [
+                { "stepId": "root", "stepCode": "ROOT", "dynamicFormTemplateId": "{{rootForm.Id}}" },
+                { "stepId": "middle", "stepCode": "MIDDLE", "dynamicFormTemplateId": "{{childForm.Id}}" },
+                { "stepId": "leaf", "stepCode": "LEAF", "dynamicFormTemplateId": "{{childForm.Id}}" }
+              ],
+              "transitions": [
+                { "fromStepId": "root", "toStepId": "middle" },
+                { "fromStepId": "middle", "toStepId": "leaf" }
+              ],
+              "mappingRules": [{
+                "mappingId": "legacy_skip_level",
+                "sourceStepId": "leaf",
+                "targetStepId": "root",
+                "sourceFieldKey": "amount",
+                "targetFieldKey": "total"
+              }]
+            }
+            """,
+            requireLockable: true,
+            rootForm.Id,
+            forms));
+
+    AssertThrows(
+        AppErrorCode.COMMON_VALIDATION_FAILED,
+        () => DynamicFlowTemplateService.NormalizePayloadJson(
+            $$"""
+            {
+              "rootDynamicFormTemplateId": "{{rootForm.Id}}",
+              "formNodes": [
+                { "formNodeId": "root_form", "role": "ROOT", "dynamicFormTemplateId": "{{rootForm.Id}}" },
+                { "formNodeId": "child_form", "role": "CHILD", "dynamicFormTemplateId": "{{childForm.Id}}" }
+              ],
+              "steps": [
+                { "stepId": "root", "stepCode": "ROOT", "dynamicFormTemplateId": "{{rootForm.Id}}" },
+                { "stepId": "child", "stepCode": "CHILD", "dynamicFormTemplateId": "{{childForm.Id}}" }
+              ],
+              "transitions": [{ "fromStepId": "root", "toStepId": "child" }],
+              "mappingRules": [{
+                "mappingId": "legacy_without_steps",
+                "sourceFieldKey": "amount",
+                "targetFieldKey": "total"
+              }]
+            }
+            """,
+            requireLockable: true,
+            rootForm.Id,
+            forms));
 }
 
 static void DynamicFlowPolicyValidationChecksDynamicFormReferences()
@@ -1004,6 +1381,11 @@ static void DynamicFlowPolicyValidationChecksDynamicFormReferences()
         [
           {
             "blockId": "b1",
+            "excelSpecKind": "TOP",
+            "defaultDataType": "NUMBER",
+            "dataRect": { "r0": 1, "c0": 0, "r1": 2, "c1": 1 },
+            "w": 2,
+            "h": 2,
             "statisticColumns": [
               { "columnKey": "amount" },
               { "columnIndex": 1 }
@@ -1023,7 +1405,7 @@ static void DynamicFlowPolicyValidationChecksDynamicFormReferences()
             { "stepId": "draft", "actorRole": "ISSUER", "fieldKey": "total", "read": true, "write": true, "required": true }
           ],
           "tableColumnPolicies": [
-            { "stepCode": "DRAFT", "actorRole": "ISSUER", "blockId": "b1", "columnKey": "amount", "read": true },
+            { "stepCode": "DRAFT", "actorRole": "ISSUER", "blockId": "b1", "columnKey": "col_1", "read": true },
             { "stepCode": "DRAFT", "actorRole": "ISSUER", "blockId": "b1", "columnKey": "col_2", "read": true }
           ]
         }
@@ -1034,6 +1416,9 @@ static void DynamicFlowPolicyValidationChecksDynamicFormReferences()
     using var doc = JsonDocument.Parse(normalized);
     AssertEqual(1, doc.RootElement.GetProperty("fieldPolicies").GetArrayLength(), "valid field policy should remain");
     AssertEqual(2, doc.RootElement.GetProperty("tableColumnPolicies").GetArrayLength(), "valid table policies should remain");
+    var normalizedFieldPolicy = doc.RootElement.GetProperty("fieldPolicies")[0];
+    AssertEqual("f_total", normalizedFieldPolicy.GetProperty("fieldId").GetString(), "field policy should persist the canonical field id");
+    AssertEqual("total", normalizedFieldPolicy.GetProperty("fieldKey").GetString(), "field policy should persist the canonical field key");
 
     AssertThrows(
         AppErrorCode.COMMON_VALIDATION_FAILED,
@@ -1066,6 +1451,7 @@ static void DynamicFlowPolicyValidationChecksDynamicFormReferences()
             """,
             requireLockable: true,
             form));
+
 }
 
 static void DynamicFlowMappingValidationChecksSchemaAndReferences()
@@ -1086,10 +1472,10 @@ static void DynamicFlowMappingValidationChecksSchemaAndReferences()
         [
           {
             "blockId": "b1",
-            "statisticColumns": [
-              { "columnKey": "amount" },
-              { "columnKey": "note" }
-            ]
+            "dataRect": { "r0": 1, "c0": 0, "r1": 2, "c1": 1 },
+            "w": 2,
+            "h": 2,
+            "indexMap": []
           }
         ]
         """
@@ -1101,6 +1487,9 @@ static void DynamicFlowMappingValidationChecksSchemaAndReferences()
           "steps": [
             { "stepId": "child", "stepCode": "CHILD" },
             { "stepId": "parent", "stepCode": "PARENT" }
+          ],
+          "transitions": [
+            { "fromStepId": "parent", "toStepId": "child" }
           ],
           "mappingRules": [
             {
@@ -1122,9 +1511,9 @@ static void DynamicFlowMappingValidationChecksSchemaAndReferences()
               "sourceStepCode": "CHILD",
               "targetStepCode": "PARENT",
               "sourceBlockId": "b1",
-              "sourceColumnKey": "amount",
+              "sourceColumnKey": "col_1",
               "targetBlockId": "b1",
-              "targetColumnKey": "amount",
+              "targetColumnKey": "col_1",
               "joinKey": "rowKey",
               "valueTransform": "COPY",
               "conflictPolicy": "TARGET_WINS",
@@ -1145,11 +1534,75 @@ static void DynamicFlowMappingValidationChecksSchemaAndReferences()
             """
             {
               "steps": [
+                { "stepId": "child", "stepCode": "CHILD" },
+                { "stepId": "parent", "stepCode": "PARENT" }
+              ],
+              "transitions": [{ "fromStepId": "parent", "toStepId": "child" }],
+              "mappingRules": [{
+                "mappingId": "legacy_field_to_unspecified_table_row",
+                "sourceStepId": "child",
+                "targetStepId": "parent",
+                "sourceFieldId": "f_total",
+                "targetBlockId": "b1",
+                "targetColumnKey": "col_1",
+                "valueTransform": "COPY"
+              }]
+            }
+            """,
+            requireLockable: true,
+            form));
+
+    AssertThrows(
+        AppErrorCode.COMMON_VALIDATION_FAILED,
+        () => DynamicFlowTemplateService.NormalizePayloadJson(
+            """
+            {
+              "steps": [
                 { "stepId": "child", "stepCode": "CHILD" }
               ],
               "mappingRules": [
                 { "mappingId": "m1", "sourceFieldId": "missing", "targetFieldId": "f_total" }
               ]
+            }
+            """,
+            requireLockable: true,
+            form));
+
+    AssertThrows(
+        AppErrorCode.COMMON_VALIDATION_FAILED,
+        () => DynamicFlowTemplateService.NormalizePayloadJson(
+            $$"""
+            {
+              "steps": [
+                { "stepId": "parent", "stepCode": "PARENT" },
+                { "stepId": "child", "stepCode": "CHILD" }
+              ],
+              "transitions": [{ "fromStepId": "parent", "toStepId": "child" }],
+              "mappingRules": [{
+                "mappingId": "field_to_unspecified_table_row",
+                "evaluationGrain": "FLOW_INSTANCE",
+                "inputs": [{
+                  "inputKey": "value",
+                  "dataType": "NUMBER",
+                  "cardinality": "ONE",
+                  "source": {
+                    "kind": "FIELD",
+                    "dynamicFormTemplateId": "{{form.Id}}",
+                    "stepId": "child",
+                    "fieldKey": "total",
+                    "dataType": "NUMBER"
+                  }
+                }],
+                "target": {
+                  "kind": "TABLE_COLUMN",
+                  "dynamicFormTemplateId": "{{form.Id}}",
+                  "stepId": "parent",
+                  "blockId": "b1",
+                  "columnKey": "col_2",
+                  "dataType": "NUMBER"
+                },
+                "calculation": { "kind": "DIRECT", "operation": "copy", "resultDataType": "NUMBER" }
+              }]
             }
             """,
             requireLockable: true,
@@ -1185,6 +1638,683 @@ static void DynamicFlowMappingValidationChecksSchemaAndReferences()
               ]
             }
             """,
+            requireLockable: true,
+            form));
+}
+
+static void DynamicFlowStructuredMappingValidatesFunctionsAndUniqueTargets()
+{
+    var form = new DynamicFormTemplate
+    {
+        Id = ObjectId(81),
+        Code = "FORM_STRUCTURED_MAP",
+        Name = "Structured Mapping Form",
+        CreatedByUsername = "admin",
+        FieldsJson = """
+        [
+          { "id": "f_numerator", "key": "numerator", "type": "NUMBER" },
+          { "id": "f_denominator", "key": "denominator", "type": "NUMBER" },
+          { "id": "f_percentage", "key": "percentage", "type": "NUMBER" },
+          { "id": "f_note", "key": "note", "type": "TEXT" }
+        ]
+        """,
+        BlocksJson = """
+        [
+          {
+            "blockId": "grid",
+            "excelSpecKind": "TOP",
+            "defaultDataType": "NUMBER",
+            "dataRect": { "r0": 2, "c0": 1, "r1": 3, "c1": 2 },
+            "w": 2,
+            "h": 2,
+            "specialRanges": [
+              { "role": "FORMULA", "r0": 2, "c0": 1, "r1": 3, "c1": 1 }
+            ],
+            "indexMap": [
+              { "index": 0, "columnKey": "metric_only", "metricKey": "metric_only" }
+            ]
+          }
+        ]
+        """
+    };
+
+    var normalized = DynamicFlowTemplateService.NormalizePayloadJson(
+        $$"""
+        {
+          "steps": [
+            { "stepId": "parent", "stepCode": "PARENT" },
+            { "stepId": "child", "stepCode": "CHILD" }
+          ],
+          "transitions": [
+            { "fromStepId": "parent", "toStepId": "child" }
+          ],
+          "mappingRules": [
+            {
+              "mappingId": "percentage",
+              "mappingVersion": 1,
+              "mappingKind": "FIELD",
+              "evaluationGrain": "FLOW_INSTANCE",
+              "errorPolicy": "BLOCK_APPLY",
+              "conflictPolicy": "OVERWRITE",
+              "inputs": [
+                {
+                  "inputKey": "numerator",
+                  "dataType": "NUMBER",
+                  "cardinality": "ONE",
+                  "nullPolicy": "ERROR",
+                  "source": {
+                    "kind": "FIELD",
+                    "dynamicFormTemplateId": "{{form.Id}}",
+                    "stepId": "child",
+                    "stepCode": "CHILD",
+                    "fieldKey": "numerator",
+                    "dataType": "NUMBER"
+                  }
+                },
+                {
+                  "inputKey": "denominator",
+                  "dataType": "NUMBER",
+                  "cardinality": "ONE",
+                  "nullPolicy": "ERROR",
+                  "source": {
+                    "kind": "FIELD",
+                    "dynamicFormTemplateId": "{{form.Id}}",
+                    "stepId": "child",
+                    "stepCode": "CHILD",
+                    "fieldKey": "denominator",
+                    "dataType": "NUMBER"
+                  }
+                }
+              ],
+              "target": {
+                "kind": "FIELD",
+                "dynamicFormTemplateId": "{{form.Id}}",
+                "stepId": "parent",
+                "stepCode": "PARENT",
+                "fieldKey": "percentage",
+                "dataType": "NUMBER"
+              },
+              "calculation": {
+                "kind": "REGISTERED_FUNCTION",
+                "functionCode": "CALC_PERCENTAGE",
+                "functionVersion": 1,
+                "resultDataType": "NUMBER",
+                "arguments": {
+                  "numerator": { "input": "numerator" },
+                  "denominator": { "input": "denominator" }
+                }
+              }
+            },
+            {
+              "mappingId": "grid-column",
+              "mappingVersion": 1,
+              "mappingKind": "TABLE_COLUMN",
+              "evaluationGrain": "TABLE_ROW",
+              "inputs": [
+                {
+                  "inputKey": "amount",
+                  "dataType": "NUMBER",
+                  "cardinality": "ONE",
+                  "nullPolicy": "SKIP",
+                  "source": {
+                    "kind": "TABLE_COLUMN",
+                    "dynamicFormTemplateId": "{{form.Id}}",
+                    "stepId": "child",
+                    "blockId": "grid",
+                    "columnKey": "col_2",
+                    "dataType": "NUMBER"
+                  }
+                }
+              ],
+              "target": {
+                "kind": "TABLE_COLUMN",
+                "dynamicFormTemplateId": "{{form.Id}}",
+                "stepId": "parent",
+                "blockId": "grid",
+                "columnKey": "col_2",
+                "dataType": "NUMBER"
+              },
+              "calculation": {
+                "kind": "DIRECT",
+                "operation": "copy",
+                "resultDataType": "NUMBER"
+              }
+            }
+          ]
+        }
+        """,
+        requireLockable: true,
+        form);
+
+    using var doc = JsonDocument.Parse(normalized);
+    AssertEqual(2, doc.RootElement.GetProperty("mappingRules").GetArrayLength(), "structured mappings should remain after validation");
+
+    AssertThrows(
+        AppErrorCode.COMMON_VALIDATION_FAILED,
+        () => DynamicFlowTemplateService.NormalizePayloadJson(
+            $$"""
+            {
+              "steps": [
+                { "stepId": "parent", "stepCode": "PARENT" },
+                { "stepId": "child", "stepCode": "CHILD" }
+              ],
+              "transitions": [{ "fromStepId": "parent", "toStepId": "child" }],
+              "mappingRules": [{
+                "mappingId": "fully-masked-column",
+                "inputs": [{
+                  "inputKey": "value",
+                  "dataType": "NUMBER",
+                  "source": {
+                    "kind": "FIELD",
+                    "dynamicFormTemplateId": "{{form.Id}}",
+                    "stepId": "child",
+                    "fieldKey": "numerator",
+                    "dataType": "NUMBER"
+                  }
+                }],
+                "target": {
+                  "kind": "TABLE_COLUMN",
+                  "dynamicFormTemplateId": "{{form.Id}}",
+                  "stepId": "parent",
+                  "blockId": "grid",
+                  "columnKey": "col_1",
+                  "dataType": "NUMBER"
+                },
+                "calculation": { "kind": "DIRECT", "operation": "copy", "resultDataType": "NUMBER" }
+              }]
+            }
+            """,
+            requireLockable: true,
+            form));
+
+    AssertThrows(
+        AppErrorCode.COMMON_VALIDATION_FAILED,
+        () => DynamicFlowTemplateService.NormalizePayloadJson(
+            $$"""
+            {
+              "steps": [
+                { "stepId": "parent", "stepCode": "PARENT" },
+                { "stepId": "child", "stepCode": "CHILD" }
+              ],
+              "transitions": [{ "fromStepId": "parent", "toStepId": "child" }],
+              "mappingRules": [{
+                "mappingId": "copy-number-as-text",
+                "inputs": [{
+                  "inputKey": "value",
+                  "dataType": "NUMBER",
+                  "source": {
+                    "kind": "FIELD",
+                    "dynamicFormTemplateId": "{{form.Id}}",
+                    "stepId": "child",
+                    "fieldKey": "numerator",
+                    "dataType": "NUMBER"
+                  }
+                }],
+                "target": {
+                  "kind": "FIELD",
+                  "dynamicFormTemplateId": "{{form.Id}}",
+                  "stepId": "parent",
+                  "fieldKey": "note",
+                  "dataType": "TEXT"
+                },
+                "calculation": { "kind": "DIRECT", "operation": "copy", "resultDataType": "TEXT" }
+              }]
+            }
+            """,
+            requireLockable: true,
+            form));
+
+    AssertThrows(
+        AppErrorCode.COMMON_VALIDATION_FAILED,
+        () => DynamicFlowTemplateService.NormalizePayloadJson(
+            $$"""
+            {
+              "steps": [
+                { "stepId": "parent", "stepCode": "PARENT" },
+                { "stepId": "child", "stepCode": "CHILD" }
+              ],
+              "transitions": [{ "fromStepId": "parent", "toStepId": "child" }],
+              "mappingRules": [{
+                "mappingId": "percentage-with-text-argument",
+                "inputs": [
+                  {
+                    "inputKey": "numerator",
+                    "dataType": "NUMBER",
+                    "source": { "kind": "FIELD", "dynamicFormTemplateId": "{{form.Id}}", "stepId": "child", "fieldKey": "numerator", "dataType": "NUMBER" }
+                  },
+                  {
+                    "inputKey": "denominator",
+                    "dataType": "NUMBER",
+                    "source": { "kind": "FIELD", "dynamicFormTemplateId": "{{form.Id}}", "stepId": "child", "fieldKey": "denominator", "dataType": "NUMBER" }
+                  }
+                ],
+                "target": { "kind": "FIELD", "dynamicFormTemplateId": "{{form.Id}}", "stepId": "parent", "fieldKey": "percentage", "dataType": "NUMBER" },
+                "calculation": {
+                  "kind": "REGISTERED_FUNCTION",
+                  "functionCode": "CALC_PERCENTAGE",
+                  "functionVersion": 1,
+                  "resultDataType": "NUMBER",
+                  "arguments": {
+                    "numerator": { "value": "khong-phai-so" },
+                    "denominator": { "input": "denominator" }
+                  }
+                }
+              }]
+            }
+            """,
+            requireLockable: true,
+            form));
+
+    AssertThrows(
+        AppErrorCode.COMMON_VALIDATION_FAILED,
+        () => DynamicFlowTemplateService.NormalizePayloadJson(
+            $$"""
+            {
+              "steps": [
+                { "stepId": "parent", "stepCode": "PARENT" },
+                { "stepId": "child", "stepCode": "CHILD" }
+              ],
+              "transitions": [{ "fromStepId": "parent", "toStepId": "child" }],
+              "mappingRules": [{
+                "mappingId": "statistic-index-is-not-a-column-catalog",
+                "inputs": [{
+                  "inputKey": "value",
+                  "dataType": "NUMBER",
+                  "source": {
+                    "kind": "FIELD",
+                    "dynamicFormTemplateId": "{{form.Id}}",
+                    "stepId": "child",
+                    "fieldKey": "numerator",
+                    "dataType": "NUMBER"
+                  }
+                }],
+                "target": {
+                  "kind": "TABLE_COLUMN",
+                  "dynamicFormTemplateId": "{{form.Id}}",
+                  "stepId": "parent",
+                  "blockId": "grid",
+                  "columnKey": "metric_only",
+                  "dataType": "NUMBER"
+                },
+                "calculation": { "kind": "DIRECT", "operation": "copy", "resultDataType": "NUMBER" }
+              }]
+            }
+            """,
+            requireLockable: true,
+            form));
+
+    AssertThrows(
+        AppErrorCode.COMMON_VALIDATION_FAILED,
+        () => DynamicFlowTemplateService.NormalizePayloadJson(
+            $$"""
+            {
+              "steps": [
+                { "stepId": "parent", "stepCode": "PARENT" },
+                { "stepId": "child", "stepCode": "CHILD" }
+              ],
+              "transitions": [{ "fromStepId": "parent", "toStepId": "child" }],
+              "mappingRules": [{
+                "mappingId": "mismatched-field-aliases",
+                "inputs": [{
+                  "inputKey": "value",
+                  "dataType": "NUMBER",
+                  "source": {
+                    "kind": "FIELD",
+                    "dynamicFormTemplateId": "{{form.Id}}",
+                    "stepId": "child",
+                    "fieldId": "f_numerator",
+                    "fieldKey": "denominator",
+                    "dataType": "NUMBER"
+                  }
+                }],
+                "target": {
+                  "kind": "FIELD",
+                  "dynamicFormTemplateId": "{{form.Id}}",
+                  "stepId": "parent",
+                  "fieldKey": "percentage",
+                  "dataType": "NUMBER"
+                },
+                "calculation": { "kind": "DIRECT", "operation": "copy", "resultDataType": "NUMBER" }
+              }]
+            }
+            """,
+            requireLockable: true,
+            form));
+
+    AssertThrows(
+        AppErrorCode.COMMON_VALIDATION_FAILED,
+        () => DynamicFlowTemplateService.NormalizePayloadJson(
+            $$"""
+            {
+              "steps": [
+                { "stepId": "parent", "stepCode": "PARENT" },
+                { "stepId": "child", "stepCode": "CHILD" }
+              ],
+              "transitions": [{ "fromStepId": "parent", "toStepId": "child" }],
+              "mappingRules": [
+                {
+                  "mappingId": "target-by-key",
+                  "inputs": [{
+                    "inputKey": "a",
+                    "dataType": "NUMBER",
+                    "source": { "kind": "FIELD", "dynamicFormTemplateId": "{{form.Id}}", "stepId": "child", "fieldKey": "numerator", "dataType": "NUMBER" }
+                  }],
+                  "target": { "kind": "FIELD", "dynamicFormTemplateId": "{{form.Id}}", "stepId": "parent", "fieldKey": "percentage", "dataType": "NUMBER" },
+                  "calculation": { "kind": "DIRECT", "operation": "copy", "resultDataType": "NUMBER" }
+                },
+                {
+                  "mappingId": "target-by-id",
+                  "inputs": [{
+                    "inputKey": "b",
+                    "dataType": "NUMBER",
+                    "source": { "kind": "FIELD", "dynamicFormTemplateId": "{{form.Id}}", "stepId": "child", "fieldKey": "denominator", "dataType": "NUMBER" }
+                  }],
+                  "target": { "kind": "FIELD", "dynamicFormTemplateId": "{{form.Id}}", "stepId": "parent", "fieldId": "f_percentage", "dataType": "NUMBER" },
+                  "calculation": { "kind": "DIRECT", "operation": "copy", "resultDataType": "NUMBER" }
+                }
+              ]
+            }
+            """,
+            requireLockable: true,
+            form));
+
+    AssertThrows(
+        AppErrorCode.COMMON_VALIDATION_FAILED,
+        () => DynamicFlowTemplateService.NormalizePayloadJson(
+            $$"""
+            {
+              "steps": [
+                { "stepId": "parent", "stepCode": "PARENT" },
+                { "stepId": "child", "stepCode": "CHILD" }
+              ],
+              "transitions": [
+                { "fromStepId": "parent", "toStepId": "child" }
+              ],
+              "mappingRules": [
+                {
+                  "mappingId": "first",
+                  "inputs": [{
+                    "inputKey": "a",
+                    "dataType": "NUMBER",
+                    "source": { "kind": "FIELD", "dynamicFormTemplateId": "{{form.Id}}", "stepId": "child", "fieldKey": "numerator" }
+                  }],
+                  "target": { "kind": "FIELD", "dynamicFormTemplateId": "{{form.Id}}", "stepId": "parent", "fieldKey": "percentage", "dataType": "NUMBER" },
+                  "calculation": { "kind": "DIRECT", "operation": "copy", "resultDataType": "NUMBER" }
+                },
+                {
+                  "mappingId": "second",
+                  "inputs": [{
+                    "inputKey": "b",
+                    "dataType": "NUMBER",
+                    "source": { "kind": "FIELD", "dynamicFormTemplateId": "{{form.Id}}", "stepId": "child", "fieldKey": "denominator" }
+                  }],
+                  "target": { "kind": "FIELD", "dynamicFormTemplateId": "{{form.Id}}", "stepId": "parent", "fieldKey": "percentage", "dataType": "NUMBER" },
+                  "calculation": { "kind": "DIRECT", "operation": "copy", "resultDataType": "NUMBER" }
+                }
+              ]
+            }
+            """,
+            requireLockable: true,
+            form));
+
+    AssertThrows(
+        AppErrorCode.COMMON_VALIDATION_FAILED,
+        () => DynamicFlowTemplateService.NormalizePayloadJson(
+            $$"""
+            {
+              "steps": [
+                { "stepId": "parent", "stepCode": "PARENT" },
+                { "stepId": "child", "stepCode": "CHILD" }
+              ],
+              "transitions": [{ "fromStepId": "parent", "toStepId": "child" }],
+              "mappingRules": [{
+                "mappingId": "mismatched-step",
+                "inputs": [{
+                  "inputKey": "a",
+                  "dataType": "NUMBER",
+                  "source": {
+                    "kind": "FIELD",
+                    "dynamicFormTemplateId": "{{form.Id}}",
+                    "stepId": "child",
+                    "stepCode": "PARENT",
+                    "fieldKey": "numerator"
+                  }
+                }],
+                "target": {
+                  "kind": "FIELD",
+                  "dynamicFormTemplateId": "{{form.Id}}",
+                  "stepId": "parent",
+                  "dataType": "NUMBER",
+                  "fieldKey": "percentage"
+                },
+                "calculation": { "kind": "DIRECT", "operation": "copy", "resultDataType": "NUMBER" }
+              }]
+            }
+            """,
+            requireLockable: true,
+            form));
+}
+
+static void DynamicFlowExpressionsEvaluateNamedValueOperands()
+{
+    var expression = JsonNode.Parse("""{"op":"trim","value":{"input":"text"}}""")!;
+    var inferredType = DynamicFlowMappingExpressionEvaluator.Validate(
+        expression,
+        new Dictionary<string, string>(StringComparer.Ordinal) { ["text"] = "TEXT" });
+    AssertEqual("TEXT", inferredType, "named value operand should be validated as the operation argument");
+
+    var result = DynamicFlowMappingExpressionEvaluator.Evaluate(
+        expression,
+        new Dictionary<string, JsonNode?>(StringComparer.Ordinal)
+        {
+            ["text"] = JsonValue.Create("  Dữ liệu  ")
+        });
+    AssertEqual("Dữ liệu", result!.GetValue<string>(), "named value operand should be evaluated before trim");
+
+    var copied = DynamicFlowMappingExpressionEvaluator.Evaluate(
+        JsonNode.Parse("""{"op":"copy","args":[{"input":"items"}]}""")!,
+        new Dictionary<string, JsonNode?>(StringComparer.Ordinal)
+        {
+            ["items"] = new JsonArray(1, 2)
+        });
+    AssertTrue(copied is JsonArray copiedArray && copiedArray.Count == 2,
+        "copy should preserve a collection instead of silently taking its first item");
+
+    var concatenated = DynamicFlowMappingExpressionEvaluator.Evaluate(
+        JsonNode.Parse("""{"op":"concat","separator":" ","args":[{"value":"Nguyễn"},{"value":"An"}]}""")!,
+        new Dictionary<string, JsonNode?>(StringComparer.Ordinal));
+    AssertEqual("Nguyễn An", concatenated!.GetValue<string>(),
+        "concat should preserve a whitespace-only separator literal");
+
+    try
+    {
+        _ = DynamicFlowMappingExpressionEvaluator.Evaluate(
+            JsonNode.Parse("""{"op":"divide","args":[{"input":"left"},{"input":"right"}]}""")!,
+            new Dictionary<string, JsonNode?>(StringComparer.Ordinal)
+            {
+                ["left"] = new JsonArray(10, 20),
+                ["right"] = JsonValue.Create(2)
+            });
+        throw new InvalidOperationException("divide should reject expanded collection arguments");
+    }
+    catch (DynamicFlowMappingEvaluationException ex)
+    {
+        AssertEqual("DYNAMIC_FLOW_MAPPING_EXPRESSION_ARGUMENT_COUNT_INVALID", ex.Reason,
+            "scalar expressions must not silently ignore collection values");
+    }
+}
+
+static void DynamicFlowStructuredMappingRejectsCollectionCopyAndInvalidLiterals()
+{
+    var form = new DynamicFormTemplate
+    {
+        Id = ObjectId(75),
+        Code = "DF_MAPPING_LITERAL",
+        Name = "Mapping literal contract",
+        FieldsJson = """
+        [
+          { "id": "f_source", "key": "source", "type": "NUMBER" },
+          { "id": "f_target", "key": "target", "type": "NUMBER" }
+        ]
+        """,
+        BlocksJson = """
+        [
+          {
+            "blockId": "grid",
+            "tableMode": "FIXED_GRID",
+            "excelSpecKind": "TOP",
+            "defaultDataType": "NUMBER",
+            "dataRect": { "r0": 0, "c0": 0, "r1": 1, "c1": 0 },
+            "w": 1,
+            "h": 2,
+            "specialRanges": []
+          }
+        ]
+        """
+    };
+
+    string Payload(string rule) => $$"""
+    {
+      "rootDynamicFormTemplateId": "{{form.Id}}",
+      "formNodes": [
+        { "formNodeId": "root", "role": "ROOT", "dynamicFormTemplateId": "{{form.Id}}" }
+      ],
+      "steps": [
+        { "stepId": "parent", "stepCode": "PARENT", "stepOrder": 1, "formNodeId": "root", "dynamicFormTemplateId": "{{form.Id}}" },
+        { "stepId": "child", "stepCode": "CHILD", "stepOrder": 2, "formNodeId": "root", "dynamicFormTemplateId": "{{form.Id}}" }
+      ],
+      "transitions": [
+        { "fromStepId": "parent", "toStepId": "child" }
+      ],
+      "mappingRules": [{{rule}}]
+    }
+    """;
+
+    AssertThrows(
+        AppErrorCode.COMMON_VALIDATION_FAILED,
+        () => DynamicFlowTemplateService.NormalizePayloadJson(
+            Payload($$"""
+            {
+              "mappingId": "copy-many",
+              "evaluationGrain": "FLOW_INSTANCE",
+              "inputs": [{
+                "inputKey": "items",
+                "dataType": "NUMBER",
+                "cardinality": "MANY",
+                "source": {
+                  "kind": "TABLE_COLUMN",
+                  "dynamicFormTemplateId": "{{form.Id}}",
+                  "stepId": "child",
+                  "blockId": "grid",
+                  "columnKey": "col_1",
+                  "dataType": "NUMBER"
+                }
+              }],
+              "target": {
+                "kind": "FIELD",
+                "dynamicFormTemplateId": "{{form.Id}}",
+                "stepId": "parent",
+                "fieldKey": "target",
+                "dataType": "NUMBER"
+              },
+              "calculation": { "kind": "DIRECT", "operation": "copy", "resultDataType": "NUMBER" }
+            }
+            """),
+            requireLockable: true,
+            form));
+
+    AssertThrows(
+        AppErrorCode.COMMON_VALIDATION_FAILED,
+        () => DynamicFlowTemplateService.NormalizePayloadJson(
+            Payload($$"""
+            {
+              "mappingId": "copy-many-table-row",
+              "evaluationGrain": "TABLE_ROW",
+              "inputs": [{
+                "inputKey": "items",
+                "dataType": "NUMBER",
+                "cardinality": "MANY",
+                "source": {
+                  "kind": "TABLE_COLUMN",
+                  "dynamicFormTemplateId": "{{form.Id}}",
+                  "stepId": "child",
+                  "blockId": "grid",
+                  "columnKey": "col_1",
+                  "dataType": "NUMBER"
+                }
+              }],
+              "target": {
+                "kind": "TABLE_COLUMN",
+                "dynamicFormTemplateId": "{{form.Id}}",
+                "stepId": "parent",
+                "blockId": "grid",
+                "columnKey": "col_1",
+                "dataType": "NUMBER"
+              },
+              "calculation": { "kind": "DIRECT", "operation": "copy", "resultDataType": "NUMBER" }
+            }
+            """),
+            requireLockable: true,
+            form));
+
+    AssertThrows(
+        AppErrorCode.COMMON_VALIDATION_FAILED,
+        () => DynamicFlowTemplateService.NormalizePayloadJson(
+            Payload($$"""
+            {
+              "mappingId": "constant-type",
+              "inputs": [{
+                "inputKey": "constant",
+                "dataType": "NUMBER",
+                "constantValue": "không-phải-số",
+                "source": { "kind": "CONSTANT" }
+              }],
+              "target": {
+                "kind": "FIELD",
+                "dynamicFormTemplateId": "{{form.Id}}",
+                "stepId": "parent",
+                "fieldKey": "target",
+                "dataType": "NUMBER"
+              },
+              "calculation": { "kind": "DIRECT", "operation": "copy", "resultDataType": "NUMBER" }
+            }
+            """),
+            requireLockable: true,
+            form));
+
+    AssertThrows(
+        AppErrorCode.COMMON_VALIDATION_FAILED,
+        () => DynamicFlowTemplateService.NormalizePayloadJson(
+            Payload($$"""
+            {
+              "mappingId": "default-type",
+              "errorPolicy": "USE_DEFAULT",
+              "inputs": [{
+                "inputKey": "source",
+                "dataType": "NUMBER",
+                "source": {
+                  "kind": "FIELD",
+                  "dynamicFormTemplateId": "{{form.Id}}",
+                  "stepId": "child",
+                  "fieldKey": "source",
+                  "dataType": "NUMBER"
+                }
+              }],
+              "target": {
+                "kind": "FIELD",
+                "dynamicFormTemplateId": "{{form.Id}}",
+                "stepId": "parent",
+                "fieldKey": "target",
+                "dataType": "NUMBER"
+              },
+              "calculation": {
+                "kind": "DIRECT",
+                "operation": "copy",
+                "resultDataType": "NUMBER",
+                "defaultValue": "sai-kiểu"
+              }
+            }
+            """),
             requireLockable: true,
             form));
 }
@@ -1280,8 +2410,596 @@ static void DynamicFlowMappingEngineProjectsValuesAndProvenance()
     AssertEqual(sourceReport.Id, summary.RootElement.GetProperty("sourceReportIds")[0].GetString(), "summary source should keep source report id");
 
     using var contribution = JsonDocument.Parse(projection.CumulativeContributionPolicyJson!);
-    AssertEqual("INCLUDE", contribution.RootElement.GetProperty("defaultMode").GetString(), "partial mapping report should remain included by default");
+    AssertEqual("EXCLUDE", contribution.RootElement.GetProperty("defaultMode").GetString(), "P7 mapping contribution should remain excluded by default");
     AssertEqual(2, contribution.RootElement.GetProperty("rules").GetArrayLength(), "generated mapping targets should be excluded by default");
+}
+
+static void DynamicFlowMappingEngineEvaluatesMultipleInputsAndFixedGridSlots()
+{
+    var formId = ObjectId(122);
+    var target = new WorkAssignmentReport
+    {
+        Id = ObjectId(123),
+        WorkId = ObjectId(124),
+        WorkAssignmentId = ObjectId(125),
+        WorkReportPeriodId = ObjectId(126),
+        DynamicFormTemplateId = formId,
+        AssigneeUserId = ObjectId(127),
+        PeriodKey = "2026-07",
+        PeriodInstanceKey = "2026-07",
+        Values1DJson = "[]",
+        FieldValuesJson = """{"values":{}}""",
+        TableValuesJson = """{"blocks":[]}"""
+    };
+    var sourceReport = new WorkAssignmentReport
+    {
+        Id = ObjectId(128),
+        WorkId = target.WorkId,
+        WorkAssignmentId = ObjectId(129),
+        WorkReportPeriodId = ObjectId(130),
+        DynamicFormTemplateId = formId,
+        AssigneeUserId = ObjectId(131),
+        PeriodKey = target.PeriodKey,
+        PeriodInstanceKey = target.PeriodInstanceKey,
+        Values1DJson = "[]",
+        FieldValuesJson = """{"values":{"numerator":25,"denominator":100}}""",
+        TableValuesJson = """
+        {
+          "blocks": [
+            {
+              "blockId": "grid",
+              "tableMode": "FIXED_GRID",
+              "hasSpecialRanges": true,
+              "values1D": [1, 2, 3, 4],
+              "indexMap": [],
+              "valueSlots": [
+                { "index": 0, "rowKey": "row_1", "columnKey": "col_1" },
+                { "index": 1, "rowKey": "row_1", "columnKey": "col_2" },
+                { "index": 2, "rowKey": "row_2", "columnKey": "col_1" },
+                { "index": 3, "rowKey": "row_2", "columnKey": "col_2" }
+              ],
+              "cells": [
+                { "rowKey": "row_1", "columnKey": "col_2", "value": 2 },
+                { "rowKey": "row_2", "columnKey": "col_2", "value": 4 }
+              ]
+            }
+          ]
+        }
+        """
+    };
+    var source = new DynamicFlowMappingSourceReport(
+        sourceReport,
+        "child",
+        "CHILD",
+        sourceReport.FieldValuesJson,
+        sourceReport.TableValuesJson);
+
+    DynamicFlowMappingEndpointDto FieldEndpoint(string stepId, string stepCode, string fieldKey) => new()
+    {
+        Kind = "FIELD",
+        DynamicFormTemplateId = formId,
+        StepId = stepId,
+        StepCode = stepCode,
+        FieldKey = fieldKey,
+        DataType = "NUMBER"
+    };
+
+    var rules = new List<DynamicFlowMappingRuleDto>
+    {
+        new()
+        {
+            MappingId = "percentage",
+            MappingVersion = 1,
+            MappingKind = "FIELD",
+            EvaluationGrain = "FLOW_INSTANCE",
+            ErrorPolicy = "BLOCK_APPLY",
+            ConflictPolicy = "OVERWRITE",
+            Inputs = new List<DynamicFlowMappingInputDto>
+            {
+                new()
+                {
+                    InputKey = "numerator",
+                    Source = FieldEndpoint("child", "CHILD", "numerator"),
+                    DataType = "NUMBER",
+                    Cardinality = "ONE",
+                    NullPolicy = "ERROR"
+                },
+                new()
+                {
+                    InputKey = "denominator",
+                    Source = FieldEndpoint("child", "CHILD", "denominator"),
+                    DataType = "NUMBER",
+                    Cardinality = "ONE",
+                    NullPolicy = "ERROR"
+                }
+            },
+            Target = FieldEndpoint("parent", "PARENT", "percentage"),
+            Calculation = new DynamicFlowMappingCalculationDto
+            {
+                Kind = "REGISTERED_FUNCTION",
+                FunctionCode = "CALC_PERCENTAGE",
+                FunctionVersion = 1,
+                ResultDataType = "NUMBER",
+                Arguments = new Dictionary<string, JsonNode?>
+                {
+                    ["numerator"] = JsonNode.Parse("""{"input":"numerator"}"""),
+                    ["denominator"] = JsonNode.Parse("""{"input":"denominator"}""")
+                }
+            }
+        },
+        new()
+        {
+            MappingId = "column-sum",
+            MappingVersion = 1,
+            MappingKind = "FIELD",
+            EvaluationGrain = "FLOW_INSTANCE",
+            ErrorPolicy = "BLOCK_APPLY",
+            Inputs = new List<DynamicFlowMappingInputDto>
+            {
+                new()
+                {
+                    InputKey = "amounts",
+                    Source = new DynamicFlowMappingEndpointDto
+                    {
+                        Kind = "TABLE_COLUMN",
+                        DynamicFormTemplateId = formId,
+                        StepId = "child",
+                        StepCode = "CHILD",
+                        BlockId = "grid",
+                        ColumnKey = "col_2",
+                        DataType = "NUMBER"
+                    },
+                    DataType = "NUMBER",
+                    Cardinality = "MANY",
+                    NullPolicy = "SKIP"
+                }
+            },
+            Target = FieldEndpoint("parent", "PARENT", "column_total"),
+            Calculation = new DynamicFlowMappingCalculationDto
+            {
+                Kind = "DIRECT",
+                Operation = "sum",
+                ResultDataType = "NUMBER"
+            }
+        }
+    };
+
+    var projection = DynamicFlowMappingEngine.Preview(
+        target,
+        new List<DynamicFlowMappingSourceReport> { source },
+        rules,
+        requestConflictPolicy: null,
+        requestContributionPolicy: null,
+        nowUtc: new DateTime(2026, 7, 21, 0, 0, 0, DateTimeKind.Utc),
+        targetStepId: "parent",
+        targetStepCode: "PARENT");
+
+    using var fields = JsonDocument.Parse(projection.FieldValuesJson!);
+    var values = fields.RootElement.GetProperty("values");
+    AssertEqual(25m, values.GetProperty("percentage").GetDecimal(), "registered function should evaluate two field inputs");
+    AssertEqual(6m, values.GetProperty("column_total").GetDecimal(), "fixed grid value slots should resolve the requested column");
+    AssertEqual(2, projection.Changes.Count(change => change.Status == "APPLIED"), "both structured rules should apply");
+    AssertEqual(2, projection.Changes.Single(change => change.MappingId == "percentage").Sources.Count, "field function should preserve both input provenances");
+    AssertEqual(2, projection.Changes.Single(change => change.MappingId == "column-sum").Sources.Count, "table sum should preserve each source cell provenance");
+}
+
+static void DynamicFlowMappingEngineKeepsTableRuntimeProjectionsAligned()
+{
+    var formId = ObjectId(82);
+    var target = new WorkAssignmentReport
+    {
+        Id = ObjectId(83),
+        WorkId = ObjectId(84),
+        WorkAssignmentId = ObjectId(85),
+        WorkReportPeriodId = ObjectId(86),
+        DynamicFormTemplateId = formId,
+        AssigneeUserId = ObjectId(87),
+        PeriodKey = "2026-07",
+        PeriodInstanceKey = "2026-07",
+        Values1DJson = "[]",
+        FieldValuesJson = """{"values":{}}""",
+        TableValuesJson = """
+        {
+          "blocks": [
+            {
+              "blockId": "append_target",
+              "tableMode": "APPEND_ROWS",
+              "values1D": [null, null],
+              "valueSlots": [
+                { "index": 0, "rowKey": "row_1", "columnKey": "col_1" },
+                { "index": 1, "rowKey": "row_1", "columnKey": "col_2" }
+              ],
+              "rows": []
+            },
+            {
+              "blockId": "matrix_target",
+              "tableMode": "MATRIX",
+              "values1D": [null],
+              "valueSlots": [
+                { "index": 0, "rowKey": "row_1", "columnKey": "col_1" }
+              ],
+              "cells": []
+            }
+          ]
+        }
+        """
+    };
+    var sourceReport = new WorkAssignmentReport
+    {
+        Id = ObjectId(88),
+        WorkId = target.WorkId,
+        WorkAssignmentId = ObjectId(89),
+        WorkReportPeriodId = ObjectId(90),
+        DynamicFormTemplateId = formId,
+        AssigneeUserId = ObjectId(91),
+        PeriodKey = target.PeriodKey,
+        PeriodInstanceKey = target.PeriodInstanceKey,
+        Values1DJson = "[]",
+        FieldValuesJson = """{"values":{}}""",
+        TableValuesJson = """
+        {
+          "blocks": [
+            {
+              "blockId": "append_source",
+              "tableMode": "APPEND_ROWS",
+              "values1D": [7],
+              "valueSlots": [
+                { "index": 0, "rowKey": "row_1", "columnKey": "col_1" }
+              ],
+              "rows": []
+            }
+          ]
+        }
+        """
+    };
+    var source = new DynamicFlowMappingSourceReport(
+        sourceReport,
+        "child",
+        "CHILD",
+        sourceReport.FieldValuesJson,
+        sourceReport.TableValuesJson);
+
+    DynamicFlowMappingRuleDto TableRule(string mappingId, string targetBlockId, string targetColumnKey) => new()
+    {
+        MappingId = mappingId,
+        MappingVersion = 1,
+        MappingKind = "TABLE_COLUMN",
+        EvaluationGrain = "TABLE_ROW",
+        ErrorPolicy = "BLOCK_APPLY",
+        ConflictPolicy = "OVERWRITE",
+        Inputs = new List<DynamicFlowMappingInputDto>
+        {
+            new()
+            {
+                InputKey = "amount",
+                Source = new DynamicFlowMappingEndpointDto
+                {
+                    Kind = "TABLE_COLUMN",
+                    DynamicFormTemplateId = formId,
+                    StepId = "child",
+                    StepCode = "CHILD",
+                    BlockId = "append_source",
+                    ColumnKey = "col_1",
+                    DataType = "NUMBER"
+                },
+                DataType = "NUMBER",
+                Cardinality = "ONE",
+                NullPolicy = "ERROR"
+            }
+        },
+        Target = new DynamicFlowMappingEndpointDto
+        {
+            Kind = "TABLE_COLUMN",
+            DynamicFormTemplateId = formId,
+            StepId = "parent",
+            StepCode = "PARENT",
+            BlockId = targetBlockId,
+            ColumnKey = targetColumnKey,
+            DataType = "NUMBER"
+        },
+        Calculation = new DynamicFlowMappingCalculationDto
+        {
+            Kind = "DIRECT",
+            Operation = "copy",
+            ResultDataType = "NUMBER"
+        }
+    };
+
+    var projection = DynamicFlowMappingEngine.Preview(
+        target,
+        new List<DynamicFlowMappingSourceReport> { source },
+        new List<DynamicFlowMappingRuleDto>
+        {
+            TableRule("append-copy", "append_target", "col_2"),
+            TableRule("matrix-copy", "matrix_target", "col_1")
+        },
+        requestConflictPolicy: null,
+        requestContributionPolicy: null,
+        nowUtc: new DateTime(2026, 7, 21, 0, 0, 0, DateTimeKind.Utc),
+        targetStepId: "parent",
+        targetStepCode: "PARENT");
+
+    using var tables = JsonDocument.Parse(projection.TableValuesJson!);
+    var blocks = tables.RootElement.GetProperty("blocks");
+    var append = blocks.EnumerateArray().Single(block => block.GetProperty("blockId").GetString() == "append_target");
+    var matrix = blocks.EnumerateArray().Single(block => block.GetProperty("blockId").GetString() == "matrix_target");
+
+    AssertEqual(7m, append.GetProperty("values1D")[1].GetDecimal(), "append-row mapping should update the editor values1D payload");
+    AssertEqual(7m, append.GetProperty("rows")[0].GetProperty("cells").GetProperty("col_2").GetDecimal(), "append-row mapping should update the statistic row projection");
+    AssertEqual("row_1", append.GetProperty("rows")[0].GetProperty("rowKey").GetString(), "append-row value slots should preserve the data-rectangle row axis when the row projection is absent");
+    AssertEqual(7m, matrix.GetProperty("values1D")[0].GetDecimal(), "matrix mapping should update the editor values1D payload");
+    AssertEqual(7m, matrix.GetProperty("cells")[0].GetProperty("value").GetDecimal(), "matrix mapping should update the statistic cell projection");
+    AssertEqual(2, projection.Changes.Count(change => change.Status == "APPLIED"), "both table mappings should apply once");
+}
+
+static void DynamicFlowMappingEnginePreservesSparseRowCoordinates()
+{
+    var formId = ObjectId(76);
+    var target = new WorkAssignmentReport
+    {
+        Id = ObjectId(77),
+        WorkId = ObjectId(78),
+        WorkAssignmentId = ObjectId(79),
+        WorkReportPeriodId = ObjectId(80),
+        DynamicFormTemplateId = formId,
+        PeriodKey = "2026-07",
+        PeriodInstanceKey = "2026-07",
+        FieldValuesJson = """{"values":{}}""",
+        TableValuesJson = """
+        {
+          "blocks": [{
+            "blockId": "target_rows",
+            "tableMode": "APPEND_ROWS",
+            "values1D": [null, null],
+            "valueSlots": [
+              { "index": 0, "rowKey": "row_1", "columnKey": "col_1" },
+              { "index": 1, "rowKey": "row_2", "columnKey": "col_1" }
+            ],
+            "rows": []
+          }]
+        }
+        """
+    };
+    var sourceReport = new WorkAssignmentReport
+    {
+        Id = ObjectId(81),
+        WorkId = target.WorkId,
+        WorkAssignmentId = ObjectId(82),
+        WorkReportPeriodId = ObjectId(83),
+        DynamicFormTemplateId = formId,
+        PeriodKey = target.PeriodKey,
+        PeriodInstanceKey = target.PeriodInstanceKey,
+        FieldValuesJson = """{"values":{}}""",
+        TableValuesJson = """
+        {
+          "blocks": [{
+            "blockId": "source_rows",
+            "tableMode": "APPEND_ROWS",
+            "values1D": [null, 7],
+            "valueSlots": [
+              { "index": 0, "rowKey": "row_1", "columnKey": "col_1" },
+              { "index": 1, "rowKey": "row_2", "columnKey": "col_1" }
+            ],
+            "rows": []
+          }]
+        }
+        """
+    };
+    var source = new DynamicFlowMappingSourceReport(
+        sourceReport,
+        "child",
+        "CHILD",
+        sourceReport.FieldValuesJson,
+        sourceReport.TableValuesJson);
+    var rule = new DynamicFlowMappingRuleDto
+    {
+        MappingId = "sparse-row",
+        MappingVersion = 1,
+        MappingKind = "TABLE_COLUMN",
+        EvaluationGrain = "TABLE_ROW",
+        ErrorPolicy = "BLOCK_APPLY",
+        ConflictPolicy = "OVERWRITE",
+        Inputs = new List<DynamicFlowMappingInputDto>
+        {
+            new()
+            {
+                InputKey = "amount",
+                Source = new DynamicFlowMappingEndpointDto
+                {
+                    Kind = "TABLE_COLUMN",
+                    DynamicFormTemplateId = formId,
+                    StepId = "child",
+                    BlockId = "source_rows",
+                    ColumnKey = "col_1",
+                    DataType = "NUMBER"
+                },
+                DataType = "NUMBER",
+                Cardinality = "ONE",
+                NullPolicy = "SKIP"
+            }
+        },
+        Target = new DynamicFlowMappingEndpointDto
+        {
+            Kind = "TABLE_COLUMN",
+            DynamicFormTemplateId = formId,
+            StepId = "parent",
+            BlockId = "target_rows",
+            ColumnKey = "col_1",
+            DataType = "NUMBER"
+        },
+        Calculation = new DynamicFlowMappingCalculationDto
+        {
+            Kind = "DIRECT",
+            Operation = "copy",
+            ResultDataType = "NUMBER"
+        }
+    };
+
+    var projection = DynamicFlowMappingEngine.Preview(
+        target,
+        new List<DynamicFlowMappingSourceReport> { source },
+        new List<DynamicFlowMappingRuleDto> { rule },
+        requestConflictPolicy: null,
+        requestContributionPolicy: null,
+        nowUtc: new DateTime(2026, 7, 21, 0, 0, 0, DateTimeKind.Utc),
+        targetStepId: "parent",
+        targetStepCode: null);
+
+    using var tables = JsonDocument.Parse(projection.TableValuesJson!);
+    var block = tables.RootElement.GetProperty("blocks")[0];
+    AssertEqual(7m, block.GetProperty("values1D")[1].GetDecimal(), "sparse source row should update the matching target slot");
+    AssertEqual(2, block.GetProperty("rows")[0].GetProperty("rowOrder").GetInt32(), "created row projection should retain canonical row_2 order");
+    AssertEqual("row_2", block.GetProperty("rows")[0].GetProperty("rowKey").GetString(), "created row projection should retain the mapping row key");
+}
+
+static void DynamicFlowMappingProvenanceExcludesSkippedNullValues()
+{
+    var formId = ObjectId(67);
+    var target = new WorkAssignmentReport
+    {
+        Id = ObjectId(68),
+        WorkId = ObjectId(69),
+        WorkAssignmentId = ObjectId(70),
+        DynamicFormTemplateId = formId,
+        FieldValuesJson = """{"values":{}}""",
+        TableValuesJson = """{"blocks":[]}"""
+    };
+    var sourceReport = new WorkAssignmentReport
+    {
+        Id = ObjectId(71),
+        WorkId = target.WorkId,
+        WorkAssignmentId = ObjectId(72),
+        DynamicFormTemplateId = formId,
+        FieldValuesJson = """{"values":{}}""",
+        TableValuesJson = """
+        {
+          "blocks": [{
+            "blockId": "grid",
+            "tableMode": "FIXED_GRID",
+            "values1D": [null, 5],
+            "valueSlots": [
+              { "index": 0, "rowKey": "row_1", "columnKey": "col_1" },
+              { "index": 1, "rowKey": "row_2", "columnKey": "col_1" }
+            ]
+          }]
+        }
+        """
+    };
+    var source = new DynamicFlowMappingSourceReport(
+        sourceReport,
+        "child",
+        "CHILD",
+        sourceReport.FieldValuesJson,
+        sourceReport.TableValuesJson);
+    var rule = new DynamicFlowMappingRuleDto
+    {
+        MappingId = "sum-non-null",
+        MappingVersion = 1,
+        MappingKind = "FIELD",
+        EvaluationGrain = "FLOW_INSTANCE",
+        Inputs = new List<DynamicFlowMappingInputDto>
+        {
+            new()
+            {
+                InputKey = "amounts",
+                Source = new DynamicFlowMappingEndpointDto
+                {
+                    Kind = "TABLE_COLUMN",
+                    DynamicFormTemplateId = formId,
+                    StepId = "child",
+                    BlockId = "grid",
+                    ColumnKey = "col_1",
+                    DataType = "NUMBER"
+                },
+                DataType = "NUMBER",
+                Cardinality = "MANY",
+                NullPolicy = "SKIP"
+            }
+        },
+        Target = new DynamicFlowMappingEndpointDto
+        {
+            Kind = "FIELD",
+            DynamicFormTemplateId = formId,
+            StepId = "parent",
+            FieldKey = "total",
+            DataType = "NUMBER"
+        },
+        Calculation = new DynamicFlowMappingCalculationDto
+        {
+            Kind = "DIRECT",
+            Operation = "sum",
+            ResultDataType = "NUMBER"
+        }
+    };
+
+    var projection = DynamicFlowMappingEngine.Preview(
+        target,
+        new List<DynamicFlowMappingSourceReport> { source },
+        new List<DynamicFlowMappingRuleDto> { rule },
+        requestConflictPolicy: null,
+        requestContributionPolicy: null,
+        nowUtc: new DateTime(2026, 7, 21, 0, 0, 0, DateTimeKind.Utc),
+        targetStepId: "parent",
+        targetStepCode: null);
+
+    var change = projection.Changes.Single(item => item.MappingId == "sum-non-null");
+    AssertEqual(1, change.Sources.Count, "null values removed by SKIP should not appear in provenance");
+    AssertEqual("5", change.Sources[0].ValueJson, "provenance should retain the value that participated in the sum");
+}
+
+static void DynamicFlowMappingSynchronizesTopLevelTableValues()
+{
+    var options = new JsonSerializerOptions(JsonSerializerDefaults.Web);
+    var synchronized = WorkAssignmentReportService.ResolveDynamicFlowMappingTopLevelValuesJson(
+        "[1,2]",
+        """
+        {
+          "blocks": [
+            { "blockId": "secondary", "values1D": [7] },
+            { "blockId": "top", "values1D": [9, "mapped"] }
+          ]
+        }
+        """,
+        "top",
+        options);
+
+    using var synchronizedDocument = JsonDocument.Parse(synchronized);
+    AssertEqual(9, synchronizedDocument.RootElement[0].GetInt32(), "top-level values should come from the configured top block");
+    AssertEqual("mapped", synchronizedDocument.RootElement[1].GetString(), "top-level text should stay aligned with the block payload");
+
+    var unchanged = WorkAssignmentReportService.ResolveDynamicFlowMappingTopLevelValuesJson(
+        "[1,2]",
+        """{"blocks":[{"blockId":"secondary","values1D":[7]}]}""",
+        "top",
+        options);
+    AssertEqual("[1,2]", unchanged, "missing top block should preserve the current top-level values");
+
+    var initialized =
+        WorkAssignmentReportService
+            .NormalizeDynamicFlowMappingTopLevelValueSlots(
+                "[]",
+                expectedLength: 2,
+                options);
+    using var initializedDocument = JsonDocument.Parse(initialized);
+    AssertEqual(
+        2,
+        initializedDocument.RootElement.GetArrayLength(),
+        "fresh mapping targets must initialize every canonical top-level value slot");
+    AssertEqual(
+        JsonValueKind.Null,
+        initializedDocument.RootElement[0].ValueKind,
+        "fresh mapping target slots must remain semantic nulls");
+
+    var existing =
+        WorkAssignmentReportService
+            .NormalizeDynamicFlowMappingTopLevelValueSlots(
+                "[7]",
+                expectedLength: 2,
+                options);
+    AssertEqual(
+        "[7]",
+        existing,
+        "mapping slot initialization must never rewrite a non-empty payload");
 }
 
 static void DynamicFlowPolicyEvaluatorAppliesFieldAndTablePermissions()
@@ -1293,13 +3011,13 @@ static void DynamicFlowPolicyEvaluatorAppliesFieldAndTablePermissions()
         { "stepId": "draft", "stepCode": "DRAFT" }
       ],
       "fieldPolicies": [
-        { "policyId": "issuer-secret", "stepId": "draft", "actorRole": "ISSUER", "fieldKey": "secret", "read": true, "write": true, "required": true, "hidden": true },
-        { "policyId": "review-score", "stepCode": "DRAFT", "actorRole": "REVIEWER", "fieldKey": "score", "read": true, "write": true, "required": true, "lockedAfterSubmit": true },
-        { "policyId": "all-note", "stepCode": "DRAFT", "actorRole": "*", "fieldKey": "note", "read": true, "write": true }
+        { "policyId": "issuer-secret", "stepId": "draft", "stepCode": "*", "actorRole": "ISSUER", "fieldKey": "secret", "read": true, "write": true, "required": true, "hidden": true },
+        { "policyId": "review-score", "stepId": "*", "stepCode": "DRAFT", "actorRole": "REVIEWER", "fieldKey": "score", "read": true, "write": true, "required": true, "lockedAfterSubmit": true },
+        { "policyId": "all-note", "stepId": "*", "stepCode": "DRAFT", "actorRole": "*", "fieldKey": "note", "read": true, "write": true }
       ],
       "tableColumnPolicies": [
-        { "policyId": "review-amount", "stepId": "draft", "actorRole": "REVIEWER", "blockId": "b1", "columnKey": "amount", "read": true, "write": true, "required": true, "lockedAfterSubmit": true },
-        { "policyId": "issuer-secret-col", "stepId": "draft", "actorRole": "ISSUER", "blockId": "b1", "columnKey": "secret_col", "read": true, "write": true, "required": true, "hidden": true }
+        { "policyId": "review-amount", "stepId": "draft", "stepCode": "*", "actorRole": "REVIEWER", "blockId": "b1", "columnKey": "amount", "read": true, "write": true, "required": true, "lockedAfterSubmit": true },
+        { "policyId": "issuer-secret-col", "stepId": "draft", "stepCode": "*", "actorRole": "ISSUER", "blockId": "b1", "columnKey": "secret_col", "read": true, "write": true, "required": true, "hidden": true }
       ]
     }
     """;
@@ -1351,6 +3069,125 @@ static void DynamicFlowPolicyEvaluatorAppliesFieldAndTablePermissions()
     AssertTrue(amount.LockedAfterSubmit, "table lockedAfterSubmit flag should be retained");
 }
 
+static void DynamicFlowPolicyEvaluatorPrefersSpecificScopes()
+{
+    var evaluator = new DynamicFlowPolicyEvaluator();
+    const string payload = """
+    {
+      "steps": [
+        { "stepId": "draft", "stepCode": "DRAFT" }
+      ],
+      "fieldPolicies": [
+        { "policyId": "all-denied", "stepId": "draft", "stepCode": "*", "actorRole": "*", "fieldKey": "amount", "write": false, "locked": true },
+        { "policyId": "assignee-allowed", "stepId": "draft", "stepCode": "*", "actorRole": "ASSIGNEE", "fieldKey": "amount", "read": true, "write": true, "locked": false }
+      ]
+    }
+    """;
+
+    var assignee = evaluator.Evaluate(payload, new DynamicFlowPolicyEvaluationContext
+    {
+        StepId = "draft",
+        StepCode = "DRAFT",
+        ActorRole = "ASSIGNEE"
+    });
+    AssertTrue(assignee.Fields["amount"].Write, "specific actor policy should override wildcard policy");
+    AssertEqual("assignee-allowed", assignee.Fields["amount"].SourcePolicyId, "specific policy should be the recorded source");
+
+    var reviewer = evaluator.Evaluate(payload, new DynamicFlowPolicyEvaluationContext
+    {
+        StepId = "draft",
+        StepCode = "DRAFT",
+        ActorRole = "REVIEWER"
+    });
+    AssertFalse(reviewer.Fields["amount"].Write, "wildcard policy should still apply to other roles");
+
+    var missingSelector = evaluator.Evaluate(
+        """
+        {
+          "steps": [{ "stepId": "draft", "stepCode": "DRAFT" }],
+          "fieldPolicies": [
+            { "policyId": "missing-step-code", "stepId": "draft", "actorRole": "ASSIGNEE", "fieldKey": "amount", "write": true }
+          ]
+        }
+        """,
+        new DynamicFlowPolicyEvaluationContext
+        {
+            StepId = "draft",
+            StepCode = "DRAFT",
+            ActorRole = "ASSIGNEE"
+        });
+    AssertTrue(
+        missingSelector.DenyAllFields,
+        "a missing policy selector must not act as an implicit wildcard");
+
+    AssertThrows(
+        AppErrorCode.COMMON_VALIDATION_FAILED,
+        () => DynamicFlowTemplateService.NormalizePayloadJson(
+            """
+            {
+              "steps": [{ "stepId": "draft", "stepCode": "DRAFT" }],
+              "fieldPolicies": [
+                { "policyId": "first", "stepId": "draft", "stepCode": "*", "actorRole": "ASSIGNEE", "fieldKey": "amount", "write": true },
+                { "policyId": "second", "stepId": "draft", "stepCode": "*", "actorRole": "ASSIGNEE", "fieldKey": "amount", "write": false }
+              ]
+            }
+            """,
+            requireLockable: false));
+
+    var unmatched = evaluator.Evaluate(
+        """
+        {
+          "steps": [{ "stepId": "draft", "stepCode": "DRAFT" }],
+          "fieldPolicies": [],
+          "tableColumnPolicies": []
+        }
+        """,
+        new DynamicFlowPolicyEvaluationContext
+        {
+            StepId = "draft",
+            StepCode = "DRAFT",
+            ActorRole = "ASSIGNEE"
+        });
+    AssertTrue(unmatched.DenyAllFields, "an unmatched field-policy scope must fail closed");
+    AssertTrue(unmatched.DenyAllTableColumns, "an unmatched table-policy scope must fail closed");
+
+    var deniedWrites = DynamicFlowReportPermissionEnforcer.FindWriteViolations(
+        unmatched,
+        """{"values":{"note":"old"}}""",
+        """{"values":{"note":"new"}}""",
+        """{"blocks":[{"blockId":"b1","rows":[{"cells":{"amount":1}}]}]}""",
+        """{"blocks":[{"blockId":"b1","rows":[{"cells":{"amount":2}}]}]}""");
+    AssertTrue(deniedWrites.Any(item => item.TargetKind == "FIELD"),
+        "empty field policies must reject writes instead of allowing them implicitly");
+    AssertTrue(deniedWrites.Any(item => item.TargetKind == "TABLE_COLUMN"),
+        "empty table policies must reject writes instead of allowing them implicitly");
+
+    var preservedDeniedWrite = DynamicFlowReportPermissionEnforcer.PreserveUnreadableValues(
+        unmatched,
+        """{"values":{"note":"old"}}""",
+        """{"values":{"note":"new"}}""",
+        null,
+        null);
+    AssertTrue(
+        DynamicFlowReportPermissionEnforcer.FindWriteViolations(
+            unmatched,
+            """{"values":{"note":"old"}}""",
+            preservedDeniedWrite.FieldValuesJson,
+            null,
+            preservedDeniedWrite.TableValuesJson).Any(),
+        "fail-closed writes must be rejected rather than silently restored and accepted");
+
+    var deniedRead = DynamicFlowReportPermissionEnforcer.ApplyReadRestrictions(
+        unmatched,
+        "[1]",
+        """{"values":{"note":"secret"}}""",
+        """{"blocks":[{"blockId":"b1","values1D":[1]}]}""",
+        null);
+    AssertEqual<string?>(null, deniedRead.FieldValuesJson, "empty field policies must redact all field values");
+    AssertEqual("[]", deniedRead.Values1DJson, "empty table policies must redact top-level values");
+    AssertEqual<string?>(null, deniedRead.TableValuesJson, "empty table policies must redact all table values");
+}
+
 static void DynamicFlowReportPermissionsRejectFieldWrites()
 {
     var permissions = new DynamicFlowPolicyEvaluationResult();
@@ -1360,6 +3197,14 @@ static void DynamicFlowReportPermissionsRejectFieldWrites()
         FieldId = "secret",
         Write = false,
         SourcePolicyId = "field-secret"
+    };
+    permissions.Fields["note"] = new DynamicFlowFieldPermissionDto
+    {
+        TargetKey = "note",
+        FieldId = "note",
+        Read = true,
+        Write = true,
+        SourcePolicyId = "field-note"
     };
 
     var unchanged = DynamicFlowReportPermissionEnforcer.FindWriteViolations(
@@ -1393,6 +3238,15 @@ static void DynamicFlowReportPermissionsRejectTableColumnWrites()
         Write = false,
         SourcePolicyId = "column-amount"
     };
+    permissions.TableColumns["b1:note"] = new DynamicFlowTableColumnPermissionDto
+    {
+        TargetKey = "b1:note",
+        BlockId = "b1",
+        ColumnKey = "note",
+        Read = true,
+        Write = true,
+        SourcePolicyId = "column-note"
+    };
 
     var unchanged = DynamicFlowReportPermissionEnforcer.FindWriteViolations(
         permissions,
@@ -1412,16 +3266,586 @@ static void DynamicFlowReportPermissionsRejectTableColumnWrites()
     AssertEqual("TABLE_COLUMN", changed[0].TargetKind, "table violation target kind should be table column");
     AssertEqual("b1:amount", changed[0].TargetKey, "table violation should identify block and column");
     AssertEqual("column-amount", changed[0].SourcePolicyId, "table violation should keep source policy id");
+
+    var slotOnlyAllowedChange = DynamicFlowReportPermissionEnforcer.FindWriteViolations(
+        permissions,
+        null,
+        null,
+        """{"blocks":[{"blockId":"b1","values1D":[1,"old"],"valueSlots":[{"index":0,"columnKey":"amount"},{"index":1,"columnKey":"note"}]}]}""",
+        """{"blocks":[{"blockId":"b1","values1D":[1,"new"],"valueSlots":[{"index":0,"columnKey":"amount"},{"index":1,"columnKey":"note"}]}]}""");
+    AssertEqual(0, slotOnlyAllowedChange.Count, "valueSlots should isolate changes in an allowed column");
+
+    var slotDeniedChange = DynamicFlowReportPermissionEnforcer.FindWriteViolations(
+        permissions,
+        null,
+        null,
+        """{"blocks":[{"blockId":"b1","values1D":[1,"same"],"valueSlots":[{"index":0,"columnKey":"amount"},{"index":1,"columnKey":"note"}]}]}""",
+        """{"blocks":[{"blockId":"b1","values1D":[2,"same"],"valueSlots":[{"index":0,"columnKey":"amount"},{"index":1,"columnKey":"note"}]}]}""");
+    AssertEqual(1, slotDeniedChange.Count, "valueSlots should reject a change in the denied column");
+
+    var directRowPropertyChange = DynamicFlowReportPermissionEnforcer.FindWriteViolations(
+        permissions,
+        null,
+        null,
+        """{"blocks":[{"blockId":"b1","rows":[{"rowKey":"row_1","amount":1,"note":"same"}]}]}""",
+        """{"blocks":[{"blockId":"b1","rows":[{"rowKey":"row_1","amount":2,"note":"same"}]}]}""");
+    AssertEqual(1, directRowPropertyChange.Count, "a denied column stored directly on an append row should not bypass write checks");
+}
+
+static void DynamicFlowReportPermissionsRedactUnreadableValues()
+{
+    var permissions = new DynamicFlowPolicyEvaluationResult();
+    permissions.Fields["secret"] = new DynamicFlowFieldPermissionDto
+    {
+        TargetKey = "secret",
+        FieldId = "secret",
+        Read = false,
+        Write = false
+    };
+    permissions.Fields["public"] = new DynamicFlowFieldPermissionDto
+    {
+        TargetKey = "public",
+        FieldId = "public",
+        Read = true,
+        Write = true
+    };
+    permissions.TableColumns["b1:amount"] = new DynamicFlowTableColumnPermissionDto
+    {
+        TargetKey = "b1:amount",
+        BlockId = "b1",
+        ColumnKey = "amount",
+        Read = false,
+        Write = false
+    };
+    permissions.TableColumns["b1:note"] = new DynamicFlowTableColumnPermissionDto
+    {
+        TargetKey = "b1:note",
+        BlockId = "b1",
+        ColumnKey = "note",
+        Read = true,
+        Write = true
+    };
+
+    var dynamicExcelTemplateId = ObjectId(87);
+    var readable = DynamicFlowReportPermissionEnforcer.ApplyReadRestrictions(
+        permissions,
+        """[11,"visible"]""",
+        """{"values":{"secret":"classified","public":"visible"}}""",
+        $$"""
+        {
+          "blocks": [
+            {
+              "blockId": "b1",
+              "dynamicExcelTemplateId": "{{dynamicExcelTemplateId}}",
+              "values1D": [11, "visible"],
+              "valueSlots": [
+                { "index": 0, "rowKey": "row_1", "columnKey": "amount" },
+                { "index": 1, "rowKey": "row_1", "columnKey": "note" }
+              ],
+              "rows": [{ "cells": { "amount": 11, "note": "visible" } }],
+              "cells": [
+                { "rowKey": "row_1", "columnKey": "amount", "value": 11 },
+                { "rowKey": "row_1", "columnKey": "note", "value": "visible" }
+              ]
+            }
+          ]
+        }
+        """,
+        dynamicExcelTemplateId);
+
+    using var fields = JsonDocument.Parse(readable.FieldValuesJson!);
+    var fieldValues = fields.RootElement.GetProperty("values");
+    AssertFalse(fieldValues.TryGetProperty("secret", out _), "unreadable field value should be removed from the response");
+    AssertEqual("visible", fieldValues.GetProperty("public").GetString(), "readable field value should remain");
+
+    var topLevelValues = Values1DCompression.DeserializeObjects(readable.Values1DJson, new JsonSerializerOptions(JsonSerializerDefaults.Web));
+    AssertTrue(topLevelValues[0] is null, "unreadable top-level table value should be redacted");
+    AssertEqual("visible", ((JsonElement)topLevelValues[1]!).GetString(), "readable top-level table value should remain");
+
+    var expandedTables = Values1DCompression.ExpandTableValuesJson(
+        readable.TableValuesJson,
+        new JsonSerializerOptions(JsonSerializerDefaults.Web));
+    using var tables = JsonDocument.Parse(expandedTables!);
+    var block = tables.RootElement.GetProperty("blocks")[0];
+    AssertEqual(JsonValueKind.Null, block.GetProperty("values1D")[0].ValueKind, "unreadable slot should be null in the table payload");
+    AssertFalse(block.GetProperty("rows")[0].GetProperty("cells").TryGetProperty("amount", out _), "unreadable row cell should be removed");
+    AssertEqual(1, block.GetProperty("cells").GetArrayLength(), "unreadable matrix cell should be removed");
+    AssertEqual("note", block.GetProperty("cells")[0].GetProperty("columnKey").GetString(), "readable matrix cell should remain");
+}
+
+static void DynamicFlowReportPermissionsPreserveUnreadableRoundTrips()
+{
+    var permissions = new DynamicFlowPolicyEvaluationResult();
+    permissions.Fields["secret"] = new DynamicFlowFieldPermissionDto
+    {
+        TargetKey = "secret",
+        FieldId = "secret",
+        Read = false,
+        Write = false
+    };
+    permissions.Fields["public"] = new DynamicFlowFieldPermissionDto
+    {
+        TargetKey = "public",
+        FieldId = "public",
+        Read = true,
+        Write = true
+    };
+    permissions.TableColumns["B1:Amount"] = new DynamicFlowTableColumnPermissionDto
+    {
+        TargetKey = "B1:Amount",
+        BlockId = "B1",
+        ColumnKey = "Amount",
+        Read = false,
+        Write = false
+    };
+    permissions.TableColumns["b1:note"] = new DynamicFlowTableColumnPermissionDto
+    {
+        TargetKey = "b1:note",
+        BlockId = "b1",
+        ColumnKey = "note",
+        Read = true,
+        Write = true
+    };
+
+    const string currentFields = """{"values":{"secret":"kept","public":"old"}}""";
+    const string nextFields = """{"values":{"public":"new"}}""";
+    const string currentTables = """
+    {
+      "blocks": [{
+        "blockId": "b1",
+        "values1D": [11, "old"],
+        "valueSlots": [
+          { "index": 0, "rowKey": "row_1", "columnKey": "amount" },
+          { "index": 1, "rowKey": "row_1", "columnKey": "note" }
+        ],
+        "rows": [{ "rowKey": "row_1", "cells": { "amount": 11, "note": "old" } }],
+        "cells": [
+          { "rowKey": "row_1", "columnKey": "amount", "value": 11 },
+          { "rowKey": "row_1", "columnKey": "note", "value": "old" }
+        ]
+      }]
+    }
+    """;
+    const string nextTables = """
+    {
+      "blocks": [{
+        "blockId": "b1",
+        "values1D": [null, "new"],
+        "valueSlots": [
+          { "index": 0, "rowKey": "row_1", "columnKey": "amount" },
+          { "index": 1, "rowKey": "row_1", "columnKey": "note" }
+        ],
+        "rows": [{ "rowKey": "row_1", "cells": { "note": "new" } }],
+        "cells": [{ "rowKey": "row_1", "columnKey": "note", "value": "new" }]
+      }]
+    }
+    """;
+
+    var preserved = DynamicFlowReportPermissionEnforcer.PreserveUnreadableValues(
+        permissions,
+        currentFields,
+        nextFields,
+        currentTables,
+        nextTables);
+    var violations = DynamicFlowReportPermissionEnforcer.FindWriteViolations(
+        permissions,
+        currentFields,
+        preserved.FieldValuesJson,
+        currentTables,
+        preserved.TableValuesJson);
+    AssertEqual(0, violations.Count, "a redacted round trip should preserve denied values without a false violation");
+
+    using var fields = JsonDocument.Parse(preserved.FieldValuesJson!);
+    AssertEqual("kept", fields.RootElement.GetProperty("values").GetProperty("secret").GetString(), "unreadable field should be restored from the server value");
+    AssertEqual("new", fields.RootElement.GetProperty("values").GetProperty("public").GetString(), "readable field edits should remain");
+
+    var expandedTables = Values1DCompression.ExpandTableValuesJson(
+        preserved.TableValuesJson,
+        new JsonSerializerOptions(JsonSerializerDefaults.Web));
+    using var tables = JsonDocument.Parse(expandedTables!);
+    var block = tables.RootElement.GetProperty("blocks")[0];
+    AssertEqual(11, block.GetProperty("values1D")[0].GetInt32(), "unreadable value slot should be restored");
+    AssertEqual("new", block.GetProperty("values1D")[1].GetString(), "readable value slot edits should remain");
+    AssertEqual(11, block.GetProperty("rows")[0].GetProperty("cells").GetProperty("amount").GetInt32(), "row projection should restore the denied column");
+    AssertEqual(2, block.GetProperty("cells").GetArrayLength(), "matrix projection should restore the denied cell");
+
+    var malicious = DynamicFlowReportPermissionEnforcer.PreserveUnreadableValues(
+        permissions,
+        currentFields,
+        """{"values":{"secret":"changed","public":"new"}}""",
+        currentTables,
+        """
+        {
+          "blocks": [{
+            "blockId": "B1",
+            "values1D": [99, "new"],
+            "valueSlots": [
+              { "index": 0, "rowKey": "row_1", "columnKey": "AMOUNT" },
+              { "index": 1, "rowKey": "row_1", "columnKey": "note" }
+            ]
+          }]
+        }
+        """);
+    var maliciousViolations = DynamicFlowReportPermissionEnforcer.FindWriteViolations(
+        permissions,
+        currentFields,
+        malicious.FieldValuesJson,
+        currentTables,
+        malicious.TableValuesJson);
+    AssertTrue(maliciousViolations.Any(item => item.TargetKind == "FIELD"), "a non-null hidden field override should still be rejected");
+    AssertTrue(maliciousViolations.Any(item => item.TargetKind == "TABLE_COLUMN"), "a case-variant hidden column override should still be rejected");
+}
+
+static void DynamicFlowMappingPreviewRedactsUnreadableValues()
+{
+    var permissions = new DynamicFlowPolicyEvaluationResult();
+    permissions.Fields["secret"] = new DynamicFlowFieldPermissionDto
+    {
+        TargetKey = "secret",
+        FieldKey = "secret",
+        Read = false,
+        Hidden = true
+    };
+    permissions.Fields["public"] = new DynamicFlowFieldPermissionDto
+    {
+        TargetKey = "public",
+        FieldKey = "public",
+        Read = true,
+        Write = true
+    };
+    permissions.TableColumns["b1:amount"] = new DynamicFlowTableColumnPermissionDto
+    {
+        TargetKey = "b1:amount",
+        BlockId = "b1",
+        ColumnKey = "amount",
+        Read = false,
+        Hidden = true
+    };
+
+    var preview = new DynamicFlowMappingPreviewResponse
+    {
+        FieldValuesJson = """{"values":{"secret":"classified","public":"visible"}}""",
+        TableValuesJson = """{"blocks":[{"blockId":"b1","values1D":[11],"valueSlots":[{"index":0,"rowKey":"row_1","columnKey":"amount"}]}]}""",
+        HasBlockingConflicts = true,
+        SummarySourceJson = """{"kind":"DYNAMIC_FLOW_MAPPING","changes":[{"sources":[{"valueJson":"11"}]}]}""",
+        Changes = new List<DynamicFlowMappingChangeDto>
+        {
+            new()
+            {
+                MappingId = "hidden-field",
+                TargetKind = "FIELD",
+                TargetKey = "secret",
+                PreviousValueJson = "\"old\"",
+                NextValueJson = "\"classified\"",
+                Sources = new List<DynamicFlowMappingInputProvenanceDto> { new() { ValueJson = "\"classified\"" } }
+            },
+            new()
+            {
+                MappingId = "hidden-column",
+                TargetKind = "TABLE",
+                TargetKey = "B1:AMOUNT",
+                PreviousValueJson = "10",
+                NextValueJson = "11",
+                Sources = new List<DynamicFlowMappingInputProvenanceDto> { new() { ValueJson = "11" } }
+            },
+            new()
+            {
+                MappingId = "visible-field",
+                TargetKind = "FIELD",
+                TargetKey = "public",
+                NextValueJson = "\"visible\"",
+                Sources = new List<DynamicFlowMappingInputProvenanceDto> { new() { ValueJson = "\"source\"" } }
+            }
+        }
+    };
+
+    var readable = DynamicFlowReportPermissionEnforcer.ApplyMappingPreviewReadRestrictions(permissions, preview);
+    AssertEqual(1, readable.Changes.Count, "preview should omit changes targeting unreadable fields and columns");
+    AssertEqual("visible-field", readable.Changes[0].MappingId, "readable mapping change should remain");
+    AssertTrue(readable.Changes[0].Sources[0].ValueJson is null, "preview provenance should not expose raw source values");
+    AssertTrue(readable.HasBlockingConflicts, "redaction must not clear the original blocking-conflict state");
+
+    using var fields = JsonDocument.Parse(readable.FieldValuesJson!);
+    AssertFalse(fields.RootElement.GetProperty("values").TryGetProperty("secret", out _), "preview should remove unreadable target field values");
+    var expandedTables = Values1DCompression.ExpandTableValuesJson(
+        readable.TableValuesJson,
+        new JsonSerializerOptions(JsonSerializerDefaults.Web));
+    using var tables = JsonDocument.Parse(expandedTables!);
+    AssertEqual(JsonValueKind.Null, tables.RootElement.GetProperty("blocks")[0].GetProperty("values1D")[0].ValueKind, "preview should redact unreadable target column values");
+    using var summary = JsonDocument.Parse(readable.SummarySourceJson!);
+    AssertFalse(summary.RootElement.GetProperty("changes")[0].GetProperty("sources")[0].TryGetProperty("valueJson", out _), "response provenance should remove raw source values");
+}
+
+static void DynamicFlowReportPermissionsEnforceRequiredValues()
+{
+    var permissions = new DynamicFlowPolicyEvaluationResult();
+    permissions.Fields["confirmed"] = new DynamicFlowFieldPermissionDto
+    {
+        TargetKey = "confirmed",
+        FieldId = "confirmed",
+        Read = true,
+        Required = true,
+        SourcePolicyId = "required-confirmed"
+    };
+    permissions.TableColumns["b1:amount"] = new DynamicFlowTableColumnPermissionDto
+    {
+        TargetKey = "b1:amount",
+        BlockId = "b1",
+        ColumnKey = "amount",
+        Read = true,
+        Required = true,
+        SourcePolicyId = "required-amount"
+    };
+
+    var missing = DynamicFlowReportPermissionEnforcer.FindRequiredViolations(
+        permissions,
+        """{"values":{"confirmed":null}}""",
+        """{"blocks":[{"blockId":"b1","tableMode":"APPEND_ROWS","rows":[{"rowKey":"row_1","cells":{"amount":""}}]}]}""");
+    AssertEqual(2, missing.Count, "required field and table column should both be enforced on submit");
+    AssertTrue(missing.Any(item => item.Reason == "DYNAMIC_FLOW_FIELD_REQUIRED"), "missing required field should be identified");
+    AssertTrue(missing.Any(item => item.Reason == "DYNAMIC_FLOW_TABLE_COLUMN_REQUIRED"), "missing required table column should be identified");
+
+    var valid = DynamicFlowReportPermissionEnforcer.FindRequiredViolations(
+        permissions,
+        """{"values":{"confirmed":false}}""",
+        """{"blocks":[{"blockId":"B1","tableMode":"APPEND_ROWS","rows":[{"rowKey":"row_1","amount":0}]}]}""");
+    AssertEqual(0, valid.Count, "false and zero are valid required values, including direct row properties");
+
+    var noAppendRows = DynamicFlowReportPermissionEnforcer.FindRequiredViolations(
+        permissions,
+        """{"values":{"confirmed":true}}""",
+        """{"blocks":[{"blockId":"b1","tableMode":"APPEND_ROWS","rows":[]}]}""");
+    AssertEqual(0, noAppendRows.Count, "a required append-row column should apply to existing rows without forcing a synthetic row");
+
+    var activeSlotRowMissingAmount = DynamicFlowReportPermissionEnforcer.FindRequiredViolations(
+        permissions,
+        """{"values":{"confirmed":true}}""",
+        """
+        {
+          "blocks": [{
+            "blockId": "b1",
+            "tableMode": "APPEND_ROWS",
+            "values1D": ["entered", null],
+            "valueSlots": [
+              { "index": 0, "rowKey": "row_1", "columnKey": "description" },
+              { "index": 1, "rowKey": "row_1", "columnKey": "amount" }
+            ],
+            "rows": []
+          }]
+        }
+        """);
+    AssertEqual(1, activeSlotRowMissingAmount.Count, "an active append row must enforce required columns even when its row projection is absent");
+}
+
+static void DynamicFlowMappingRejectsAmbiguousTableRowKeys()
+{
+    var sourceFormId = ObjectId(72);
+    var targetFormId = ObjectId(73);
+    WorkAssignmentReport SourceReport(string id, string assignmentId, decimal amount) => new()
+    {
+        Id = id,
+        WorkId = ObjectId(74),
+        WorkAssignmentId = assignmentId,
+        WorkReportPeriodId = ObjectId(75),
+        DynamicFormTemplateId = sourceFormId,
+        AssigneeUserId = ObjectId(76),
+        PeriodKey = "2026-07",
+        PeriodInstanceKey = "2026-07",
+        FieldValuesJson = """{"values":{}}""",
+        TableValuesJson = $$"""
+        {
+          "blocks": [{
+            "blockId": "source_rows",
+            "tableMode": "APPEND_ROWS",
+            "rows": [{ "rowOrder": 1, "amount": {{amount.ToString(System.Globalization.CultureInfo.InvariantCulture)}} }]
+          }]
+        }
+        """
+    };
+
+    var first = SourceReport(ObjectId(77), ObjectId(78), 10m);
+    var second = SourceReport(ObjectId(79), ObjectId(80), 20m);
+    var target = new WorkAssignmentReport
+    {
+        Id = ObjectId(81),
+        WorkId = first.WorkId,
+        WorkAssignmentId = ObjectId(82),
+        WorkReportPeriodId = ObjectId(83),
+        DynamicFormTemplateId = targetFormId,
+        AssigneeUserId = ObjectId(84),
+        PeriodKey = "2026-07",
+        PeriodInstanceKey = "2026-07",
+        FieldValuesJson = """{"values":{}}""",
+        TableValuesJson = """{"blocks":[{"blockId":"target_rows","tableMode":"APPEND_ROWS","rows":[]}]}"""
+    };
+    var rule = new DynamicFlowMappingRuleDto
+    {
+        MappingId = "ambiguous-row",
+        MappingVersion = 1,
+        EvaluationGrain = "TABLE_ROW",
+        ErrorPolicy = "BLOCK_APPLY",
+        ConflictPolicy = "OVERWRITE",
+        Inputs = new List<DynamicFlowMappingInputDto>
+        {
+            new()
+            {
+                InputKey = "amount",
+                Source = new DynamicFlowMappingEndpointDto
+                {
+                    Kind = "TABLE_COLUMN",
+                    DynamicFormTemplateId = sourceFormId,
+                    StepId = "source",
+                    BlockId = "source_rows",
+                    ColumnKey = "amount",
+                    DataType = "NUMBER"
+                },
+                DataType = "NUMBER",
+                Cardinality = "ONE",
+                NullPolicy = "ERROR"
+            }
+        },
+        Target = new DynamicFlowMappingEndpointDto
+        {
+            Kind = "TABLE_COLUMN",
+            DynamicFormTemplateId = targetFormId,
+            StepId = "target",
+            BlockId = "target_rows",
+            ColumnKey = "amount",
+            DataType = "NUMBER"
+        },
+        Calculation = new DynamicFlowMappingCalculationDto
+        {
+            Kind = "DIRECT",
+            Operation = "copy",
+            ResultDataType = "NUMBER"
+        }
+    };
+
+    var projection = DynamicFlowMappingEngine.Preview(
+        target,
+        new List<DynamicFlowMappingSourceReport>
+        {
+            new(first, "source", "SOURCE", first.FieldValuesJson, first.TableValuesJson),
+            new(second, "source", "SOURCE", second.FieldValuesJson, second.TableValuesJson)
+        },
+        new List<DynamicFlowMappingRuleDto> { rule },
+        requestConflictPolicy: null,
+        requestContributionPolicy: null,
+        nowUtc: new DateTime(2026, 7, 21, 0, 0, 0, DateTimeKind.Utc),
+        targetStepId: "target",
+        targetStepCode: "TARGET");
+
+    AssertTrue(projection.HasBlockingConflicts, "two source reports with the same relative row key should fail closed");
+    AssertEqual(
+        "DYNAMIC_FLOW_MAPPING_TABLE_ROW_KEY_AMBIGUOUS",
+        projection.Changes.Single().Reason,
+        "ambiguous relative row keys should require a future explicit join contract");
+}
+
+static void DynamicFlowMappingProvenanceCannotBeForgedByReportRequests()
+{
+    AssertThrows(
+        AppErrorCode.WORK_ASSIGNMENT_REPORT_SUMMARY_SOURCE_JSON_INVALID,
+        () => WorkAssignmentReportService.EnsureDynamicFlowMappingSummaryOverrideAllowed(
+            currentSummarySourceJson: null,
+            requestedSummarySourceJson: """{"kind":"dynamic_flow_mapping","changes":[]}""",
+            reportId: ObjectId(70),
+            actorUserId: ObjectId(71)));
+
+    WorkAssignmentReportService.EnsureDynamicFlowMappingSummaryOverrideAllowed(
+        currentSummarySourceJson: """{"kind":"DYNAMIC_FLOW_MAPPING"}""",
+        requestedSummarySourceJson: """{"kind":"DYNAMIC_FLOW_MAPPING","changes":[]}""",
+        reportId: ObjectId(70),
+        actorUserId: ObjectId(71));
+}
+
+static void DynamicFlowReportActorRolesFollowAssignmentRelationships()
+{
+    var assigneeId = ObjectId(84);
+    var issuerId = ObjectId(85);
+    var coordinatorId = ObjectId(86);
+    var assignment = new WorkAssignment
+    {
+        Id = ObjectId(83),
+        WorkId = ObjectId(82),
+        CreatedByUserId = issuerId,
+        FlowRole = "REVIEWER",
+        Assignees = new List<UserRef> { new() { UserId = assigneeId } },
+        LeaderWatcherUserIds = new List<string> { coordinatorId }
+    };
+    var report = new WorkAssignmentReport
+    {
+        Id = ObjectId(81),
+        WorkId = assignment.WorkId,
+        WorkAssignmentId = assignment.Id,
+        AssigneeUserId = assigneeId
+    };
+
+    AssertEqual(
+        "REVIEWER",
+        WorkAssignmentReportService.ResolveDirectDynamicFlowActorRole(assignment, report, assigneeId),
+        "branch assignee should use the role captured on the branch");
+    AssertEqual(
+        "ISSUER",
+        WorkAssignmentReportService.ResolveDirectDynamicFlowActorRole(assignment, report, issuerId),
+        "assignment creator should resolve as issuer");
+    AssertEqual(
+        "COORDINATOR",
+        WorkAssignmentReportService.ResolveDirectDynamicFlowActorRole(assignment, report, coordinatorId),
+        "leader watcher should resolve as coordinator");
+    AssertTrue(
+        WorkAssignmentReportService.ResolveDirectDynamicFlowActorRole(assignment, report, ObjectId(80)) is null,
+        "unrelated readers should require the projected review or ancestor relationship");
+
+    assignment.FlowRole = "UNKNOWN";
+    AssertEqual(
+        "ASSIGNEE",
+        WorkAssignmentReportService.ResolveDirectDynamicFlowActorRole(assignment, report, assigneeId),
+        "unknown legacy branch role should fall back to assignee");
+}
+
+static void DynamicFlowReportLifecycleKeepsPostSubmitLocks()
+{
+    var freshDraft = new WorkAssignmentReport { Status = WorkAssignmentReportStatus.Draft };
+    AssertFalse(
+        WorkAssignmentReportService.IsDynamicFlowReportAfterSubmit(freshDraft),
+        "a never-submitted draft should remain editable by lockedAfterSubmit policies");
+
+    var returnedDraft = new WorkAssignmentReport
+    {
+        Status = WorkAssignmentReportStatus.Draft,
+        SubmittedAtUtc = DateTime.UtcNow.AddDays(-1),
+        ReturnedAtUtc = DateTime.UtcNow
+    };
+    AssertTrue(
+        WorkAssignmentReportService.IsDynamicFlowReportAfterSubmit(returnedDraft),
+        "a returned draft should remain locked after its first submission");
+
+    var withdrawnDraft = new WorkAssignmentReport
+    {
+        Status = WorkAssignmentReportStatus.Draft,
+        SubmittedByUserId = ObjectId(79)
+    };
+    AssertTrue(
+        WorkAssignmentReportService.IsDynamicFlowReportAfterSubmit(withdrawnDraft),
+        "a withdrawn draft with submission history should remain locked");
+
+    var submitted = new WorkAssignmentReport { Status = WorkAssignmentReportStatus.Submitted };
+    AssertTrue(
+        WorkAssignmentReportService.IsDynamicFlowReportAfterSubmit(submitted),
+        "a submitted report should be treated as post-submit even if legacy timestamps are missing");
 }
 
 static void DynamicFlowRuntimePlannerCreatesBranchPerTargetUnit()
 {
+    var rootFormTemplateId = ObjectId(92);
+    var childFormTemplateId = ObjectId(89);
     var template = new DynamicFlowTemplate
     {
         Id = ObjectId(91),
         Code = "FLOW_RUNTIME",
         Name = "Flow runtime",
-        DynamicFormTemplateId = ObjectId(92),
+        DynamicFormTemplateId = rootFormTemplateId,
         Status = DynamicFlowTemplateStatuses.Active
     };
 
@@ -1434,17 +3858,21 @@ static void DynamicFlowRuntimePlannerCreatesBranchPerTargetUnit()
         Status = DynamicFlowTemplateVersionStatuses.Locked,
         PayloadJson = """
         {
+          "formNodes": [
+            { "formNodeId": "root", "role": "ROOT", "dynamicFormTemplateId": "100000000000000000000092" },
+            { "formNodeId": "child-review", "role": "CHILD", "dynamicFormTemplateId": "100000000000000000000089" }
+          ],
           "steps": [
-            { "stepId": "draft", "stepCode": "DRAFT", "stepOrder": 1 },
-            { "stepId": "review", "stepCode": "REVIEW", "stepOrder": 2 },
-            { "stepId": "final", "stepCode": "FINAL", "stepOrder": 3 }
+            { "stepId": "draft", "stepCode": "DRAFT", "stepOrder": 1, "formNodeId": "root" },
+            { "stepId": "review", "stepCode": "REVIEW", "stepOrder": 2, "formNodeId": "child-review" },
+            { "stepId": "final", "stepCode": "FINAL", "stepOrder": 3, "formNodeId": "root" }
           ],
           "transitions": [
             { "fromStepId": "draft", "toStepId": "review" },
             { "fromStepCode": "REVIEW", "toStepId": "final" }
           ],
           "actorPolicies": [
-            { "stepCode": "REVIEW", "actorRole": "ASSIGNEE", "allowSubFlow": true }
+            { "stepId": "*", "stepCode": "REVIEW", "actorRole": "ASSIGNEE", "allowSubFlow": true }
           ]
         }
         """
@@ -1456,7 +3884,13 @@ static void DynamicFlowRuntimePlannerCreatesBranchPerTargetUnit()
         WorkId = ObjectId(95),
         FlowInstanceId = ObjectId(96),
         FlowBranchId = ObjectId(97),
-        FlowAttemptNo = 2
+        FlowAttemptNo = 2,
+        FlowTemplateId = template.Id,
+        FlowTemplateVersionNo = version.VersionNo,
+        FlowStepId = "draft",
+        FlowStepCode = "DRAFT",
+        AllowSubFlow = true,
+        FlowEffectiveStatus = DynamicFlowEffectiveStatuses.Effective
     };
 
     var targetUnitA = ObjectId(98);
@@ -1466,6 +3900,7 @@ static void DynamicFlowRuntimePlannerCreatesBranchPerTargetUnit()
         FlowTemplateVersionId = version.Id,
         ParentAssignmentId = parent.Id,
         StepCode = "REVIEW",
+        FlowRole = "FINALIZER",
         TargetUnitIds = new List<string> { targetUnitA, targetUnitB, targetUnitA }
     };
 
@@ -1478,7 +3913,7 @@ static void DynamicFlowRuntimePlannerCreatesBranchPerTargetUnit()
 
     AssertEqual(template.Id, plan.FlowTemplateId, "flow template id should come from locked version");
     AssertEqual(3, plan.FlowTemplateVersionNo, "flow template version should be captured");
-    AssertEqual(template.DynamicFormTemplateId, plan.DynamicFormTemplateId, "dynamic form template should be captured");
+    AssertEqual(childFormTemplateId, plan.DynamicFormTemplateId, "selected step dynamic form template should be captured");
     AssertEqual(parent.FlowInstanceId, plan.FlowInstanceId, "child launch should reuse parent flow instance");
     AssertEqual("review", plan.Step.StepId, "requested step should resolve by step code");
     AssertEqual("REVIEW", plan.Step.StepCode, "requested step code should be captured");
@@ -1492,12 +3927,61 @@ static void DynamicFlowRuntimePlannerCreatesBranchPerTargetUnit()
     {
         AssertEqual(parent.FlowBranchId, branch.ParentFlowBranchId, "branch should link back to parent flow branch");
         AssertEqual(2, branch.FlowAttemptNo, "branch should inherit parent flow attempt");
-        AssertEqual(DynamicFlowRuntimePlanner.AssignmentFlowRole, branch.FlowRole, "branch role should be assignee");
+        AssertEqual(DynamicFlowRuntimePlanner.AssignmentFlowRole, branch.FlowRole,
+            "branch role should be derived by the server instead of accepting request elevation");
         AssertEqual(DynamicFlowRuntimePlanner.EffectiveStatus, branch.FlowEffectiveStatus, "branch status should start effective");
         AssertTrue(branch.AllowSubFlow, "actor policy should allow sub-flow on selected step");
         AssertFalse(branch.IsFlowFinalNode, "review step should not be final while it has an outgoing transition");
         AssertTrue(MongoDB.Bson.ObjectId.TryParse(branch.FlowBranchId, out _), "branch id should be a generated ObjectId");
     }
+
+    var directChild = new WorkAssignment
+    {
+        Id = ObjectId(100),
+        WorkId = parent.WorkId,
+        ParentAssignmentId = parent.Id,
+        IsActive = true,
+        FlowInstanceId = parent.FlowInstanceId,
+        FlowTemplateId = parent.FlowTemplateId,
+        FlowTemplateVersionNo = parent.FlowTemplateVersionNo,
+        FlowEffectiveStatus = DynamicFlowEffectiveStatuses.Effective
+    };
+    AssertTrue(
+        WorkAssignmentReportService.DynamicFlowSourceContextMatches(parent, directChild),
+        "mapping source should accept an effective direct child");
+
+    directChild.FlowTemplateVersionNo = parent.FlowTemplateVersionNo + 1;
+    AssertFalse(
+        WorkAssignmentReportService.DynamicFlowSourceContextMatches(parent, directChild),
+        "mapping source should reject a direct child from another locked flow version");
+    directChild.FlowTemplateVersionNo = parent.FlowTemplateVersionNo;
+
+    directChild.FlowInstanceId = ObjectId(79);
+    AssertFalse(
+        WorkAssignmentReportService.DynamicFlowSourceContextMatches(parent, directChild),
+        "mapping source should reject a direct child from another flow instance");
+    directChild.FlowInstanceId = parent.FlowInstanceId;
+
+    directChild.ParentAssignmentId = ObjectId(80);
+    AssertFalse(
+        WorkAssignmentReportService.DynamicFlowSourceContextMatches(parent, directChild),
+        "mapping source should reject a sibling or unrelated branch");
+
+    directChild.ParentAssignmentId = parent.Id;
+    directChild.FlowEffectiveStatus = DynamicFlowEffectiveStatuses.Invalidated;
+    AssertFalse(
+        WorkAssignmentReportService.DynamicFlowSourceContextMatches(parent, directChild),
+        "mapping source should reject an invalidated child branch");
+
+    parent.FlowEffectiveStatus = DynamicFlowEffectiveStatuses.Invalidated;
+    AssertThrows(
+        AppErrorCode.COMMON_VALIDATION_FAILED,
+        () => DynamicFlowRuntimePlanner.CreateLaunchPlan(
+            template,
+            version,
+            request,
+            parent,
+            actorUnitId: ObjectId(90)));
 }
 
 static void DynamicFlowRuntimePlannerRejectsInvalidLaunchInputs()
@@ -1507,7 +3991,7 @@ static void DynamicFlowRuntimePlannerRejectsInvalidLaunchInputs()
         Id = ObjectId(101),
         Code = "FLOW_RUNTIME_BLOCKED",
         Name = "Flow runtime blocked",
-        DynamicFormTemplateId = ObjectId(102),
+        DynamicFormTemplateId = ObjectId(82),
         Status = DynamicFlowTemplateStatuses.Active
     };
 
@@ -1762,6 +4246,7 @@ static void StatisticProjectionContextCapturesDynamicFlowMetadata()
         ParentFlowBranchId = ObjectId(47),
         FlowAttemptNo = 3,
         FlowRole = "ASSIGNEE",
+        IsFlowFinalNode = true,
         FlowEffectiveStatus = DynamicFlowEffectiveStatuses.Effective,
         InvalidatedByFlowEventId = ObjectId(48)
     };
@@ -1783,6 +4268,7 @@ static void StatisticProjectionContextCapturesDynamicFlowMetadata()
     AssertEqual(assignment.ParentFlowBranchId, context.ParentFlowBranchId, "parent flow branch should be projected");
     AssertEqual(assignment.FlowAttemptNo, context.FlowAttemptNo, "flow attempt should be projected");
     AssertEqual(assignment.FlowRole, context.FlowRole, "flow role should be projected");
+    AssertEqual(assignment.IsFlowFinalNode, context.IsFlowFinalNode, "flow final-node flag should be projected");
     AssertEqual(assignment.FlowEffectiveStatus, context.FlowEffectiveStatus, "flow status should be projected");
     AssertEqual(assignment.InvalidatedByFlowEventId, context.InvalidatedByFlowEventId, "invalidation event should be projected");
 }
@@ -2763,6 +5249,218 @@ static void ClearsPreviousAggregateDraftTargetCells()
     AssertEqual(null, values[2], "previous mapped cell 2 should be cleared before reapply");
 }
 
+static void DynamicFormSectionSnapshotsAreDeterministicAndOrdered()
+{
+    var first = DynamicFormSectionSnapshotBuilder.Build(TestDynamicFormSectionSnapshotTemplate());
+    var equivalent = DynamicFormSectionSnapshotBuilder.Build(
+        TestDynamicFormSectionSnapshotTemplate(
+            sectionsJson: """
+            [
+              { "tagCodes": ["beta"], "order": 2, "title": "Beta", "id": "s_beta" },
+              { "description": "Alpha section", "id": "s_alpha", "order": 1, "title": "Alpha" }
+            ]
+            """,
+            fieldsJson: """
+            [
+              { "name": "Beta", "type": "number", "id": "f_beta", "sectionId": "s_beta" },
+              { "type": "shortText", "sectionId": "s_alpha", "name": "Alpha one", "id": "f_alpha" },
+              { "sectionId": "s_alpha", "id": "f_alpha_2", "name": "Alpha two", "type": "boolean" }
+            ]
+            """,
+            blocksJson: """
+            [
+              { "tableMode": "FIXED_GRID", "sectionId": "s_beta", "blockId": "b_beta" },
+              { "sectionId": "s_alpha", "tableMode": "FIXED_GRID", "blockId": "b_alpha" }
+            ]
+            """));
+
+    AssertSequenceEqual(
+        new[] { "s_alpha", "s_beta" },
+        first.Sections.Select(x => x.SectionId).ToArray(),
+        "section snapshots should be ordered by section order");
+    var alpha = first.GetRequiredSection(" s_alpha ");
+    AssertSequenceEqual(
+        new[] { "f_alpha", "f_alpha_2" },
+        alpha.FieldIds,
+        "alpha snapshot should retain exact field ids in form order");
+    AssertSequenceEqual(new[] { "b_alpha" }, alpha.BlockIds, "alpha snapshot should retain exact block ids");
+    AssertEqual(
+        "[{\"id\":\"f_alpha\",\"name\":\"Alpha one\",\"sectionId\":\"s_alpha\",\"type\":\"shortText\"},{\"id\":\"f_alpha_2\",\"name\":\"Alpha two\",\"sectionId\":\"s_alpha\",\"type\":\"boolean\"}]",
+        alpha.FieldsJson,
+        "section fields should be compact canonical JSON");
+    AssertFalse(alpha.BlocksJson.Contains('\n'), "section blocks should not contain formatting whitespace");
+    AssertEqual(64, alpha.ContentHash.Length, "section content hash should be SHA-256 hex");
+    AssertEqual(alpha.ContentHash, alpha.ContentHash.ToLowerInvariant(), "section content hash should use lowercase hex");
+
+    AssertSequenceEqual(
+        first.Sections.Select(x => x.ContentHash).ToArray(),
+        equivalent.Sections.Select(x => x.ContentHash).ToArray(),
+        "equivalent property ordering and whitespace should produce deterministic hashes");
+}
+
+static void DynamicFormPublishedSchemaSnapshotIsCanonicalAndVersionBound()
+{
+    var first = DynamicFormPublishedSchemaSnapshotBuilder.Build(
+        3,
+        """[{ "title": "Main", "id": "s1" }]""",
+        """[{ "label": "Amount", "sectionId": "s1", "id": "f1", "config": { "scale": 2, "required": true } }]""",
+        """[{ "title": "Rows", "sectionId": "s1", "blockId": "b1" }]""");
+    var equivalent = DynamicFormPublishedSchemaSnapshotBuilder.Build(
+        3,
+        """
+        [
+          { "id": "s1", "title": "Main" }
+        ]
+        """,
+        """[{ "config": { "required": true, "scale": 2.00 }, "id": "f1", "sectionId": "s1", "label": "Amount" }]""",
+        """[{ "blockId": "b1", "sectionId": "s1", "title": "Rows" }]""");
+
+    AssertEqual(first.Json, equivalent.Json, "equivalent schemas should have the same canonical JSON");
+    AssertEqual(first.Sha256, equivalent.Sha256, "equivalent schemas should have the same SHA-256");
+    AssertEqual(64, first.Sha256.Length, "schema hash should be a 64-character SHA-256 hex value");
+    AssertEqual(first.Sha256.ToLowerInvariant(), first.Sha256, "schema hash should use lowercase hex");
+
+    var reorderedArray = DynamicFormPublishedSchemaSnapshotBuilder.Build(
+        3,
+        """[{ "id": "s2", "title": "Second" }, { "id": "s1", "title": "Main" }]""",
+        """[{ "id": "f1", "sectionId": "s1", "label": "Amount", "config": { "required": true, "scale": 2 } }]""",
+        """[{ "blockId": "b1", "sectionId": "s1", "title": "Rows" }]""");
+    AssertFalse(
+        string.Equals(first.Sha256, reorderedArray.Sha256, StringComparison.Ordinal),
+        "array order is part of the published schema contract");
+
+    var nextSchemaVersion = DynamicFormPublishedSchemaSnapshotBuilder.Build(
+        4,
+        """[{ "id": "s1", "title": "Main" }]""",
+        """[{ "id": "f1", "sectionId": "s1", "label": "Amount", "config": { "required": true, "scale": 2 } }]""",
+        """[{ "blockId": "b1", "sectionId": "s1", "title": "Rows" }]""");
+    AssertFalse(
+        string.Equals(first.Sha256, nextSchemaVersion.Sha256, StringComparison.Ordinal),
+        "schemaVersion is part of the published schema contract");
+
+    var legacyTemplate = new DynamicFormTemplate
+    {
+        SchemaVersion = 3,
+        SectionsJson = """[{ "id": "s1", "title": "Main" }]""",
+        FieldsJson = """[{ "id": "f1", "sectionId": "s1", "label": "Amount", "config": { "required": true, "scale": 2 } }]""",
+        BlocksJson = "[]",
+        ExcelBlockJson = """{ "blockId": "b1", "sectionId": "s1", "title": "Rows" }"""
+    };
+    var legacySnapshot = DynamicFormPublishedSchemaSnapshotBuilder.Build(legacyTemplate);
+    var normalizedLegacySnapshot = DynamicFormPublishedSchemaSnapshotBuilder.Build(
+        3,
+        legacyTemplate.SectionsJson,
+        legacyTemplate.FieldsJson,
+        """[{ "blockId": "b1", "sectionId": "s1", "title": "Rows" }]""");
+    AssertEqual(
+        normalizedLegacySnapshot.Sha256,
+        legacySnapshot.Sha256,
+        "legacy ExcelBlockJson should hash as the equivalent canonical blocks array");
+}
+
+static void DynamicFormSectionSnapshotsFailClosedOnMalformedTopology()
+{
+    AssertThrows(
+        AppErrorCode.DYNAMIC_FORM_SECTION_CONFIG_INVALID,
+        () => DynamicFormSectionSnapshotBuilder.Build(TestDynamicFormSectionSnapshotTemplate(fieldsJson: "{")));
+    AssertThrows(
+        AppErrorCode.DYNAMIC_FORM_SECTION_CONFIG_INVALID,
+        () => DynamicFormSectionSnapshotBuilder.Build(TestDynamicFormSectionSnapshotTemplate(
+            sectionsJson: """[{ "id": "s_alpha", "title": "Alpha" }, { "id": "s_alpha", "title": "Again" }]""")));
+    AssertThrows(
+        AppErrorCode.DYNAMIC_FORM_SECTION_CONFIG_INVALID,
+        () => DynamicFormSectionSnapshotBuilder.Build(TestDynamicFormSectionSnapshotTemplate(
+            sectionsJson: """[{ "title": "Missing id" }]""")));
+    AssertThrows(
+        AppErrorCode.DYNAMIC_FORM_SECTION_CONFIG_INVALID,
+        () => DynamicFormSectionSnapshotBuilder.Build(TestDynamicFormSectionSnapshotTemplate(
+            fieldsJson: """[{ "id": "f_same", "sectionId": "s_alpha" }, { "id": "f_same", "sectionId": "s_beta" }]""")));
+    AssertThrows(
+        AppErrorCode.DYNAMIC_FORM_SECTION_CONFIG_INVALID,
+        () => DynamicFormSectionSnapshotBuilder.Build(TestDynamicFormSectionSnapshotTemplate(
+            blocksJson: """[{ "blockId": "b_same", "sectionId": "s_alpha" }, { "blockId": "b_same", "sectionId": "s_beta" }]""")));
+    AssertThrows(
+        AppErrorCode.DYNAMIC_FORM_SECTION_CONFIG_INVALID,
+        () => DynamicFormSectionSnapshotBuilder.Build(TestDynamicFormSectionSnapshotTemplate(
+            fieldsJson: """[{ "id": "f_orphan", "sectionId": "s_missing" }]""")));
+    AssertThrows(
+        AppErrorCode.DYNAMIC_FORM_SECTION_CONFIG_INVALID,
+        () => DynamicFormSectionSnapshotBuilder.Build(TestDynamicFormSectionSnapshotTemplate(
+            fieldsJson: """[{ "id": "f_missing_section" }]""")));
+    AssertThrows(
+        AppErrorCode.DYNAMIC_FORM_SECTION_CONFIG_INVALID,
+        () => DynamicFormSectionSnapshotBuilder.Build(TestDynamicFormSectionSnapshotTemplate(
+            blocksJson: """[{ "blockId": "b_orphan", "sectionId": "s_missing" }]""")));
+    AssertThrows(
+        AppErrorCode.DYNAMIC_FORM_SECTION_CONFIG_INVALID,
+        () => DynamicFormSectionSnapshotBuilder.Build(TestDynamicFormSectionSnapshotTemplate(
+            blocksJson: """[{ "blockId": "b_missing_section" }]""")));
+}
+
+static void AdvancedSummarySectionLookupUsesExactFormSnapshots()
+{
+    var template = TestDynamicFormSectionSnapshotTemplate();
+    var snapshots = DynamicFormSectionSnapshotBuilder.Build(template);
+    AssertTrue(snapshots.TryGetSection("s_alpha", out var alpha), "snapshot lookup should find an exact section");
+    AssertEqual("Alpha", alpha.Title, "snapshot lookup returned the wrong section");
+    AssertFalse(snapshots.TryGetSection("missing", out _), "snapshot lookup should not invent missing sections");
+    AssertThrows(
+        AppErrorCode.DYNAMIC_FORM_SECTION_CONFIG_INVALID,
+        () => snapshots.GetRequiredSection("missing"));
+
+    var configFields = (System.Collections.IEnumerable)InvokePrivateStatic<object>(
+        typeof(WorkAssignmentAdvancedSummaryConfigService),
+        "LoadSectionFields",
+        template,
+        "s_alpha");
+    var hierarchyFields = (System.Collections.IEnumerable)InvokePrivateStatic<object>(
+        typeof(WorkAssignmentAdvancedSummaryHierarchyService),
+        "LoadSectionFields",
+        template,
+        "s_alpha");
+    var expectedIds = new[] { "f_alpha", "f_alpha_2" };
+    AssertSequenceEqual(
+        expectedIds,
+        configFields.Cast<object>().Select(x => GetReflectedProperty<string>(x, "FieldId")!).ToArray(),
+        "advanced summary config lookup should use exact template snapshot fields");
+    AssertSequenceEqual(
+        expectedIds,
+        hierarchyFields.Cast<object>().Select(x => GetReflectedProperty<string>(x, "FieldId")!).ToArray(),
+        "advanced summary hierarchy lookup should use exact template snapshot fields");
+}
+
+static DynamicFormTemplate TestDynamicFormSectionSnapshotTemplate(
+    string? sectionsJson = null,
+    string? fieldsJson = null,
+    string? blocksJson = null)
+    => new()
+    {
+        Id = ObjectId(94),
+        Code = "DF_SECTION_SNAPSHOT",
+        Name = "Dynamic Form section snapshot",
+        SchemaVersion = 3,
+        SectionsJson = sectionsJson ?? """
+        [
+          { "id": "s_beta", "title": "Beta", "order": 2, "tagCodes": ["beta"] },
+          { "title": "Alpha", "order": 1, "id": "s_alpha", "description": "Alpha section" }
+        ]
+        """,
+        FieldsJson = fieldsJson ?? """
+        [
+          { "sectionId": "s_beta", "id": "f_beta", "type": "number", "name": "Beta" },
+          { "name": "Alpha one", "id": "f_alpha", "type": "shortText", "sectionId": "s_alpha" },
+          { "id": "f_alpha_2", "sectionId": "s_alpha", "name": "Alpha two", "type": "boolean" }
+        ]
+        """,
+        BlocksJson = blocksJson ?? """
+        [
+          { "blockId": "b_beta", "sectionId": "s_beta", "tableMode": "FIXED_GRID" },
+          { "tableMode": "FIXED_GRID", "blockId": "b_alpha", "sectionId": "s_alpha" }
+        ]
+        """,
+        IsDeleted = false
+    };
+
 static void ValidatesDynamicFormFieldDisplayName()
 {
     var serviceType = typeof(DynamicFormService);
@@ -2796,8 +5494,7 @@ static void ValidatesDynamicFormFieldDisplayName()
         """
         [
           { "id": "f1", "sectionId": "s1", "type": "number", "name": "Doanh thu" },
-          { "id": "f2", "sectionId": "s1", "type": "number", "name": "Chi phí", "key": "total" },
-          { "id": "f3", "sectionId": "s1", "type": "number", "name": "Lợi nhuận", "key": "total" }
+          { "id": "f2", "sectionId": "s1", "type": "number", "name": "Chi phí", "key": "total" }
         ]
         """,
         """
@@ -2808,7 +5505,19 @@ static void ValidatesDynamicFormFieldDisplayName()
     using var normalizedKeyDoc = JsonDocument.Parse(normalizedKeys!);
     AssertEqual("old_revenue", normalizedKeyDoc.RootElement[0].GetProperty("key").GetString(), "existing field key should be retained when UI omits it");
     AssertEqual("total", normalizedKeyDoc.RootElement[1].GetProperty("key").GetString(), "first requested field key should be kept");
-    AssertEqual("total_2", normalizedKeyDoc.RootElement[2].GetProperty("key").GetString(), "duplicate field key should be made unique");
+
+    AssertThrowsFromReflection(
+        AppErrorCode.DYNAMIC_FORM_FIELD_CONFIG_INVALID,
+        () => InvokePrivateStatic<string?>(
+            serviceType,
+            "NormalizeFieldPayload",
+            """
+            [
+              { "id": "f2", "sectionId": "s1", "type": "number", "name": "Chi phí", "key": "total" },
+              { "id": "f3", "sectionId": "s1", "type": "number", "name": "Lợi nhuận", "key": "total" }
+            ]
+            """,
+            null));
 
     AssertThrowsFromReflection(
         AppErrorCode.DYNAMIC_FORM_FIELD_NAME_INVALID,
@@ -2826,15 +5535,32 @@ static void ValidatesDynamicFormFieldDisplayName()
         "EnsureStatisticConfigOnlyChange",
         """
         [
-          { "id": "f3", "sectionId": "s1", "key": "number_1", "type": "number", "label": "Số", "isStatistic": true, "statisticLabelCodes": ["old"] }
+          { "id": "f3", "sectionId": "s1", "key": "number_1", "type": "number", "name": "Doanh thu", "isStatistic": false, "statisticLabelCodes": ["old"] }
         ]
         """,
         """
         [
-          { "id": "f3", "sectionId": "s1", "key": "number_1", "type": "number", "name": "Doanh thu kỳ này", "displayName": "Doanh thu kỳ này", "label": "Doanh thu kỳ này", "isStatistic": true, "statisticLabelCodes": ["revenue"] }
+          { "id": "f3", "sectionId": "s1", "key": "number_1", "type": "number", "name": "Doanh thu", "isStatistic": true, "statisticLabelCodes": ["revenue"] }
         ]
         """,
         "FieldsJson");
+
+    AssertThrowsFromReflection(
+        AppErrorCode.DYNAMIC_FORM_STATISTIC_CONFIG_STRUCTURE_INVALID,
+        () => InvokePrivateStatic<object?>(
+            serviceType,
+            "EnsureStatisticConfigOnlyChange",
+            """
+            [
+              { "id": "f3", "sectionId": "s1", "key": "number_1", "type": "number", "name": "Doanh thu", "isStatistic": true, "statisticLabelCodes": ["old"] }
+            ]
+            """,
+            """
+            [
+              { "id": "f3", "sectionId": "s1", "key": "number_1", "type": "number", "name": "Doanh thu kỳ này", "isStatistic": true, "statisticLabelCodes": ["revenue"] }
+            ]
+            """,
+            "FieldsJson"));
 
     InvokePrivateStatic<object?>(
         serviceType,
@@ -2967,6 +5693,241 @@ static void ValidatesDynamicFormFieldDisplayName()
             }));
 }
 
+static void AcceptsDynamicFormFieldSchemaContract()
+{
+    InvokePrivateStatic<object?>(
+        typeof(DynamicFormService),
+        "EnsureFieldSchemaContract",
+        """
+        [
+          {
+            "id": "f_short_fixed",
+            "sectionId": "s1",
+            "type": "shortText",
+            "valueSource": {
+              "sourceType": "FIXED_ENUM",
+              "options": [{ "code": "FIXED_A", "label": "Fixed A" }]
+            }
+          },
+          { "id": "f_long", "sectionId": "s1", "type": "longText" },
+          { "id": "f_rich", "sectionId": "s1", "type": "richText" },
+          { "id": "f_list", "sectionId": "s1", "type": "stringList" },
+          { "id": "f_number", "sectionId": "s1", "type": "number" },
+          { "id": "f_date", "sectionId": "s1", "type": "date" },
+          { "id": "f_full_date", "sectionId": "s1", "type": "fullDate" },
+          {
+            "id": "f_single_catalog",
+            "sectionId": "s1",
+            "type": "singleSelect",
+            "valueSource": { "sourceType": "ENUM_CATALOG", "catalogId": "catalog_1" }
+          },
+          {
+            "id": "f_multi_unit",
+            "sectionId": "s1",
+            "type": "multiSelect",
+            "valueSource": { "sourceType": "SYSTEM_UNIT" }
+          },
+          { "id": "f_boolean", "sectionId": "s1", "type": "boolean" },
+          {
+            "id": "f_short_user",
+            "sectionId": "s1",
+            "type": "shortText",
+            "valueSource": { "sourceType": "SYSTEM_USER" }
+          },
+          {
+            "id": "f_single_position",
+            "sectionId": "s1",
+            "type": "singleSelect",
+            "valueSource": { "sourceType": "SYSTEM_POSITION" }
+          },
+          {
+            "id": "f_multi_unit_type",
+            "sectionId": "s1",
+            "type": "multiSelect",
+            "valueSource": { "sourceType": "SYSTEM_UNIT_TYPE" }
+          }
+        ]
+        """,
+        """
+        [
+          { "id": "s1", "title": "Main section" }
+        ]
+        """);
+}
+
+static void RejectsUnknownDynamicFormFieldType()
+{
+    AssertThrowsFromReflection(
+        AppErrorCode.DYNAMIC_FORM_FIELD_CONFIG_INVALID,
+        () => InvokePrivateStatic<object?>(
+            typeof(DynamicFormService),
+            "EnsureFieldSchemaContract",
+            """
+            [
+              { "id": "f_unknown", "sectionId": "s1", "type": "currency" }
+            ]
+            """,
+            """
+            [
+              { "id": "s1", "title": "Main section" }
+            ]
+            """));
+}
+
+static void RejectsDuplicateDynamicFormFieldIdsAndOrphanSections()
+{
+    var serviceType = typeof(DynamicFormService);
+    const string sectionsJson = """
+        [
+          { "id": "s1", "title": "Main section" }
+        ]
+        """;
+
+    AssertThrowsFromReflection(
+        AppErrorCode.DYNAMIC_FORM_FIELD_CONFIG_INVALID,
+        () => InvokePrivateStatic<object?>(
+            serviceType,
+            "EnsureFieldSchemaContract",
+            """
+            [
+              { "id": "f_duplicate", "sectionId": "s1", "type": "number" },
+              { "id": "f_duplicate", "sectionId": "s1", "type": "date" }
+            ]
+            """,
+            sectionsJson));
+
+    AssertThrowsFromReflection(
+        AppErrorCode.DYNAMIC_FORM_FIELD_CONFIG_INVALID,
+        () => InvokePrivateStatic<object?>(
+            serviceType,
+            "EnsureFieldSchemaContract",
+            """
+            [
+              { "id": "f_orphan", "sectionId": "missing_section", "type": "number" }
+            ]
+            """,
+            sectionsJson));
+}
+
+static void RejectsDuplicateAndExcessiveDynamicFormFieldOptions()
+{
+    var serviceType = typeof(DynamicFormService);
+    const string sectionsJson = """
+        [
+          { "id": "s1", "title": "Main section" }
+        ]
+        """;
+
+    AssertThrowsFromReflection(
+        AppErrorCode.DYNAMIC_FORM_FIELD_CONFIG_INVALID,
+        () => InvokePrivateStatic<object?>(
+            serviceType,
+            "EnsureFieldSchemaContract",
+            """
+            [
+              {
+                "id": "f_duplicate_options",
+                "sectionId": "s1",
+                "type": "singleSelect",
+                "options": [
+                  { "code": "A", "label": "Option A" },
+                  { "code": "a", "label": "Option A duplicate" }
+                ]
+              }
+            ]
+            """,
+            sectionsJson));
+
+    AssertThrowsFromReflection(
+        AppErrorCode.DYNAMIC_FORM_FIELD_CONFIG_INVALID,
+        () => InvokePrivateStatic<object?>(
+            serviceType,
+            "EnsureFieldSchemaContract",
+            """
+            [
+              {
+                "id": "f_mismatched_fixed_options",
+                "sectionId": "s1",
+                "type": "shortText",
+                "options": [{ "code": "A", "label": "Field option" }],
+                "valueSource": {
+                  "sourceType": "FIXED_ENUM",
+                  "options": [{ "code": "B", "label": "Source option" }]
+                }
+              }
+            ]
+            """,
+            sectionsJson));
+
+    var options = new JsonArray();
+    for (var index = 0; index < 101; index++)
+    {
+        options.Add(new JsonObject
+        {
+            ["code"] = $"OPTION_{index}",
+            ["label"] = $"Option {index}"
+        });
+    }
+
+    var fields = new JsonArray
+    {
+        new JsonObject
+        {
+            ["id"] = "f_excessive_options",
+            ["sectionId"] = "s1",
+            ["type"] = "multiSelect",
+            ["options"] = options
+        }
+    };
+
+    AssertThrowsFromReflection(
+        AppErrorCode.DYNAMIC_FORM_LIMIT_EXCEEDED,
+        () => InvokePrivateStatic<object?>(
+            serviceType,
+            "EnsureFieldSchemaContract",
+            fields.ToJsonString(),
+            sectionsJson));
+}
+
+static void RejectsRichTextStatisticsAndInvalidDynamicFormValueSources()
+{
+    var serviceType = typeof(DynamicFormService);
+    const string sectionsJson = """
+        [
+          { "id": "s1", "title": "Main section" }
+        ]
+        """;
+
+    AssertThrowsFromReflection(
+        AppErrorCode.DYNAMIC_FORM_FIELD_CONFIG_INVALID,
+        () => InvokePrivateStatic<object?>(
+            serviceType,
+            "EnsureFieldSchemaContract",
+            """
+            [
+              { "id": "f_rich_stat", "sectionId": "s1", "type": "richText", "isStatistic": true }
+            ]
+            """,
+            sectionsJson));
+
+    AssertThrowsFromReflection(
+        AppErrorCode.DYNAMIC_FORM_FIELD_CONFIG_INVALID,
+        () => InvokePrivateStatic<object?>(
+            serviceType,
+            "EnsureFieldSchemaContract",
+            """
+            [
+              {
+                "id": "f_invalid_source",
+                "sectionId": "s1",
+                "type": "singleSelect",
+                "valueSource": { "sourceType": "REMOTE_API" }
+              }
+            ]
+            """,
+            sectionsJson));
+}
+
 static void BucketsShortTextFieldStatistics()
 {
     var serviceType = typeof(WorkReportFieldStatisticsService);
@@ -2976,7 +5937,7 @@ static void BucketsShortTextFieldStatistics()
         "ExtractStatisticFields",
         """
         [
-          { "id": "f_short", "sectionId": "s1", "key": "phan_loai_ngan", "type": "shortText", "name": "Phan loai ngan", "isStatistic": true, "statisticLabelCodes": ["short_label"] }
+          { "id": "f_short", "sectionId": "s1", "key": "phan_loai_ngan", "type": "shortText", "name": "Phan loai ngan", "isStatistic": true, "statisticLabelCodes": [" Short_Label ", "short_label"] }
         ]
         """);
 
@@ -2993,6 +5954,90 @@ static void BucketsShortTextFieldStatistics()
     AssertEqual("Nhom A", GetReflectedProperty<string>(rows[0], "BucketKey"), "shortText bucket key should be the trimmed value");
     AssertEqual("Nhom A", GetReflectedProperty<string>(rows[0], "BucketLabel"), "shortText bucket label should be the trimmed value");
     AssertEqual("TEXT_BUCKET", GetReflectedProperty<string>(rows[0], "ValueKind"), "shortText should be stored as a text bucket statistic");
+
+    var field = GetReflectedProperty<object>(rows[0], "Field");
+    AssertSequenceEqual(
+        new[] { "short_label" },
+        GetReflectedProperty<List<string>>(field, "StatisticLabelCodes"),
+        "field statistic labels should be normalized and preserved in projected values");
+}
+
+static void TableStatisticsKeepMetricsFromEligibleBlocks()
+{
+    var serviceType = typeof(WorkReportTableStatisticsService);
+    var mapType = serviceType.GetNestedType("MetricTargetMap", BindingFlags.NonPublic)
+        ?? throw new InvalidOperationException("MetricTargetMap helper type was not found.");
+    var map = Activator.CreateInstance(mapType, nonPublic: true)
+        ?? throw new InvalidOperationException("MetricTargetMap could not be created.");
+    var addTargets = serviceType.GetMethod(
+        "AddMetricTargetsFromBlockJson",
+        BindingFlags.NonPublic | BindingFlags.Static)
+        ?? throw new MissingMethodException(serviceType.Name, "AddMetricTargetsFromBlockJson");
+    var contains = mapType.GetMethod("Contains", BindingFlags.Public | BindingFlags.Instance)
+        ?? throw new MissingMethodException(mapType.Name, "Contains");
+
+    addTargets.Invoke(null, new object?[]
+    {
+        """
+        [
+          {
+            "blockId": "large",
+            "statisticsInputCellCount": 400,
+            "metricRules": [{ "metricKey": "large_metric" }]
+          },
+          {
+            "blockId": "small",
+            "statisticsInputCellCount": 1,
+            "metricRules": [{ "metricKey": "small_metric" }]
+          }
+        ]
+        """,
+        map
+    });
+
+    AssertFalse(
+        (bool)contains.Invoke(map, new object?[] { "large", "large_metric" })!,
+        "oversized block metrics should be excluded");
+    AssertTrue(
+        (bool)contains.Invoke(map, new object?[] { "small", "small_metric" })!,
+        "an oversized sibling block must not disable eligible block metrics");
+}
+
+static void TableStatisticsDoNotReviveDisabledCanonicalBlockFromLegacyJson()
+{
+    var serviceType = typeof(WorkReportTableStatisticsService);
+    var buildMap = serviceType.GetMethod(
+        "BuildMetricTargetMap",
+        BindingFlags.NonPublic | BindingFlags.Static)
+        ?? throw new MissingMethodException(serviceType.Name, "BuildMetricTargetMap");
+    var map = buildMap.Invoke(null, new object?[]
+    {
+        """
+        [
+          {
+            "blockId": "primary",
+            "statisticsDisabled": true,
+            "metricRules": [{ "metricKey": "canonical_metric" }]
+          }
+        ]
+        """,
+        """
+        {
+          "blockId": "primary",
+          "statisticsDisabled": false,
+          "metricRules": [{ "metricKey": "legacy_metric" }]
+        }
+        """
+    }) ?? throw new InvalidOperationException("Metric target map could not be built.");
+    var contains = map.GetType().GetMethod("Contains", BindingFlags.Public | BindingFlags.Instance)
+        ?? throw new MissingMethodException(map.GetType().Name, "Contains");
+
+    AssertFalse(
+        (bool)contains.Invoke(map, new object?[] { "primary", "canonical_metric" })!,
+        "disabled canonical block metrics should stay excluded");
+    AssertFalse(
+        (bool)contains.Invoke(map, new object?[] { "primary", "legacy_metric" })!,
+        "legacy duplicate must not revive a disabled canonical block");
 }
 
 static void AcceptsVerifiedExternalPayloadForStatisticProjection()
@@ -4179,6 +7224,52 @@ static void BasicSummaryRejectsTableMethodRules()
         }));
 }
 
+static void BasicSummaryRejectsIncompatibleFieldMethodRules()
+{
+    var serviceType = typeof(WorkAssignmentBasicSummaryService);
+    var normalizeRules = serviceType.GetMethod(
+        "NormalizeRules",
+        BindingFlags.NonPublic | BindingFlags.Static)
+        ?? throw new MissingMethodException(serviceType.Name, "NormalizeRules");
+
+    AssertThrowsFromReflection(
+        AppErrorCode.WORK_ASSIGNMENT_AGGREGATE_MODE_INVALID,
+        () => normalizeRules.Invoke(null, new object?[]
+        {
+            new List<WorkAssignmentBasicSummaryRuleDto>
+            {
+                new()
+                {
+                    TargetKind = "FIELD",
+                    TargetKey = "field:note",
+                    Operation = "PERCENTILE"
+                }
+            }
+        }));
+
+    var rules = new List<WorkAssignmentBasicSummaryRuleDto>
+    {
+        new()
+        {
+            TargetKind = "FIELD",
+            TargetKey = "field:note",
+            Operation = "SUM"
+        }
+    };
+
+    AssertThrowsFromReflection(
+        AppErrorCode.WORK_ASSIGNMENT_AGGREGATE_MODE_INVALID,
+        () => InvokePrivateStatic<string>(
+            serviceType,
+            "ResolveOperation",
+            rules,
+            "FIELD",
+            "field:note",
+            "note",
+            "TEXT",
+            "COUNT"));
+}
+
 static void BasicSummaryRefreshStatusControlsEnqueue()
 {
     var shouldEnqueue = typeof(WorkAssignmentBasicSummaryService).GetMethod(
@@ -4685,6 +7776,29 @@ static void StatisticDiffCompatibilityRejectsDataCategoryMismatch()
         "EnsureDataCategoryCompatible",
         "NUMBER",
         "NUMBER");
+}
+
+static void StatisticDiffAcceptsFieldStatisticLabelSelector()
+{
+    var normalized = InvokePrivateStatic<WorkReportStatisticDiffTargetDto>(
+        typeof(WorkReportStatisticDiffService),
+        "NormalizeTarget",
+        new WorkReportStatisticDiffTargetDto
+        {
+            SourceKind = WorkReportStatisticDiffSourceKinds.Field,
+            StatisticLabelCode = " Revenue_Total "
+        },
+        ObjectId(82),
+        "current");
+
+    AssertEqual(
+        "revenue_total",
+        normalized.StatisticLabelCode,
+        "field statistic label selector should be trimmed and normalized");
+    AssertEqual(
+        ObjectId(82),
+        normalized.DynamicFormTemplateId,
+        "field statistic label selector should keep the fallback dynamic form template");
 }
 
 static void AdvancedSummaryConfigHashIncludesSourceScope()

@@ -19,6 +19,8 @@ using tdtd_be.Models.Enums;
 using tdtd_be.Services.Common;
 using tdtd_be.Services;
 using tdtd_be.Services.DynamicFlows;
+using tdtd_be.Services.DynamicForms;
+using tdtd_be.Services.WorkAssignmentReports.Runtime;
 using tdtd_be.Services.WorkAssignments.Domain;
 using tdtd_be.Services.WorkAssignments.Internal;
 using tdtd_be.Services.WorkAssignments.Lookups;
@@ -45,6 +47,9 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
     private readonly INotificationService _notifications;
     private readonly IUnitSelectionService _unitSelection;
     private readonly IUserActionLogService _userActionLog;
+    private readonly IDynamicFlowDefinitionTransactionRunner _dynamicFlowTransactions;
+    private readonly IDynamicFlowRuntimeStateProjector _dynamicFlowRuntimeStateProjector;
+    private readonly IWorkReportLifecycleSeriesLockService _lifecycleSeriesLock;
     private readonly WorkAssignmentTargetScopePolicy _targetScopePolicy;
     private readonly MeAccessor _me;
     private readonly ILogger<WorkAssignmentService> _log;
@@ -65,6 +70,9 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
         INotificationService notifications,
         IUnitSelectionService unitSelection,
         IUserActionLogService userActionLog,
+        IDynamicFlowDefinitionTransactionRunner dynamicFlowTransactions,
+        IDynamicFlowRuntimeStateProjector dynamicFlowRuntimeStateProjector,
+        IWorkReportLifecycleSeriesLockService lifecycleSeriesLock,
         WorkAssignmentTargetScopePolicy targetScopePolicy,
         MeAccessor me,
         ILogger<WorkAssignmentService> log)
@@ -84,6 +92,9 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
         _notifications = notifications;
         _unitSelection = unitSelection;
         _userActionLog = userActionLog;
+        _dynamicFlowTransactions = dynamicFlowTransactions;
+        _dynamicFlowRuntimeStateProjector = dynamicFlowRuntimeStateProjector;
+        _lifecycleSeriesLock = lifecycleSeriesLock;
         _targetScopePolicy = targetScopePolicy;
         _me = me;
         _log = log;
@@ -325,6 +336,25 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
         var work = await _lookup.LoadWorkAsync(workId, ct);
 
         var normalizedReq = WorkAssignmentScheduleHelper.NormalizeRequest(req);
+        var flowInstanceId = await _ctx.DynamicFlowInstances
+            .Find(x => x.WorkId == workId && !x.IsDeleted)
+            .Project(x => x.Id)
+            .FirstOrDefaultAsync(ct);
+        if (!string.IsNullOrWhiteSpace(flowInstanceId))
+        {
+            throw AppExceptionFactory.Create(
+                AppErrorCode.DYNAMIC_FLOW_EXECUTION_BLOCKED_UNTIL_TARGET_PHASE,
+                new
+                {
+                    workId,
+                    flowInstanceId,
+                    command = string.IsNullOrWhiteSpace(normalizedReq.ParentAssignmentId)
+                        ? "CREATE_ROOT_ASSIGNMENT"
+                        : "CREATE_CHILD_ASSIGNMENT",
+                    reason = "DYNAMIC_FLOW_TOPOLOGY_MUTATION_BLOCKED_UNTIL_P6",
+                    blockedUntilPhase = "P6"
+                });
+        }
 
         // Unit assignment is the only place where virtual units change meaning:
         // selected VU ids are expanded to real descendant units, then mapped to mu_* accounts.
@@ -352,6 +382,19 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
                     AppErrorCode.WORK_ASSIGNMENT_PARENT_NOT_FOUND,
                     new { workId, parentAssignmentId = normalizedReq.ParentAssignmentId });
 
+            if (!string.IsNullOrWhiteSpace(parent.FlowInstanceId))
+            {
+                throw AppExceptionFactory.Create(
+                    AppErrorCode.DYNAMIC_FLOW_EXECUTION_BLOCKED_UNTIL_TARGET_PHASE,
+                    new
+                    {
+                        parentAssignmentId = parent.Id,
+                        flowInstanceId = parent.FlowInstanceId,
+                        command = "CREATE_CHILD_ASSIGNMENT",
+                        reason = "DYNAMIC_FLOW_TOPOLOGY_MUTATION_BLOCKED_UNTIL_P6",
+                        blockedUntilPhase = "P6"
+                    });
+            }
         }
 
         await EnsureCreateScopeOpenAsync(work, parent, actorUserId, ct);
@@ -377,6 +420,7 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
 
         var template = await _templateResolver.ResolveAsync(
             normalizedReq.DynamicFormTemplateId,
+            actorUserId,
             ct);
 
         var dynamicFormTemplate = await _ctx.DynamicFormTemplates
@@ -392,11 +436,19 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
         var autoApproveConditionJson = WorkAssignmentAutoApproveConditionNormalizer.NormalizeOrNull(
             normalizedReq.AutoApproveConditionJson,
             dynamicFormTemplate.FieldsJson);
+        var dynamicFormSchemaHash = dynamicFormTemplate.PublishedSchemaHash;
+        if (string.IsNullOrWhiteSpace(dynamicFormSchemaHash))
+        {
+            dynamicFormSchemaHash = DynamicFormPublishedSchemaSnapshotBuilder
+                .Build(dynamicFormTemplate)
+                .Sha256;
+        }
 
         EnsureNoCreateTimeSourceAssignments(dynamicFormDataSourceRulesJson);
 
         var assignees = await WorkAssignmentUserHelper.BuildAssigneesAsync(_ctx, normalizedReq.AssigneeUserIds, ct);
         await EnsureAssignmentTargetsAllowedAsync(actorUserId, assignees, ct);
+        var tenantPins = await ResolveAssignmentTenantPinsAsync(actorUserId, assignees, ct);
 
         var leaderWatchers = await WorkAssignmentUserHelper.BuildLeaderWatchersAsync(
             _ctx,
@@ -435,6 +487,11 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
             DynamicFormTemplateId = template.DynamicFormTemplateId,
             DynamicFormTemplateCode = template.DynamicFormTemplateCode,
             DynamicFormTemplateName = template.DynamicFormTemplateName,
+            DynamicFormFamilyId = string.IsNullOrWhiteSpace(dynamicFormTemplate.FamilyId)
+                ? dynamicFormTemplate.Id
+                : dynamicFormTemplate.FamilyId,
+            DynamicFormVersionNo = Math.Max(1, dynamicFormTemplate.VersionNo),
+            DynamicFormSchemaHash = dynamicFormSchemaHash,
             DynamicFormDataSourceRulesJson = dynamicFormDataSourceRulesJson,
             AutoApproveConditionJson = autoApproveConditionJson,
 
@@ -451,6 +508,8 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
             CompletedDate = null,
 
             Assignees = assignees,
+            IssuedByUnitId = tenantPins.IssuedByUnitId,
+            TargetUnitIds = tenantPins.TargetUnitIds,
             LeaderWatcherUserIds = leaderWatchers
                 .Select(x => x.UserId)
                 .Where(x => !string.IsNullOrWhiteSpace(x))
@@ -481,7 +540,50 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
             DueAtUtc = NormalizeDueDateUtc(normalizedReq.DueAtUtc),
         };
 
-        await _ctx.WorkAssignments.InsertOneAsync(entity, cancellationToken: ct);
+        await _dynamicFlowTransactions.ExecuteAsync(
+            async (session, transactionCt) =>
+            {
+                var workFilter = Builders<Work>.Filter;
+                var noRuntimeOwner =
+                    workFilter.Eq(x => x.DynamicFlowRuntimeInstanceId, null) |
+                    workFilter.Exists(x => x.DynamicFlowRuntimeInstanceId, false);
+                var legacyTopology =
+                    workFilter.Eq(x => x.AssignmentTopologyOwner, null) |
+                    workFilter.Exists(x => x.AssignmentTopologyOwner, false) |
+                    workFilter.Eq(
+                        x => x.AssignmentTopologyOwner,
+                        WorkAssignmentTopologyOwners.Legacy);
+                var claimed = await _ctx.Works.UpdateOneAsync(
+                    session,
+                    workFilter.Eq(x => x.Id, workId) &
+                    workFilter.Eq(x => x.IsDeleted, false) &
+                    noRuntimeOwner &
+                    legacyTopology,
+                    Builders<Work>.Update.Set(
+                        x => x.AssignmentTopologyOwner,
+                        WorkAssignmentTopologyOwners.Legacy),
+                    cancellationToken: transactionCt);
+                if (claimed.MatchedCount != 1)
+                {
+                    throw AppExceptionFactory.Create(
+                        AppErrorCode.DYNAMIC_FLOW_EXECUTION_BLOCKED_UNTIL_TARGET_PHASE,
+                        new
+                        {
+                            workId,
+                            command = isRootCreate
+                                ? "CREATE_ROOT_ASSIGNMENT"
+                                : "CREATE_CHILD_ASSIGNMENT",
+                            reason = "DYNAMIC_FLOW_TOPOLOGY_MUTATION_BLOCKED_UNTIL_P6",
+                            blockedUntilPhase = "P6"
+                        });
+                }
+
+                await _ctx.WorkAssignments.InsertOneAsync(
+                    session,
+                    entity,
+                    cancellationToken: transactionCt);
+            },
+            ct);
 
         if (parent is null)
         {
@@ -574,6 +676,20 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
                 AppErrorCode.WORK_ASSIGNMENT_DATA_SOURCE_RULES_FORBIDDEN,
                 new { assignmentId = id });
 
+        if (!string.IsNullOrWhiteSpace(entity.FlowInstanceId))
+        {
+            throw AppExceptionFactory.Create(
+                AppErrorCode.DYNAMIC_FLOW_EXECUTION_BLOCKED_UNTIL_TARGET_PHASE,
+                new
+                {
+                    assignmentId = entity.Id,
+                    flowInstanceId = entity.FlowInstanceId,
+                    command = "UPDATE_DATA_SOURCE_RULES",
+                    reason = "DYNAMIC_FLOW_MAPPING_MUTATION_BLOCKED_UNTIL_P7",
+                    blockedUntilPhase = "P7"
+                });
+        }
+
         await EnsureAssignmentMutationScopeOpenAsync(entity, actorUserId, ct);
 
         var hasData = await _dataGuard.HasAssignmentDataAsync(entity.Id!, ct);
@@ -641,6 +757,20 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
                 AppErrorCode.WORK_ASSIGNMENT_DATA_SOURCE_RULES_FORBIDDEN,
                 new { assignmentId = id });
 
+        if (!string.IsNullOrWhiteSpace(entity.FlowInstanceId))
+        {
+            throw AppExceptionFactory.Create(
+                AppErrorCode.DYNAMIC_FLOW_EXECUTION_BLOCKED_UNTIL_TARGET_PHASE,
+                new
+                {
+                    assignmentId = entity.Id,
+                    flowInstanceId = entity.FlowInstanceId,
+                    command = "UPDATE_AUTO_APPROVE_CONDITION",
+                    reason = "DYNAMIC_FLOW_RUNTIME_CONFIG_MUTATION_BLOCKED_UNTIL_P6",
+                    blockedUntilPhase = "P6"
+                });
+        }
+
         await EnsureAssignmentMutationScopeOpenAsync(entity, actorUserId, ct);
 
         var dynamicFormTemplate = await _ctx.DynamicFormTemplates
@@ -697,6 +827,25 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
                 AppErrorCode.WORK_ASSIGNMENT_COMPLETION_FORBIDDEN,
                 new { assignmentId = id, actorUserId });
 
+        if (!entity.IsActive)
+        {
+            throw AppExceptionFactory.Create(
+                AppErrorCode.WORK_ASSIGNMENT_COMPLETION_PENDING_REPORTS,
+                new
+                {
+                    assignmentId = id,
+                    reason = "WORK_ASSIGNMENT_INACTIVE"
+                });
+        }
+
+        if (entity.CompletedAtUtc.HasValue &&
+            string.IsNullOrWhiteSpace(entity.FlowInstanceId))
+        {
+            await ConvergeCompletedAssignmentAsync(entity, actorUserId, ct);
+            var replayHasData = await _dataGuard.HasAssignmentDataAsync(entity.Id!, ct);
+            return ToDetailResponse(entity, replayHasData);
+        }
+
         var work = await _ctx.Works
             .Find(x => x.Id == entity.WorkId && !x.IsDeleted)
             .FirstOrDefaultAsync(ct)
@@ -711,40 +860,140 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
 
         await EnsureNoCompletedAncestorAsync(entity, actorUserId, ct);
 
-        var now = DateTime.UtcNow;
-        var completedDate = (req?.CompletedDate ?? now).Date;
-        await EnsureAssignmentCompletionReadyAsync(entity, work, completedDate, actorUserId, ct);
-
-        var rs = await _ctx.WorkAssignments.UpdateOneAsync(
-            x => x.Id == id && !x.IsDeleted,
-            Builders<WorkAssignment>.Update
-                .Set(x => x.CompletedDate, completedDate)
-                .Set(x => x.CompletedAtUtc, now)
-                .Set(x => x.CompletedByUserId, actorUserId)
-                .Set(x => x.ProgressStatus, (int)WorkAssignmentProgressStatus.Completed)
-                .Set(x => x.ProgressStatusUpdatedAtUtc, now)
-                .Set(x => x.UpdatedAtUtc, now)
-                .Set(x => x.UpdatedByUserId, actorUserId),
-            cancellationToken: ct);
-
-        if (rs.ModifiedCount > 0)
+        WorkReportLifecycleSeriesLease? completionLease = null;
+        try
         {
-            entity.CompletedDate = completedDate;
-            entity.CompletedAtUtc = now;
-            entity.CompletedByUserId = actorUserId;
-            entity.ProgressStatus = (int)WorkAssignmentProgressStatus.Completed;
-            entity.ProgressStatusUpdatedAtUtc = now;
-            entity.UpdatedAtUtc = now;
-            entity.UpdatedByUserId = actorUserId;
+            if (!string.IsNullOrWhiteSpace(entity.FlowInstanceId))
+            {
+                completionLease = await _lifecycleSeriesLock.AcquireAsync(
+                    entity.Id!,
+                    WorkReportLifecycleSeriesOperations.AssignmentComplete,
+                    ct);
+                entity = await _ctx.WorkAssignments
+                    .Find(x => x.Id == id && !x.IsDeleted)
+                    .FirstOrDefaultAsync(ct);
+                if (entity is null)
+                    return null;
+            }
 
-            await DisableRuntimeForCompletedAssignmentScopeAsync(entity, actorUserId, now, ct);
-            await _docRoleReadModelProjection.RebuildAssignmentAsync(id, actorUserId, ct);
-            await _statusRepair.RebuildWorkTreeAsync(entity.WorkId, ct);
-            await RebuildReportPeriodProjectionsForAssignmentScopeAsync(entity, actorUserId, ct);
+            if (!entity.CompletedAtUtc.HasValue)
+            {
+                var now = DateTime.UtcNow;
+                var completedDate = (req?.CompletedDate ?? now).Date;
+                await EnsureAssignmentCompletionReadyAsync(
+                    entity,
+                    work,
+                    completedDate,
+                    actorUserId,
+                    ct);
+                if (!await _dynamicFlowRuntimeStateProjector
+                        .IsAssignmentCompletionProjectionReadyAsync(entity.Id!, ct))
+                {
+                    throw AppExceptionFactory.Create(
+                        AppErrorCode.WORK_ASSIGNMENT_COMPLETION_PENDING_REPORTS,
+                        new
+                        {
+                            assignmentId = entity.Id,
+                            reason = "DYNAMIC_FLOW_APPROVED_PROJECTION_PENDING"
+                        });
+                }
+
+                var completionFilter =
+                    Builders<WorkAssignment>.Filter.Eq(x => x.Id, id) &
+                    Builders<WorkAssignment>.Filter.Eq(x => x.IsDeleted, false) &
+                    Builders<WorkAssignment>.Filter.Eq(x => x.IsActive, true) &
+                    Builders<WorkAssignment>.Filter.Eq(x => x.CompletedAtUtc, null) &
+                    Builders<WorkAssignment>.Filter.Eq(
+                        x => x.DynamicFlowMaterializationRevision,
+                        entity.DynamicFlowMaterializationRevision);
+                if (completionLease is not null)
+                {
+                    await completionLease.RenewAsync(ct);
+                    completionFilter &=
+                        Builders<WorkAssignment>.Filter.Eq(
+                            x => x.ReportLifecycleLeaseId,
+                            completionLease.LeaseId);
+                }
+                var rs = await _ctx.WorkAssignments.UpdateOneAsync(
+                    completionFilter,
+                    Builders<WorkAssignment>.Update
+                        .Set(x => x.CompletedDate, completedDate)
+                        .Set(x => x.CompletedAtUtc, now)
+                        .Set(x => x.CompletedByUserId, actorUserId)
+                        .Set(
+                            x => x.ProgressStatus,
+                            (int)WorkAssignmentProgressStatus.Completed)
+                        .Set(x => x.ProgressStatusUpdatedAtUtc, now)
+                        .Set(x => x.UpdatedAtUtc, now)
+                        .Set(x => x.UpdatedByUserId, actorUserId)
+                        .Inc(x => x.DynamicFlowMaterializationRevision, 1),
+                    cancellationToken: ct);
+
+                if (rs.ModifiedCount > 0)
+                {
+                    entity.CompletedDate = completedDate;
+                    entity.CompletedAtUtc = now;
+                    entity.CompletedByUserId = actorUserId;
+                    entity.ProgressStatus =
+                        (int)WorkAssignmentProgressStatus.Completed;
+                    entity.ProgressStatusUpdatedAtUtc = now;
+                    entity.UpdatedAtUtc = now;
+                    entity.UpdatedByUserId = actorUserId;
+                    entity.DynamicFlowMaterializationRevision++;
+                }
+                else
+                {
+                    entity = await _ctx.WorkAssignments
+                        .Find(x => x.Id == id && !x.IsDeleted)
+                        .FirstOrDefaultAsync(ct);
+                    if (entity?.CompletedAtUtc is null)
+                    {
+                        throw new InvalidOperationException(
+                            "WORK_ASSIGNMENT_COMPLETION_REVISION_CONFLICT");
+                    }
+                }
+            }
+
+            if (completionLease is not null)
+                await completionLease.RenewAsync(ct);
+            await ConvergeCompletedAssignmentAsync(entity, actorUserId, ct);
+        }
+        finally
+        {
+            if (completionLease is not null)
+                await completionLease.DisposeAsync();
         }
 
         var hasData = await _dataGuard.HasAssignmentDataAsync(entity.Id!, ct);
         return ToDetailResponse(entity, hasData);
+    }
+
+    private async Task ConvergeCompletedAssignmentAsync(
+        WorkAssignment assignment,
+        string actorUserId,
+        CancellationToken ct)
+    {
+        var completedAtUtc = assignment.CompletedAtUtc
+            ?? throw new InvalidOperationException(
+                "WORK_ASSIGNMENT_COMPLETION_NOT_COMMITTED");
+        await DisableRuntimeForCompletedAssignmentScopeAsync(
+            assignment,
+            actorUserId,
+            completedAtUtc,
+            ct);
+        await _docRoleReadModelProjection.RebuildAssignmentAsync(
+            assignment.Id!,
+            actorUserId,
+            ct);
+        await _statusRepair.RebuildWorkTreeAsync(assignment.WorkId, ct);
+        await RebuildReportPeriodProjectionsForAssignmentScopeAsync(
+            assignment,
+            actorUserId,
+            ct);
+        await _dynamicFlowRuntimeStateProjector.ProjectAssignmentCompletionAsync(
+            assignment.Id!,
+            actorUserId,
+            ct);
     }
 
     private async Task EnsureAssignmentCompletionReadyAsync(
@@ -916,6 +1165,20 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
         if (entity is null)
             return false;
 
+        if (!string.IsNullOrWhiteSpace(entity.FlowInstanceId))
+        {
+            throw AppExceptionFactory.Create(
+                AppErrorCode.DYNAMIC_FLOW_EXECUTION_BLOCKED_UNTIL_TARGET_PHASE,
+                new
+                {
+                    assignmentId = entity.Id,
+                    flowInstanceId = entity.FlowInstanceId,
+                    command = "DEACTIVATE_ASSIGNMENT",
+                    reason = "DYNAMIC_FLOW_ASSIGNMENT_MUTATION_BLOCKED_UNTIL_P6",
+                    blockedUntilPhase = "P6"
+                });
+        }
+
         if (!entity.IsActive)
             return true;
 
@@ -923,38 +1186,91 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
 
         var now = DateTime.UtcNow;
 
-        var rs = await _ctx.WorkAssignments.UpdateOneAsync(
-            x => x.Id == id &&
-                 x.CreatedByUserId == actorUserId &&
-                 !x.IsDeleted &&
-                 x.IsActive,
-            Builders<WorkAssignment>.Update
-                .Set(x => x.IsActive, false)
-                .Set(x => x.UpdatedAtUtc, now)
-                .Set(x => x.UpdatedByUserId, actorUserId),
-            cancellationToken: ct);
+        var mutation = await _dynamicFlowTransactions.ExecuteAsync<(
+            bool Changed,
+            List<string> PeriodIds)>(
+            async (session, transactionCt) =>
+            {
+                var assignmentResult = await _ctx.WorkAssignments.UpdateOneAsync(
+                    session,
+                    x => x.Id == id &&
+                         x.WorkId == entity.WorkId &&
+                         x.UpdatedAtUtc == entity.UpdatedAtUtc &&
+                         x.CreatedByUserId == actorUserId &&
+                         !x.IsDeleted &&
+                         x.IsActive &&
+                         x.FlowInstanceId == null,
+                    Builders<WorkAssignment>.Update
+                        .Set(x => x.IsActive, false)
+                        .Set(x => x.UpdatedAtUtc, now)
+                        .Set(x => x.UpdatedByUserId, actorUserId),
+                    cancellationToken: transactionCt);
 
-        if (rs.ModifiedCount > 0)
+                // Only a canonical state transition to inactive is a replay.
+                // A generic CAS miss can also be an unrelated concurrent
+                // assignment update, so fail closed instead of reporting a
+                // successful deactivation that never happened.
+                if (assignmentResult.MatchedCount != 1 ||
+                    assignmentResult.ModifiedCount != 1)
+                {
+                    var canonical = await _ctx.WorkAssignments
+                        .Find(
+                            session,
+                            x => x.Id == id &&
+                                 x.WorkId == entity.WorkId &&
+                                 x.CreatedByUserId == actorUserId &&
+                                 !x.IsDeleted)
+                        .FirstOrDefaultAsync(transactionCt);
+                    if (canonical is not null &&
+                        !canonical.IsActive &&
+                        string.IsNullOrWhiteSpace(canonical.FlowInstanceId))
+                    {
+                        return (false, new List<string>());
+                    }
+
+                    throw new InvalidOperationException(
+                        "P9_ASSIGNMENT_DEACTIVATE_CAS_LOST");
+                }
+
+                var periodIds = await _ctx.WorkReportPeriods
+                    .Find(
+                        session,
+                        x => x.WorkAssignmentId == id && !x.IsDeleted)
+                    .Project(x => x.Id)
+                    .ToListAsync(transactionCt);
+
+                // Membership visibility changes with the assignment in this
+                // same owner transaction. Lifecycle authority/time/form pins
+                // are deliberately left untouched.
+                await _ctx.WorkReportPeriods.UpdateManyAsync(
+                    session,
+                    x => x.WorkAssignmentId == id &&
+                         !x.IsDeleted &&
+                         x.IsActive,
+                    Builders<WorkReportPeriod>.Update
+                        .Set(x => x.IsActive, false)
+                        .Set(x => x.UpdatedAtUtc, now)
+                        .Set(x => x.UpdatedByUserId, actorUserId),
+                    cancellationToken: transactionCt);
+
+                await WorkDirectSourceRevisionFence.IncrementAsync(
+                    _ctx,
+                    session,
+                    entity.WorkId,
+                    transactionCt);
+
+                return (true, periodIds);
+            },
+            ct);
+
+        if (mutation.Changed)
         {
             await _docRoleReadModelProjection.RebuildAssignmentAsync(id, actorUserId, ct);
             await _binding.DisableByAssignmentAsync(id, actorUserId, ct);
             await _queueService.DisableByAssignmentAsync(id, actorUserId, ct);
             await _materializeJob.DisableByAssignmentIdAsync(id, actorUserId, ct);
 
-            var periodIds = await _ctx.WorkReportPeriods
-                .Find(x => x.WorkAssignmentId == id && !x.IsDeleted)
-                .Project(x => x.Id)
-                .ToListAsync(ct);
-
-            await _ctx.WorkReportPeriods.UpdateManyAsync(
-                x => x.WorkAssignmentId == id && !x.IsDeleted,
-                Builders<WorkReportPeriod>.Update
-                    .Set(x => x.IsActive, false)
-                    .Set(x => x.UpdatedAtUtc, now)
-                    .Set(x => x.UpdatedByUserId, actorUserId),
-                cancellationToken: ct);
-
-            foreach (var periodId in periodIds.Where(x => !string.IsNullOrWhiteSpace(x)))
+            foreach (var periodId in mutation.PeriodIds.Where(x => !string.IsNullOrWhiteSpace(x)))
                 await _docRoleReadModelProjection.RebuildReportPeriodAsync(periodId, actorUserId, ct);
 
             await _statusRepair.RebuildWorkTreeAsync(entity.WorkId, ct);
@@ -981,6 +1297,20 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
         if (entity is null)
             return false;
 
+        if (!string.IsNullOrWhiteSpace(entity.FlowInstanceId))
+        {
+            throw AppExceptionFactory.Create(
+                AppErrorCode.DYNAMIC_FLOW_EXECUTION_BLOCKED_UNTIL_TARGET_PHASE,
+                new
+                {
+                    assignmentId = entity.Id,
+                    flowInstanceId = entity.FlowInstanceId,
+                    command = "ACTIVATE_ASSIGNMENT",
+                    reason = "DYNAMIC_FLOW_ASSIGNMENT_MUTATION_BLOCKED_UNTIL_P6",
+                    blockedUntilPhase = "P6"
+                });
+        }
+
         if (entity.IsActive)
             return true;
 
@@ -1001,18 +1331,83 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
 
         var now = DateTime.UtcNow;
 
-        var rs = await _ctx.WorkAssignments.UpdateOneAsync(
-            x => x.Id == id &&
-                 x.CreatedByUserId == actorUserId &&
-                 !x.IsDeleted &&
-                 !x.IsActive,
-            Builders<WorkAssignment>.Update
-                .Set(x => x.IsActive, true)
-                .Set(x => x.UpdatedAtUtc, now)
-                .Set(x => x.UpdatedByUserId, actorUserId),
-            cancellationToken: ct);
+        var mutation = await _dynamicFlowTransactions.ExecuteAsync<(
+            bool Changed,
+            List<string> PeriodIds)>(
+            async (session, transactionCt) =>
+            {
+                var assignmentResult = await _ctx.WorkAssignments.UpdateOneAsync(
+                    session,
+                    x => x.Id == id &&
+                         x.WorkId == entity.WorkId &&
+                         x.UpdatedAtUtc == entity.UpdatedAtUtc &&
+                         x.CreatedByUserId == actorUserId &&
+                         !x.IsDeleted &&
+                         !x.IsActive &&
+                         x.FlowInstanceId == null,
+                    Builders<WorkAssignment>.Update
+                        .Set(x => x.IsActive, true)
+                        .Set(x => x.UpdatedAtUtc, now)
+                        .Set(x => x.UpdatedByUserId, actorUserId),
+                    cancellationToken: transactionCt);
 
-        if (rs.ModifiedCount > 0)
+                // Preserve idempotency only when the canonical assignment is
+                // already active. An unrelated UpdatedAtUtc change is not an
+                // activation replay and must fail closed.
+                if (assignmentResult.MatchedCount != 1 ||
+                    assignmentResult.ModifiedCount != 1)
+                {
+                    var canonical = await _ctx.WorkAssignments
+                        .Find(
+                            session,
+                            x => x.Id == id &&
+                                 x.WorkId == entity.WorkId &&
+                                 x.CreatedByUserId == actorUserId &&
+                                 !x.IsDeleted)
+                        .FirstOrDefaultAsync(transactionCt);
+                    if (canonical is not null &&
+                        canonical.IsActive &&
+                        string.IsNullOrWhiteSpace(canonical.FlowInstanceId))
+                    {
+                        return (false, new List<string>());
+                    }
+
+                    throw new InvalidOperationException(
+                        "P9_ASSIGNMENT_ACTIVATE_CAS_LOST");
+                }
+
+                var periodIds = await _ctx.WorkReportPeriods
+                    .Find(
+                        session,
+                        x => x.WorkAssignmentId == id && !x.IsDeleted)
+                    .Project(x => x.Id)
+                    .ToListAsync(transactionCt);
+
+                // Restore only membership visibility. Lifecycle authority,
+                // time windows and form/config pins remain byte-for-byte under
+                // their existing owners.
+                await _ctx.WorkReportPeriods.UpdateManyAsync(
+                    session,
+                    x => x.WorkAssignmentId == id &&
+                         !x.IsDeleted &&
+                         !x.IsActive,
+                    Builders<WorkReportPeriod>.Update
+                        .Set(x => x.IsActive, true)
+                        .Set(x => x.UpdatedAtUtc, now)
+                        .Set(x => x.UpdatedByUserId, actorUserId),
+                    cancellationToken: transactionCt);
+
+                await WorkDirectSourceRevisionFence.IncrementAsync(
+                    _ctx,
+                    session,
+                    entity.WorkId,
+                    transactionCt);
+
+                return (true, periodIds);
+            },
+            ct);
+
+        if (mutation.Changed)
         {
             entity.IsActive = true;
             entity.UpdatedAtUtc = now;
@@ -1021,6 +1416,15 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
             await _docRole.UpsertWorkAssignmentRolesAsync(entity, ct);
             await _docRole.RebuildWorkParticipantRolesFromAssignmentsAsync(entity.WorkId, actorUserId, ct);
             await _binding.RebuildForAssignmentAsync(entity, actorUserId, ct);
+
+            foreach (var periodId in mutation.PeriodIds.Where(
+                         value => !string.IsNullOrWhiteSpace(value)))
+            {
+                await _docRoleReadModelProjection.RebuildReportPeriodAsync(
+                    periodId,
+                    actorUserId,
+                    ct);
+            }
 
             await _materializeJob.EnqueueOrTouchAsync(entity, actorUserId, ct);
             await _statusRepair.RebuildWorkTreeAsync(entity.WorkId, ct);
@@ -1118,6 +1522,37 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
             unitById,
             actorUnitHasAssignableDescendants,
             _targetScopePolicy);
+    }
+
+    private async Task<(string IssuedByUnitId, List<string> TargetUnitIds)> ResolveAssignmentTenantPinsAsync(
+        string actorUserId,
+        IReadOnlyCollection<UserRef> assignees,
+        CancellationToken ct)
+    {
+        var actorUnitId = await _ctx.Users
+            .Find(x => x.Id == actorUserId && !x.IsDeleted)
+            .Project(x => x.UnitId)
+            .FirstOrDefaultAsync(ct);
+
+        if (!ObjectId.TryParse(actorUnitId, out var issuedByUnitId))
+            throw AppExceptionFactory.Unauthorized(
+                AppErrorCode.WORK_ASSIGNMENT_ACTOR_REQUIRED,
+                new { actorUserId, reason = "ACTOR_UNIT_INVALID" });
+
+        var targetUnitIds = (assignees ?? Array.Empty<UserRef>())
+            .Select(x => x.UnitId)
+            .Where(x => ObjectId.TryParse(x, out _))
+            .Select(x => ObjectId.Parse(x!).ToString())
+            .Distinct(StringComparer.Ordinal)
+            .OrderBy(x => x, StringComparer.Ordinal)
+            .ToList();
+
+        if (targetUnitIds.Count == 0)
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_USER_UNIT_INVALID,
+                new { actorUserId, reason = "TARGET_UNIT_INVALID" });
+
+        return (issuedByUnitId.ToString(), targetUnitIds);
     }
 
     private async Task<bool> HasAssignableDescendantUnitAsync(Unit actorUnit, CancellationToken ct)
@@ -1692,6 +2127,9 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
             DynamicFormTemplateId = detail.DynamicFormTemplateId,
             DynamicFormTemplateCode = detail.DynamicFormTemplateCode,
             DynamicFormTemplateName = detail.DynamicFormTemplateName,
+            DynamicFormFamilyId = detail.DynamicFormFamilyId,
+            DynamicFormVersionNo = detail.DynamicFormVersionNo,
+            DynamicFormSchemaHash = detail.DynamicFormSchemaHash,
             DynamicFormDataSourceRulesJson = detail.DynamicFormDataSourceRulesJson,
             AutoApproveConditionJson = detail.AutoApproveConditionJson,
 
@@ -1776,6 +2214,9 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
             DynamicFormTemplateId = entity.DynamicFormTemplateId,
             DynamicFormTemplateCode = entity.DynamicFormTemplateCode,
             DynamicFormTemplateName = entity.DynamicFormTemplateName,
+            DynamicFormFamilyId = entity.DynamicFormFamilyId,
+            DynamicFormVersionNo = entity.DynamicFormVersionNo,
+            DynamicFormSchemaHash = entity.DynamicFormSchemaHash,
             DynamicFormDataSourceRulesJson = entity.DynamicFormDataSourceRulesJson,
             AutoApproveConditionJson = entity.AutoApproveConditionJson,
 

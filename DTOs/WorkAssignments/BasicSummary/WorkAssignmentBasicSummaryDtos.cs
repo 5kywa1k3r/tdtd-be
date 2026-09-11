@@ -1,4 +1,128 @@
+using System.Text.Json.Serialization;
+using tdtd_be.DTOs.StatisticsConfiguration;
+
 namespace tdtd_be.DTOs.WorkAssignments.BasicSummary;
+
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record WorkAssignmentBasicSummaryConfigPayload(
+    WorkAssignmentBasicSummarySourceScopePayload? SourceScope,
+    WorkAssignmentBasicSummaryPeriodRulePayload? PeriodRule,
+    IReadOnlyList<string>? GroupingHints,
+    WorkAssignmentBasicSummaryDetailHintsPayload? DetailHints,
+    IReadOnlyList<WorkAssignmentBasicSummaryTargetPayload>? Targets);
+
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record WorkAssignmentBasicSummarySourceScopePayload(
+    string? Mode,
+    string? FlowInstanceId,
+    string? FlowStepId,
+    string? FlowBranchId,
+    string? FlowEffectiveStatus);
+
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record WorkAssignmentBasicSummaryPeriodRulePayload(
+    string? Mode,
+    string? PeriodKey,
+    string? PeriodKeyFrom,
+    string? PeriodKeyTo);
+
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record WorkAssignmentBasicSummaryDetailHintsPayload(
+    bool? IncludeSourceRows,
+    int? MaxTextChars);
+
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record WorkAssignmentBasicSummaryTargetPayload(
+    string? ConceptKind,
+    string? ConceptKey,
+    string? DataType,
+    string? Operation);
+
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record WorkAssignmentBasicSummaryEmptyCommandPayload();
+
+public sealed record WorkAssignmentBasicSummaryConfigReadback(
+    StatConfigIdentity Identity,
+    WorkAssignmentBasicSummaryConfigPayload Payload,
+    StatConfigPermissionSet Permissions,
+    string RuntimeEligibility,
+    bool IsVirtualEmpty,
+    string? PreviousVersionId,
+    WorkAssignmentBasicSummaryMeanContract MeanContract,
+    IReadOnlyList<WorkAssignmentBasicSummaryConfigVersionDto> Versions,
+    string? ReceiptId);
+
+public sealed record WorkAssignmentBasicSummaryConfigVersionDto(
+    string VersionId,
+    string? PreviousVersionId,
+    int VersionNo,
+    long Revision,
+    string Status,
+    string ConfigHash,
+    IReadOnlyList<string> DependencyPins,
+    WorkAssignmentBasicSummaryConfigPayload Payload,
+    DateTime CreatedAtUtc,
+    DateTime? LockedAtUtc);
+
+public sealed record WorkAssignmentBasicSummaryConfigVersionsResult(
+    IReadOnlyList<WorkAssignmentBasicSummaryConfigVersionDto> Items);
+
+public sealed record WorkAssignmentBasicSummaryMeanContract(
+    string Formula,
+    bool MetadataOnly);
+
+public static class WorkAssignmentBasicSummaryConfigContract
+{
+    public const string RuntimeEligibilityBlockedUntilP9 =
+        "BLOCKED_UNTIL_P9";
+    public const string MeanFormula = "sum/numericValueCount";
+    public const int MinimumMaxTextChars = 1000;
+    public const int MaximumMaxTextChars = 100000;
+
+    public const string DirectChildrenOrSelf =
+        "DIRECT_CHILDREN_OR_SELF";
+    public const string DirectChildren = "DIRECT_CHILDREN";
+    public const string Self = "SELF";
+    public const string FlowBranch = "FLOW_BRANCH";
+    public const string FlowStep = "FLOW_STEP";
+    public const string FlowEffectivePath = "FLOW_EFFECTIVE_PATH";
+    public const string FlowFinal = "FLOW_FINAL";
+
+    public const string Effective = "EFFECTIVE";
+    public const string Invalidated = "INVALIDATED";
+    public const string Terminated = "TERMINATED";
+    public const string Any = "ANY";
+
+    public const string AllPeriods = "ALL_PERIODS";
+    public const string SinglePeriod = "SINGLE_PERIOD";
+    public const string PeriodRange = "PERIOD_RANGE";
+
+    public const string Unit = "UNIT";
+    public const string Assignment = "ASSIGNMENT";
+    public const string Period = "PERIOD";
+
+    public const string Field = "FIELD";
+    public const string TableMetric = "TABLE_METRIC";
+    public const string RowLabel = "ROW_LABEL";
+
+    public const string Number = "NUMBER";
+    public const string Date = "DATE";
+    public const string Boolean = "BOOLEAN";
+    public const string Choice = "CHOICE";
+    public const string Text = "TEXT";
+
+    public const string Sum = "SUM";
+    public const string Minimum = "MIN";
+    public const string Maximum = "MAX";
+    public const string Mean = "MEAN";
+    public const string Count = "COUNT";
+    public const string MinimumDate = "MIN_DATE";
+    public const string MaximumDate = "MAX_DATE";
+    public const string TrueCount = "TRUE_COUNT";
+    public const string FalseCount = "FALSE_COUNT";
+    public const string BucketCount = "BUCKET_COUNT";
+    public const string Join = "JOIN";
+}
 
 public sealed class WorkAssignmentBasicSummaryRequest
 {
@@ -123,6 +247,18 @@ public sealed class WorkAssignmentBasicSummaryMetaDto
     public DateTime? CalculationStartedAtUtc { get; set; }
     public DateTime? CalculationFinishedAtUtc { get; set; }
     public string? CalculationError { get; set; }
+    public string ConfigId { get; set; } = string.Empty;
+    public string ConfigVersionId { get; set; } = string.Empty;
+    public int ConfigVersionNo { get; set; }
+    public long ConfigRevision { get; set; }
+    public string ConfigHash { get; set; } = string.Empty;
+    public List<string> ConfigDependencyPins { get; set; } = new();
+    public string CandidateChainId { get; set; } = string.Empty;
+    public string CandidatePromptId { get; set; } = string.Empty;
+    public int CandidateStage { get; set; }
+    public string CandidateCatalogRawSha256 { get; set; } = string.Empty;
+    public string CandidateCatalogSemanticSha256 { get; set; } = string.Empty;
+    public string CandidateStageLockSha256 { get; set; } = string.Empty;
 }
 
 public sealed class WorkAssignmentBasicSummaryItemDto

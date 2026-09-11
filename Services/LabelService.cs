@@ -1,4 +1,5 @@
 using System.Text.RegularExpressions;
+using Microsoft.Extensions.Configuration;
 using MongoDB.Bson;
 using MongoDB.Driver;
 using tdtd_be.Common.Auth;
@@ -31,17 +32,24 @@ public sealed class LabelService : ILabelService
     private readonly MeAccessor _me;
     private readonly IWorkReportStatisticRebuildJobService _statisticRebuildJobs;
     private readonly ILabelEnumCatalogService _enumCatalogs;
+    private readonly ILogger<LabelService> _logger;
+    private readonly bool _hangfireRecurringRegistrationEnabled;
 
     public LabelService(
         MongoDbContext ctx,
         MeAccessor me,
         IWorkReportStatisticRebuildJobService statisticRebuildJobs,
-        ILabelEnumCatalogService enumCatalogs)
+        ILabelEnumCatalogService enumCatalogs,
+        IConfiguration configuration,
+        ILogger<LabelService> logger)
     {
         _ctx = ctx;
         _me = me;
         _statisticRebuildJobs = statisticRebuildJobs;
         _enumCatalogs = enumCatalogs;
+        _hangfireRecurringRegistrationEnabled =
+            configuration.GetValue<bool?>("Hangfire:RecurringRegistrationEnabled") ?? true;
+        _logger = logger;
     }
 
     private static AppException LabelRequestRequired(string action)
@@ -296,7 +304,9 @@ public sealed class LabelService : ILabelService
             ct);
 
         if (results.Count > 0)
-            HangfireRecurringJobRegistrar.TriggerDynamicFormStatisticRebuildNow();
+            HangfireRecurringJobRegistrar.TryTriggerDynamicFormStatisticRebuildNow(
+                _hangfireRecurringRegistrationEnabled,
+                _logger);
     }
 
     private async Task<LabelCatalogItem> LoadVisibleAsync(string id, MeResponse me, CancellationToken ct)

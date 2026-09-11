@@ -1,6 +1,8 @@
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using tdtd_be.DTOs.StatisticsConfiguration;
 using tdtd_be.DTOs.WorkAssignments.AggregateTable;
+using tdtd_be.Services.StatisticsConfiguration;
 using tdtd_be.Services.WorkAssignments.Aggregate;
 
 namespace tdtd_be.Controllers;
@@ -22,6 +24,7 @@ public sealed class WorkAssignmentAggregateTableController : ControllerBase
         [FromBody] AggregateTableRequest req,
         CancellationToken ct)
     {
+        StatConfigPhaseBarrier.Reject(StatConfigPhaseBarrierEntries.P9Result);
         try
         {
             var result = await _service.GetTableAsync(req, ct);
@@ -42,6 +45,7 @@ public sealed class WorkAssignmentAggregateTableController : ControllerBase
         [FromBody] DynamicFormAggregateRequest req,
         CancellationToken ct)
     {
+        StatConfigPhaseBarrier.Reject(StatConfigPhaseBarrierEntries.P9Result);
         try
         {
             var result = await _service.GetDynamicFormAggregateAsync(req, ct);

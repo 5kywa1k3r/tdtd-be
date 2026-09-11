@@ -1,0 +1,241 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:tdtd:dynamic-form-flow:capability-catalog:v1",
+  "title": "TDTD Dynamic Form and Flow capability catalog v1.1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "catalogVersion",
+    "approvedAt",
+    "terminology",
+    "defaults",
+    "uiGate",
+    "domains"
+  ],
+  "properties": {
+    "catalogVersion": {
+      "type": "string",
+      "const": "1.2"
+    },
+    "approvedAt": {
+      "type": "string",
+      "format": "date"
+    },
+    "terminology": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "flowScopeName",
+        "fullBpmnClaimAllowed"
+      ],
+      "properties": {
+        "flowScopeName": {
+          "type": "string",
+          "const": "BPMN_LITE_12_ARCHETYPES"
+        },
+        "fullBpmnClaimAllowed": {
+          "type": "boolean",
+          "const": false
+        }
+      }
+    },
+    "defaults": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "publishedFormSchemaMutable",
+        "assignmentBindsFormVersionId",
+        "emptyFlowPolicy",
+        "runtimeRoleSource",
+        "rawSourceReportAccess",
+        "mappedTargetStatisticContribution",
+        "flowStatisticProfile"
+      ],
+      "properties": {
+        "publishedFormSchemaMutable": {
+          "type": "boolean",
+          "const": false
+        },
+        "assignmentBindsFormVersionId": {
+          "type": "boolean",
+          "const": true
+        },
+        "emptyFlowPolicy": {
+          "type": "string",
+          "const": "DENY"
+        },
+        "runtimeRoleSource": {
+          "type": "string",
+          "const": "SERVER_DERIVED"
+        },
+        "rawSourceReportAccess": {
+          "type": "string",
+          "const": "EXPLICIT_PERMISSION_ONLY"
+        },
+        "mappedTargetStatisticContribution": {
+          "type": "string",
+          "const": "EXCLUDE"
+        },
+        "flowStatisticProfile": {
+          "type": "string",
+          "const": "INTENTIONAL_BLOCK"
+        }
+      }
+    },
+    "uiGate": {
+      "$ref": "#/$defs/uiGate"
+    },
+    "domains": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "dynamicFormFieldTypes",
+        "dynamicFormValueSources",
+        "dynamicFormTableModes",
+        "dynamicFlowArchetypes",
+        "statisticsCapabilities"
+      ],
+      "properties": {
+        "dynamicFormFieldTypes": {
+          "$ref": "#/$defs/capabilityArray"
+        },
+        "dynamicFormValueSources": {
+          "$ref": "#/$defs/capabilityArray"
+        },
+        "dynamicFormTableModes": {
+          "$ref": "#/$defs/capabilityArray"
+        },
+        "dynamicFlowArchetypes": {
+          "$ref": "#/$defs/capabilityArray"
+        },
+        "statisticsCapabilities": {
+          "$ref": "#/$defs/capabilityArray"
+        }
+      }
+    }
+  },
+  "$defs": {
+    "capabilityArray": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/capability"
+      },
+      "minItems": 1
+    },
+    "capability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "name",
+        "status",
+        "targetPhase",
+        "testPrefix",
+        "uiSurface"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "SUPPORTED",
+            "PATCH_REQUIRED",
+            "TARGET",
+            "INTENTIONAL_BLOCK"
+          ]
+        },
+        "targetPhase": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^P([0-9]|1[0-2])$"
+        },
+        "testPrefix": {
+          "type": "string",
+          "minLength": 1
+        },
+        "uiSurface": {
+          "type": "string",
+          "minLength": 1
+        },
+        "notes": {
+          "type": "string"
+        }
+      }
+    },
+    "uiGate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "continuous",
+        "requiredStates",
+        "requiredActors",
+        "requiredEvidence"
+      ],
+      "properties": {
+        "continuous": {
+          "type": "boolean",
+          "const": true
+        },
+        "requiredStates": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": [
+              "LOADING",
+              "EMPTY",
+              "ERROR",
+              "FORBIDDEN",
+              "READONLY",
+              "LOCKED",
+              "STALE_CONFLICT",
+              "SUCCESS",
+              "RETRYING",
+              "UNSUPPORTED"
+            ]
+          }
+        },
+        "requiredActors": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": [
+              "OWNER",
+              "ISSUER",
+              "REPORTER",
+              "REVIEWER",
+              "COORDINATOR",
+              "SYSTEM_ADMIN",
+              "OUTSIDER"
+            ]
+          }
+        },
+        "requiredEvidence": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": [
+              "COMPONENT_TEST",
+              "BROWSER_TEST",
+              "ACCESSIBILITY_SMOKE",
+              "RESPONSIVE_REVIEW",
+              "SCREENSHOT",
+              "TRACE"
+            ]
+          }
+        }
+      }
+    }
+  }
+}

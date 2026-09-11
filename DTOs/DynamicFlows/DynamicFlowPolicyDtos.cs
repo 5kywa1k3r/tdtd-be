@@ -10,8 +10,10 @@ public sealed class DynamicFlowPolicyEvaluationContext
 
 public sealed class DynamicFlowPolicyEvaluationResult
 {
-    public Dictionary<string, DynamicFlowFieldPermissionDto> Fields { get; set; } = new(StringComparer.Ordinal);
-    public Dictionary<string, DynamicFlowTableColumnPermissionDto> TableColumns { get; set; } = new(StringComparer.Ordinal);
+    public Dictionary<string, DynamicFlowFieldPermissionDto> Fields { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+    public Dictionary<string, DynamicFlowTableColumnPermissionDto> TableColumns { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+    public bool DenyAllFields { get; set; }
+    public bool DenyAllTableColumns { get; set; }
 }
 
 public sealed class DynamicFlowFieldPermissionDto
@@ -19,7 +21,7 @@ public sealed class DynamicFlowFieldPermissionDto
     public string TargetKey { get; set; } = string.Empty;
     public string? FieldId { get; set; }
     public string? FieldKey { get; set; }
-    public bool Read { get; set; } = true;
+    public bool Read { get; set; }
     public bool Write { get; set; }
     public bool Required { get; set; }
     public bool Hidden { get; set; }
@@ -33,7 +35,7 @@ public sealed class DynamicFlowTableColumnPermissionDto
     public string TargetKey { get; set; } = string.Empty;
     public string BlockId { get; set; } = string.Empty;
     public string ColumnKey { get; set; } = string.Empty;
-    public bool Read { get; set; } = true;
+    public bool Read { get; set; }
     public bool Write { get; set; }
     public bool Required { get; set; }
     public bool Hidden { get; set; }

@@ -50,6 +50,37 @@ public sealed class WorkReportStatisticDiffConfig : BaseEntity
 
     [BsonElement("isActive")]
     public bool IsActive { get; set; } = true;
+
+    [BsonElement("configId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? ConfigId { get; set; }
+
+    [BsonElement("previousVersionId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? PreviousVersionId { get; set; }
+
+    [BsonElement("versionNo")]
+    public int VersionNo { get; set; }
+
+    [BsonElement("revision")]
+    public long Revision { get; set; }
+
+    [BsonElement("status")]
+    public string? Status { get; set; }
+
+    [BsonElement("configHash")]
+    public string? ConfigHash { get; set; }
+
+    [BsonElement("dependencyPins")]
+    public List<string> DependencyPins { get; set; } = new();
+
+    [BsonElement("lockedAtUtc")]
+    [BsonDateTimeOptions(Kind = DateTimeKind.Utc)]
+    public DateTime? LockedAtUtc { get; set; }
+
+    [BsonElement("lockedByUserId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? LockedByUserId { get; set; }
 }
 
 [BsonIgnoreExtraElements]
@@ -67,6 +98,9 @@ public sealed class WorkReportStatisticDiffSourceConfig
 
     [BsonElement("fieldKey")]
     public string? FieldKey { get; set; }
+
+    [BsonElement("statisticLabelCode")]
+    public string? StatisticLabelCode { get; set; }
 
     [BsonElement("blockId")]
     public string? BlockId { get; set; }

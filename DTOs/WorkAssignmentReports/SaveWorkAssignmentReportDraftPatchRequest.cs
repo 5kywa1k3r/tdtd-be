@@ -4,6 +4,8 @@ namespace tdtd_be.DTOs.WorkAssignmentReports;
 
 public sealed class SaveWorkAssignmentReportDraftPatchRequest
 {
+    public int? ExpectedPayloadRevision { get; set; }
+    public string? CommandId { get; set; }
     public int? Values1DLength { get; set; }
     public List<WorkReportValuePatchItem>? Values1DPatch { get; set; }
     public string? FieldValuesJson { get; set; }

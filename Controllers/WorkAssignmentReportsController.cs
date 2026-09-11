@@ -3,7 +3,9 @@ using Microsoft.AspNetCore.Mvc;
 using System.Security.Claims;
 using tdtd_be.Common.Errors;
 using tdtd_be.DTOs.DynamicFlows;
+using tdtd_be.DTOs.StatisticsConfiguration;
 using tdtd_be.DTOs.WorkAssignmentReports;
+using tdtd_be.Services.StatisticsConfiguration;
 using tdtd_be.Services.WorkAssignmentReports;
 
 namespace tdtd_be.Controllers;
@@ -115,7 +117,7 @@ public sealed class WorkAssignmentReportsController : ControllerBase
     {
         var actorUserId = GetActorUserId();
         var rs = await _service.SaveDraftAsync(id, req, actorUserId, ct);
-        return Ok(rs);
+        return rs.LifecycleProjectionPending ? Accepted(rs) : Ok(rs);
     }
 
     [HttpPatch("work-assignment-reports/{id}/draft/patch")]
@@ -123,13 +125,14 @@ public sealed class WorkAssignmentReportsController : ControllerBase
     {
         var actorUserId = GetActorUserId();
         var rs = await _service.SaveDraftPatchAsync(id, req, actorUserId, ct);
-        return Ok(rs);
+        return rs.LifecycleProjectionPending ? Accepted(rs) : Ok(rs);
     }
 
     [HttpPost("work-assignment-reports/{id}/draft/apply-dynamic-form-aggregate")]
     public async Task<IActionResult> ApplyDynamicFormAggregateDraft([FromRoute] string id, [FromBody] ApplyDynamicFormAggregateDraftRequest req, CancellationToken ct)
     {
         var actorUserId = GetActorUserId();
+        StatConfigPhaseBarrier.Reject(StatConfigPhaseBarrierEntries.P9Run);
         var rs = await _service.ApplyDynamicFormAggregateDraftAsync(id, req, actorUserId, ct);
         return Ok(rs);
     }
@@ -138,12 +141,23 @@ public sealed class WorkAssignmentReportsController : ControllerBase
     public async Task<IActionResult> PreviewDynamicFormAggregateDraft([FromRoute] string id, [FromBody] ApplyDynamicFormAggregateDraftRequest req, CancellationToken ct)
     {
         var actorUserId = GetActorUserId();
+        StatConfigPhaseBarrier.Reject(StatConfigPhaseBarrierEntries.P9Run);
         var rs = await _service.PreviewDynamicFormAggregateDraftAsync(id, req, actorUserId, ct);
         return Ok(rs);
     }
 
     [HttpPost("work-assignment-reports/{id}/draft/preview-dynamic-flow-mapping")]
-    public async Task<IActionResult> PreviewDynamicFlowMapping([FromRoute] string id, [FromBody] DynamicFlowMappingRequest req, CancellationToken ct)
+    [ProducesResponseType(typeof(DynamicFlowMappingPreviewResponse), StatusCodes.Status200OK)]
+    [ProducesResponseType(typeof(AppErrorResponse), StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(typeof(AppErrorResponse), StatusCodes.Status401Unauthorized)]
+    [ProducesResponseType(typeof(AppErrorResponse), StatusCodes.Status403Forbidden)]
+    [ProducesResponseType(typeof(AppErrorResponse), StatusCodes.Status404NotFound)]
+    [ProducesResponseType(typeof(AppErrorResponse), StatusCodes.Status409Conflict)]
+    [ProducesResponseType(typeof(AppErrorResponse), StatusCodes.Status503ServiceUnavailable)]
+    public async Task<ActionResult<DynamicFlowMappingPreviewResponse>> PreviewDynamicFlowMapping(
+        [FromRoute] string id,
+        [FromBody] DynamicFlowMappingRequest req,
+        CancellationToken ct)
     {
         var actorUserId = GetActorUserId();
         var rs = await _service.PreviewDynamicFlowMappingAsync(id, req ?? new DynamicFlowMappingRequest(), actorUserId, ct);
@@ -151,7 +165,17 @@ public sealed class WorkAssignmentReportsController : ControllerBase
     }
 
     [HttpPost("work-assignment-reports/{id}/draft/apply-dynamic-flow-mapping")]
-    public async Task<IActionResult> ApplyDynamicFlowMapping([FromRoute] string id, [FromBody] DynamicFlowMappingRequest req, CancellationToken ct)
+    [ProducesResponseType(typeof(WorkAssignmentReportResponse), StatusCodes.Status200OK)]
+    [ProducesResponseType(typeof(AppErrorResponse), StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(typeof(AppErrorResponse), StatusCodes.Status401Unauthorized)]
+    [ProducesResponseType(typeof(AppErrorResponse), StatusCodes.Status403Forbidden)]
+    [ProducesResponseType(typeof(AppErrorResponse), StatusCodes.Status404NotFound)]
+    [ProducesResponseType(typeof(AppErrorResponse), StatusCodes.Status409Conflict)]
+    [ProducesResponseType(typeof(AppErrorResponse), StatusCodes.Status503ServiceUnavailable)]
+    public async Task<ActionResult<WorkAssignmentReportResponse>> ApplyDynamicFlowMapping(
+        [FromRoute] string id,
+        [FromBody] DynamicFlowMappingRequest req,
+        CancellationToken ct)
     {
         var actorUserId = GetActorUserId();
         var rs = await _service.ApplyDynamicFlowMappingAsync(id, req ?? new DynamicFlowMappingRequest(), actorUserId, ct);
@@ -163,7 +187,7 @@ public sealed class WorkAssignmentReportsController : ControllerBase
     {
         var actorUserId = GetActorUserId();
         var rs = await _service.SubmitAsync(id, req, actorUserId, ct);
-        return Ok(rs);
+        return rs.LifecycleProjectionPending ? Accepted(rs) : Ok(rs);
     }
 
     [HttpPost("work-assignment-reports/{id}/withdraw-submitted")]
@@ -171,7 +195,7 @@ public sealed class WorkAssignmentReportsController : ControllerBase
     {
         var actorUserId = GetActorUserId();
         var rs = await _service.WithdrawSubmittedAsync(id, req, actorUserId, ct);
-        return Ok(rs);
+        return rs.LifecycleProjectionPending ? Accepted(rs) : Ok(rs);
     }
 
     [HttpGet("work-assignment-reports/{id}/logs")]

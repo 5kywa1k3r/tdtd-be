@@ -76,6 +76,9 @@ public sealed class WorkReportFieldStatValue : BaseEntity
     [BsonElement("flowRole")]
     public string? FlowRole { get; set; }
 
+    [BsonElement("isFlowFinalNode")]
+    public bool IsFlowFinalNode { get; set; }
+
     [BsonElement("flowEffectiveStatus")]
     public string? FlowEffectiveStatus { get; set; }
 
@@ -116,6 +119,9 @@ public sealed class WorkReportFieldStatValue : BaseEntity
     [BsonElement("conceptCode")]
     public string? ConceptCode { get; set; }
 
+    [BsonElement("statisticLabelCodes")]
+    public List<string> StatisticLabelCodes { get; set; } = new();
+
     [BsonElement("showInTree")]
     public bool ShowInTree { get; set; }
 
@@ -143,6 +149,10 @@ public sealed class WorkReportFieldStatValue : BaseEntity
     [BsonElement("dateValueUtc")]
     [BsonDateTimeOptions(Kind = DateTimeKind.Utc)]
     public DateTime? DateValueUtc { get; set; }
+
+    [BsonElement("textValue")]
+    [BsonIgnoreIfNull]
+    public string? TextValue { get; set; }
 
     [BsonElement("periodKey")]
     public string PeriodKey { get; set; } = default!;
@@ -180,4 +190,8 @@ public sealed class WorkReportFieldStatValue : BaseEntity
 
     [BsonElement("sourcePayloadHash")]
     public string? SourcePayloadHash { get; set; }
+
+    [BsonElement("directProjection")]
+    [BsonIgnoreIfNull]
+    public WorkReportDirectProjectionPin? DirectProjection { get; set; }
 }

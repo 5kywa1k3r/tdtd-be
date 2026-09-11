@@ -4,6 +4,8 @@ namespace tdtd_be.DTOs.WorkAssignmentReports;
 
 public sealed class ApplyDynamicFormAggregateDraftRequest
 {
+    public int? ExpectedPayloadRevision { get; set; }
+    public string? CommandId { get; set; }
     public DynamicFormAggregateRequest AggregateRequest { get; set; } = new();
 
     public string? DataOrigin { get; set; }

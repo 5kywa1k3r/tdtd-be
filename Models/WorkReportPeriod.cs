@@ -53,6 +53,16 @@ public sealed class WorkReportPeriod : BaseEntity
     [BsonElement("dynamicFormTemplateName")]
     public string? DynamicFormTemplateName { get; set; }
 
+    [BsonElement("dynamicFormFamilyId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? DynamicFormFamilyId { get; set; }
+
+    [BsonElement("dynamicFormVersionNo")]
+    public int? DynamicFormVersionNo { get; set; }
+
+    [BsonElement("dynamicFormSchemaHash")]
+    public string? DynamicFormSchemaHash { get; set; }
+
     [BsonElement("assigneeUserId")]
     [BsonRepresentation(BsonType.ObjectId)]
     public string AssigneeUserId { get; set; } = default!;
@@ -116,6 +126,17 @@ public sealed class WorkReportPeriod : BaseEntity
     [BsonElement("currentReportId")]
     [BsonRepresentation(BsonType.ObjectId)]
     public string? CurrentReportId { get; set; }
+
+    [BsonElement("sourceLifecycleReportId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? SourceLifecycleReportId { get; set; }
+
+    [BsonElement("sourceLifecycleRevision")]
+    public int SourceLifecycleRevision { get; set; }
+
+    [BsonElement("sourceLifecycleAppliedAtUtc")]
+    [BsonDateTimeOptions(Kind = DateTimeKind.Utc)]
+    public DateTime? SourceLifecycleAppliedAtUtc { get; set; }
 
     [BsonElement("reportVersionCount")]
     public int ReportVersionCount { get; set; }

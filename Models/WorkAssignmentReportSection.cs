@@ -39,6 +39,16 @@ public sealed class WorkAssignmentReportSection : BaseEntity
     [BsonElement("dynamicFormTemplateName")]
     public string? DynamicFormTemplateName { get; set; }
 
+    [BsonElement("dynamicFormFamilyId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? DynamicFormFamilyId { get; set; }
+
+    [BsonElement("dynamicFormVersionNo")]
+    public int? DynamicFormVersionNo { get; set; }
+
+    [BsonElement("dynamicFormSchemaHash")]
+    public string? DynamicFormSchemaHash { get; set; }
+
     [BsonElement("sectionId")]
     public string SectionId { get; set; } = default!;
 
@@ -77,6 +87,36 @@ public sealed class WorkAssignmentReportSection : BaseEntity
     [BsonElement("sourcePayloadUpdatedAtUtc")]
     [BsonDateTimeOptions(Kind = DateTimeKind.Utc)]
     public DateTime? SourcePayloadUpdatedAtUtc { get; set; }
+
+    [BsonElement("sourcePayloadRevision")]
+    public int SourcePayloadRevision { get; set; }
+
+    [BsonElement("sourcePayloadHash")]
+    public string? SourcePayloadHash { get; set; }
+
+    [BsonElement("sourceLifecycleRevision")]
+    public int SourceLifecycleRevision { get; set; }
+
+    [BsonElement("dynamicFlowMappingReceiptId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? DynamicFlowMappingReceiptId { get; set; }
+
+    [BsonElement("dynamicFlowMappingProvenanceId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? DynamicFlowMappingProvenanceId { get; set; }
+
+    [BsonElement("dynamicFlowMappingProvenanceHash")]
+    public string? DynamicFlowMappingProvenanceHash { get; set; }
+
+    [BsonElement("dynamicFlowMappingResultPayloadRevision")]
+    public int? DynamicFlowMappingResultPayloadRevision { get; set; }
+
+    [BsonElement("dynamicFlowMappingResultPayloadHash")]
+    public string? DynamicFlowMappingResultPayloadHash { get; set; }
+
+    [BsonElement("sourceReportUpdatedAtUtc")]
+    [BsonDateTimeOptions(Kind = DateTimeKind.Utc)]
+    public DateTime? SourceReportUpdatedAtUtc { get; set; }
 
     [BsonElement("payloadHash")]
     public string? PayloadHash { get; set; }

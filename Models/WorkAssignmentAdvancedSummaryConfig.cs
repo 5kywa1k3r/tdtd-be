@@ -12,6 +12,14 @@ public sealed class WorkAssignmentAdvancedSummaryConfig : BaseEntity
     [BsonRepresentation(BsonType.ObjectId)]
     public string Id { get; set; } = default!;
 
+    [BsonElement("configId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string ConfigId { get; set; } = default!;
+
+    [BsonElement("previousVersionId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? PreviousVersionId { get; set; }
+
     [BsonElement("workId")]
     [BsonRepresentation(BsonType.ObjectId)]
     public string WorkId { get; set; } = default!;
@@ -56,11 +64,23 @@ public sealed class WorkAssignmentAdvancedSummaryConfig : BaseEntity
     [BsonElement("draftRevision")]
     public int DraftRevision { get; set; } = 1;
 
+    [BsonElement("revision")]
+    public long Revision { get; set; }
+
     [BsonElement("configJson")]
     public string ConfigJson { get; set; } = "{}";
 
     [BsonElement("configHash")]
     public string ConfigHash { get; set; } = string.Empty;
+
+    [BsonElement("dependencyPins")]
+    public List<string> DependencyPins { get; set; } = new();
+
+    [BsonElement("validationReceiptJson")]
+    public string? ValidationReceiptJson { get; set; }
+
+    [BsonElement("validationReceiptHash")]
+    public string? ValidationReceiptHash { get; set; }
 
     [BsonElement("previewStatus")]
     public string PreviewStatus { get; set; } = WorkAssignmentAdvancedSummaryPreviewStatuses.NotRequested;
@@ -99,6 +119,14 @@ public sealed class WorkAssignmentAdvancedSummaryConfig : BaseEntity
     [BsonElement("lockTokenId")]
     [BsonRepresentation(BsonType.ObjectId)]
     public string? LockTokenId { get; set; }
+
+    [BsonElement("archivedAtUtc")]
+    [BsonDateTimeOptions(Kind = DateTimeKind.Utc)]
+    public DateTime? ArchivedAtUtc { get; set; }
+
+    [BsonElement("archivedByUserId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? ArchivedByUserId { get; set; }
 }
 
 public static class WorkAssignmentAdvancedSummaryConfigStatuses

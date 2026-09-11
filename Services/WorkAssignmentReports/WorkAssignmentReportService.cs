@@ -2,8 +2,6 @@
 using Microsoft.Extensions.Logging;
 using MongoDB.Bson;
 using System.Globalization;
-using System.Security.Cryptography;
-using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
@@ -22,6 +20,7 @@ using tdtd_be.Models.Enums;
 using tdtd_be.Services.Common;
 using tdtd_be.Services.Common.Time;
 using tdtd_be.Services;
+using tdtd_be.Services.DynamicForms;
 using tdtd_be.Services.DynamicFlows;
 using tdtd_be.Services.WorkAssignments.Domain;
 using tdtd_be.Services.WorkAssignments.Internal;
@@ -30,16 +29,18 @@ using tdtd_be.Services.WorkAssignments.Aggregate;
 using tdtd_be.Services.WorkAssignments.Queue;
 using tdtd_be.Services.WorkAssignments.Runtime;
 using tdtd_be.Services.WorkAssignmentReports.Payloads;
+using tdtd_be.Services.WorkAssignmentReports.Runtime;
 using tdtd_be.Services.WorkAssignmentReports.Statistics;
 
 namespace tdtd_be.Services.WorkAssignmentReports;
 
-public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
+public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportService
 {
     private static readonly Regex LabelCodeRegex = new("^[a-z0-9][a-z0-9_.-]{0,63}$", RegexOptions.Compiled);
     private static readonly Regex RuntimeFullDateRegex = new(@"^(\d{2})/(\d{2})/(\d{4})$", RegexOptions.Compiled);
     private static readonly Regex RuntimeMonthDateRegex = new(@"^(\d{2})/(\d{4})$", RegexOptions.Compiled);
     private static readonly Regex RuntimeYearDateRegex = new(@"^(\d{4})$", RegexOptions.Compiled);
+    private static readonly Regex PayloadCommandIdRegex = new("^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$", RegexOptions.Compiled);
     private const string RuntimeDataTypeNumber = "NUMBER";
     private const string RuntimeDataTypeDate = "DATE";
     private const string RuntimeDataTypeFullDate = "FULL_DATE";
@@ -49,6 +50,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
     private const string RuntimeDataTypeLongText = "LONG_TEXT";
     private const string RuntimeDataTypeStringList = "STRING_LIST";
     private const string RuntimeDataTypeIgnore = "IGNORE";
+    private const string RuntimeDataTypeUnsupported = "UNSUPPORTED";
 
     private readonly MongoDbContext _ctx;
     private readonly IWorkAssignmentQueueService _queueService;
@@ -67,6 +69,17 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
     private readonly ILabelEnumCatalogService _enumCatalogs;
     private readonly IWorkAssignmentAdvancedSummaryDirtyService _advancedSummaryDirty;
     private readonly IDynamicFlowPolicyEvaluator _dynamicFlowPolicyEvaluator;
+    private readonly IWorkReportAggregateDependentRecoveryService _aggregateDependentRecovery;
+    private readonly IWorkAssignmentReportSectionProjectionService _sectionProjection;
+    private readonly IWorkReportLifecycleProjectionReconciler _lifecycleProjectionReconciler;
+    private readonly IWorkReportLifecycleSeriesLockService _lifecycleSeriesLock;
+    private readonly IDynamicFlowRuntimeActivationPolicy _dynamicFlowRuntimeActivationPolicy;
+    private readonly IDynamicFlowDefinitionTransactionRunner _dynamicFlowTransactions;
+    private readonly IDynamicFlowMappingOutboxReconciler
+        _dynamicFlowMappingOutboxReconciler;
+    private readonly IDynamicFlowMappingApplyFaultInjector
+        _dynamicFlowMappingApplyFaultInjector;
+    private readonly IConfiguration _configuration;
     private readonly ILogger<WorkAssignmentReportService> _log;
 
     private static readonly JsonSerializerOptions _jsonOptions = new(JsonSerializerDefaults.Web)
@@ -111,6 +124,17 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         ILabelEnumCatalogService enumCatalogs,
         IWorkAssignmentAdvancedSummaryDirtyService advancedSummaryDirty,
         IDynamicFlowPolicyEvaluator dynamicFlowPolicyEvaluator,
+        IWorkReportAggregateDependentRecoveryService aggregateDependentRecovery,
+        IWorkAssignmentReportSectionProjectionService sectionProjection,
+        IWorkReportLifecycleProjectionReconciler lifecycleProjectionReconciler,
+        IWorkReportLifecycleSeriesLockService lifecycleSeriesLock,
+        IDynamicFlowRuntimeActivationPolicy dynamicFlowRuntimeActivationPolicy,
+        IDynamicFlowDefinitionTransactionRunner dynamicFlowTransactions,
+        IDynamicFlowMappingOutboxReconciler
+            dynamicFlowMappingOutboxReconciler,
+        IDynamicFlowMappingApplyFaultInjector
+            dynamicFlowMappingApplyFaultInjector,
+        IConfiguration configuration,
         ILogger<WorkAssignmentReportService> log)
     {
         _ctx = ctx;
@@ -130,6 +154,17 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         _enumCatalogs = enumCatalogs;
         _advancedSummaryDirty = advancedSummaryDirty;
         _dynamicFlowPolicyEvaluator = dynamicFlowPolicyEvaluator;
+        _aggregateDependentRecovery = aggregateDependentRecovery;
+        _sectionProjection = sectionProjection;
+        _lifecycleProjectionReconciler = lifecycleProjectionReconciler;
+        _lifecycleSeriesLock = lifecycleSeriesLock;
+        _dynamicFlowRuntimeActivationPolicy = dynamicFlowRuntimeActivationPolicy;
+        _dynamicFlowTransactions = dynamicFlowTransactions;
+        _dynamicFlowMappingOutboxReconciler =
+            dynamicFlowMappingOutboxReconciler;
+        _dynamicFlowMappingApplyFaultInjector =
+            dynamicFlowMappingApplyFaultInjector;
+        _configuration = configuration;
         _log = log;
     }
 
@@ -596,9 +631,10 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
 
             if (existed is not null)
             {
+                await TryReconcileCommittedLifecycleProjectionAsync(existed.Id);
                 await _docRoleReadModelProjection.RebuildReportPeriodAsync(period.Id, actorUserId, ct);
                 await _docRoleReadModelFreshness.EnsureReportPeriodFreshAsync(period, existed, actorUserId, ct);
-                return await MapToResponseAsync(existed, period, ct);
+                return await MapToResponseAsync(existed, period, actorUserId, ct);
             }
         }
 
@@ -617,9 +653,10 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             rebuildProjection: true,
             syncAssignment: true,
             ct);
+        await TryReconcileCommittedLifecycleProjectionAsync(created.Id);
         await _docRoleReadModelFreshness.EnsureReportPeriodFreshAsync(period, created, actorUserId, ct);
 
-        return await MapToResponseAsync(created, period, ct);
+        return await MapToResponseAsync(created, period, actorUserId, ct);
     }
 
     public async Task<WorkAssignmentReportResponse> InitDraftAsync(
@@ -681,9 +718,19 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             .FirstOrDefaultAsync(ct);
 
         if (entity is null)
-            throw ReportNotFound(id);
+            throw RawReportReadAccessForbidden();
 
-        await EnsureReportAccessAsync(entity, actorUserId, ct);
+        try
+        {
+            await EnsureReportAccessAsync(entity, actorUserId, ct);
+        }
+        catch (AppException error) when (
+            error.Code is
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_ACCESS_FORBIDDEN or
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_ASSIGNMENT_NOT_FOUND)
+        {
+            throw RawReportReadAccessForbidden();
+        }
 
         var period = await _ctx.WorkReportPeriods
             .Find(x => x.Id == entity.WorkReportPeriodId && !x.IsDeleted)
@@ -693,7 +740,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
 
         entity = await RefreshAggregateSnapshotForReadAsync(entity, actorUserId, ct);
 
-        return await MapToResponseAsync(entity, period, ct);
+        return await MapToResponseAsync(entity, period, actorUserId, ct);
     }
 
     public async Task<List<WorkAssignmentReportSectionSummaryRow>> GetSectionSummariesAsync(
@@ -701,13 +748,19 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         string actorUserId,
         CancellationToken ct = default)
     {
-        var entity = await EnsureReadableReportAsync(id, actorUserId, ct);
+        var (entity, _) = await EnsureReadableReportAsync(id, actorUserId, ct);
 
         var sections = await _ctx.WorkAssignmentReportSections
             .Find(x => x.WorkAssignmentReportId == entity.Id && !x.IsDeleted)
             .SortBy(x => x.SectionOrder)
             .ThenBy(x => x.SectionId)
             .ToListAsync(ct);
+
+        sections = await EnsureFreshReportSectionProjectionsAsync(
+            entity,
+            sections,
+            actorUserId,
+            ct);
 
         return sections.Select(MapSectionSummaryRow).ToList();
     }
@@ -725,14 +778,18 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                 new { reportId = id, sectionId },
                 "sectionId is required.");
 
-        var entity = await EnsureReadableReportAsync(id, actorUserId, ct);
+        var (entity, assignment) = await EnsureReadableReportAsync(id, actorUserId, ct);
 
-        var section = await _ctx.WorkAssignmentReportSections
-            .Find(x =>
-                x.WorkAssignmentReportId == entity.Id &&
-                x.SectionId == normalizedSectionId &&
-                !x.IsDeleted)
-            .FirstOrDefaultAsync(ct);
+        var loadedSections = await _ctx.WorkAssignmentReportSections
+            .Find(x => x.WorkAssignmentReportId == entity.Id && !x.IsDeleted)
+            .ToListAsync(ct);
+        var refreshed = await EnsureFreshReportSectionProjectionsAsync(
+            entity,
+            loadedSections,
+            actorUserId,
+            ct);
+        var section = refreshed.FirstOrDefault(x =>
+            string.Equals(x.SectionId, normalizedSectionId, StringComparison.Ordinal));
 
         if (section is null)
             throw AppExceptionFactory.NotFound(
@@ -740,16 +797,33 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                 new { reportId = id, sectionId = normalizedSectionId },
                 "Không tìm thấy dữ liệu phần của báo cáo.");
 
-        DynamicFormSectionDocument? templateSection = null;
+        DynamicFormSectionSnapshot? templateSection = null;
         if (!string.IsNullOrWhiteSpace(section.DynamicFormTemplateId))
         {
-            templateSection = await _ctx.DynamicFormSections
-                .Find(x =>
-                    x.DynamicFormTemplateId == section.DynamicFormTemplateId &&
-                    x.SectionId == section.SectionId &&
-                    !x.IsDeleted)
-                .FirstOrDefaultAsync(ct);
+            var templateId = section.DynamicFormTemplateId;
+            var template = await _ctx.DynamicFormTemplates
+                .Find(x => x.Id == templateId && !x.IsDeleted)
+                .FirstOrDefaultAsync(ct)
+                ?? throw AppExceptionFactory.NotFound(
+                    AppErrorCode.DYNAMIC_FORM_TEMPLATE_NOT_FOUND,
+                    new { dynamicFormTemplateId = templateId });
+            templateSection = DynamicFormSectionSnapshotBuilder.GetRequiredSection(template, section.SectionId);
         }
+
+        var dynamicFlowPermissions = await ResolveDynamicFlowReportPermissionsAsync(
+            assignment,
+            entity,
+            actorUserId,
+            IsDynamicFlowReportAfterSubmit(entity),
+            ct);
+        var readablePayload = dynamicFlowPermissions is null
+            ? new DynamicFlowReportReadablePayload(null, section.FieldValuesJson, section.TableValuesJson)
+            : DynamicFlowReportPermissionEnforcer.ApplyReadRestrictions(
+                dynamicFlowPermissions,
+                null,
+                section.FieldValuesJson,
+                section.TableValuesJson,
+                null);
 
         return new WorkAssignmentReportSectionDetailResponse
         {
@@ -763,17 +837,34 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             LastUpdatedAtUtc = section.LastUpdatedAtUtc,
             LastUpdatedByUserId = section.LastUpdatedByUserId,
             SourcePayloadUpdatedAtUtc = section.SourcePayloadUpdatedAtUtc,
+            SourcePayloadRevision = section.SourcePayloadRevision,
+            SourcePayloadHash = section.SourcePayloadHash,
+            DynamicFlowMappingReceiptId =
+                section.DynamicFlowMappingReceiptId,
+            DynamicFlowMappingProvenanceId =
+                section.DynamicFlowMappingProvenanceId,
+            DynamicFlowMappingProvenanceHash =
+                section.DynamicFlowMappingProvenanceHash,
+            DynamicFlowMappingResultPayloadRevision =
+                section.DynamicFlowMappingResultPayloadRevision,
+            DynamicFlowMappingResultPayloadHash =
+                section.DynamicFlowMappingResultPayloadHash,
+            SourceLifecycleRevision = section.SourceLifecycleRevision,
+            SourceReportUpdatedAtUtc = section.SourceReportUpdatedAtUtc,
             DynamicFormTemplateId = section.DynamicFormTemplateId,
             DynamicFormTemplateCode = section.DynamicFormTemplateCode,
             DynamicFormTemplateName = section.DynamicFormTemplateName,
+            DynamicFormFamilyId = section.DynamicFormFamilyId,
+            DynamicFormVersionNo = section.DynamicFormVersionNo,
+            DynamicFormSchemaHash = section.DynamicFormSchemaHash,
             FieldsJson = templateSection?.FieldsJson ?? "[]",
             BlocksJson = templateSection?.BlocksJson ?? "[]",
-            FieldValuesJson = section.FieldValuesJson,
-            TableValuesJson = section.TableValuesJson
+            FieldValuesJson = readablePayload.FieldValuesJson,
+            TableValuesJson = readablePayload.TableValuesJson
         };
     }
 
-    private async Task<WorkAssignmentReport> EnsureReadableReportAsync(
+    private async Task<(WorkAssignmentReport report, WorkAssignment assignment)> EnsureReadableReportAsync(
         string id,
         string actorUserId,
         CancellationToken ct)
@@ -790,9 +881,9 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         if (entity is null)
             throw ReportNotFound(id);
 
+        var access = await EnsureReportAccessAsync(entity, actorUserId, ct);
         EnsureReportIsActive(entity);
-        await EnsureReportAccessAsync(entity, actorUserId, ct);
-        return entity;
+        return (entity, access.assignment);
     }
 
     private static WorkAssignmentReportSectionSummaryRow MapSectionSummaryRow(
@@ -807,247 +898,42 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             HasData = section.HasData,
             LastUpdatedAtUtc = section.LastUpdatedAtUtc,
             LastUpdatedByUserId = section.LastUpdatedByUserId,
-            SourcePayloadUpdatedAtUtc = section.SourcePayloadUpdatedAtUtc
+            SourcePayloadUpdatedAtUtc = section.SourcePayloadUpdatedAtUtc,
+            SourcePayloadRevision = section.SourcePayloadRevision,
+            SourcePayloadHash = section.SourcePayloadHash,
+            DynamicFlowMappingReceiptId =
+                section.DynamicFlowMappingReceiptId,
+            DynamicFlowMappingProvenanceId =
+                section.DynamicFlowMappingProvenanceId,
+            DynamicFlowMappingProvenanceHash =
+                section.DynamicFlowMappingProvenanceHash,
+            DynamicFlowMappingResultPayloadRevision =
+                section.DynamicFlowMappingResultPayloadRevision,
+            DynamicFlowMappingResultPayloadHash =
+                section.DynamicFlowMappingResultPayloadHash,
+            SourceLifecycleRevision = section.SourceLifecycleRevision,
+            SourceReportUpdatedAtUtc = section.SourceReportUpdatedAtUtc
         };
 
-    private async Task UpsertReportSectionProjectionsAsync(
+    private async Task<List<WorkAssignmentReportSection>> EnsureFreshReportSectionProjectionsAsync(
         WorkAssignmentReport report,
-        string? fieldValuesJson,
-        string? tableValuesJson,
+        IReadOnlyCollection<WorkAssignmentReportSection> loadedSections,
         string actorUserId,
-        DateTime now,
         CancellationToken ct)
     {
-        var templateId = NormalizeOptionalTextOrNull(report.DynamicFormTemplateId);
-        if (string.IsNullOrWhiteSpace(templateId) || string.IsNullOrWhiteSpace(report.Id))
-            return;
-
-        var templateSections = await _ctx.DynamicFormSections
-            .Find(x => x.DynamicFormTemplateId == templateId && !x.IsDeleted)
-            .SortBy(x => x.Order)
-            .ThenBy(x => x.SectionId)
-            .ToListAsync(ct);
-
-        if (templateSections.Count == 0)
-            return;
-
-        var existingSections = await _ctx.WorkAssignmentReportSections
-            .Find(x => x.WorkAssignmentReportId == report.Id && !x.IsDeleted)
-            .ToListAsync(ct);
-        var existingBySectionId = existingSections
-            .GroupBy(x => x.SectionId, StringComparer.Ordinal)
-            .ToDictionary(x => x.Key, x => x.First(), StringComparer.Ordinal);
-
-        var fieldRoot = ParseJsonObjectNodeOrNull(fieldValuesJson);
-        var fieldValues = fieldRoot?["values"] as JsonObject ?? fieldRoot ?? new JsonObject();
-        var tableRoot = ParseJsonObjectNodeOrNull(tableValuesJson);
-        var tableBlocksById = BuildTableBlockMap(tableRoot);
-
-        foreach (var templateSection in templateSections)
-        {
-            var sectionValues = BuildSectionFieldValues(fieldValues, templateSection.FieldIds);
-            var sectionBlocks = BuildSectionTableBlocks(tableBlocksById, templateSection.BlockIds);
-            var hasData = JsonObjectHasData(sectionValues) ||
-                          sectionBlocks.OfType<JsonObject>().Any(TableBlockHasEnteredData);
-            var payloadHash = ComputeSectionPayloadHash(sectionValues, sectionBlocks);
-            existingBySectionId.TryGetValue(templateSection.SectionId, out var existing);
-            var changed = existing is null ||
-                          !string.Equals(existing.PayloadHash, payloadHash, StringComparison.Ordinal);
-            DateTime? lastUpdatedAtUtc = hasData
-                ? (changed ? now : existing?.LastUpdatedAtUtc ?? now)
-                : null;
-            var lastUpdatedByUserId = hasData
-                ? (changed ? actorUserId : existing?.LastUpdatedByUserId ?? actorUserId)
-                : null;
-
-            var section = new WorkAssignmentReportSection
-            {
-                Id = existing?.Id ?? ObjectId.GenerateNewId().ToString(),
-                WorkAssignmentReportId = report.Id,
-                WorkId = report.WorkId,
-                WorkAssignmentId = report.WorkAssignmentId,
-                WorkReportPeriodId = report.WorkReportPeriodId,
-                DynamicFormTemplateId = report.DynamicFormTemplateId,
-                DynamicFormTemplateCode = report.DynamicFormTemplateCode,
-                DynamicFormTemplateName = report.DynamicFormTemplateName,
-                SectionId = templateSection.SectionId,
-                SectionTitle = templateSection.Title,
-                SectionOrder = templateSection.Order,
-                Status = report.Status,
-                FieldValuesJson = BuildSectionFieldValuesJson(report, templateSection.SchemaVersion, sectionValues, now),
-                TableValuesJson = BuildSectionTableValuesJson(report, tableRoot, sectionBlocks, now),
-                FieldCount = templateSection.FieldIds.Length,
-                BlockCount = templateSection.BlockIds.Length,
-                HasData = hasData,
-                LastUpdatedAtUtc = lastUpdatedAtUtc,
-                LastUpdatedByUserId = lastUpdatedByUserId,
-                SourcePayloadUpdatedAtUtc = report.PayloadUpdatedAtUtc ?? now,
-                PayloadHash = payloadHash,
-                CreatedAtUtc = existing?.CreatedAtUtc ?? now,
-                UpdatedAtUtc = now,
-                CreatedByUserId = existing?.CreatedByUserId ?? actorUserId,
-                UpdatedByUserId = actorUserId,
-                IsDeleted = false
-            };
-
-            await _ctx.WorkAssignmentReportSections.ReplaceOneAsync(
-                x => x.WorkAssignmentReportId == report.Id &&
-                     x.SectionId == templateSection.SectionId &&
-                     !x.IsDeleted,
-                section,
-                new ReplaceOptions { IsUpsert = true },
-                ct);
-        }
+        var projected = await _sectionProjection.EnsureCurrentAndVerifyAsync(
+            report,
+            loadedSections,
+            report.UpdatedByUserId ?? actorUserId,
+            report.PayloadUpdatedAtUtc ?? report.UpdatedAtUtc,
+            ct);
+        return projected.ToList();
     }
 
-    private static JsonObject? ParseJsonObjectNodeOrNull(string? json)
-    {
-        if (string.IsNullOrWhiteSpace(json))
-            return null;
-
-        try
-        {
-            return JsonNode.Parse(json) as JsonObject;
-        }
-        catch (JsonException)
-        {
-            return null;
-        }
-    }
-
-    private static Dictionary<string, JsonObject> BuildTableBlockMap(JsonObject? tableRoot)
-    {
-        var result = new Dictionary<string, JsonObject>(StringComparer.Ordinal);
-        if (tableRoot?["blocks"] is not JsonArray blocks)
-            return result;
-
-        foreach (var item in blocks)
-        {
-            if (item is not JsonObject block)
-                continue;
-
-            var blockId = NormalizeBlockId(ReadJsonNodeString(block, "blockId") ?? ReadJsonNodeString(block, "id"));
-            if (!string.IsNullOrWhiteSpace(blockId))
-                result[blockId] = block;
-        }
-
-        return result;
-    }
-
-    private static JsonObject BuildSectionFieldValues(JsonObject fieldValues, IReadOnlyCollection<string> fieldIds)
-    {
-        var result = new JsonObject();
-        foreach (var fieldId in fieldIds)
-        {
-            if (fieldValues.TryGetPropertyValue(fieldId, out var value))
-                result[fieldId] = CloneJsonNode(value);
-        }
-
-        return result;
-    }
-
-    private static JsonArray BuildSectionTableBlocks(
-        IReadOnlyDictionary<string, JsonObject> tableBlocksById,
-        IReadOnlyCollection<string> blockIds)
-    {
-        var result = new JsonArray();
-        foreach (var blockId in blockIds)
-        {
-            var normalizedBlockId = NormalizeBlockId(blockId);
-            if (tableBlocksById.TryGetValue(normalizedBlockId, out var block))
-                result.Add(CloneJsonNode(block));
-        }
-
-        return result;
-    }
-
-    private static string BuildSectionFieldValuesJson(
-        WorkAssignmentReport report,
-        int schemaVersion,
-        JsonObject values,
-        DateTime updatedAtUtc)
-        => new JsonObject
-        {
-            ["dynamicFormTemplateId"] = report.DynamicFormTemplateId,
-            ["dynamicFormTemplateCode"] = report.DynamicFormTemplateCode,
-            ["dynamicFormTemplateName"] = report.DynamicFormTemplateName,
-            ["schemaVersion"] = schemaVersion,
-            ["values"] = CloneJsonNode(values),
-            ["updatedAtUtc"] = updatedAtUtc.ToString("O", CultureInfo.InvariantCulture)
-        }.ToJsonString(_jsonOptions);
-
-    private static string? BuildSectionTableValuesJson(
-        WorkAssignmentReport report,
-        JsonObject? tableRoot,
-        JsonArray blocks,
-        DateTime updatedAtUtc)
-    {
-        if (blocks.Count == 0)
-            return null;
-
-        var root = CloneJsonObject(tableRoot) ?? new JsonObject();
-        root["dynamicFormTemplateId"] = report.DynamicFormTemplateId;
-        root["dynamicFormTemplateCode"] = report.DynamicFormTemplateCode;
-        root["dynamicFormTemplateName"] = report.DynamicFormTemplateName;
-        root["updatedAtUtc"] = updatedAtUtc.ToString("O", CultureInfo.InvariantCulture);
-        root["blocks"] = CloneJsonNode(blocks);
-        return root.ToJsonString(_jsonOptions);
-    }
-
-    private static string ComputeSectionPayloadHash(JsonObject sectionValues, JsonArray sectionBlocks)
-    {
-        var root = new JsonObject
-        {
-            ["fieldValues"] = CloneJsonNode(sectionValues),
-            ["tableBlocks"] = CloneJsonNode(sectionBlocks)
-        };
-
-        return Sha256Hex(root.ToJsonString(_jsonOptions));
-    }
-
-    private static bool JsonObjectHasData(JsonObject obj)
-        => obj.Any(item => JsonNodeHasData(item.Value));
-
-    private static bool TableBlockHasEnteredData(JsonObject block)
-        => block.TryGetPropertyValue("values1D", out var values) && JsonNodeHasData(values);
-
-    private static bool JsonNodeHasData(JsonNode? node)
-    {
-        if (node is null)
-            return false;
-
-        if (node is JsonArray array)
-            return array.Any(JsonNodeHasData);
-
-        if (node is JsonObject obj)
-            return obj.Any(item => JsonNodeHasData(item.Value));
-
-        if (node is not JsonValue value)
-            return false;
-
-        if (value.TryGetValue<string>(out var text))
-            return !string.IsNullOrWhiteSpace(text);
-
-        if (value.TryGetValue<bool>(out _))
-            return true;
-
-        if (value.TryGetValue<double>(out var number))
-            return !double.IsNaN(number);
-
-        return true;
-    }
-
-    private static JsonObject? CloneJsonObject(JsonObject? obj)
-        => CloneJsonNode(obj) as JsonObject;
-
-    private static JsonNode? CloneJsonNode(JsonNode? node)
-        => node is null ? null : JsonNode.Parse(node.ToJsonString(_jsonOptions));
-
-    private static string Sha256Hex(string value)
-    {
-        var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(value));
-        return Convert.ToHexString(bytes).ToLowerInvariant();
-    }
+    private static long DateTimeToUnixMilliseconds(DateTime? value)
+        => value.HasValue
+            ? new DateTimeOffset(DateTime.SpecifyKind(value.Value, DateTimeKind.Utc)).ToUnixTimeMilliseconds()
+            : long.MinValue;
 
     public async Task<DynamicExcelDetail> GetReportTemplateWorkbookAsync(
         string id,
@@ -1258,14 +1144,29 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
 
         if (entity is null)
             throw ReportNotFound(id);
-        EnsureReportIsActive(entity);
-        await HydrateReportPayloadAsync(entity, ct);
-
         var reportAccess = await EnsureReportAccessAsync(entity, actorUserId, ct);
         if (!reportAccess.isAssignee || entity.AssigneeUserId != actorUserId)
             throw AppExceptionFactory.Forbidden(
                 AppErrorCode.WORK_ASSIGNMENT_REPORT_SAVE_FORBIDDEN,
                 ReportDetails(entity, actorUserId));
+        EnsureReportIsActive(entity);
+        await HydrateReportPayloadAsync(entity, ct);
+        await EnsureDynamicFlowMappingProvenanceIntegrityAsync(entity, ct);
+        await ValidateDynamicFlowMappingLifecycleBoundaryAsync(
+            entity,
+            ct);
+
+        var payloadCommand = ResolvePayloadMutationCommand(
+            entity,
+            req.ExpectedPayloadRevision,
+            req.CommandId,
+            "SAVE_DRAFT",
+            req.CommandHashOverride ?? ComputeReportPayloadCommandHash("SAVE_DRAFT", req));
+        if (IsCompletedPayloadCommandReplay(entity, payloadCommand))
+        {
+            await TryReconcileCommittedLifecycleProjectionAsync(entity.Id);
+            return await MapPayloadCommandReplayResponseAsync(entity.Id, actorUserId, CancellationToken.None);
+        }
 
         await EnsureReportMutationScopeOpenAsync(reportAccess.assignment, actorUserId, ct);
 
@@ -1305,42 +1206,89 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             requireWhenMissing: false);
         EnsureReportDateRange(startedDate, completedDate, "StartedDate", "CompletedDate");
         var effectiveDueAtUtc = ResolveEffectiveReportDueAtUtc(entity.DueAtUtc ?? period?.DueAtUtc, reportAccess.assignment);
-        var nextDataOrigin = ResolveReportDataOrigin(req.DataOrigin, entity.DataOrigin);
-        var nextContributionMode = ResolveCumulativeContributionMode(
-            req.CumulativeContributionMode,
-            req.DataOrigin,
-            entity.CumulativeContributionMode,
-            entity.DataOrigin);
-        var nextContributionPolicyJson = ResolveContributionPolicyJsonOverride(
-            req.CumulativeContributionPolicyJson,
-            entity.CumulativeContributionPolicyJson,
-            id,
-            actorUserId);
-        var nextSummarySourceJson = ResolveSummarySourceJsonOverride(
-            req.SummarySourceJson,
+        var hasFlowOwnedMappingMetadata = IsDynamicFlowMappingSummary(entity.SummarySourceJson);
+        EnsureDynamicFlowMappingProvenanceOverrideAllowed(
+            entity,
+            req.SummarySourceJson);
+        EnsureDynamicFlowMappingSummaryOverrideAllowed(
             entity.SummarySourceJson,
+            req.SummarySourceJson,
             id,
             actorUserId);
+        var nextDataOrigin = hasFlowOwnedMappingMetadata
+            ? WorkReportDataOrigin.Normalize(entity.DataOrigin)
+            : ResolveReportDataOrigin(req.DataOrigin, entity.DataOrigin);
+        var nextContributionMode = hasFlowOwnedMappingMetadata
+            ? WorkReportCumulativeContributionMode.Normalize(entity.CumulativeContributionMode)
+            : ResolveCumulativeContributionMode(
+                req.CumulativeContributionMode,
+                req.DataOrigin,
+                entity.CumulativeContributionMode,
+                entity.DataOrigin);
+        var nextContributionPolicyJson = hasFlowOwnedMappingMetadata
+            ? NormalizeOptionalTextOrNull(entity.CumulativeContributionPolicyJson)
+            : ResolveContributionPolicyJsonOverride(
+                req.CumulativeContributionPolicyJson,
+                entity.CumulativeContributionPolicyJson,
+                id,
+                actorUserId);
+        var nextSummarySourceJson = hasFlowOwnedMappingMetadata
+            ? NormalizeOptionalTextOrNull(entity.SummarySourceJson)
+            : ResolveSummarySourceJsonOverride(
+                req.SummarySourceJson,
+                entity.SummarySourceJson,
+                id,
+                actorUserId);
         var nextAggregateSources = ExtractAggregateSourceSnapshot(nextSummarySourceJson);
         var acceptsReportDataPayload = ShouldAcceptReportDataPayload(entity, nextDataOrigin, nextSummarySourceJson);
         var isStackedAggregatePayload = IsStackedAggregateSummary(nextSummarySourceJson);
         var requestValues1D = req.Values1D ?? new List<object?>();
 
+        if (acceptsReportDataPayload &&
+            !isStackedAggregatePayload &&
+            DynamicFlowBranchVisibility.IsFlowAssignment(reportAccess.assignment) &&
+            req.TableValuesJson is null &&
+            runtimeTopLevelBlock is not null &&
+            requestValues1D.Count > 0)
+        {
+            req.TableValuesJson = MergeDynamicFlowTopLevelValuesIntoTableValuesJson(
+                entity,
+                entity.TableValuesJson,
+                runtimeTopLevelBlock,
+                requestValues1D,
+                actorUserId);
+        }
+
         if (acceptsReportDataPayload && !isStackedAggregatePayload)
-            await EnsureDynamicFlowReportWriteAllowedAsync(
+        {
+            var writablePayload = await PrepareDynamicFlowReportWritePayloadAsync(
                 reportAccess.assignment,
                 entity,
                 req.FieldValuesJson,
                 req.TableValuesJson,
                 actorUserId,
-                ct);
+                validateRequired: false,
+                ct: ct);
+            req.FieldValuesJson = writablePayload.FieldValuesJson;
+            req.TableValuesJson = writablePayload.TableValuesJson;
+            if (runtimeTopLevelBlock is not null && !string.IsNullOrWhiteSpace(req.TableValuesJson))
+            {
+                var submittedValues1DJson = Values1DCompression.Serialize(requestValues1D, _jsonOptions);
+                var synchronizedValues1DJson = ResolveDynamicFlowMappingTopLevelValuesJson(
+                    submittedValues1DJson,
+                    req.TableValuesJson,
+                    runtimeTopLevelBlock.BlockId,
+                    _jsonOptions);
+                requestValues1D = Values1DCompression.DeserializeObjects(synchronizedValues1DJson, _jsonOptions);
+            }
+        }
 
         await ValidateRuntimeRowLabelsAsync(
             entity,
             acceptsReportDataPayload ? req.TableValuesJson : entity.TableValuesJson,
             ct);
         if (acceptsReportDataPayload && !isStackedAggregatePayload)
-            await ValidateRuntimeDataPayloadAsync(
+            req.FieldValuesJson = await ValidateRuntimeDataPayloadAsync(
                 entity,
                 requestValues1D,
                 req.FieldValuesJson,
@@ -1367,6 +1315,21 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         var nextAggregateSourceUpdatedAtUtc = nextAggregateSources.IsAggregate
             ? (acceptsReportDataPayload ? now : entity.AggregateSourceUpdatedAtUtc)
             : null;
+        _ = WorkReportPayloadService.PreflightReportPayload(
+            entity,
+            values1DJson,
+            fieldValuesJson,
+            tableValuesJson,
+            nextSummarySourceJson,
+            actorUserId,
+            now);
+        var reservation = await ReservePayloadMutationCommandAsync(entity, payloadCommand, now, ct);
+        if (reservation == PayloadCommandReservationOutcome.CompletedReplay)
+        {
+            await TryReconcileCommittedLifecycleProjectionAsync(entity.Id);
+            return await MapPayloadCommandReplayResponseAsync(entity.Id, actorUserId, CancellationToken.None);
+        }
+
         var payloadResult = await _payloadWriter.SaveReportPayloadAsync(
             entity,
             values1DJson,
@@ -1377,12 +1340,11 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             now,
             ct);
 
-        await _ctx.WorkAssignmentReports.UpdateOneAsync(
-            x => x.Id == id && !x.IsDeleted,
-            ApplyPayloadHeaderUpdate(
-                Builders<WorkAssignmentReport>.Update,
-                payloadResult,
-                now)
+        var headerCommitUpdate = ApplyPayloadCommandCompletion(
+                ApplyPayloadHeaderUpdate(
+                    Builders<WorkAssignmentReport>.Update,
+                    payloadResult,
+                    now)
                 .Set(x => x.DataOrigin, nextDataOrigin)
                 .Set(x => x.CumulativeContributionMode, nextContributionMode)
                 .Set(x => x.CumulativeContributionPolicyJson, nextContributionPolicyJson)
@@ -1408,7 +1370,32 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                 .Set(x => x.CreatedByUserId, string.IsNullOrWhiteSpace(entity.CreatedByUserId) ? actorUserId : entity.CreatedByUserId)
                 .Set(x => x.UpdatedAtUtc, now)
                 .Set(x => x.UpdatedByUserId, actorUserId),
+                payloadCommand,
+                payloadResult);
+        headerCommitUpdate = WorkReportLifecycleOutboxContract.Append(
+            headerCommitUpdate,
+            new WorkReportLifecycleOutboxSeed(
+                payloadCommand.CommandId,
+                entity.LifecycleRevision,
+                "SAVE_DRAFT",
+                actorUserId,
+                fromStatus.ToString(),
+                nextStatus.ToString(),
+                entity.IsActive,
+                entity.IsActive,
+                payloadResult.PayloadRevision,
+                payloadResult.PayloadHash,
+                now,
+                MappingBinding:
+                    DynamicFlowMappingLifecycleBinding.FromReport(entity)));
+
+        var headerCommit = await _ctx.WorkAssignmentReports.UpdateOneAsync(
+            BuildPayloadMutationCommitFilter(entity, payloadCommand),
+            headerCommitUpdate,
             cancellationToken: ct);
+
+        if (headerCommit.ModifiedCount != 1)
+            return await ResolvePayloadCommandCommitRaceAsync(entity.Id, payloadCommand, actorUserId, ct);
 
         entity.Values1DJson = values1DJson;
         entity.FieldValuesJson = fieldValuesJson;
@@ -1435,76 +1422,8 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         entity.UpdatedAtUtc = now;
         entity.UpdatedByUserId = actorUserId;
 
-        await UpsertReportSectionProjectionsAsync(
-            entity,
-            fieldValuesJson,
-            tableValuesJson,
-            actorUserId,
-            now,
-            ct);
-
-        if (period is not null)
-        {
-            var periodStatus = ResolveDraftPeriodStatus(isHistoricalData, completedDate, effectiveDueAtUtc, now);
-
-            await _ctx.WorkReportPeriods.UpdateOneAsync(
-                x => x.Id == period.Id && !x.IsDeleted,
-                Builders<WorkReportPeriod>.Update
-                    .Set(x => x.Status, periodStatus)
-                    .Set(x => x.IsOverdue, WorkReportPeriodStatusHelper.IsOverdue(periodStatus))
-                    .Set(x => x.LastDraftSavedAtUtc, now)
-                    .Set(x => x.StartedDate, startedDate)
-                    .Set(x => x.CompletedDate, completedDate)
-                    .Set(x => x.IsHistoricalData, isHistoricalData)
-                    .Set(x => x.DueAtUtc, effectiveDueAtUtc)
-                    .Set(x => x.LateReason, req.LateReason)
-                    .Set(x => x.UpdatedAtUtc, now)
-                    .Set(x => x.UpdatedByUserId, actorUserId),
-                cancellationToken: ct);
-
-            period.Status = periodStatus;
-            period.IsOverdue = WorkReportPeriodStatusHelper.IsOverdue(periodStatus);
-            period.LastDraftSavedAtUtc = now;
-            period.StartedDate = startedDate;
-            period.CompletedDate = completedDate;
-            period.IsHistoricalData = isHistoricalData;
-            period.DueAtUtc = effectiveDueAtUtc;
-            period.LateReason = req.LateReason;
-            period.UpdatedAtUtc = now;
-            period.UpdatedByUserId = actorUserId;
-        }
-
-        await InsertLogAsync(
-            workId: entity.WorkId,
-            workAssignmentId: entity.WorkAssignmentId,
-            workReportPeriodId: entity.WorkReportPeriodId,
-            workAssignmentReportId: entity.Id,
-            action: "SAVE_DRAFT",
-            fromStatus: fromStatus.ToString(),
-            toStatus: nextStatus.ToString(),
-            actionByUserId: actorUserId,
-            reason: null,
-            comment: null,
-            snapshotJson: null,
-            ct: ct);
-
-        if (period is not null)
-        {
-            await FinalizeReportStatusOperationAsync(
-                "SAVE_DRAFT",
-                entity,
-                period,
-                fromStatus.ToString(),
-                nextStatus.ToString(),
-                actorUserId,
-                upsertQueue: true,
-                disableQueue: false,
-                rebuildProjection: true,
-                syncAssignment: true,
-                ct);
-        }
-
-        return await MapToResponseAsync(entity, period, ct);
+        await TryReconcileCommittedLifecycleProjectionAsync(entity.Id);
+        return await MapPayloadCommandReplayResponseAsync(entity.Id, actorUserId, CancellationToken.None);
     }
 
     public async Task<WorkAssignmentReportResponse> SaveDraftPatchAsync(
@@ -1529,11 +1448,19 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
 
         if (entity is null)
             throw ReportNotFound(id);
+        var reportAccess = await EnsureReportAccessAsync(entity, actorUserId, ct);
+        if (!reportAccess.isAssignee || entity.AssigneeUserId != actorUserId)
+            throw AppExceptionFactory.Forbidden(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_SAVE_FORBIDDEN,
+                ReportDetails(entity, actorUserId));
         EnsureReportIsActive(entity);
         await HydrateReportPayloadAsync(entity, ct);
 
         var merged = new SaveWorkAssignmentReportDraftRequest
         {
+            ExpectedPayloadRevision = req.ExpectedPayloadRevision,
+            CommandId = req.CommandId,
+            CommandHashOverride = ComputeReportPayloadCommandHash("SAVE_DRAFT_PATCH", req),
             Values1D = MergeDraftValuesPatch(entity.Values1DJson, req.Values1DLength, req.Values1DPatch),
             FieldValuesJson = req.FieldValuesJson ?? entity.FieldValuesJson,
             TableValuesJson = MergeDraftTableBlockPatches(entity, req.TableBlockPatches),
@@ -1571,14 +1498,13 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
 
         if (entity is null)
             throw ReportNotFound(id);
-        EnsureReportIsActive(entity);
-        await HydrateReportPayloadAsync(entity, ct);
-
         var reportAccess = await EnsureReportAccessAsync(entity, actorUserId, ct);
         if (!reportAccess.isAssignee || entity.AssigneeUserId != actorUserId)
             throw AppExceptionFactory.Forbidden(
                 AppErrorCode.WORK_ASSIGNMENT_REPORT_SAVE_FORBIDDEN,
                 ReportDetails(entity, actorUserId));
+        EnsureReportIsActive(entity);
+        await HydrateReportPayloadAsync(entity, ct);
 
         if (entity.Status != WorkAssignmentReportStatus.Draft)
             throw InvalidReportStatus(
@@ -1596,6 +1522,9 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
 
         var saveReq = new SaveWorkAssignmentReportDraftRequest
         {
+            ExpectedPayloadRevision = req.ExpectedPayloadRevision,
+            CommandId = req.CommandId,
+            CommandHashOverride = ComputeReportPayloadCommandHash("APPLY_DYNAMIC_FORM_AGGREGATE", req),
             Values1D = projection.TopLevelValues,
             FieldValuesJson = entity.FieldValuesJson,
             TableValuesJson = projection.TableValuesJson,
@@ -1632,14 +1561,13 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
 
         if (entity is null)
             throw ReportNotFound(id);
-        EnsureReportIsActive(entity);
-        await HydrateReportPayloadAsync(entity, ct);
-
         var reportAccess = await EnsureReportAccessAsync(entity, actorUserId, ct);
         if (!reportAccess.isAssignee || entity.AssigneeUserId != actorUserId)
             throw AppExceptionFactory.Forbidden(
                 AppErrorCode.WORK_ASSIGNMENT_REPORT_SAVE_FORBIDDEN,
                 ReportDetails(entity, actorUserId));
+        EnsureReportIsActive(entity);
+        await HydrateReportPayloadAsync(entity, ct);
 
         if (entity.Status != WorkAssignmentReportStatus.Draft)
             throw InvalidReportStatus(
@@ -1679,7 +1607,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             .Find(x => x.Id == entity.WorkReportPeriodId && !x.IsDeleted)
             .FirstOrDefaultAsync(ct);
 
-        return await MapToResponseAsync(entity, period, ct);
+        return await MapToResponseAsync(entity, period, actorUserId, ct);
     }
 
     public async Task<DynamicFlowMappingPreviewResponse> PreviewDynamicFlowMappingAsync(
@@ -1688,8 +1616,35 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         string actorUserId,
         CancellationToken ct = default)
     {
-        var (entity, reportAccess, _) = await LoadDynamicFlowMappingDraftTargetAsync(id, req, actorUserId, ct);
-        return await BuildDynamicFlowMappingProjectionAsync(entity, reportAccess.assignment, req, actorUserId, ct);
+        EnsureActor(actorUserId);
+        if (string.IsNullOrWhiteSpace(id))
+            throw ReportIdRequired(id);
+        req ??= new DynamicFlowMappingRequest();
+        EnsureDynamicFlowMappingRequestDoesNotOverrideConfig(req);
+
+        var (entity, reportAccess, _) =
+            await LoadDynamicFlowMappingDraftTargetAsync(
+                id,
+                actorUserId,
+                ct);
+        var result = await BuildDynamicFlowMappingProjectionAsync(
+            entity,
+            reportAccess.assignment,
+            req,
+            actorUserId,
+            ct,
+            issuePreviewToken:
+                IsDynamicFlowMappingPreviewTokenEnabled());
+        var projection =
+            DynamicFlowReportPermissionEnforcer.ApplyMappingPreviewReadRestrictions(
+                result.Permissions,
+                result.Projection);
+        await RedactDynamicFlowMappingSourceIdentityWithoutRawAccessAsync(
+            projection,
+            result.Sources,
+            actorUserId,
+            ct);
+        return projection;
     }
 
     public async Task<WorkAssignmentReportResponse> ApplyDynamicFlowMappingAsync(
@@ -1698,32 +1653,165 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         string actorUserId,
         CancellationToken ct = default)
     {
-        var (entity, reportAccess, period) = await LoadDynamicFlowMappingDraftTargetAsync(id, req, actorUserId, ct);
-        await EnsureReportMutationScopeOpenAsync(reportAccess.assignment, actorUserId, ct);
+        EnsureActor(actorUserId);
+        if (string.IsNullOrWhiteSpace(id))
+            throw ReportIdRequired(id);
+        EnsureDynamicFlowMappingApplyEnabled();
 
-        var projection = await BuildDynamicFlowMappingProjectionAsync(entity, reportAccess.assignment, req, actorUserId, ct);
-        if (projection.HasBlockingConflicts)
+        req ??= new DynamicFlowMappingRequest();
+        EnsureDynamicFlowMappingRequestDoesNotOverrideConfig(req);
+        var (receiptTarget, receiptAccess) =
+            await LoadDynamicFlowMappingAuthorizedTargetAsync(
+                id,
+                actorUserId,
+                ct);
+        if (!IsDynamicFlowMappingApplyEnabled())
         {
-            throw AppExceptionFactory.BadRequest(
-                AppErrorCode.WORK_ASSIGNMENT_REPORT_VALUES_INVALID,
-                new
-                {
-                    reportId = entity.Id,
-                    workAssignmentId = entity.WorkAssignmentId,
-                    actorUserId,
-                    reason = "DYNAMIC_FLOW_MAPPING_CONFLICT",
-                    conflicts = projection.Changes
-                        .Where(x => string.Equals(x.Status, "CONFLICT", StringComparison.Ordinal))
-                        .Take(20)
-                        .ToList()
-                });
+            return await PreflightDynamicFlowMappingApplyAsync(
+                receiptTarget,
+                receiptAccess,
+                req,
+                actorUserId,
+                ct);
         }
+
+        var commandId = ResolveDynamicFlowMappingCommandId(
+            receiptTarget,
+            req);
+        var requestHash = ComputeDynamicFlowMappingApplyRequestHash(
+            receiptTarget,
+            req,
+            actorUserId,
+            commandId);
+        var existingReceipt = await LoadDynamicFlowMappingReceiptAsync(
+            receiptTarget.Id,
+            commandId,
+            ct);
+        if (existingReceipt is not null)
+        {
+            ValidateDynamicFlowMappingReceiptReplayRequest(
+                existingReceipt,
+                commandId,
+                requestHash,
+                actorUserId);
+            var replayCommand = ResolveDynamicFlowMappingApplyCommand(
+                receiptTarget,
+                req,
+                actorUserId);
+            ValidateDynamicFlowMappingReceiptReplay(
+                existingReceipt,
+                replayCommand,
+                actorUserId);
+            await EnsureDynamicFlowMappingProvenanceIntegrityAsync(
+                receiptTarget,
+                ct);
+            await ReconcileDynamicFlowMappingOutboxAsync(
+                existingReceipt.OutboxIntentId,
+                ct);
+            return await MapDynamicFlowMappingReceiptReplayResponseAsync(
+                existingReceipt,
+                actorUserId,
+                ct);
+        }
+
+        var entity = receiptTarget;
+        var reportAccess = receiptAccess;
+        var period = await ValidateDynamicFlowMappingDraftTargetAsync(
+            entity,
+            reportAccess,
+            actorUserId,
+            ct);
+        var applyCommand = ResolveDynamicFlowMappingApplyCommand(
+            entity,
+            req,
+            actorUserId);
+        await EnsureReportMutationScopeOpenAsync(reportAccess.assignment, actorUserId, ct);
+        var successorPlan =
+            await BuildDynamicFlowMappingSuccessorAsync(entity, ct);
+
+        var mappingRuntime = await ResolveDynamicFlowMappingRuntimeAsync(
+            reportAccess.assignment,
+            entity,
+            req,
+            ct);
+        var projectionResult = await BuildDynamicFlowMappingProjectionAsync(
+            entity,
+            reportAccess.assignment,
+            req,
+            actorUserId,
+            ct,
+            mappingRuntime,
+            issuePreviewToken: false);
+        var projection = projectionResult.Projection;
+        EnsureDynamicFlowMappingExpectedTarget(
+            entity,
+            applyCommand,
+            reportAccess.assignment);
+        EnsureDynamicFlowMappingPreviewParity(
+            entity,
+            reportAccess.assignment,
+            applyCommand,
+            projection);
+
+        DynamicFlowMappingPreviewTokenClaims previewClaims;
+        try
+        {
+            previewClaims = DynamicFlowMappingSecurityContract.ValidatePreviewToken(
+                req.PreviewToken,
+                _configuration["DynamicFlowMapping:PreviewTokenSigningKey"],
+                new DynamicFlowMappingPreviewTokenBinding(
+                    actorUserId,
+                    entity.Id,
+                    reportAccess.assignment.Id,
+                    mappingRuntime.FlowInstance.Id,
+                    mappingRuntime.TargetStep.ExecutionEpoch,
+                    entity.PayloadRevision,
+                    entity.LifecycleRevision,
+                    projection.SourceSignature,
+                    projection.ResultSemanticHash,
+                    mappingRuntime.RuleSetHash,
+                    ComputeDynamicFlowMappingAuthorizationScopeHash(
+                        reportAccess.assignment,
+                        entity,
+                        mappingRuntime,
+                        projectionResult.Permissions,
+                        actorUserId)),
+                DateTime.UtcNow);
+        }
+        catch (DynamicFlowMappingSecurityException error)
+        {
+            throw DynamicFlowMappingPreviewTokenFailure(entity, error);
+        }
+
+        if (projection.HasBlockingConflicts)
+            throw DynamicFlowMappingBlockingConflict();
+
+        // P7-07 deliberately runs the complete canonical apply preflight,
+        // including authorization, source/rule re-resolution, parity, and token
+        // validation. The durable writer remains behind the P7-08 barrier.
+        EnsureDynamicFlowMappingPersistenceEnabled();
 
         var now = DateTime.UtcNow;
         var fromStatus = entity.Status;
-        var values = Values1DCompression.DeserializeObjects(entity.Values1DJson, _jsonOptions);
+        var values1DJson = ResolveDynamicFlowMappingTopLevelValuesJson(
+            entity.Values1DJson,
+            projection.TableValuesJson,
+            projectionResult.TopLevelBlockId,
+            _jsonOptions);
+        values1DJson = NormalizeDynamicFlowMappingTopLevelValueSlots(
+            values1DJson,
+            ResolveReportRuntimeInputCells(entity).Count,
+            _jsonOptions);
+        var values = Values1DCompression.DeserializeObjects(values1DJson, _jsonOptions);
+        var runtimeTopLevelBlock = await ResolveRuntimeTopLevelBlockShapeAsync(
+            entity,
+            projection.TableValuesJson,
+            values.Count,
+            ct);
+        if (runtimeTopLevelBlock is not null)
+            ApplyRuntimeTopLevelShape(entity, runtimeTopLevelBlock);
         await ValidateRuntimeRowLabelsAsync(entity, projection.TableValuesJson, ct);
-        await ValidateRuntimeDataPayloadAsync(
+        var canonicalMappedFieldValuesJson = await ValidateRuntimeDataPayloadAsync(
             entity,
             values,
             projection.FieldValuesJson,
@@ -1744,138 +1832,423 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         var tableValuesJson = Values1DCompression.CompressTableValuesJson(projection.TableValuesJson, _jsonOptions);
         var sourceSnapshot = ExtractAggregateSourceSnapshot(projection.SummarySourceJson);
 
-        var payloadResult = await _payloadWriter.SaveReportPayloadAsync(
+        var payloadResult = WorkReportPayloadService.PreflightReportPayload(
             entity,
-            entity.Values1DJson,
-            projection.FieldValuesJson,
+            values1DJson,
+            canonicalMappedFieldValuesJson,
             tableValuesJson,
             projection.SummarySourceJson,
             actorUserId,
-            now,
-            ct);
-
-        await _ctx.WorkAssignmentReports.UpdateOneAsync(
-            x => x.Id == entity.Id && !x.IsDeleted,
-            ApplyPayloadHeaderUpdate(
-                Builders<WorkAssignmentReport>.Update,
-                payloadResult,
-                now)
-                .Set(x => x.DataOrigin, projection.DataOrigin)
-                .Set(x => x.CumulativeContributionMode, projection.CumulativeContributionMode)
-                .Set(x => x.CumulativeContributionPolicyJson, projection.CumulativeContributionPolicyJson)
-                .Set(x => x.AggregateSourceReportIds, sourceSnapshot.ReportIds)
-                .Set(x => x.AggregateSourceAssignmentIds, sourceSnapshot.AssignmentIds)
-                .Set(x => x.AggregateSourceUpdatedAtUtc, now)
-                .Set(x => x.AggregateSnapshotDirty, false)
-                .Set(x => x.AggregateSnapshotDirtyAtUtc, (DateTime?)null)
-                .Set(x => x.AggregateSnapshotRefreshedAtUtc, now)
-                .Set(x => x.AggregateRefreshError, (string?)null)
-                .Set(x => x.StartedDate, startedDate)
-                .Set(x => x.CompletedDate, completedDate)
-                .Set(x => x.IsHistoricalData, isHistoricalData)
-                .Set(x => x.DueAtUtc, effectiveDueAtUtc)
-                .Set(x => x.Status, WorkAssignmentReportStatus.Draft)
-                .Set(x => x.CreatedByUserId, string.IsNullOrWhiteSpace(entity.CreatedByUserId) ? actorUserId : entity.CreatedByUserId)
-                .Set(x => x.UpdatedAtUtc, now)
-                .Set(x => x.UpdatedByUserId, actorUserId),
-            cancellationToken: ct);
-
-        entity.FieldValuesJson = projection.FieldValuesJson;
-        entity.TableValuesJson = tableValuesJson;
-        ApplyPayloadMetadata(entity, payloadResult, now);
-        entity.DataOrigin = projection.DataOrigin;
-        entity.CumulativeContributionMode = projection.CumulativeContributionMode;
-        entity.CumulativeContributionPolicyJson = projection.CumulativeContributionPolicyJson;
-        entity.SummarySourceJson = projection.SummarySourceJson;
-        entity.AggregateSourceReportIds = sourceSnapshot.ReportIds;
-        entity.AggregateSourceAssignmentIds = sourceSnapshot.AssignmentIds;
-        entity.AggregateSourceUpdatedAtUtc = now;
-        entity.AggregateSnapshotDirty = false;
-        entity.AggregateSnapshotDirtyAtUtc = null;
-        entity.AggregateSnapshotRefreshedAtUtc = now;
-        entity.AggregateRefreshError = null;
-        entity.StartedDate = startedDate;
-        entity.CompletedDate = completedDate;
-        entity.IsHistoricalData = isHistoricalData;
-        entity.DueAtUtc = effectiveDueAtUtc;
-        entity.Status = WorkAssignmentReportStatus.Draft;
-        entity.CreatedByUserId = string.IsNullOrWhiteSpace(entity.CreatedByUserId) ? actorUserId : entity.CreatedByUserId;
-        entity.UpdatedAtUtc = now;
-        entity.UpdatedByUserId = actorUserId;
-
-        await UpsertReportSectionProjectionsAsync(
+            now);
+        var periodStatus = period is null
+            ? (WorkReportPeriodStatus?)null
+            : ResolveDraftPeriodStatus(
+                isHistoricalData,
+                completedDate,
+                effectiveDueAtUtc,
+                now);
+        var persistence = BuildDynamicFlowMappingPersistenceBundle(
             entity,
-            entity.FieldValuesJson,
-            entity.TableValuesJson,
+            reportAccess.assignment,
+            period,
+            projectionResult,
+            applyCommand,
+            successorPlan,
+            previewClaims,
+            payloadResult,
+            sourceSnapshot,
+            startedDate,
+            completedDate,
+            isHistoricalData,
+            effectiveDueAtUtc,
+            fromStatus,
+            periodStatus,
             actorUserId,
-            now,
-            ct);
+            now);
+        var payloadCommand = new PayloadMutationCommand(
+            applyCommand.ExpectedPayloadRevision,
+            applyCommand.CommandId,
+            "APPLY_DYNAMIC_FLOW_MAPPING",
+            applyCommand.RequestHash);
+        var committedReport = BuildDynamicFlowMappingCommittedReport(
+            entity,
+            persistence,
+            payloadResult,
+            payloadCommand,
+            projection,
+            sourceSnapshot,
+            values1DJson,
+            canonicalMappedFieldValuesJson,
+            tableValuesJson,
+            startedDate,
+            completedDate,
+            isHistoricalData,
+            effectiveDueAtUtc,
+            actorUserId,
+            now);
 
-        if (period is not null)
+        DynamicFlowMappingTransactionOutcome transactionOutcome;
+        try
         {
-            var periodStatus = ResolveDraftPeriodStatus(isHistoricalData, completedDate, effectiveDueAtUtc, now);
-            await _ctx.WorkReportPeriods.UpdateOneAsync(
-                x => x.Id == period.Id && !x.IsDeleted,
-                Builders<WorkReportPeriod>.Update
-                    .Set(x => x.Status, periodStatus)
-                    .Set(x => x.IsOverdue, WorkReportPeriodStatusHelper.IsOverdue(periodStatus))
-                    .Set(x => x.LastDraftSavedAtUtc, now)
-                    .Set(x => x.StartedDate, startedDate)
-                    .Set(x => x.CompletedDate, completedDate)
-                    .Set(x => x.IsHistoricalData, isHistoricalData)
-                    .Set(x => x.DueAtUtc, effectiveDueAtUtc)
-                    .Set(x => x.UpdatedAtUtc, now)
-                    .Set(x => x.UpdatedByUserId, actorUserId),
-                cancellationToken: ct);
+            transactionOutcome = await _dynamicFlowTransactions.ExecuteAsync(
+                async (session, transactionCt) =>
+                {
+                    var claimedReceipt = await _ctx.DynamicFlowMappingApplyReceipts
+                        .Find(
+                            session,
+                            receipt =>
+                                receipt.TargetReportId == entity.Id &&
+                                receipt.CommandId == applyCommand.CommandId)
+                        .FirstOrDefaultAsync(transactionCt);
+                    if (claimedReceipt is not null)
+                    {
+                        ValidateDynamicFlowMappingReceiptReplay(
+                            claimedReceipt,
+                            applyCommand,
+                            actorUserId);
+                        return new DynamicFlowMappingTransactionOutcome(
+                            claimedReceipt,
+                            IsReplay: true);
+                    }
 
-            period.Status = periodStatus;
-            period.IsOverdue = WorkReportPeriodStatusHelper.IsOverdue(periodStatus);
-            period.LastDraftSavedAtUtc = now;
-            period.StartedDate = startedDate;
-            period.CompletedDate = completedDate;
-            period.IsHistoricalData = isHistoricalData;
-            period.DueAtUtc = effectiveDueAtUtc;
-            period.UpdatedAtUtc = now;
-            period.UpdatedByUserId = actorUserId;
+                    var boundaryReport =
+                        await RevalidateDynamicFlowMappingWriteBoundaryAsync(
+                            session,
+                            entity,
+                            reportAccess.assignment,
+                            projectionResult,
+                            applyCommand,
+                            actorUserId,
+                            transactionCt);
+
+                    _dynamicFlowMappingApplyFaultInjector.ThrowIfConfigured(
+                        applyCommand.CommandId,
+                        DynamicFlowMappingApplyFaultPoints.BeforeReceipt);
+                    await _ctx.DynamicFlowMappingApplyReceipts.InsertOneAsync(
+                        session,
+                        persistence.Receipt,
+                        cancellationToken: transactionCt);
+                    _dynamicFlowMappingApplyFaultInjector.ThrowIfConfigured(
+                        applyCommand.CommandId,
+                        DynamicFlowMappingApplyFaultPoints.AfterReceipt);
+
+                    _dynamicFlowMappingApplyFaultInjector.ThrowIfConfigured(
+                        applyCommand.CommandId,
+                        DynamicFlowMappingApplyFaultPoints.BeforePayload);
+                    var writtenPayload = await _payloadWriter.SaveReportPayloadAsync(
+                        boundaryReport,
+                        values1DJson,
+                        canonicalMappedFieldValuesJson,
+                        tableValuesJson,
+                        projection.SummarySourceJson,
+                        actorUserId,
+                        now,
+                        transactionCt,
+                        session);
+                    EnsureDynamicFlowMappingPayloadWriteMatches(
+                        payloadResult,
+                        writtenPayload,
+                        boundaryReport);
+                    _dynamicFlowMappingApplyFaultInjector.ThrowIfConfigured(
+                        applyCommand.CommandId,
+                        DynamicFlowMappingApplyFaultPoints.AfterPayload);
+
+                    var headerCommit = await _ctx.WorkAssignmentReports.UpdateOneAsync(
+                        session,
+                        BuildDynamicFlowMappingCommitFilter(
+                            boundaryReport,
+                            applyCommand),
+                        ApplyDynamicFlowMappingHeaderCommit(
+                            committedReport,
+                            payloadCommand,
+                            payloadResult,
+                            persistence),
+                        cancellationToken: transactionCt);
+                    if (headerCommit.ModifiedCount != 1)
+                    {
+                        throw DynamicFlowMappingTargetRevisionConflict(
+                            boundaryReport,
+                            applyCommand,
+                            "DYNAMIC_FLOW_MAPPING_TARGET_CAS_LOST");
+                    }
+
+                    await CommitDynamicFlowMappingSuccessorAsync(
+                        session,
+                        successorPlan,
+                        now,
+                        transactionCt);
+
+                    if (period is not null && periodStatus.HasValue)
+                    {
+                        var periodCommit = await _ctx.WorkReportPeriods.UpdateOneAsync(
+                            session,
+                            periodRow =>
+                                periodRow.Id == period.Id &&
+                                periodRow.WorkAssignmentId ==
+                                boundaryReport.WorkAssignmentId &&
+                                periodRow.CurrentReportId ==
+                                boundaryReport.Id &&
+                                !periodRow.IsDeleted,
+                            BuildDynamicFlowMappingPeriodUpdate(
+                                periodStatus.Value,
+                                startedDate,
+                                completedDate,
+                                isHistoricalData,
+                                effectiveDueAtUtc,
+                                actorUserId,
+                                now),
+                            cancellationToken: transactionCt);
+                        if (periodCommit.MatchedCount != 1)
+                        {
+                            throw DynamicFlowMappingTargetRevisionConflict(
+                                boundaryReport,
+                                applyCommand,
+                                "DYNAMIC_FLOW_MAPPING_PERIOD_CAS_LOST");
+                        }
+                    }
+
+                    _dynamicFlowMappingApplyFaultInjector.ThrowIfConfigured(
+                        applyCommand.CommandId,
+                        DynamicFlowMappingApplyFaultPoints.BeforeProjection);
+                    await _sectionProjection.ProjectAndVerifyAsync(
+                        committedReport,
+                        canonicalMappedFieldValuesJson,
+                        tableValuesJson,
+                        actorUserId,
+                        now,
+                        transactionCt,
+                        session);
+                    _dynamicFlowMappingApplyFaultInjector.ThrowIfConfigured(
+                        applyCommand.CommandId,
+                        DynamicFlowMappingApplyFaultPoints.AfterProjection);
+
+                    // Provenance plus the mapping event are the immutable
+                    // committed-intent envelope consumed by reconciliation.
+                    _dynamicFlowMappingApplyFaultInjector.ThrowIfConfigured(
+                        applyCommand.CommandId,
+                        DynamicFlowMappingApplyFaultPoints.BeforeIntentCommit);
+                    await _ctx.DynamicFlowMappingProvenanceRecords.InsertOneAsync(
+                        session,
+                        persistence.Provenance,
+                        cancellationToken: transactionCt);
+                    await _ctx.DynamicFlowMappingEvents.InsertOneAsync(
+                        session,
+                        persistence.Event,
+                        cancellationToken: transactionCt);
+                    _dynamicFlowMappingApplyFaultInjector.ThrowIfConfigured(
+                        applyCommand.CommandId,
+                        DynamicFlowMappingApplyFaultPoints.AfterIntentCommit);
+
+                    _dynamicFlowMappingApplyFaultInjector.ThrowIfConfigured(
+                        applyCommand.CommandId,
+                        DynamicFlowMappingApplyFaultPoints.BeforeOutbox);
+                    await _ctx.DynamicFlowMappingOutbox.InsertOneAsync(
+                        session,
+                        persistence.Outbox,
+                        cancellationToken: transactionCt);
+                    _dynamicFlowMappingApplyFaultInjector.ThrowIfConfigured(
+                        applyCommand.CommandId,
+                        DynamicFlowMappingApplyFaultPoints.AfterOutbox);
+
+                    _dynamicFlowMappingApplyFaultInjector.ThrowIfConfigured(
+                        applyCommand.CommandId,
+                        DynamicFlowMappingApplyFaultPoints.BeforeAudit);
+                    await _ctx.WorkAssignmentReportLogs.InsertOneAsync(
+                        session,
+                        persistence.AuditLog,
+                        cancellationToken: transactionCt);
+                    _dynamicFlowMappingApplyFaultInjector.ThrowIfConfigured(
+                        applyCommand.CommandId,
+                        DynamicFlowMappingApplyFaultPoints.AfterAudit);
+
+                    // This is the last callback boundary before
+                    // IDynamicFlowDefinitionTransactionRunner commits.
+                    _dynamicFlowMappingApplyFaultInjector.ThrowIfConfigured(
+                        applyCommand.CommandId,
+                        DynamicFlowMappingApplyFaultPoints
+                            .BeforeTransactionCommit);
+
+                    return new DynamicFlowMappingTransactionOutcome(
+                        persistence.Receipt,
+                        IsReplay: false);
+                },
+                ct);
+            // ExecuteAsync returned only after the Mongo transaction commit.
+            // A one-shot failure here proves committed replay/reconcile.
+            if (!transactionOutcome.IsReplay)
+            {
+                _dynamicFlowMappingApplyFaultInjector.ThrowIfConfigured(
+                    applyCommand.CommandId,
+                    DynamicFlowMappingApplyFaultPoints
+                        .AfterTransactionCommit);
+            }
+        }
+        catch (AppException error) when (
+            error.Code == AppErrorCode.DYNAMIC_FLOW_TRANSACTION_UNSUPPORTED)
+        {
+            throw new AppException(
+                AppErrorCode.DYNAMIC_FLOW_MAPPING_TRANSACTION_REQUIRED,
+                new
+                {
+                    reportId = entity.Id,
+                    commandId = applyCommand.CommandId,
+                    reason = "DYNAMIC_FLOW_MAPPING_TRANSACTION_REQUIRED"
+                },
+                innerException: error);
+        }
+        catch (Exception error) when (IsMongoDuplicateKey(error))
+        {
+            var winner = await LoadDynamicFlowMappingReceiptAsync(
+                entity.Id,
+                applyCommand.CommandId,
+                ct);
+            if (winner is null)
+                throw;
+
+            ValidateDynamicFlowMappingReceiptReplay(
+                winner,
+                applyCommand,
+                actorUserId);
+            transactionOutcome = new DynamicFlowMappingTransactionOutcome(
+                winner,
+                IsReplay: true);
         }
 
-        await InsertLogAsync(
-            workId: entity.WorkId,
-            workAssignmentId: entity.WorkAssignmentId,
-            workReportPeriodId: entity.WorkReportPeriodId,
-            workAssignmentReportId: entity.Id,
-            action: "APPLY_DYNAMIC_FLOW_MAPPING",
-            fromStatus: fromStatus.ToString(),
-            toStatus: entity.Status.ToString(),
-            actionByUserId: actorUserId,
-            reason: null,
-            comment: null,
-            snapshotJson: projection.SummarySourceJson,
-            ct: ct);
-
-        if (period is not null)
+        if (transactionOutcome.IsReplay)
         {
-            await FinalizeReportStatusOperationAsync(
-                "APPLY_DYNAMIC_FLOW_MAPPING",
-                entity,
-                period,
-                fromStatus.ToString(),
-                entity.Status.ToString(),
+            await ReconcileDynamicFlowMappingOutboxAsync(
+                transactionOutcome.Receipt.OutboxIntentId,
+                ct);
+            return await MapDynamicFlowMappingReceiptReplayResponseAsync(
+                transactionOutcome.Receipt,
                 actorUserId,
-                upsertQueue: true,
-                disableQueue: false,
-                rebuildProjection: true,
-                syncAssignment: true,
                 ct);
         }
 
-        return await MapToResponseAsync(entity, period, ct);
+        ApplyDynamicFlowMappingPeriodInMemory(
+            period,
+            periodStatus,
+            startedDate,
+            completedDate,
+            isHistoricalData,
+            effectiveDueAtUtc,
+            actorUserId,
+            now);
+        await ReconcileDynamicFlowMappingOutboxAsync(
+            persistence.Outbox.Id,
+            ct);
+        return await MapToResponseAsync(committedReport, period, actorUserId, ct);
+    }
+
+    private async Task<WorkAssignmentReportResponse>
+        PreflightDynamicFlowMappingApplyAsync(
+            WorkAssignmentReport entity,
+            (
+                WorkAssignment assignment,
+                bool isOwner,
+                bool isAssignee
+            ) reportAccess,
+            DynamicFlowMappingRequest request,
+            string actorUserId,
+            CancellationToken ct)
+    {
+        _ = await ValidateDynamicFlowMappingDraftTargetAsync(
+            entity,
+            reportAccess,
+            actorUserId,
+            ct);
+        var applyCommand = ResolveDynamicFlowMappingApplyCommand(
+            entity,
+            request,
+            actorUserId);
+        await EnsureReportMutationScopeOpenAsync(
+            reportAccess.assignment,
+            actorUserId,
+            ct);
+
+        var mappingRuntime = await ResolveDynamicFlowMappingRuntimeAsync(
+            reportAccess.assignment,
+            entity,
+            request,
+            ct);
+        var projectionResult = await BuildDynamicFlowMappingProjectionAsync(
+            entity,
+            reportAccess.assignment,
+            request,
+            actorUserId,
+            ct,
+            mappingRuntime,
+            issuePreviewToken: false);
+        var projection = projectionResult.Projection;
+        EnsureDynamicFlowMappingExpectedTarget(
+            entity,
+            applyCommand,
+            reportAccess.assignment);
+        EnsureDynamicFlowMappingPreviewParity(
+            entity,
+            reportAccess.assignment,
+            applyCommand,
+            projection);
+
+        try
+        {
+            _ = DynamicFlowMappingSecurityContract.ValidatePreviewToken(
+                request.PreviewToken,
+                _configuration["DynamicFlowMapping:PreviewTokenSigningKey"],
+                new DynamicFlowMappingPreviewTokenBinding(
+                    actorUserId,
+                    entity.Id,
+                    reportAccess.assignment.Id,
+                    mappingRuntime.FlowInstance.Id,
+                    mappingRuntime.TargetStep.ExecutionEpoch,
+                    entity.PayloadRevision,
+                    entity.LifecycleRevision,
+                    projection.SourceSignature,
+                    projection.ResultSemanticHash,
+                    mappingRuntime.RuleSetHash,
+                    ComputeDynamicFlowMappingAuthorizationScopeHash(
+                        reportAccess.assignment,
+                        entity,
+                        mappingRuntime,
+                        projectionResult.Permissions,
+                        actorUserId)),
+                DateTime.UtcNow);
+        }
+        catch (DynamicFlowMappingSecurityException error)
+        {
+            throw DynamicFlowMappingPreviewTokenFailure(entity, error);
+        }
+
+        if (projection.HasBlockingConflicts)
+            throw DynamicFlowMappingBlockingConflict();
+
+        EnsureDynamicFlowMappingPersistenceEnabled();
+        throw new InvalidOperationException(
+            "P7-08 mapping persistence barrier did not block P7-07 preflight.");
     }
 
     private async Task<(WorkAssignmentReport entity, (WorkAssignment assignment, bool isOwner, bool isAssignee) reportAccess, WorkReportPeriod? period)>
         LoadDynamicFlowMappingDraftTargetAsync(
             string id,
-            DynamicFlowMappingRequest? req,
+            string actorUserId,
+            CancellationToken ct)
+    {
+        var (entity, reportAccess) =
+            await LoadDynamicFlowMappingAuthorizedTargetAsync(
+                id,
+                actorUserId,
+                ct);
+        var period = await ValidateDynamicFlowMappingDraftTargetAsync(
+            entity,
+            reportAccess,
+            actorUserId,
+            ct);
+        return (entity, reportAccess, period);
+    }
+
+    private async Task<(WorkAssignmentReport entity, (WorkAssignment assignment, bool isOwner, bool isAssignee) reportAccess)>
+        LoadDynamicFlowMappingAuthorizedTargetAsync(
+            string id,
             string actorUserId,
             CancellationToken ct)
     {
@@ -1884,21 +2257,61 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         if (string.IsNullOrWhiteSpace(id))
             throw ReportIdRequired(id);
 
-        req ??= new DynamicFlowMappingRequest();
         var entity = await _ctx.WorkAssignmentReports
             .Find(x => x.Id == id && !x.IsDeleted)
             .FirstOrDefaultAsync(ct);
 
         if (entity is null)
-            throw ReportNotFound(id);
-        EnsureReportIsActive(entity);
-        await HydrateReportPayloadAsync(entity, ct);
-
-        var reportAccess = await EnsureReportAccessAsync(entity, actorUserId, ct);
+            throw DynamicFlowMappingTargetAccessForbidden();
+        (WorkAssignment assignment, bool isOwner, bool isAssignee)
+            reportAccess;
+        try
+        {
+            reportAccess =
+                await EnsureReportAccessAsync(
+                    entity,
+                    actorUserId,
+                    ct);
+        }
+        catch (AppException error) when (
+            error.Code is
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_ACCESS_FORBIDDEN or
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_ASSIGNMENT_NOT_FOUND)
+        {
+            throw DynamicFlowMappingTargetAccessForbidden();
+        }
         if (!reportAccess.isAssignee || entity.AssigneeUserId != actorUserId)
-            throw AppExceptionFactory.Forbidden(
-                AppErrorCode.WORK_ASSIGNMENT_REPORT_SAVE_FORBIDDEN,
-                ReportDetails(entity, actorUserId));
+            throw DynamicFlowMappingTargetAccessForbidden();
+
+        return (entity, reportAccess);
+    }
+
+    private async Task<WorkReportPeriod?>
+        ValidateDynamicFlowMappingDraftTargetAsync(
+            WorkAssignmentReport entity,
+            (WorkAssignment assignment, bool isOwner, bool isAssignee)
+                reportAccess,
+            string actorUserId,
+            CancellationToken ct)
+    {
+        EnsureReportIsActive(entity);
+
+        if (DynamicFlowBranchVisibility.IsFlowAssignment(reportAccess.assignment) &&
+            !string.Equals(
+                reportAccess.assignment.FlowEffectiveStatus,
+                DynamicFlowEffectiveStatuses.Effective,
+                StringComparison.Ordinal))
+        {
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_VALUES_INVALID,
+                new
+                {
+                    reportId = entity.Id,
+                    workAssignmentId = entity.WorkAssignmentId,
+                    reportAccess.assignment.FlowEffectiveStatus,
+                    reason = "DYNAMIC_FLOW_MAPPING_TARGET_NOT_EFFECTIVE"
+                });
+        }
 
         if (entity.Status != WorkAssignmentReportStatus.Draft)
             throw InvalidReportStatus(
@@ -1918,20 +2331,46 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             .Find(x => x.Id == entity.WorkReportPeriodId && !x.IsDeleted)
             .FirstOrDefaultAsync(ct);
 
-        return (entity, reportAccess, period);
+        return period;
     }
 
-    private async Task<DynamicFlowMappingPreviewResponse> BuildDynamicFlowMappingProjectionAsync(
+    private async Task<DynamicFlowMappingProjectionResult> BuildDynamicFlowMappingProjectionAsync(
         WorkAssignmentReport entity,
         WorkAssignment assignment,
         DynamicFlowMappingRequest? req,
         string actorUserId,
-        CancellationToken ct)
+        CancellationToken ct,
+        DynamicFlowMappingRuntimeContext? resolvedRuntime = null,
+        bool issuePreviewToken = true)
     {
         req ??= new DynamicFlowMappingRequest();
-        var rules = await ResolveDynamicFlowMappingRulesAsync(assignment, req, ct);
-        var sources = await ResolveDynamicFlowMappingSourceReportsAsync(entity, assignment, req, actorUserId, ct);
-        if (sources.Count == 0 && req.RequireSourceReport != false)
+        var runtime = resolvedRuntime ??
+                      await ResolveDynamicFlowMappingRuntimeAsync(
+                          assignment,
+                          entity,
+                          req,
+                          ct);
+        var rules = runtime.Rules;
+        var permissions = ResolveDynamicFlowMappingTargetPermissions(
+            assignment,
+            entity,
+            runtime,
+            actorUserId,
+            ct);
+        EnsureDynamicFlowMappingTargetRulesWritable(
+            entity,
+            assignment,
+            rules,
+            permissions);
+
+        var sources = await ResolveCanonicalDynamicFlowMappingSourceReportsAsync(
+            entity,
+            assignment,
+            runtime,
+            actorUserId,
+            ct);
+        var requiresSource = rules.Any(RuleRequiresDynamicFlowMappingSource);
+        if (sources.Count == 0 && requiresSource)
         {
             throw AppExceptionFactory.BadRequest(
                 AppErrorCode.WORK_ASSIGNMENT_REPORT_VALUES_INVALID,
@@ -1944,63 +2383,1001 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                 });
         }
 
+        await HydrateReportPayloadAsync(entity, ct);
+        foreach (var source in sources)
+            await HydrateReportPayloadAsync(source.Report, ct);
+
+        var topLevelBlockId = await EnsureDynamicFlowMappingTargetTableShapeAsync(entity, rules, ct);
+        var now = DateTime.UtcNow;
         var projection = DynamicFlowMappingEngine.Preview(
             entity,
             sources,
             rules,
-            req.ConflictPolicy,
-            req.ContributionPolicy,
-            DateTime.UtcNow);
+            requestConflictPolicy: null,
+            requestContributionPolicy: null,
+            now,
+            assignment.FlowStepId,
+            assignment.FlowStepCode,
+            enforceP7Contract: true);
 
-        return projection;
+        var writeViolations = DynamicFlowReportPermissionEnforcer.FindWriteViolations(
+            permissions,
+            entity.FieldValuesJson,
+            projection.FieldValuesJson,
+            entity.TableValuesJson,
+            projection.TableValuesJson);
+        if (writeViolations.Count > 0)
+        {
+            throw DynamicFlowMappingPolicyDenied(
+                entity,
+                assignment,
+                "DYNAMIC_FLOW_MAPPING_TARGET_WRITE_FORBIDDEN",
+                writeViolations);
+        }
+
+        var requiredViolations =
+            DynamicFlowReportPermissionEnforcer.FindRequiredViolations(
+                permissions,
+                projection.FieldValuesJson,
+                projection.TableValuesJson);
+        var requiredValuesMissing = requiredViolations.Count > 0;
+        if (requiredValuesMissing)
+            projection.HasBlockingConflicts = true;
+
+        DynamicFlowMappingRuntimeContract.PopulateResponseIdentity(
+            projection,
+            runtime,
+            entity);
+        projection.SourceSignature =
+            DynamicFlowMappingRuntimeContract.ComputeSourceSignature(
+                runtime,
+                entity,
+                sources);
+        projection.ResultSemanticHash =
+            DynamicFlowMappingRuntimeContract.ComputeResultSemanticHash(projection);
+        projection.MappingCapability = projection.HasBlockingConflicts
+            ? DynamicFlowMappingRuntimeContract.CapabilityBlocked
+            : DynamicFlowMappingRuntimeContract.CapabilityAllowed;
+        projection.MappingCapabilityReason = requiredValuesMissing
+            ? "DYNAMIC_FLOW_MAPPING_REQUIRED_VALUE_MISSING"
+            : projection.HasBlockingConflicts
+                ? "DYNAMIC_FLOW_MAPPING_CONFLICT"
+                : "DYNAMIC_FLOW_MAPPING_CAPABILITY_ALLOWED";
+        projection.CanPreview = true;
+        projection.CanApply =
+            IsDynamicFlowMappingApplyEnabled() &&
+            !projection.HasBlockingConflicts;
+        projection.Freshness = DynamicFlowMappingRuntimeContract.Fresh;
+
+        if (issuePreviewToken)
+        {
+            var tokenKey = _configuration[
+                "DynamicFlowMapping:PreviewTokenSigningKey"];
+            try
+            {
+                projection.PreviewToken =
+                    DynamicFlowMappingSecurityContract.IssuePreviewToken(
+                        new DynamicFlowMappingPreviewTokenBinding(
+                            actorUserId,
+                            entity.Id,
+                            assignment.Id,
+                            runtime.FlowInstance.Id,
+                            runtime.TargetStep.ExecutionEpoch,
+                            entity.PayloadRevision,
+                            entity.LifecycleRevision,
+                            projection.SourceSignature,
+                            projection.ResultSemanticHash,
+                            runtime.RuleSetHash,
+                            ComputeDynamicFlowMappingAuthorizationScopeHash(
+                                assignment,
+                                entity,
+                                runtime,
+                                permissions,
+                                actorUserId)),
+                        ObjectId.GenerateNewId().ToString(),
+                        tokenKey,
+                        now);
+                projection.PreviewIssuedAtUtc = now;
+                projection.PreviewExpiresAtUtc =
+                    now.Add(DynamicFlowMappingSecurityContract.PreviewTokenTtl);
+            }
+            catch (DynamicFlowMappingSecurityException error)
+            {
+                throw AppExceptionFactory.Create(
+                    AppErrorCode.DYNAMIC_FLOW_MAPPING_PREVIEW_TOKEN_KEY_UNAVAILABLE,
+                    new { reason = error.Reason });
+            }
+        }
+
+        return new DynamicFlowMappingProjectionResult(
+            projection,
+            topLevelBlockId,
+            runtime,
+            sources,
+            permissions);
     }
 
-    private async Task<List<DynamicFlowMappingRuleDto>> ResolveDynamicFlowMappingRulesAsync(
+    private DynamicFlowPolicyEvaluationResult
+        ResolveDynamicFlowMappingTargetPermissions(
+            WorkAssignment assignment,
+            WorkAssignmentReport report,
+            DynamicFlowMappingRuntimeContext runtime,
+            string actorUserId,
+            CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        var actorRole = ResolveDirectDynamicFlowActorRole(
+            assignment,
+            report,
+            actorUserId);
+        if (actorRole is null)
+        {
+            throw DynamicFlowMappingPolicyDenied(
+                report,
+                assignment,
+                "DYNAMIC_FLOW_MAPPING_POLICY_NOT_LOADED");
+        }
+
+        try
+        {
+            return _dynamicFlowPolicyEvaluator.Evaluate(
+                runtime.FlowVersion.PayloadJson,
+                new DynamicFlowPolicyEvaluationContext
+                {
+                    StepId = runtime.TargetStep.FlowStepId,
+                    StepCode = runtime.TargetStep.FlowStepCode,
+                    ActorRole = actorRole,
+                    IsAfterSubmit =
+                        IsDynamicFlowReportAfterSubmit(report)
+                });
+        }
+        catch (Exception error) when (
+            error is AppException or
+            InvalidOperationException or
+            JsonException)
+        {
+            throw DynamicFlowMappingPolicyDenied(
+                report,
+                assignment,
+                "DYNAMIC_FLOW_MAPPING_TARGET_POLICY_LOAD_FAILED");
+        }
+    }
+
+    private async Task RedactDynamicFlowMappingSourceIdentityWithoutRawAccessAsync(
+        DynamicFlowMappingPreviewResponse projection,
+        IReadOnlyCollection<DynamicFlowMappingSourceReport> sources,
+        string actorUserId,
+        CancellationToken ct)
+    {
+        var redactedReportIds = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var source in sources)
+        {
+            var hasRawAccess =
+                string.Equals(
+                    source.Report.AssigneeUserId,
+                    actorUserId,
+                    StringComparison.Ordinal) ||
+                await WorkAssignmentReadAccessHelper.CanReadAssignmentAsync(
+                    _ctx,
+                    source.Report.WorkAssignmentId,
+                    actorUserId,
+                    ct);
+            if (!hasRawAccess)
+                redactedReportIds.Add(source.Report.Id);
+        }
+
+        if (redactedReportIds.Count == 0)
+            return;
+        DynamicFlowMappingCallerRedaction.RedactSourceIdentities(
+            projection,
+            redactedReportIds);
+    }
+
+    private async Task<string?> EnsureDynamicFlowMappingTargetTableShapeAsync(
+        WorkAssignmentReport report,
+        IReadOnlyList<DynamicFlowMappingRuleDto> rules,
+        CancellationToken ct)
+    {
+        var targetBlockIds = rules
+            .Select(rule => NormalizeOptionalTextOrNull(rule.Target?.BlockId) ?? NormalizeOptionalTextOrNull(rule.TargetBlockId))
+            .Where(blockId => !string.IsNullOrWhiteSpace(blockId))
+            .Select(blockId => blockId!)
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+        if (targetBlockIds.Count == 0 || string.IsNullOrWhiteSpace(report.DynamicFormTemplateId))
+            return null;
+
+        var formId = report.DynamicFormTemplateId.Trim();
+        var form = await _ctx.DynamicFormTemplates
+            .Find(x => x.Id == formId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct);
+        if (form is null)
+        {
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_VALUES_INVALID,
+                new
+                {
+                    reportId = report.Id,
+                    dynamicFormTemplateId = formId,
+                    reason = "DYNAMIC_FLOW_MAPPING_TARGET_FORM_NOT_FOUND"
+                });
+        }
+
+        var contracts = ReadRuntimeTableBlocks(form);
+        var expanded = Values1DCompression.ExpandTableValuesJson(report.TableValuesJson, _jsonOptions);
+        JsonObject root;
+        try
+        {
+            if (string.IsNullOrWhiteSpace(expanded))
+            {
+                root = new JsonObject();
+            }
+            else
+            {
+                root = JsonNode.Parse(expanded) as JsonObject
+                    ?? throw AppExceptionFactory.BadRequest(
+                        AppErrorCode.WORK_ASSIGNMENT_REPORT_VALUES_INVALID,
+                        new
+                        {
+                            reportId = report.Id,
+                            field = "tableValuesJson",
+                            reason = "DYNAMIC_FLOW_MAPPING_TARGET_TABLE_VALUES_OBJECT_REQUIRED"
+                        });
+            }
+        }
+        catch (JsonException)
+        {
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_VALUES_INVALID,
+                new
+                {
+                    reportId = report.Id,
+                    field = "tableValuesJson",
+                    reason = "DYNAMIC_FLOW_MAPPING_TARGET_TABLE_VALUES_INVALID"
+                });
+        }
+
+        var blocks = root["blocks"] as JsonArray;
+        if (blocks is null)
+        {
+            if (root["blocks"] is not null)
+            {
+                throw AppExceptionFactory.BadRequest(
+                    AppErrorCode.WORK_ASSIGNMENT_REPORT_VALUES_INVALID,
+                    new
+                    {
+                        reportId = report.Id,
+                        field = "tableValuesJson.blocks",
+                        reason = "DYNAMIC_FLOW_MAPPING_TARGET_TABLE_BLOCKS_ARRAY_REQUIRED"
+                    });
+            }
+
+            blocks = new JsonArray();
+            root["blocks"] = blocks;
+        }
+
+        var changed = false;
+        foreach (var blockId in targetBlockIds)
+        {
+            var normalizedBlockId = NormalizeBlockId(blockId);
+            if (!contracts.TryGetValue(normalizedBlockId, out var contract))
+            {
+                throw AppExceptionFactory.BadRequest(
+                    AppErrorCode.WORK_ASSIGNMENT_REPORT_VALUES_INVALID,
+                    new
+                    {
+                        reportId = report.Id,
+                        dynamicFormTemplateId = formId,
+                        blockId = normalizedBlockId,
+                        reason = "DYNAMIC_FLOW_MAPPING_TARGET_TABLE_BLOCK_NOT_FOUND"
+                    });
+            }
+
+            var matchingBlocks = blocks
+                .OfType<JsonObject>()
+                .Where(block => string.Equals(
+                    NormalizeBlockId(ReadJsonNodeString(block, "blockId", "id")),
+                    contract.BlockId,
+                    StringComparison.Ordinal))
+                .ToList();
+            if (matchingBlocks.Count > 1)
+            {
+                throw AppExceptionFactory.BadRequest(
+                    AppErrorCode.WORK_ASSIGNMENT_REPORT_VALUES_INVALID,
+                    new
+                    {
+                        reportId = report.Id,
+                        blockId = contract.BlockId,
+                        reason = "DYNAMIC_FLOW_MAPPING_TARGET_TABLE_BLOCK_DUPLICATE"
+                    });
+            }
+
+            var runtimeBlock = matchingBlocks.FirstOrDefault();
+            if (runtimeBlock is null)
+            {
+                runtimeBlock = new JsonObject();
+                blocks.Add(runtimeBlock);
+                changed = true;
+            }
+            else
+            {
+                var runtimeMode = ReadJsonNodeString(runtimeBlock, "tableMode")?.Trim().ToUpperInvariant();
+                var contractMode = ReadJsonString(contract.Block, "tableMode")?.Trim().ToUpperInvariant();
+                if (string.IsNullOrWhiteSpace(contractMode))
+                    contractMode = "FIXED_GRID";
+                if (!string.IsNullOrWhiteSpace(runtimeMode) &&
+                    !string.Equals(runtimeMode, contractMode, StringComparison.Ordinal))
+                {
+                    throw AppExceptionFactory.BadRequest(
+                        AppErrorCode.WORK_ASSIGNMENT_REPORT_VALUES_INVALID,
+                        new
+                        {
+                            reportId = report.Id,
+                            blockId = contract.BlockId,
+                            runtimeMode,
+                            contractMode,
+                            reason = "DYNAMIC_FLOW_MAPPING_TARGET_TABLE_MODE_MISMATCH"
+                        });
+                }
+            }
+
+            changed |= ApplyDynamicFlowMappingTargetTableShape(runtimeBlock, contract);
+        }
+
+        if (changed)
+            report.TableValuesJson = root.ToJsonString(_jsonOptions);
+
+        return ResolveTopLevelBlockId(form);
+    }
+
+    private static bool ApplyDynamicFlowMappingTargetTableShape(
+        JsonObject runtimeBlock,
+        RuntimeTableBlockContract contract)
+    {
+        var changed = false;
+        changed |= SetJsonNodeIfMissing(runtimeBlock, "blockId", contract.BlockId);
+
+        var tableMode = ReadJsonString(contract.Block, "tableMode")?.Trim().ToUpperInvariant();
+        if (string.IsNullOrWhiteSpace(tableMode))
+            tableMode = "FIXED_GRID";
+        changed |= SetJsonNodeIfMissing(runtimeBlock, "tableMode", tableMode);
+        changed |= SetJsonNodeIfMissing(runtimeBlock, "w", contract.W);
+        changed |= SetJsonNodeIfMissing(runtimeBlock, "h", contract.H);
+        changed |= SetJsonNodeIfMissing(runtimeBlock, "dataRect", new JsonObject
+        {
+            ["r0"] = contract.DataRect.R0,
+            ["c0"] = contract.DataRect.C0,
+            ["r1"] = contract.DataRect.R1,
+            ["c1"] = contract.DataRect.C1
+        });
+
+        var inputCells = ResolveRuntimeInputCells(contract.Block, contract.DataRect, contract.W, contract.H);
+        if (runtimeBlock["values1D"] is not JsonArray values)
+        {
+            values = new JsonArray();
+            runtimeBlock["values1D"] = values;
+            changed = true;
+        }
+        while (values.Count < inputCells.Count)
+        {
+            values.Add(null);
+            changed = true;
+        }
+
+        var expectedValueSlots = new JsonArray(inputCells.Select(cell => (JsonNode)new JsonObject
+        {
+            ["index"] = cell.Index,
+            ["rowKey"] = $"row_{cell.R - contract.DataRect.R0 + 1}",
+            ["columnKey"] = $"col_{cell.C - contract.DataRect.C0 + 1}",
+            ["rowOffset"] = cell.R - contract.DataRect.R0,
+            ["columnOffset"] = cell.C - contract.DataRect.C0,
+            ["row"] = cell.R,
+            ["column"] = cell.C
+        }).ToArray());
+        if (runtimeBlock["valueSlots"] is not JsonArray valueSlots ||
+            !JsonNode.DeepEquals(valueSlots, expectedValueSlots))
+        {
+            runtimeBlock["valueSlots"] = expectedValueSlots;
+            changed = true;
+        }
+
+        var hasSpecialRanges = ReadRuntimeSpecialRanges(contract.Block, contract.DataRect).Count > 0;
+        changed |= SetJsonNodeIfMissing(runtimeBlock, "hasSpecialRanges", hasSpecialRanges);
+        changed |= CopyJsonPropertyIfMissing(runtimeBlock, contract.Block, "dynamicExcelTemplateId");
+        changed |= CopyJsonPropertyIfMissing(runtimeBlock, contract.Block, "indexMap");
+        changed |= CopyJsonPropertyIfMissing(runtimeBlock, contract.Block, "statisticsDisabled");
+        changed |= CopyJsonPropertyIfMissing(runtimeBlock, contract.Block, "statisticsInputCellCount");
+        changed |= CopyJsonPropertyIfMissing(runtimeBlock, contract.Block, "statisticsInputCellLimit");
+        changed |= CopyJsonPropertyIfMissing(runtimeBlock, contract.Block, "statisticsDisabledReason");
+
+        if (tableMode == "APPEND_ROWS" && runtimeBlock["rows"] is not JsonArray)
+        {
+            runtimeBlock["rows"] = new JsonArray();
+            changed = true;
+        }
+        else if (tableMode == "MATRIX" && runtimeBlock["cells"] is not JsonArray)
+        {
+            runtimeBlock["cells"] = new JsonArray();
+            changed = true;
+        }
+
+        return changed;
+    }
+
+    private static string MergeDynamicFlowTopLevelValuesIntoTableValuesJson(
+        WorkAssignmentReport report,
+        string? tableValuesJson,
+        RuntimeTableBlockContract contract,
+        IReadOnlyList<object?> values,
+        string actorUserId)
+    {
+        var contractMode = ReadJsonString(contract.Block, "tableMode")?.Trim().ToUpperInvariant();
+        if (string.IsNullOrWhiteSpace(contractMode))
+            contractMode = "FIXED_GRID";
+        if (contractMode != "FIXED_GRID")
+        {
+            throw RuntimeTableValuesInvalid(
+                report,
+                "DYNAMIC_FLOW_TOP_LEVEL_TABLE_VALUES_REQUIRED",
+                new { actorUserId, blockId = contract.BlockId, tableMode = contractMode });
+        }
+
+        var expanded = Values1DCompression.ExpandTableValuesJson(tableValuesJson, _jsonOptions) ?? tableValuesJson;
+        JsonObject root;
+        try
+        {
+            root = string.IsNullOrWhiteSpace(expanded)
+                ? new JsonObject()
+                : JsonNode.Parse(expanded) as JsonObject
+                  ?? throw RuntimeTableValuesInvalid(
+                      report,
+                      "DYNAMIC_FLOW_TOP_LEVEL_TABLE_VALUES_OBJECT_REQUIRED",
+                      new { actorUserId, blockId = contract.BlockId });
+        }
+        catch (JsonException)
+        {
+            throw RuntimeTableValuesInvalid(
+                report,
+                "DYNAMIC_FLOW_TOP_LEVEL_TABLE_VALUES_INVALID",
+                new { actorUserId, blockId = contract.BlockId });
+        }
+
+        var blocks = root["blocks"] as JsonArray;
+        if (blocks is null)
+        {
+            if (root["blocks"] is not null)
+            {
+                throw RuntimeTableValuesInvalid(
+                    report,
+                    "DYNAMIC_FLOW_TOP_LEVEL_TABLE_BLOCKS_ARRAY_REQUIRED",
+                    new { actorUserId, blockId = contract.BlockId });
+            }
+
+            blocks = new JsonArray();
+            root["blocks"] = blocks;
+        }
+
+        var matchingBlocks = blocks
+            .OfType<JsonObject>()
+            .Where(block => string.Equals(
+                NormalizeBlockId(ReadJsonNodeString(block, "blockId", "id")),
+                contract.BlockId,
+                StringComparison.Ordinal))
+            .ToList();
+        if (matchingBlocks.Count > 1)
+        {
+            throw RuntimeTableValuesInvalid(
+                report,
+                "DYNAMIC_FLOW_TOP_LEVEL_TABLE_BLOCK_DUPLICATE",
+                new { actorUserId, blockId = contract.BlockId });
+        }
+
+        var runtimeBlock = matchingBlocks.FirstOrDefault();
+        if (runtimeBlock is null)
+        {
+            runtimeBlock = new JsonObject();
+            blocks.Add(runtimeBlock);
+        }
+        else
+        {
+            var runtimeMode = ReadJsonNodeString(runtimeBlock, "tableMode")?.Trim().ToUpperInvariant();
+            if (!string.IsNullOrWhiteSpace(runtimeMode) && runtimeMode != contractMode)
+            {
+                throw RuntimeTableValuesInvalid(
+                    report,
+                    "DYNAMIC_FLOW_TOP_LEVEL_TABLE_MODE_MISMATCH",
+                    new { actorUserId, blockId = contract.BlockId, runtimeMode, contractMode });
+            }
+        }
+
+        ApplyDynamicFlowMappingTargetTableShape(runtimeBlock, contract);
+        runtimeBlock["values1D"] = JsonSerializer.SerializeToNode(values, _jsonOptions) as JsonArray
+                                   ?? new JsonArray();
+        return root.ToJsonString(_jsonOptions);
+    }
+
+    internal static string ResolveDynamicFlowMappingTopLevelValuesJson(
+        string? currentValues1DJson,
+        string? tableValuesJson,
+        string? topLevelBlockId,
+        JsonSerializerOptions jsonOptions)
+    {
+        var fallback = string.IsNullOrWhiteSpace(currentValues1DJson) ? EmptyValues1DJson : currentValues1DJson;
+        if (string.IsNullOrWhiteSpace(tableValuesJson) || string.IsNullOrWhiteSpace(topLevelBlockId))
+            return fallback;
+
+        var expanded = Values1DCompression.ExpandTableValuesJson(tableValuesJson, jsonOptions) ?? tableValuesJson;
+        try
+        {
+            using var document = JsonDocument.Parse(expanded);
+            if (!TryGetJsonProperty(document.RootElement, "blocks", out var blocks) ||
+                blocks.ValueKind != JsonValueKind.Array)
+            {
+                return fallback;
+            }
+
+            foreach (var block in blocks.EnumerateArray())
+            {
+                if (block.ValueKind != JsonValueKind.Object ||
+                    !string.Equals(
+                        NormalizeBlockId(ReadJsonString(block, "blockId") ?? ReadJsonString(block, "id")),
+                        NormalizeBlockId(topLevelBlockId),
+                        StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                var values = Values1DCompression.ReadBlockObjects(block, jsonOptions);
+                return values is null ? fallback : Values1DCompression.Serialize(values, jsonOptions);
+            }
+        }
+        catch (JsonException)
+        {
+            return fallback;
+        }
+
+        return fallback;
+    }
+
+    internal static string NormalizeDynamicFlowMappingTopLevelValueSlots(
+        string? values1DJson,
+        int expectedLength,
+        JsonSerializerOptions jsonOptions)
+    {
+        var normalized = string.IsNullOrWhiteSpace(values1DJson)
+            ? EmptyValues1DJson
+            : values1DJson;
+        if (expectedLength <= 0)
+            return normalized;
+
+        var values = Values1DCompression.DeserializeObjects(
+            normalized,
+            jsonOptions);
+        if (values.Count != 0)
+            return normalized;
+
+        return Values1DCompression.Serialize(
+            Enumerable.Repeat<object?>(null, expectedLength).ToList(),
+            jsonOptions);
+    }
+
+    private static bool SetJsonNodeIfMissing(JsonObject target, string propertyName, JsonNode? value)
+    {
+        if (target[propertyName] is not null)
+            return false;
+
+        target[propertyName] = value?.DeepClone();
+        return true;
+    }
+
+    private static bool SetJsonNodeIfMissing(JsonObject target, string propertyName, string value)
+        => SetJsonNodeIfMissing(target, propertyName, JsonValue.Create(value));
+
+    private static bool SetJsonNodeIfMissing(JsonObject target, string propertyName, int value)
+        => SetJsonNodeIfMissing(target, propertyName, JsonValue.Create(value));
+
+    private static bool SetJsonNodeIfMissing(JsonObject target, string propertyName, bool value)
+        => SetJsonNodeIfMissing(target, propertyName, JsonValue.Create(value));
+
+    private static bool CopyJsonPropertyIfMissing(
+        JsonObject target,
+        JsonElement source,
+        string propertyName)
+    {
+        if (target[propertyName] is not null || !TryGetJsonProperty(source, propertyName, out var value))
+            return false;
+
+        target[propertyName] = JsonNode.Parse(value.GetRawText());
+        return true;
+    }
+
+    private static string? ReadJsonNodeString(JsonObject node, params string[] names)
+    {
+        foreach (var name in names)
+        {
+            if (node[name] is JsonValue value && value.TryGetValue<string>(out var text))
+                return text;
+        }
+
+        return null;
+    }
+
+    private async Task<DynamicFlowMappingRuntimeContext> ResolveDynamicFlowMappingRuntimeAsync(
         WorkAssignment assignment,
+        WorkAssignmentReport targetReport,
         DynamicFlowMappingRequest req,
         CancellationToken ct)
     {
-        var rules = req.MappingRules is { Count: > 0 }
-            ? req.MappingRules
-            : DynamicFlowMappingEngine.ReadRulesFromJson(req.MappingRulesJson);
+        EnsureDynamicFlowMappingRequestDoesNotOverrideConfig(req);
 
-        if (rules.Count == 0)
+        if (!DynamicFlowBranchVisibility.IsFlowAssignment(assignment) ||
+            string.IsNullOrWhiteSpace(assignment.FlowInstanceId) ||
+            string.IsNullOrWhiteSpace(assignment.FlowStepId) ||
+            string.IsNullOrWhiteSpace(assignment.FlowBranchId) ||
+            assignment.FlowExecutionEpoch is not > 0 ||
+            assignment.FlowAttemptNo is not > 0)
         {
-            var version = await ResolveDynamicFlowMappingTemplateVersionAsync(assignment, req, ct);
-            if (version is not null)
-                rules = DynamicFlowMappingEngine.ReadRulesFromPayloadJson(version.PayloadJson);
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_VALUES_INVALID,
+                new
+                {
+                    reportId = targetReport.Id,
+                    workAssignmentId = assignment.Id,
+                    reason = "DYNAMIC_FLOW_MAPPING_RUNTIME_PIN_MISSING"
+                });
         }
 
-        ValidateDynamicFlowMappingRules(rules);
-        return rules;
+        var instance = await _ctx.DynamicFlowInstances
+            .Find(item =>
+                item.Id == assignment.FlowInstanceId &&
+                item.WorkId == assignment.WorkId &&
+                item.ExecutionEpoch == assignment.FlowExecutionEpoch)
+            .FirstOrDefaultAsync(ct);
+        if (instance is null ||
+            instance.State is not DynamicFlowInstanceStates.Active and
+                not DynamicFlowInstanceStates.Completed and
+                not DynamicFlowInstanceStates.Reconciled)
+        {
+            throw DynamicFlowMappingIdentityConflict(
+                targetReport,
+                assignment,
+                "flowInstanceId",
+                "DYNAMIC_FLOW_MAPPING_RUNTIME_INSTANCE_INVALID");
+        }
+
+        if (!_dynamicFlowRuntimeActivationPolicy.CanExecuteP7MappingPin(
+                instance.CatalogVersion,
+                instance.CatalogSemanticHash))
+        {
+            throw AppExceptionFactory.Create(
+                AppErrorCode.DYNAMIC_FLOW_EXECUTION_BLOCKED_UNTIL_TARGET_PHASE,
+                new
+                {
+                    field = "catalogVersion",
+                    reason = "DYNAMIC_FLOW_MAPPING_EXECUTION_BLOCKED_UNTIL_TARGET_PHASE",
+                    catalogVersion = instance.CatalogVersion,
+                    catalogSemanticHash = instance.CatalogSemanticHash,
+                    executionEligibility = DynamicFlowExecutionEligibilities.BlockedUntilTargetPhase,
+                    blockedUntilPhase = "P7",
+                    canExecute = false
+                });
+        }
+
+        var version = await _ctx.DynamicFlowTemplateVersions
+            .Find(item =>
+                item.Id == instance.FlowTemplateVersionId &&
+                item.TemplateId == instance.FlowTemplateId &&
+                item.VersionNo == instance.FlowTemplateVersionNo &&
+                item.Status == DynamicFlowTemplateVersionStatuses.Locked &&
+                !item.IsDeleted)
+            .FirstOrDefaultAsync(ct);
+        if (version is null ||
+            !string.Equals(version.PayloadHash, instance.FlowPayloadHash, StringComparison.Ordinal) ||
+            !string.Equals(version.CatalogVersion, instance.CatalogVersion, StringComparison.Ordinal) ||
+            !string.Equals(
+                version.CatalogSemanticHash,
+                instance.CatalogSemanticHash,
+                StringComparison.Ordinal))
+        {
+            throw DynamicFlowMappingIdentityConflict(
+                targetReport,
+                assignment,
+                "flowVersionId",
+                "DYNAMIC_FLOW_MAPPING_LOCKED_FLOW_PIN_CONFLICT");
+        }
+
+        var family = await _ctx.DynamicFlowTemplates
+            .Find(item => item.Id == instance.FlowTemplateId && !item.IsDeleted)
+            .FirstOrDefaultAsync(ct)
+            ?? throw DynamicFlowMappingIdentityConflict(
+                targetReport,
+                assignment,
+                "flowFamilyId",
+                "DYNAMIC_FLOW_MAPPING_FLOW_FAMILY_NOT_FOUND");
+        IReadOnlySet<string> referencedFormIds;
+        try
+        {
+            referencedFormIds =
+                DynamicFlowLockedSnapshotIntegrity.CollectReferencedFormIds(
+                    new[] { version });
+        }
+        catch (AppException error) when (
+            IsDynamicFlowMappingPolicySnapshotFailure(error))
+        {
+            throw DynamicFlowMappingPolicyDenied(
+                targetReport,
+                assignment,
+                "DYNAMIC_FLOW_MAPPING_TARGET_POLICY_LOAD_FAILED");
+        }
+        var forms = await _ctx.DynamicFormTemplates
+            .Find(item => referencedFormIds.Contains(item.Id) && !item.IsDeleted)
+            .ToListAsync(ct);
+        try
+        {
+            DynamicFlowLockedSnapshotIntegrity.Validate(
+                family,
+                new[] { version },
+                forms.ToDictionary(item => item.Id, StringComparer.Ordinal));
+        }
+        catch (AppException error) when (
+            IsDynamicFlowMappingPolicySnapshotFailure(error))
+        {
+            throw DynamicFlowMappingPolicyDenied(
+                targetReport,
+                assignment,
+                "DYNAMIC_FLOW_MAPPING_TARGET_POLICY_LOAD_FAILED");
+        }
+
+        var targetStep = await _ctx.DynamicFlowStepInstances
+            .Find(step =>
+                step.FlowInstanceId == instance.Id &&
+                step.ExecutionEpoch == instance.ExecutionEpoch &&
+                step.AssignmentId == assignment.Id &&
+                step.ReportId == targetReport.Id)
+            .FirstOrDefaultAsync(ct);
+        if (targetStep is null ||
+            targetStep.IsCanonicalEpoch == false ||
+            !string.IsNullOrWhiteSpace(targetStep.InvalidatedByFlowEventId) ||
+            targetStep.InvalidatedAtUtc.HasValue ||
+            !string.IsNullOrWhiteSpace(targetStep.SupersededByStepInstanceId) ||
+            targetStep.State is not DynamicFlowStepStates.Assigned and
+                not DynamicFlowStepStates.InProgress and
+                not DynamicFlowStepStates.Returned)
+        {
+            throw DynamicFlowMappingIdentityConflict(
+                targetReport,
+                assignment,
+                "stepInstanceId",
+                "DYNAMIC_FLOW_MAPPING_TARGET_STEP_INVALID");
+        }
+
+        if (!string.Equals(assignment.FlowTemplateId, instance.FlowTemplateId, StringComparison.Ordinal) ||
+            assignment.FlowTemplateVersionNo != instance.FlowTemplateVersionNo ||
+            assignment.FlowExecutionEpoch != targetStep.ExecutionEpoch ||
+            !string.Equals(assignment.FlowStepId, targetStep.FlowStepId, StringComparison.Ordinal) ||
+            !string.Equals(assignment.FlowBranchId, targetStep.BranchId, StringComparison.Ordinal) ||
+            assignment.FlowAttemptNo != targetStep.AttemptNo ||
+            !string.Equals(targetReport.DynamicFormTemplateId, targetStep.FormVersionId, StringComparison.Ordinal) ||
+            !string.Equals(
+                targetReport.DynamicFormFamilyId,
+                targetStep.FormFamilyId,
+                StringComparison.Ordinal) ||
+            targetReport.DynamicFormVersionNo != targetStep.FormVersionNo ||
+            !string.Equals(
+                targetReport.DynamicFormSchemaHash,
+                targetStep.FormSchemaHash,
+                StringComparison.Ordinal) ||
+            targetStep.ReportLifecycleRevision != targetReport.LifecycleRevision ||
+            !string.Equals(
+                targetStep.ReportLifecycleStatus,
+                targetReport.Status.ToString().ToUpperInvariant(),
+                StringComparison.Ordinal) ||
+            targetStep.ReportLifecycleIsActive != targetReport.IsActive)
+        {
+            throw DynamicFlowMappingIdentityConflict(
+                targetReport,
+                assignment,
+                "runtimeIdentity",
+                "DYNAMIC_FLOW_MAPPING_TARGET_RUNTIME_PIN_CONFLICT");
+        }
+
+        IReadOnlyList<DynamicFlowMappingRuleDto> rules;
+        try
+        {
+            rules = DynamicFlowMappingEngine.ReadRulesFromPayloadJson(
+                version.PayloadJson);
+        }
+        catch (AppException error) when (
+            IsDynamicFlowMappingPolicySnapshotFailure(error))
+        {
+            throw DynamicFlowMappingPolicyDenied(
+                targetReport,
+                assignment,
+                "DYNAMIC_FLOW_MAPPING_TARGET_POLICY_LOAD_FAILED");
+        }
+        try
+        {
+            DynamicFlowMappingEngine.ValidateP7Rules(rules);
+        }
+        catch (DynamicFlowMappingEvaluationException error)
+        {
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_VALUES_INVALID,
+                new
+                {
+                    reportId = targetReport.Id,
+                    workAssignmentId = assignment.Id,
+                    reason = error.Reason
+                });
+        }
+
+        var runtime = new DynamicFlowMappingRuntimeContext(
+            version,
+            instance,
+            targetStep,
+            rules,
+            DynamicFlowMappingRuntimeContract.ComputeRuleSetHash(rules));
+        try
+        {
+            DynamicFlowMappingRuntimeContract.ValidateCallerAssertions(req, runtime, targetReport);
+        }
+        catch (DynamicFlowMappingContractException error)
+        {
+            throw DynamicFlowMappingIdentityConflict(
+                targetReport,
+                assignment,
+                error.Field ?? "runtimeIdentity",
+                error.Reason);
+        }
+
+        return runtime;
+    }
+
+    private static bool IsDynamicFlowMappingPolicySnapshotFailure(
+        AppException error)
+    {
+        for (Exception? current = error;
+             current is not null;
+             current = current.InnerException)
+        {
+            if (current is not AppException appError)
+                continue;
+
+            if (appError.Code is
+                AppErrorCode.DYNAMIC_FLOW_ACTOR_POLICY_COVERAGE_INCOMPLETE or
+                AppErrorCode.DYNAMIC_FLOW_FIELD_POLICY_COVERAGE_INCOMPLETE or
+                AppErrorCode.DYNAMIC_FLOW_TABLE_POLICY_COVERAGE_INCOMPLETE or
+                AppErrorCode.DYNAMIC_FLOW_TABLE_POLICY_ENDPOINT_INCOMPATIBLE or
+                AppErrorCode.DYNAMIC_FLOW_POLICY_SPECIFICITY_CONFLICT or
+                AppErrorCode.DYNAMIC_FLOW_POLICY_FIELD_UNKNOWN or
+                AppErrorCode.DYNAMIC_FLOW_ACTOR_ROLE_UNKNOWN)
+            {
+                return true;
+            }
+
+            if (appError.Code == AppErrorCode.COMMON_VALIDATION_FAILED &&
+                IsDynamicFlowMappingPolicyFailureDetails(
+                    appError.Details))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool IsDynamicFlowMappingPolicyFailureDetails(
+        object? details)
+    {
+        if (details is null)
+            return false;
+
+        try
+        {
+            var json = JsonSerializer.Serialize(details);
+            return new[]
+                {
+                    "DYNAMIC_FLOW_ACTOR_POLICY_COVERAGE_INCOMPLETE",
+                    "DYNAMIC_FLOW_FIELD_POLICY_COVERAGE_INCOMPLETE",
+                    "DYNAMIC_FLOW_TABLE_POLICY_COVERAGE_INCOMPLETE",
+                    "DYNAMIC_FLOW_TABLE_POLICY_ENDPOINT_INCOMPATIBLE",
+                    "DYNAMIC_FLOW_POLICY_SPECIFICITY_CONFLICT",
+                    "DYNAMIC_FLOW_POLICY_SCOPE_DUPLICATE",
+                    "DYNAMIC_FLOW_POLICY_FIELD_UNKNOWN",
+                    "DYNAMIC_FLOW_ACTOR_ROLE_UNKNOWN"
+                }
+                .Any(reason => json.Contains(
+                    reason,
+                    StringComparison.Ordinal));
+        }
+        catch (Exception error) when (
+            error is NotSupportedException or
+            InvalidOperationException)
+        {
+            return false;
+        }
+    }
+
+    private static AppException DynamicFlowMappingIdentityConflict(
+        WorkAssignmentReport report,
+        WorkAssignment assignment,
+        string field,
+        string reason)
+        => AppExceptionFactory.Create(
+            AppErrorCode.DYNAMIC_FLOW_MAPPING_IDENTITY_CONFLICT,
+            new
+            {
+                reportId = report.Id,
+                workAssignmentId = assignment.Id,
+                field,
+                reason
+            });
+
+    private static AppException
+        DynamicFlowMappingTargetAccessForbidden()
+        => RawReportReadAccessForbidden();
+
+    internal static AppException DynamicFlowMappingBlockingConflict()
+        => AppExceptionFactory.BadRequest(
+            AppErrorCode.WORK_ASSIGNMENT_REPORT_VALUES_INVALID,
+            new
+            {
+                reason = "DYNAMIC_FLOW_MAPPING_CONFLICT",
+                hasBlockingConflicts = true
+            });
+
+    private static void EnsureDynamicFlowMappingRequestDoesNotOverrideConfig(DynamicFlowMappingRequest req)
+    {
+        try
+        {
+            DynamicFlowMappingSecurityContract
+                .ValidateFlowOwnedRequestInputs(req);
+        }
+        catch (DynamicFlowMappingSecurityException error) when (
+            string.Equals(
+                error.Reason,
+                DynamicFlowMappingSecurityContract
+                    .FlowOwnedConfigurationReason,
+                StringComparison.Ordinal))
+        {
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.COMMON_VALIDATION_FAILED,
+                new
+                {
+                    field = error.Field,
+                    reason = error.Reason
+                });
+        }
     }
 
     private async Task<DynamicFlowTemplateVersion?> ResolveDynamicFlowMappingTemplateVersionAsync(
         WorkAssignment assignment,
-        DynamicFlowMappingRequest req,
         CancellationToken ct)
     {
-        if (!string.IsNullOrWhiteSpace(req.FlowTemplateVersionId))
-        {
-            var versionId = NormalizeObjectIdOrValidation(req.FlowTemplateVersionId, "flowTemplateVersionId");
-            return await _ctx.DynamicFlowTemplateVersions
-                .Find(x => x.Id == versionId && !x.IsDeleted)
-                .FirstOrDefaultAsync(ct)
-                ?? throw AppExceptionFactory.NotFound(
-                    AppErrorCode.COMMON_NOT_FOUND,
-                    new { flowTemplateVersionId = versionId, reason = "DYNAMIC_FLOW_TEMPLATE_VERSION_NOT_FOUND" });
-        }
-
-        var templateId = NormalizeOptionalTextOrNull(req.FlowTemplateId) ?? NormalizeOptionalTextOrNull(assignment.FlowTemplateId);
-        var versionNo = req.FlowTemplateVersionNo ?? assignment.FlowTemplateVersionNo;
+        var templateId = NormalizeOptionalTextOrNull(assignment.FlowTemplateId);
+        var versionNo = assignment.FlowTemplateVersionNo;
         if (string.IsNullOrWhiteSpace(templateId) || !versionNo.HasValue)
             return null;
 
-        return await _ctx.DynamicFlowTemplateVersions
+        var version = await _ctx.DynamicFlowTemplateVersions
             .Find(x => x.TemplateId == templateId &&
                        x.VersionNo == versionNo.Value &&
+                       x.Status == DynamicFlowTemplateVersionStatuses.Locked &&
                        !x.IsDeleted)
             .FirstOrDefaultAsync(ct);
+        if (version is null)
+        {
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.COMMON_VALIDATION_FAILED,
+                new
+                {
+                    flowTemplateId = templateId,
+                    flowTemplateVersionNo = versionNo,
+                    reason = "DYNAMIC_FLOW_TEMPLATE_VERSION_LOCKED_REQUIRED"
+                });
+        }
+
+        return version;
     }
 
     private static void ValidateDynamicFlowMappingRules(IReadOnlyCollection<DynamicFlowMappingRuleDto> rules)
@@ -2031,6 +3408,502 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         }
     }
 
+    private async Task<List<DynamicFlowMappingSourceReport>>
+        ResolveCanonicalDynamicFlowMappingSourceReportsAsync(
+            WorkAssignmentReport targetReport,
+            WorkAssignment targetAssignment,
+            DynamicFlowMappingRuntimeContext runtime,
+            string actorUserId,
+            CancellationToken ct)
+    {
+        var sourceStepIds = runtime.Rules
+            .SelectMany(rule =>
+                rule.Inputs is { Count: > 0 }
+                    ? rule.Inputs
+                        .Where(input => !string.Equals(
+                            input.Source.Kind,
+                            "CONSTANT",
+                            StringComparison.OrdinalIgnoreCase))
+                        .Select(input => NormalizeOptionalTextOrNull(input.Source.StepId))
+                    : new[] { NormalizeOptionalTextOrNull(rule.SourceStepId) })
+            .Where(stepId => !string.IsNullOrWhiteSpace(stepId))
+            .Select(stepId => stepId!)
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+        if (sourceStepIds.Count == 0)
+            return new List<DynamicFlowMappingSourceReport>();
+        if (sourceStepIds.Contains(runtime.TargetStep.FlowStepId, StringComparer.Ordinal))
+        {
+            throw DynamicFlowMappingIdentityConflict(
+                targetReport,
+                targetAssignment,
+                "source.stepId",
+                "DYNAMIC_FLOW_MAPPING_SOURCE_TARGET_CYCLE_FORBIDDEN");
+        }
+
+        var canonical = DynamicFlowDefinitionPayloadContract.CanonicalizeAndValidate(
+            runtime.FlowVersion.PayloadJson,
+            new DynamicFlowDefinitionValidationOptions(
+                AllowLegacy: false,
+                AllowServerManagedPins: true,
+                RequireServerManagedPins: true,
+                AllowHistoricalCatalogPins: true));
+        foreach (var sourceStepId in sourceStepIds)
+        {
+            if (!IsDynamicFlowMappingTopologyAncestor(
+                    canonical.Payload,
+                    sourceStepId,
+                    runtime.TargetStep.FlowStepId))
+            {
+                throw DynamicFlowMappingIdentityConflict(
+                    targetReport,
+                    targetAssignment,
+                    "source.stepId",
+                    "DYNAMIC_FLOW_MAPPING_SOURCE_TOPOLOGY_MISMATCH");
+            }
+        }
+
+        var sourceSteps = await _ctx.DynamicFlowStepInstances
+            .Find(step =>
+                step.FlowInstanceId == runtime.FlowInstance.Id &&
+                step.ExecutionEpoch == runtime.TargetStep.ExecutionEpoch &&
+                sourceStepIds.Contains(step.FlowStepId))
+            .ToListAsync(ct);
+        if (sourceSteps.Count == 0)
+            return new List<DynamicFlowMappingSourceReport>();
+
+        var reportIds = sourceSteps
+            .Select(step => NormalizeOptionalTextOrNull(step.ReportId))
+            .Where(reportId => !string.IsNullOrWhiteSpace(reportId))
+            .Select(reportId => reportId!)
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+        var reports = await _ctx.WorkAssignmentReports
+            .Find(report => reportIds.Contains(report.Id) && !report.IsDeleted)
+            .ToListAsync(ct);
+        var reportById = reports.ToDictionary(report => report.Id, StringComparer.Ordinal);
+
+        var assignmentIds = sourceSteps
+            .Select(step => NormalizeOptionalTextOrNull(step.AssignmentId))
+            .Where(assignmentId => !string.IsNullOrWhiteSpace(assignmentId))
+            .Select(assignmentId => assignmentId!)
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+        var assignments = await _ctx.WorkAssignments
+            .Find(assignment => assignmentIds.Contains(assignment.Id) && !assignment.IsDeleted)
+            .ToListAsync(ct);
+        var assignmentById = assignments.ToDictionary(
+            assignment => assignment.Id,
+            StringComparer.Ordinal);
+
+        var actorRole = ResolveDirectDynamicFlowActorRole(
+            targetAssignment,
+            targetReport,
+            actorUserId);
+        if (actorRole is null)
+        {
+            if (await HasReviewReportReadAccessAsync(targetReport, actorUserId, ct))
+            {
+                actorRole = "REVIEWER";
+            }
+            else if (await HasAggregateAncestorReadAccessAsync(
+                         targetAssignment,
+                         actorUserId,
+                         ct))
+            {
+                actorRole = "FINALIZER";
+            }
+            else
+            {
+                throw AppExceptionFactory.Forbidden(
+                    AppErrorCode.DYNAMIC_FLOW_MAPPING_SOURCE_FORBIDDEN,
+                    new
+                    {
+                        reportId = targetReport.Id,
+                        workAssignmentId = targetAssignment.Id,
+                        reason = "DYNAMIC_FLOW_MAPPING_SERVER_ROLE_UNRESOLVED"
+                    });
+            }
+        }
+        var result = new List<DynamicFlowMappingSourceReport>();
+        foreach (var step in sourceSteps
+                     .OrderBy(item => item.StepOrder)
+                     .ThenBy(item => item.BranchId, StringComparer.Ordinal)
+                     .ThenBy(item => item.AttemptNo)
+                     .ThenBy(item => item.Id, StringComparer.Ordinal))
+        {
+            if (step.IsCanonicalEpoch == false ||
+                !string.IsNullOrWhiteSpace(step.InvalidatedByFlowEventId) ||
+                step.InvalidatedAtUtc.HasValue ||
+                !string.IsNullOrWhiteSpace(step.SupersededByStepInstanceId) ||
+                step.State is not DynamicFlowStepStates.Approved and
+                    not DynamicFlowStepStates.Completed ||
+                string.IsNullOrWhiteSpace(step.ReportId) ||
+                string.IsNullOrWhiteSpace(step.AssignmentId) ||
+                !reportById.TryGetValue(step.ReportId, out var report) ||
+                !assignmentById.TryGetValue(step.AssignmentId, out var assignment))
+            {
+                throw DynamicFlowMappingIdentityConflict(
+                    targetReport,
+                    targetAssignment,
+                    "source.stepInstanceId",
+                    "DYNAMIC_FLOW_MAPPING_SOURCE_RUNTIME_INVALID");
+            }
+
+            if (!report.IsActive ||
+                !report.IsCurrent ||
+                report.Status != WorkAssignmentReportStatus.Approved ||
+                !assignment.IsActive ||
+                !string.Equals(
+                    assignment.FlowEffectiveStatus,
+                    DynamicFlowEffectiveStatuses.Effective,
+                    StringComparison.Ordinal) ||
+                !string.Equals(assignment.WorkId, targetAssignment.WorkId, StringComparison.Ordinal) ||
+                !string.Equals(assignment.FlowInstanceId, runtime.FlowInstance.Id, StringComparison.Ordinal) ||
+                assignment.FlowExecutionEpoch != runtime.TargetStep.ExecutionEpoch ||
+                !string.Equals(assignment.FlowStepId, step.FlowStepId, StringComparison.Ordinal) ||
+                !string.Equals(assignment.FlowBranchId, step.BranchId, StringComparison.Ordinal) ||
+                assignment.FlowAttemptNo != step.AttemptNo ||
+                !string.Equals(report.WorkAssignmentId, assignment.Id, StringComparison.Ordinal) ||
+                !string.Equals(report.DynamicFormTemplateId, step.FormVersionId, StringComparison.Ordinal) ||
+                !string.Equals(report.DynamicFormFamilyId, step.FormFamilyId, StringComparison.Ordinal) ||
+                report.DynamicFormVersionNo != step.FormVersionNo ||
+                !string.Equals(report.DynamicFormSchemaHash, step.FormSchemaHash, StringComparison.Ordinal) ||
+                step.ReportLifecycleRevision != report.LifecycleRevision ||
+                !string.Equals(
+                    step.ReportLifecycleStatus,
+                    report.Status.ToString().ToUpperInvariant(),
+                    StringComparison.Ordinal) ||
+                step.ReportLifecycleIsActive != report.IsActive ||
+                report.PayloadRevision < 0 ||
+                !IsLowerSha256(report.PayloadHash))
+            {
+                throw DynamicFlowMappingIdentityConflict(
+                    targetReport,
+                    targetAssignment,
+                    "source.runtimeIdentity",
+                    "DYNAMIC_FLOW_MAPPING_SOURCE_PIN_CONFLICT");
+            }
+
+            try
+            {
+                DynamicFlowMappingCanonicalSourceContract.Validate(
+                    runtime.FlowInstance,
+                    runtime.TargetStep,
+                    targetAssignment,
+                    step,
+                    assignment,
+                    report,
+                    IsDynamicFlowMappingTopologyAncestor(
+                        canonical.Payload,
+                        step.FlowStepId,
+                        runtime.TargetStep.FlowStepId));
+            }
+            catch (DynamicFlowMappingSourceContractException error)
+            {
+                throw DynamicFlowMappingIdentityConflict(
+                    targetReport,
+                    targetAssignment,
+                    error.Field,
+                    error.Reason);
+            }
+
+            DynamicFlowPolicyEvaluationResult sourcePermissions;
+            try
+            {
+                sourcePermissions = _dynamicFlowPolicyEvaluator.Evaluate(
+                    runtime.FlowVersion.PayloadJson,
+                    new DynamicFlowPolicyEvaluationContext
+                    {
+                        StepId = step.FlowStepId,
+                        StepCode = step.FlowStepCode,
+                        ActorRole = actorRole,
+                        IsAfterSubmit = true
+                    });
+            }
+            catch (Exception error) when (
+                error is AppException or
+                InvalidOperationException or
+                JsonException)
+            {
+                throw DynamicFlowMappingPolicyDenied(
+                    targetReport,
+                    targetAssignment,
+                    "DYNAMIC_FLOW_MAPPING_SOURCE_POLICY_LOAD_FAILED");
+            }
+
+            EnsureDynamicFlowMappingSourceRulesReadable(
+                targetReport,
+                targetAssignment,
+                runtime.Rules,
+                step.FlowStepId,
+                sourcePermissions);
+            await HydrateReportPayloadAsync(report, ct);
+            result.Add(new DynamicFlowMappingSourceReport(
+                report,
+                step.FlowStepId,
+                step.FlowStepCode,
+                report.FieldValuesJson,
+                report.TableValuesJson,
+                runtime.FlowInstance,
+                step,
+                assignment));
+        }
+
+        return result;
+    }
+
+    private static bool RuleRequiresDynamicFlowMappingSource(
+        DynamicFlowMappingRuleDto rule)
+        => rule.Inputs is { Count: > 0 }
+            ? rule.Inputs.Any(input => !string.Equals(
+                input.Source.Kind,
+                "CONSTANT",
+                StringComparison.OrdinalIgnoreCase))
+            : !string.IsNullOrWhiteSpace(rule.SourceStepId);
+
+    private static bool IsDynamicFlowMappingTopologyAncestor(
+        DynamicFlowTemplatePayloadDto payload,
+        string sourceStepId,
+        string targetStepId)
+    {
+        var nextByNode = payload.Edges
+            .GroupBy(edge => edge.FromNodeId, StringComparer.Ordinal)
+            .ToDictionary(
+                group => group.Key,
+                group => group
+                    .Select(edge => edge.ToNodeId)
+                    .Distinct(StringComparer.Ordinal)
+                    .ToList(),
+                StringComparer.Ordinal);
+        var pending = new Queue<string>();
+        var seen = new HashSet<string>(StringComparer.Ordinal)
+        {
+            sourceStepId
+        };
+        pending.Enqueue(sourceStepId);
+        while (pending.TryDequeue(out var current))
+        {
+            if (!nextByNode.TryGetValue(current, out var nextNodes))
+                continue;
+            foreach (var next in nextNodes)
+            {
+                if (string.Equals(next, targetStepId, StringComparison.Ordinal))
+                    return true;
+                if (seen.Add(next))
+                    pending.Enqueue(next);
+            }
+        }
+
+        return false;
+    }
+
+    private static bool IsLowerSha256(string? value)
+        => value is { Length: 64 } &&
+           value.All(character =>
+               character is >= '0' and <= '9' ||
+               character is >= 'a' and <= 'f');
+
+    private static void EnsureDynamicFlowMappingTargetRulesWritable(
+        WorkAssignmentReport report,
+        WorkAssignment assignment,
+        IReadOnlyCollection<DynamicFlowMappingRuleDto> rules,
+        DynamicFlowPolicyEvaluationResult permissions)
+    {
+        foreach (var rule in rules)
+        {
+            var targetKind = !string.IsNullOrWhiteSpace(rule.Target?.FieldId) ||
+                             !string.IsNullOrWhiteSpace(rule.Target?.FieldKey) ||
+                             !string.IsNullOrWhiteSpace(rule.TargetFieldId) ||
+                             !string.IsNullOrWhiteSpace(rule.TargetFieldKey)
+                ? "FIELD"
+                : "TABLE_COLUMN";
+            if (targetKind == "FIELD")
+            {
+                var fieldId = NormalizeOptionalTextOrNull(rule.Target?.FieldId) ??
+                              NormalizeOptionalTextOrNull(rule.TargetFieldId);
+                var fieldKey = NormalizeOptionalTextOrNull(rule.Target?.FieldKey) ??
+                               NormalizeOptionalTextOrNull(rule.TargetFieldKey);
+                var allowed = !permissions.DenyAllFields &&
+                              permissions.Fields.Values.Any(permission =>
+                                  DynamicFlowMappingFieldPermissionMatches(
+                                      permission,
+                                      fieldId,
+                                      fieldKey) &&
+                                  permission.Write &&
+                                  !permission.Hidden &&
+                                  !permission.Locked);
+                if (!allowed)
+                {
+                    throw DynamicFlowMappingPolicyDenied(
+                        report,
+                        assignment,
+                        "DYNAMIC_FLOW_MAPPING_TARGET_FIELD_WRITE_FORBIDDEN");
+                }
+
+                continue;
+            }
+
+            var blockId = NormalizeOptionalTextOrNull(rule.Target?.BlockId) ??
+                          NormalizeOptionalTextOrNull(rule.TargetBlockId);
+            var columnKey = NormalizeOptionalTextOrNull(rule.Target?.ColumnKey) ??
+                            NormalizeOptionalTextOrNull(rule.TargetColumnKey);
+            var tableAllowed = !permissions.DenyAllTableColumns &&
+                               permissions.TableColumns.Values.Any(permission =>
+                                   string.Equals(
+                                       permission.BlockId,
+                                       blockId,
+                                       StringComparison.Ordinal) &&
+                                   string.Equals(
+                                       permission.ColumnKey,
+                                       columnKey,
+                                       StringComparison.OrdinalIgnoreCase) &&
+                                   permission.Write &&
+                                   !permission.Hidden &&
+                                   !permission.Locked);
+            if (!tableAllowed)
+            {
+                throw DynamicFlowMappingPolicyDenied(
+                    report,
+                    assignment,
+                    "DYNAMIC_FLOW_MAPPING_TARGET_TABLE_WRITE_FORBIDDEN");
+            }
+        }
+    }
+
+    private static void EnsureDynamicFlowMappingSourceRulesReadable(
+        WorkAssignmentReport targetReport,
+        WorkAssignment targetAssignment,
+        IReadOnlyCollection<DynamicFlowMappingRuleDto> rules,
+        string sourceStepId,
+        DynamicFlowPolicyEvaluationResult permissions)
+    {
+        foreach (var rule in rules)
+        {
+            var endpoints = rule.Inputs is { Count: > 0 }
+                ? rule.Inputs
+                    .Where(input =>
+                        !string.Equals(
+                            input.Source.Kind,
+                            "CONSTANT",
+                            StringComparison.OrdinalIgnoreCase) &&
+                        string.Equals(
+                            input.Source.StepId,
+                            sourceStepId,
+                            StringComparison.Ordinal))
+                    .Select(input => input.Source)
+                : string.Equals(rule.SourceStepId, sourceStepId, StringComparison.Ordinal)
+                    ? new[]
+                    {
+                        new DynamicFlowMappingEndpointDto
+                        {
+                            Kind = !string.IsNullOrWhiteSpace(rule.SourceFieldId) ||
+                                   !string.IsNullOrWhiteSpace(rule.SourceFieldKey)
+                                ? "FIELD"
+                                : "TABLE_COLUMN",
+                            FieldId = rule.SourceFieldId,
+                            FieldKey = rule.SourceFieldKey,
+                            BlockId = rule.SourceBlockId,
+                            ColumnKey = rule.SourceColumnKey
+                        }
+                    }
+                    : Array.Empty<DynamicFlowMappingEndpointDto>();
+
+            foreach (var endpoint in endpoints)
+            {
+                if (string.Equals(endpoint.Kind, "FIELD", StringComparison.OrdinalIgnoreCase))
+                {
+                    var allowed = !permissions.DenyAllFields &&
+                                  permissions.Fields.Values.Any(permission =>
+                                      DynamicFlowMappingFieldPermissionMatches(
+                                          permission,
+                                          endpoint.FieldId,
+                                          endpoint.FieldKey) &&
+                                      permission.Read &&
+                                      !permission.Hidden);
+                    if (!allowed)
+                    {
+                        throw DynamicFlowMappingPolicyDenied(
+                            targetReport,
+                            targetAssignment,
+                            "DYNAMIC_FLOW_MAPPING_SOURCE_FIELD_READ_FORBIDDEN");
+                    }
+                }
+                else
+                {
+                    var allowed = !permissions.DenyAllTableColumns &&
+                                  permissions.TableColumns.Values.Any(permission =>
+                                      string.Equals(
+                                          permission.BlockId,
+                                          endpoint.BlockId,
+                                          StringComparison.Ordinal) &&
+                                      string.Equals(
+                                          permission.ColumnKey,
+                                          endpoint.ColumnKey,
+                                          StringComparison.OrdinalIgnoreCase) &&
+                                      permission.Read &&
+                                      !permission.Hidden);
+                    if (!allowed)
+                    {
+                        throw DynamicFlowMappingPolicyDenied(
+                            targetReport,
+                            targetAssignment,
+                            "DYNAMIC_FLOW_MAPPING_SOURCE_TABLE_READ_FORBIDDEN");
+                    }
+                }
+            }
+        }
+    }
+
+    private static bool DynamicFlowMappingFieldPermissionMatches(
+        DynamicFlowFieldPermissionDto permission,
+        string? fieldId,
+        string? fieldKey)
+        => (!string.IsNullOrWhiteSpace(fieldId) &&
+            (string.Equals(permission.FieldId, fieldId, StringComparison.Ordinal) ||
+             string.Equals(permission.TargetKey, fieldId, StringComparison.Ordinal))) ||
+           (!string.IsNullOrWhiteSpace(fieldKey) &&
+            (string.Equals(
+                 permission.FieldKey,
+                 fieldKey,
+                 StringComparison.OrdinalIgnoreCase) ||
+             string.Equals(
+                 permission.TargetKey,
+                 fieldKey,
+                 StringComparison.OrdinalIgnoreCase)));
+
+    private static AppException DynamicFlowMappingPolicyDenied(
+        WorkAssignmentReport report,
+        WorkAssignment assignment,
+        string reason,
+        object? violations = null)
+    {
+        var code = reason switch
+        {
+            "DYNAMIC_FLOW_MAPPING_POLICY_NOT_LOADED" or
+            "DYNAMIC_FLOW_MAPPING_TARGET_POLICY_LOAD_FAILED" or
+            "DYNAMIC_FLOW_MAPPING_SOURCE_POLICY_LOAD_FAILED" =>
+                AppErrorCode.DYNAMIC_FLOW_MAPPING_POLICY_UNAVAILABLE,
+            "DYNAMIC_FLOW_MAPPING_TARGET_FIELD_WRITE_FORBIDDEN" =>
+                AppErrorCode.DYNAMIC_FLOW_MAPPING_FIELD_WRITE_FORBIDDEN,
+            "DYNAMIC_FLOW_MAPPING_TARGET_TABLE_WRITE_FORBIDDEN" =>
+                AppErrorCode.DYNAMIC_FLOW_MAPPING_TABLE_COLUMN_WRITE_FORBIDDEN,
+            "DYNAMIC_FLOW_MAPPING_SOURCE_FIELD_READ_FORBIDDEN" or
+            "DYNAMIC_FLOW_MAPPING_SOURCE_TABLE_READ_FORBIDDEN" =>
+                AppErrorCode.DYNAMIC_FLOW_MAPPING_SOURCE_FORBIDDEN,
+            _ => AppErrorCode.DYNAMIC_FLOW_MAPPING_POLICY_DENIED
+        };
+        return AppExceptionFactory.Create(
+            code,
+            new
+            {
+                reportId = report.Id,
+                workAssignmentId = assignment.Id,
+                reason,
+                violations
+            });
+    }
+
     private async Task<List<DynamicFlowMappingSourceReport>> ResolveDynamicFlowMappingSourceReportsAsync(
         WorkAssignmentReport targetReport,
         WorkAssignment targetAssignment,
@@ -2045,7 +3918,12 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             .Distinct(StringComparer.Ordinal)
             .ToList();
         if (explicitIds.Count > 0)
-            return await LoadDynamicFlowMappingSourceReportsByIdsAsync(explicitIds, actorUserId, ct);
+            return await LoadDynamicFlowMappingSourceReportsByIdsAsync(
+                explicitIds,
+                targetReport,
+                targetAssignment,
+                actorUserId,
+                ct);
 
         var sourceMode = NormalizeDynamicFlowMappingSourceMode(req.SourceMode, targetAssignment);
         return sourceMode switch
@@ -2057,6 +3935,8 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
 
     private async Task<List<DynamicFlowMappingSourceReport>> LoadDynamicFlowMappingSourceReportsByIdsAsync(
         IReadOnlyCollection<string> sourceReportIds,
+        WorkAssignmentReport targetReport,
+        WorkAssignment targetAssignment,
         string actorUserId,
         CancellationToken ct)
     {
@@ -2067,6 +3947,11 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             .Find(x => ids.Contains(x.Id) && !x.IsDeleted)
             .ToListAsync(ct);
         var byId = reports.ToDictionary(x => x.Id, StringComparer.Ordinal);
+        var sourceAssignmentIds = reports.Select(report => report.WorkAssignmentId).Distinct(StringComparer.Ordinal).ToList();
+        var sourceAssignments = await _ctx.WorkAssignments
+            .Find(assignment => sourceAssignmentIds.Contains(assignment.Id) && !assignment.IsDeleted)
+            .ToListAsync(ct);
+        var assignmentById = sourceAssignments.ToDictionary(assignment => assignment.Id, StringComparer.Ordinal);
         var result = new List<DynamicFlowMappingSourceReport>();
 
         foreach (var id in ids)
@@ -2074,7 +3959,23 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             if (!byId.TryGetValue(id, out var report))
                 throw ReportNotFound(id);
             EnsureReportIsActive(report);
-            result.Add(await ToDynamicFlowMappingSourceReportAsync(report, actorUserId, ct));
+            if (!report.IsCurrent ||
+                report.Status != WorkAssignmentReportStatus.Approved ||
+                !string.Equals(report.WorkId, targetReport.WorkId, StringComparison.Ordinal) ||
+                !assignmentById.TryGetValue(report.WorkAssignmentId, out var sourceAssignment) ||
+                !DynamicFlowSourceContextMatches(targetAssignment, sourceAssignment))
+            {
+                throw AppExceptionFactory.BadRequest(
+                    AppErrorCode.WORK_ASSIGNMENT_REPORT_VALUES_INVALID,
+                    new
+                    {
+                        sourceReportId = report.Id,
+                        targetReportId = targetReport.Id,
+                        reason = "DYNAMIC_FLOW_MAPPING_SOURCE_CONTEXT_MISMATCH"
+                    });
+            }
+
+            result.Add(await ToDynamicFlowMappingSourceReportAsync(report, sourceAssignment, ct));
         }
 
         return result;
@@ -2089,19 +3990,42 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         var childFilter = Builders<WorkAssignment>.Filter.Eq(x => x.ParentAssignmentId, targetAssignment.Id)
                           & Builders<WorkAssignment>.Filter.Eq(x => x.WorkId, targetAssignment.WorkId)
                           & Builders<WorkAssignment>.Filter.Eq(x => x.IsActive, true)
+                          & Builders<WorkAssignment>.Filter.Eq(x => x.FlowEffectiveStatus, DynamicFlowEffectiveStatuses.Effective)
                           & Builders<WorkAssignment>.Filter.Eq(x => x.IsDeleted, false);
         if (!string.IsNullOrWhiteSpace(targetAssignment.FlowInstanceId))
             childFilter &= Builders<WorkAssignment>.Filter.Eq(x => x.FlowInstanceId, targetAssignment.FlowInstanceId);
+        if (!string.IsNullOrWhiteSpace(targetAssignment.FlowTemplateId))
+            childFilter &= Builders<WorkAssignment>.Filter.Eq(x => x.FlowTemplateId, targetAssignment.FlowTemplateId);
+        if (targetAssignment.FlowTemplateVersionNo.HasValue)
+            childFilter &= Builders<WorkAssignment>.Filter.Eq(x => x.FlowTemplateVersionNo, targetAssignment.FlowTemplateVersionNo);
 
         var childAssignments = await _ctx.WorkAssignments
             .Find(childFilter)
             .ToListAsync(ct);
-        if (childAssignments.Count == 0)
+        var relatedAssignments = new List<WorkAssignment>(childAssignments);
+        if (!string.IsNullOrWhiteSpace(targetAssignment.ParentAssignmentId))
+        {
+            var parentAssignment = await _ctx.WorkAssignments
+                .Find(x => x.Id == targetAssignment.ParentAssignmentId &&
+                           x.WorkId == targetAssignment.WorkId &&
+                           x.IsActive &&
+                           x.FlowEffectiveStatus == DynamicFlowEffectiveStatuses.Effective &&
+                           !x.IsDeleted)
+                .FirstOrDefaultAsync(ct);
+            if (parentAssignment is not null && DynamicFlowSourceContextMatches(targetAssignment, parentAssignment))
+                relatedAssignments.Add(parentAssignment);
+        }
+
+        relatedAssignments = relatedAssignments
+            .GroupBy(assignment => assignment.Id, StringComparer.Ordinal)
+            .Select(group => group.First())
+            .ToList();
+        if (relatedAssignments.Count == 0)
             return new List<DynamicFlowMappingSourceReport>();
 
-        var childIds = childAssignments.Select(x => x.Id).ToList();
+        var relatedIds = relatedAssignments.Select(x => x.Id).ToList();
         var reports = await _ctx.WorkAssignmentReports
-            .Find(x => childIds.Contains(x.WorkAssignmentId) &&
+            .Find(x => relatedIds.Contains(x.WorkAssignmentId) &&
                        x.WorkId == targetReport.WorkId &&
                        x.PeriodInstanceKey == targetReport.PeriodInstanceKey &&
                        x.IsCurrent &&
@@ -2109,16 +4033,55 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                        x.Status == WorkAssignmentReportStatus.Approved &&
                        !x.IsDeleted)
             .ToListAsync(ct);
-        var assignmentById = childAssignments.ToDictionary(x => x.Id, StringComparer.Ordinal);
+        var assignmentById = relatedAssignments.ToDictionary(x => x.Id, StringComparer.Ordinal);
 
         var result = new List<DynamicFlowMappingSourceReport>();
         foreach (var report in reports.OrderBy(x => assignmentById.TryGetValue(x.WorkAssignmentId, out var a) ? a.FlowStepOrder ?? 0 : 0)
                                       .ThenBy(x => x.WorkAssignmentId, StringComparer.Ordinal))
         {
-            result.Add(await ToDynamicFlowMappingSourceReportAsync(report, actorUserId, ct));
+            result.Add(await ToDynamicFlowMappingSourceReportAsync(
+                report,
+                assignmentById.GetValueOrDefault(report.WorkAssignmentId),
+                ct));
         }
 
         return result;
+    }
+
+    internal static bool DynamicFlowSourceContextMatches(
+        WorkAssignment targetAssignment,
+        WorkAssignment sourceAssignment)
+    {
+        if (!sourceAssignment.IsActive ||
+            !string.Equals(targetAssignment.WorkId, sourceAssignment.WorkId, StringComparison.Ordinal))
+            return false;
+
+        if (!DynamicFlowBranchVisibility.IsFlowAssignment(targetAssignment) ||
+            !DynamicFlowBranchVisibility.IsFlowAssignment(sourceAssignment) ||
+            string.IsNullOrWhiteSpace(targetAssignment.FlowTemplateId) ||
+            !targetAssignment.FlowTemplateVersionNo.HasValue)
+        {
+            return false;
+        }
+
+        var isSameAssignment = string.Equals(targetAssignment.Id, sourceAssignment.Id, StringComparison.Ordinal);
+        var isDirectParent = string.Equals(targetAssignment.ParentAssignmentId, sourceAssignment.Id, StringComparison.Ordinal);
+        var isDirectChild = string.Equals(sourceAssignment.ParentAssignmentId, targetAssignment.Id, StringComparison.Ordinal);
+        if (!isSameAssignment && !isDirectParent && !isDirectChild)
+            return false;
+
+        if (DynamicFlowBranchVisibility.IsFlowAssignment(sourceAssignment) &&
+            !string.Equals(
+                sourceAssignment.FlowEffectiveStatus,
+                DynamicFlowEffectiveStatuses.Effective,
+                StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        return string.Equals(targetAssignment.FlowInstanceId, sourceAssignment.FlowInstanceId, StringComparison.Ordinal) &&
+               string.Equals(targetAssignment.FlowTemplateId, sourceAssignment.FlowTemplateId, StringComparison.Ordinal) &&
+               targetAssignment.FlowTemplateVersionNo == sourceAssignment.FlowTemplateVersionNo;
     }
 
     private async Task<List<DynamicFlowMappingSourceReport>> LoadPreviousPeriodDynamicFlowMappingSourceReportAsync(
@@ -2145,23 +4108,28 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
 
         return new List<DynamicFlowMappingSourceReport>
         {
-            await ToDynamicFlowMappingSourceReportAsync(previous, actorUserId, ct)
+            await ToDynamicFlowMappingSourceReportAsync(previous, sourceAssignment: null, ct: ct)
         };
     }
 
     private async Task<DynamicFlowMappingSourceReport> ToDynamicFlowMappingSourceReportAsync(
         WorkAssignmentReport report,
-        string actorUserId,
+        WorkAssignment? sourceAssignment,
         CancellationToken ct)
     {
         await HydrateReportPayloadAsync(report, ct);
-        var access = await EnsureReportAccessAsync(report, actorUserId, ct);
+        sourceAssignment ??= await _ctx.WorkAssignments
+            .Find(x => x.Id == report.WorkAssignmentId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct)
+            ?? throw ReportAssignmentNotFound(report.WorkAssignmentId);
+
         return new DynamicFlowMappingSourceReport(
             report,
-            access.assignment.FlowStepId,
-            access.assignment.FlowStepCode,
+            sourceAssignment.FlowStepId,
+            sourceAssignment.FlowStepCode,
             report.FieldValuesJson,
-            report.TableValuesJson);
+            report.TableValuesJson,
+            Assignment: sourceAssignment);
     }
 
     private static bool IsBeforeTargetPeriod(WorkAssignmentReport candidate, WorkAssignmentReport target)
@@ -2426,14 +4394,70 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
 
         if (entity is null)
             throw ReportNotFound(id);
-        EnsureReportIsActive(entity);
-        await HydrateReportPayloadAsync(entity, ct);
-
         var reportAccess = await EnsureReportAccessAsync(entity, actorUserId, ct);
         if (!reportAccess.isAssignee || entity.AssigneeUserId != actorUserId)
             throw AppExceptionFactory.Forbidden(
                 AppErrorCode.WORK_ASSIGNMENT_REPORT_SUBMIT_FORBIDDEN,
                 ReportDetails(entity, actorUserId));
+        EnsureReportIsActive(entity);
+        await HydrateReportPayloadAsync(entity, ct);
+        await ValidateDynamicFlowMappingLifecycleMutationBoundaryAsync(
+            entity,
+            "SUBMIT",
+            ct);
+
+        var submitCommandHash = ComputeReportPayloadCommandHash("SUBMIT", req);
+        var payloadCommand = ResolvePayloadMutationCommand(
+            entity,
+            req.ExpectedPayloadRevision,
+            req.CommandId,
+            "SUBMIT",
+            submitCommandHash);
+        var payloadReplay = IsCompletedPayloadCommandReplay(entity, payloadCommand);
+        if (payloadReplay)
+        {
+            var replayLifecycleCommand =
+                BuildLegacySubmitLifecycleReplayCommand(
+                    entity,
+                    req.ExpectedLifecycleRevision,
+                    payloadCommand);
+            if (WorkReportLifecycleCommandContract.IsCompletedReplay(
+                    entity,
+                    replayLifecycleCommand) ||
+                IsCompletedLegacyAutoApprovalSubmitReplay(
+                    entity,
+                    replayLifecycleCommand))
+            {
+                await TryReconcileCommittedLifecycleProjectionAsync(entity.Id);
+                return await MapPayloadCommandReplayResponseAsync(
+                    entity.Id,
+                    actorUserId,
+                    CancellationToken.None);
+            }
+
+            throw WorkReportLifecycleCommandContract.Conflict(
+                entity,
+                replayLifecycleCommand);
+        }
+
+        var (lifecycleCommand, lifecycleResolution) = WorkReportLifecycleCommandContract.Resolve(
+            entity,
+            req.ExpectedLifecycleRevision,
+            req.ExpectedPayloadRevision,
+            req.CommandId,
+            "SUBMIT",
+            submitCommandHash,
+            payloadRevisionDelta: 1);
+        if (lifecycleResolution ==
+            WorkReportLifecycleCommandResolution.CompletedReplay)
+        {
+            throw WorkReportLifecycleCommandContract.Conflict(entity, lifecycleCommand);
+        }
+
+        await using var lifecycleSeriesLease = await _lifecycleSeriesLock.AcquireAsync(
+            entity.WorkAssignmentId,
+            lifecycleCommand.Operation,
+            ct);
 
         await EnsureReportMutationScopeOpenAsync(reportAccess.assignment, actorUserId, ct);
 
@@ -2451,9 +4475,10 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         var previousStatus = entity.Status;
 
         string? requestedValues1DJson = null;
+        RuntimeTableBlockContract? runtimeTopLevelBlock = null;
         if (req.Values1D is { Count: > 0 })
         {
-            var runtimeTopLevelBlock = await ResolveRuntimeTopLevelBlockShapeAsync(entity, req.TableValuesJson, req.Values1D.Count, ct);
+            runtimeTopLevelBlock = await ResolveRuntimeTopLevelBlockShapeAsync(entity, req.TableValuesJson, req.Values1D.Count, ct);
             var expectedLength = runtimeTopLevelBlock is not null
                 ? ResolveRuntimeInputCells(runtimeTopLevelBlock.Block, runtimeTopLevelBlock.DataRect, runtimeTopLevelBlock.W, runtimeTopLevelBlock.H).Count
                 : ResolveReportRuntimeInputCells(entity).Count;
@@ -2463,45 +4488,104 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             requestedValues1DJson = Values1DCompression.Serialize(req.Values1D, _jsonOptions);
         }
 
-        var nextDataOrigin = ResolveReportDataOrigin(req.DataOrigin, entity.DataOrigin);
-        var nextContributionMode = ResolveCumulativeContributionMode(
-            req.CumulativeContributionMode,
-            req.DataOrigin,
-            entity.CumulativeContributionMode,
-            entity.DataOrigin);
-        var nextContributionPolicyJson = ResolveContributionPolicyJsonOverride(
-            req.CumulativeContributionPolicyJson,
-            entity.CumulativeContributionPolicyJson,
-            id,
-            actorUserId);
-        var nextSummarySourceJson = ResolveSummarySourceJsonOverride(
-            req.SummarySourceJson,
+        var hasFlowOwnedMappingMetadata = IsDynamicFlowMappingSummary(entity.SummarySourceJson);
+        EnsureDynamicFlowMappingSummaryOverrideAllowed(
             entity.SummarySourceJson,
+            req.SummarySourceJson,
             id,
             actorUserId);
+        var nextDataOrigin = hasFlowOwnedMappingMetadata
+            ? WorkReportDataOrigin.Normalize(entity.DataOrigin)
+            : ResolveReportDataOrigin(req.DataOrigin, entity.DataOrigin);
+        var nextContributionMode = hasFlowOwnedMappingMetadata
+            ? WorkReportCumulativeContributionMode.Normalize(entity.CumulativeContributionMode)
+            : ResolveCumulativeContributionMode(
+                req.CumulativeContributionMode,
+                req.DataOrigin,
+                entity.CumulativeContributionMode,
+                entity.DataOrigin);
+        var nextContributionPolicyJson = hasFlowOwnedMappingMetadata
+            ? NormalizeOptionalTextOrNull(entity.CumulativeContributionPolicyJson)
+            : ResolveContributionPolicyJsonOverride(
+                req.CumulativeContributionPolicyJson,
+                entity.CumulativeContributionPolicyJson,
+                id,
+                actorUserId);
+        var nextSummarySourceJson = hasFlowOwnedMappingMetadata
+            ? NormalizeOptionalTextOrNull(entity.SummarySourceJson)
+            : ResolveSummarySourceJsonOverride(
+                req.SummarySourceJson,
+                entity.SummarySourceJson,
+                id,
+                actorUserId);
         var nextAggregateSources = ExtractAggregateSourceSnapshot(nextSummarySourceJson);
         var acceptsReportDataPayload = ShouldAcceptReportDataPayload(entity, nextDataOrigin, nextSummarySourceJson);
         var isStackedAggregatePayload = IsStackedAggregateSummary(nextSummarySourceJson);
+        var nextFieldValuesJson = req.FieldValuesJson ?? entity.FieldValuesJson;
+        var nextTableValuesJson = req.TableValuesJson ?? entity.TableValuesJson;
+        var mergedDynamicFlowTopLevelValues = false;
+
+        if (acceptsReportDataPayload &&
+            !isStackedAggregatePayload &&
+            DynamicFlowBranchVisibility.IsFlowAssignment(reportAccess.assignment) &&
+            req.TableValuesJson is null &&
+            requestedValues1DJson is not null &&
+            runtimeTopLevelBlock is not null)
+        {
+            nextTableValuesJson = MergeDynamicFlowTopLevelValuesIntoTableValuesJson(
+                entity,
+                entity.TableValuesJson,
+                runtimeTopLevelBlock,
+                Values1DCompression.DeserializeObjects(requestedValues1DJson, _jsonOptions),
+                actorUserId);
+            mergedDynamicFlowTopLevelValues = true;
+        }
 
         if (acceptsReportDataPayload && !isStackedAggregatePayload)
-            await EnsureDynamicFlowReportWriteAllowedAsync(
+        {
+            var writablePayload = await PrepareDynamicFlowReportWritePayloadAsync(
                 reportAccess.assignment,
                 entity,
-                req.FieldValuesJson ?? entity.FieldValuesJson,
-                req.TableValuesJson ?? entity.TableValuesJson,
+                nextFieldValuesJson,
+                nextTableValuesJson,
                 actorUserId,
-                ct);
+                validateRequired: true,
+                ct: ct);
+            nextFieldValuesJson = writablePayload.FieldValuesJson;
+            nextTableValuesJson = writablePayload.TableValuesJson;
+
+            if (req.TableValuesJson is not null || mergedDynamicFlowTopLevelValues)
+            {
+                var baseValues1DJson = requestedValues1DJson ?? entity.Values1DJson;
+                var baseValuesCount = Values1DCompression.DeserializeObjects(baseValues1DJson, _jsonOptions).Count;
+                runtimeTopLevelBlock ??= await ResolveRuntimeTopLevelBlockShapeAsync(
+                    entity,
+                    nextTableValuesJson,
+                    baseValuesCount,
+                    ct);
+                if (runtimeTopLevelBlock is not null)
+                {
+                    requestedValues1DJson = ResolveDynamicFlowMappingTopLevelValuesJson(
+                        baseValues1DJson,
+                        nextTableValuesJson,
+                        runtimeTopLevelBlock.BlockId,
+                        _jsonOptions);
+                }
+            }
+        }
 
         await ValidateRuntimeRowLabelsAsync(
             entity,
-            acceptsReportDataPayload ? req.TableValuesJson ?? entity.TableValuesJson : entity.TableValuesJson,
+            acceptsReportDataPayload ? nextTableValuesJson : entity.TableValuesJson,
             ct);
         if (acceptsReportDataPayload && !isStackedAggregatePayload)
-            await ValidateRuntimeDataPayloadAsync(
+            nextFieldValuesJson = await ValidateRuntimeDataPayloadAsync(
                 entity,
-                req.Values1D is { Count: > 0 } ? req.Values1D : DeserializeRawValues1D(entity.Values1DJson),
-                req.FieldValuesJson ?? entity.FieldValuesJson,
-                req.TableValuesJson ?? entity.TableValuesJson,
+                requestedValues1DJson is not null
+                    ? Values1DCompression.DeserializeObjects(requestedValues1DJson, _jsonOptions)
+                    : DeserializeRawValues1D(entity.Values1DJson),
+                nextFieldValuesJson,
+                nextTableValuesJson,
                 validateRequiredFields: true,
                 ct);
 
@@ -2511,10 +4595,10 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                 entity.Values1DJson = requestedValues1DJson;
 
             if (req.FieldValuesJson is not null)
-                entity.FieldValuesJson = req.FieldValuesJson;
+                entity.FieldValuesJson = nextFieldValuesJson;
 
-            if (req.TableValuesJson is not null)
-                entity.TableValuesJson = Values1DCompression.CompressTableValuesJson(req.TableValuesJson, _jsonOptions);
+            if (req.TableValuesJson is not null || mergedDynamicFlowTopLevelValues)
+                entity.TableValuesJson = Values1DCompression.CompressTableValuesJson(nextTableValuesJson, _jsonOptions);
         }
 
         var nextAggregateSnapshotDirty = nextAggregateSources.IsAggregate
@@ -2598,6 +4682,15 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         var autoApproveSnapshotJson = autoApproveByCondition
             ? reportAccess.assignment.AutoApproveConditionJson
             : null;
+        var autoApprovalLifecycleCommand = approveWithoutManualReview
+            ? BuildLegacyAutoApprovalLifecycleCommand(
+                entity,
+                lifecycleCommand,
+                approvalActorUserId,
+                autoApproveSnapshotJson)
+            : null;
+        var committedLifecycleCommand =
+            autoApprovalLifecycleCommand ?? lifecycleCommand;
 
         entity.Status = nextStatus;
         entity.StartedDate = startedDate;
@@ -2621,6 +4714,34 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         entity.CreatedByUserId = string.IsNullOrWhiteSpace(entity.CreatedByUserId) ? actorUserId : entity.CreatedByUserId;
         entity.UpdatedAtUtc = now;
         entity.UpdatedByUserId = approveWithoutManualReview ? approvalActorUserId : actorUserId;
+        _ = WorkReportPayloadService.PreflightReportPayload(
+            entity,
+            entity.Values1DJson,
+            entity.FieldValuesJson,
+            entity.TableValuesJson,
+            entity.SummarySourceJson,
+            entity.UpdatedByUserId,
+            now);
+        await lifecycleSeriesLease.RenewAsync(ct);
+        var reservation = await ReservePayloadMutationCommandAsync(entity, payloadCommand, now, ct);
+        if (reservation == PayloadCommandReservationOutcome.CompletedReplay)
+        {
+            var current = await _ctx.WorkAssignmentReports
+                .Find(x => x.Id == entity.Id && !x.IsDeleted)
+                .FirstOrDefaultAsync(ct)
+                ?? throw ReportNotFound(entity.Id);
+            if (!WorkReportLifecycleCommandContract.IsCompletedReplay(current, lifecycleCommand) &&
+                !IsCompletedLegacyAutoApprovalSubmitReplay(current, lifecycleCommand))
+            {
+                throw WorkReportLifecycleCommandContract.Conflict(
+                    current,
+                    lifecycleCommand);
+            }
+
+            await TryReconcileCommittedLifecycleProjectionAsync(current.Id);
+            return await MapPayloadCommandReplayResponseAsync(current.Id, actorUserId, CancellationToken.None);
+        }
+
         var payloadResult = await _payloadWriter.SaveReportPayloadAsync(
             entity,
             entity.Values1DJson,
@@ -2632,18 +4753,10 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             ct);
         ApplyPayloadMetadata(entity, payloadResult, now);
 
-        await UpsertReportSectionProjectionsAsync(
-            entity,
-            entity.FieldValuesJson,
-            entity.TableValuesJson,
-            entity.UpdatedByUserId ?? actorUserId,
-            now,
-            ct);
-
-        await _ctx.WorkAssignmentReports.UpdateOneAsync(
-            x => x.Id == id && !x.IsDeleted,
-            ApplyPayloadHeaderUpdate(
-                Builders<WorkAssignmentReport>.Update,
+        var headerCommitUpdate = WorkReportLifecycleCommandContract.ApplyCompletion(
+                ApplyPayloadCommandCompletion(
+                ApplyPayloadHeaderUpdate(
+                    Builders<WorkAssignmentReport>.Update,
                 payloadResult,
                 now)
                 .Set(x => x.DataOrigin, entity.DataOrigin)
@@ -2678,155 +4791,93 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                 .Set(x => x.CreatedByUserId, string.IsNullOrWhiteSpace(entity.CreatedByUserId) ? actorUserId : entity.CreatedByUserId)
                 .Set(x => x.UpdatedAtUtc, entity.UpdatedAtUtc)
                 .Set(x => x.UpdatedByUserId, entity.UpdatedByUserId),
-            cancellationToken: ct);
-
-        if (period is not null)
+                payloadCommand,
+                payloadResult),
+                committedLifecycleCommand,
+                entity.Status,
+                resultIsActive: true);
+        var mappingBinding =
+            DynamicFlowMappingLifecycleBinding.FromReport(entity);
+        var submitOutboxSeed = new WorkReportLifecycleOutboxSeed(
+            lifecycleCommand.CommandId,
+            lifecycleCommand.ExpectedLifecycleRevision + 1,
+            lifecycleCommand.Operation,
+            actorUserId,
+            WorkAssignmentReportStatus.Draft.ToString(),
+            WorkAssignmentReportStatus.Submitted.ToString(),
+            FromIsActive: true,
+            ToIsActive: true,
+            PayloadRevision: payloadResult.PayloadRevision,
+            PayloadHash: payloadResult.PayloadHash,
+            CreatedAtUtc: now,
+            BusinessComment: lateReason,
+            MappingBinding: mappingBinding);
+        WorkReportLifecycleOutboxSeed? autoApprovalOutboxSeed = null;
+        if (autoApprovalLifecycleCommand is not null)
         {
-            var periodStatus = approveWithoutManualReview
-                ? ResolveApprovedPeriodStatus(period, entity, now)
-                : ResolveSubmittedPeriodStatus(period, entity, now);
-
-            await _ctx.WorkReportPeriods.UpdateOneAsync(
-                x => x.Id == period.Id && !x.IsDeleted,
-                Builders<WorkReportPeriod>.Update
-                    .Set(x => x.Status, periodStatus)
-                    .Set(x => x.IsOverdue, WorkReportPeriodStatusHelper.IsOverdue(periodStatus))
-                    .Set(x => x.LastSubmittedAtUtc, now)
-                    .Set(x => x.CurrentReportId, entity.Id)
-                    .Set(x => x.StartedDate, entity.StartedDate)
-                    .Set(x => x.CompletedDate, entity.CompletedDate)
-                    .Set(x => x.IsHistoricalData, entity.IsHistoricalData)
-                    .Set(x => x.DueAtUtc, entity.DueAtUtc)
-                    .Set(x => x.LateReason, entity.LateReason)
-                    .Set(x => x.RequiresLateReason, isLate)
-                    .Set(x => x.LastReviewedAtUtc, approveWithoutManualReview ? now : period.LastReviewedAtUtc)
-                    .Set(x => x.ReviewerComment, approveWithoutManualReview ? autoApproveComment : period.ReviewerComment)
-                    .Set(x => x.AcceptedLateReason, approveWithoutManualReview ? lateReason : period.AcceptedLateReason)
-                    .Set(x => x.UpdatedAtUtc, now)
-                    .Set(x => x.UpdatedByUserId, approveWithoutManualReview ? approvalActorUserId : actorUserId),
-                cancellationToken: ct);
-
-            period.Status = periodStatus;
-            period.IsOverdue = WorkReportPeriodStatusHelper.IsOverdue(periodStatus);
-            period.LastSubmittedAtUtc = now;
-            period.CurrentReportId = entity.Id;
-            period.StartedDate = entity.StartedDate;
-            period.CompletedDate = entity.CompletedDate;
-            period.IsHistoricalData = entity.IsHistoricalData;
-            period.DueAtUtc = entity.DueAtUtc;
-            period.LateReason = entity.LateReason;
-            period.RequiresLateReason = isLate;
-            period.LastReviewedAtUtc = approveWithoutManualReview ? now : period.LastReviewedAtUtc;
-            period.ReviewerComment = approveWithoutManualReview ? autoApproveComment : period.ReviewerComment;
-            period.AcceptedLateReason = approveWithoutManualReview ? lateReason : period.AcceptedLateReason;
-            period.UpdatedAtUtc = now;
-            period.UpdatedByUserId = approveWithoutManualReview ? approvalActorUserId : actorUserId;
+            autoApprovalOutboxSeed = new WorkReportLifecycleOutboxSeed(
+                autoApprovalLifecycleCommand.CommandId,
+                autoApprovalLifecycleCommand.ExpectedLifecycleRevision + 1,
+                autoApprovalLifecycleCommand.Operation,
+                approvalActorUserId,
+                WorkAssignmentReportStatus.Submitted.ToString(),
+                WorkAssignmentReportStatus.Approved.ToString(),
+                FromIsActive: true,
+                ToIsActive: true,
+                PayloadRevision: payloadResult.PayloadRevision,
+                PayloadHash: payloadResult.PayloadHash,
+                CreatedAtUtc: now,
+                BusinessReason: autoApproveReason,
+                BusinessComment: autoApproveComment,
+                BusinessSnapshotJson: autoApproveSnapshotJson,
+                MappingBinding: mappingBinding);
         }
+        headerCommitUpdate = AppendLegacySubmitLifecycleOutbox(
+            headerCommitUpdate,
+            submitOutboxSeed,
+            autoApprovalOutboxSeed);
 
-        await InsertLogAsync(
-            workId: entity.WorkId,
-            workAssignmentId: entity.WorkAssignmentId,
-            workReportPeriodId: entity.WorkReportPeriodId,
-            workAssignmentReportId: entity.Id,
-            action: "SUBMIT",
-            fromStatus: fromStatus.ToString(),
-            toStatus: WorkAssignmentReportStatus.Submitted.ToString(),
-            actionByUserId: actorUserId,
-            reason: null,
-            comment: lateReason,
-            snapshotJson: null,
-            ct: ct);
-
-        if (approveWithoutManualReview)
-        {
-            await InsertLogAsync(
-                workId: entity.WorkId,
-                workAssignmentId: entity.WorkAssignmentId,
-                workReportPeriodId: entity.WorkReportPeriodId,
-                workAssignmentReportId: entity.Id,
-                action: "AUTO_APPROVE",
-                fromStatus: WorkAssignmentReportStatus.Submitted.ToString(),
-                toStatus: WorkAssignmentReportStatus.Approved.ToString(),
-                actionByUserId: approvalActorUserId,
-                reason: autoApproveReason,
-                comment: autoApproveComment,
-                snapshotJson: autoApproveSnapshotJson,
-                ct: ct);
-        }
-
-        if (period is not null || approveWithoutManualReview)
-        {
-            await FinalizeReportStatusOperationAsync(
-                approveWithoutManualReview ? "SUBMIT_AUTO_APPROVE" : "SUBMIT",
+        await lifecycleSeriesLease.RenewAsync(ct);
+        var headerCommit = await CommitLegacyLifecycleWithDirectSourceFenceAsync(
+            entity,
+            BuildPayloadMutationCommitFilter(entity, payloadCommand) &
+            WorkReportLifecycleCommandContract.BuildCommitFilter(
                 entity,
-                period,
-                fromStatus.ToString(),
-                nextStatus.ToString(),
-                approveWithoutManualReview ? approvalActorUserId : actorUserId,
-                upsertQueue: !approveWithoutManualReview,
-                disableQueue: approveWithoutManualReview && period is not null,
-                rebuildProjection: true,
-                syncAssignment: true,
-                ct);
-        }
+                lifecycleCommand,
+                WorkAssignmentReportStatus.Draft,
+                expectedPayloadMutationCommandId: lifecycleCommand.CommandId),
+            headerCommitUpdate,
+            ct);
 
-        if (HasSourceWindowChanged(previousSourceWindow, previousPeriodKey, entity))
+        if (headerCommit.ModifiedCount != 1)
         {
-            await RefreshDynamicFormAggregateDependentsForSourceWindowChangeAsync(
-                entity,
-                previousSourceWindow,
-                previousPeriodKey,
-                previousStatus,
-                actorUserId,
-                ct);
-        }
-
-        await _userActionLog.RecordAsync(new UserActionLogSeed
-        {
-            Action = UserActionLogActions.ReportSubmitted,
-            Scope = "report",
-            ActorUserId = actorUserId,
-            WorkId = entity.WorkId,
-            WorkAssignmentId = entity.WorkAssignmentId,
-            WorkReportPeriodId = entity.WorkReportPeriodId,
-            WorkAssignmentReportId = entity.Id,
-            TargetUserId = entity.AssigneeUserId,
-            Summary = $"Submitted report {entity.PeriodInstanceKey}",
-            Data = new Dictionary<string, string>
+            var current = await _ctx.WorkAssignmentReports
+                .Find(x => x.Id == entity.Id && !x.IsDeleted)
+                .FirstOrDefaultAsync(ct)
+                ?? throw ReportNotFound(entity.Id);
+            if (IsCompletedPayloadCommandReplay(current, payloadCommand) &&
+                (WorkReportLifecycleCommandContract.IsCompletedReplay(
+                     current,
+                     lifecycleCommand) ||
+                 IsCompletedLegacyAutoApprovalSubmitReplay(
+                     current,
+                     lifecycleCommand)))
             {
-                { "fromStatus", fromStatus.ToString() },
-                { "toStatus", nextStatus.ToString() },
-                { "isLateSubmission", isLate.ToString() },
-                { "isHistoricalData", isHistoricalData.ToString() },
-                { "autoApproved", approveWithoutManualReview.ToString() }
-            },
-            OccurredAtUtc = now
-        }, CancellationToken.None);
+                await TryReconcileCommittedLifecycleProjectionAsync(current.Id);
+                return await MapPayloadCommandReplayResponseAsync(current, actorUserId, CancellationToken.None);
+            }
 
-        if (approveWithoutManualReview)
-        {
-            await _userActionLog.RecordAsync(new UserActionLogSeed
-            {
-                Action = UserActionLogActions.ReportApproved,
-                Scope = "report",
-                ActorUserId = approvalActorUserId,
-                WorkId = entity.WorkId,
-                WorkAssignmentId = entity.WorkAssignmentId,
-                WorkReportPeriodId = entity.WorkReportPeriodId,
-                WorkAssignmentReportId = entity.Id,
-                TargetUserId = entity.AssigneeUserId,
-                Summary = $"Auto approved report {entity.PeriodInstanceKey}",
-                Data = new Dictionary<string, string>
-                {
-                    { "fromStatus", WorkAssignmentReportStatus.Submitted.ToString() },
-                    { "toStatus", WorkAssignmentReportStatus.Approved.ToString() },
-                    { "autoApproved", true.ToString() }
-                },
-                OccurredAtUtc = now
-            }, CancellationToken.None);
+            throw WorkReportLifecycleCommandContract.Conflict(current, lifecycleCommand);
         }
 
-        return await MapToResponseAsync(entity, period, ct);
+        WorkReportLifecycleCommandContract.ApplyCompletionInMemory(
+            entity,
+            committedLifecycleCommand,
+            entity.Status,
+            resultIsActive: true);
+
+        await TryReconcileCommittedLifecycleProjectionAsync(entity.Id);
+        return await MapPayloadCommandReplayResponseAsync(entity.Id, actorUserId, CancellationToken.None);
     }
 
     private static Task<WorkAssignment> LoadReviewNodeAsync(
@@ -2910,7 +4961,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             ActionAtUtc = x.ActionAtUtc,
             Reason = x.Reason,
             Comment = x.Comment,
-            SnapshotJson = x.SnapshotJson
+            SnapshotJson = DynamicFlowReportPermissionEnforcer.RedactSummarySourceValues(x.SnapshotJson)
         }).ToList();
     }
 
@@ -2933,12 +4984,43 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
 
         if (entity is null)
             throw ReportNotFound(id);
+        var assignment = await _ctx.WorkAssignments
+            .Find(x => x.Id == entity.WorkAssignmentId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct)
+            ?? throw ReportAssignmentNotFound(entity.WorkAssignmentId);
+
+        await LoadReviewNodeAsync(assignment, actorUserId, ct);
         EnsureReportIsActive(entity);
+        await ValidateDynamicFlowMappingLifecycleMutationBoundaryAsync(
+            entity,
+            "LEGACY_APPROVE",
+            ct);
 
         if (entity.AssigneeUserId == actorUserId)
             throw AppExceptionFactory.Forbidden(
                 AppErrorCode.WORK_ASSIGNMENT_REPORT_REVIEW_SELF_FORBIDDEN,
                 ReportDetails(entity, actorUserId));
+
+        var approveCommandHash = WorkReportLifecycleCommandContract.ComputeHash("LEGACY_APPROVE", req);
+        var (lifecycleCommand, lifecycleResolution) = WorkReportLifecycleCommandContract.Resolve(
+            entity,
+            req.ExpectedLifecycleRevision,
+            req.ExpectedPayloadRevision,
+            req.CommandId,
+            "LEGACY_APPROVE",
+            approveCommandHash);
+        if (lifecycleResolution == WorkReportLifecycleCommandResolution.CompletedReplay)
+        {
+            await TryReconcileCommittedLifecycleProjectionAsync(entity.Id);
+            return await MapPayloadCommandReplayResponseAsync(entity, actorUserId, CancellationToken.None);
+        }
+
+        await using var lifecycleSeriesLease = await _lifecycleSeriesLock.AcquireAsync(
+            entity.WorkAssignmentId,
+            lifecycleCommand.Operation,
+            ct);
+
+        await EnsureReportMutationScopeOpenAsync(assignment, actorUserId, ct);
 
         if (entity.Status != WorkAssignmentReportStatus.Submitted)
             throw InvalidReportStatus(
@@ -2947,16 +5029,8 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                 WorkAssignmentReportStatus.Submitted,
                 actorUserId);
 
+        await HydrateReportPayloadAsync(entity, ct);
         WorkReportPayloadConsistency.EnsureReadyForStatisticProjection(entity);
-
-        var assignment = await _ctx.WorkAssignments
-            .Find(x => x.Id == entity.WorkAssignmentId && !x.IsDeleted)
-            .FirstOrDefaultAsync(ct)
-            ?? throw ReportAssignmentNotFound(entity.WorkAssignmentId);
-
-        await EnsureReportMutationScopeOpenAsync(assignment, actorUserId, ct);
-
-        await LoadReviewNodeAsync(assignment, actorUserId, ct);
 
         var period = await _ctx.WorkReportPeriods
             .Find(x => x.Id == entity.WorkReportPeriodId && !x.IsDeleted)
@@ -2982,9 +5056,8 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             ? entity.HistoricalDataApprovedByUserId ?? actorUserId
             : null;
 
-        await _ctx.WorkAssignmentReports.UpdateOneAsync(
-            x => x.Id == id && !x.IsDeleted,
-            Builders<WorkAssignmentReport>.Update
+        var reportCommitUpdate = WorkReportLifecycleCommandContract.ApplyCompletion(
+                Builders<WorkAssignmentReport>.Update
                 .Set(x => x.Status, WorkAssignmentReportStatus.Approved)
                 .Set(x => x.IsHistoricalData, isHistoricalData)
                 .Set(x => x.HistoricalDataApproved, historicalDataApproved)
@@ -2998,7 +5071,44 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                 .Set(x => x.ApprovedByUserId, actorUserId)
                 .Set(x => x.UpdatedAtUtc, now)
                 .Set(x => x.UpdatedByUserId, actorUserId),
-            cancellationToken: ct);
+                lifecycleCommand,
+                WorkAssignmentReportStatus.Approved,
+                resultIsActive: true);
+        reportCommitUpdate = WorkReportLifecycleOutboxContract.Append(
+            reportCommitUpdate,
+            WorkReportLifecycleOutboxContract.FromCommand(
+                entity,
+                lifecycleCommand,
+                WorkAssignmentReportStatus.Approved,
+                resultIsActive: true,
+                actorUserId: actorUserId,
+                committedAtUtc: now,
+                resultPayloadHash: entity.PayloadHash,
+                businessComment: req.ReviewerComment));
+
+        await lifecycleSeriesLease.RenewAsync(ct);
+        var reportCommit = await CommitLegacyLifecycleWithDirectSourceFenceAsync(
+            entity,
+            WorkReportLifecycleCommandContract.BuildCommitFilter(
+                entity,
+                lifecycleCommand,
+                WorkAssignmentReportStatus.Submitted),
+            reportCommitUpdate,
+            ct);
+
+        if (reportCommit.ModifiedCount != 1)
+        {
+            var current = await _ctx.WorkAssignmentReports
+                .Find(x => x.Id == id && !x.IsDeleted)
+                .FirstOrDefaultAsync(ct)
+                ?? throw ReportNotFound(id);
+            if (WorkReportLifecycleCommandContract.IsCompletedReplay(current, lifecycleCommand))
+            {
+                await TryReconcileCommittedLifecycleProjectionAsync(current.Id);
+                return await MapPayloadCommandReplayResponseAsync(current, actorUserId, CancellationToken.None);
+            }
+            throw WorkReportLifecycleCommandContract.Conflict(current, lifecycleCommand);
+        }
 
         entity.Status = WorkAssignmentReportStatus.Approved;
         entity.IsHistoricalData = isHistoricalData;
@@ -3013,89 +5123,13 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         entity.ApprovedByUserId = actorUserId;
         entity.UpdatedAtUtc = now;
         entity.UpdatedByUserId = actorUserId;
-
-        if (period is not null)
-        {
-            var nextPeriodStatus = ResolveApprovedPeriodStatus(period, entity, now);
-
-            await _ctx.WorkReportPeriods.UpdateOneAsync(
-                x => x.Id == period.Id && !x.IsDeleted,
-                Builders<WorkReportPeriod>.Update
-                    .Set(x => x.Status, nextPeriodStatus)
-                    .Set(x => x.IsOverdue, WorkReportPeriodStatusHelper.IsOverdue(nextPeriodStatus))
-                    .Set(x => x.IsHistoricalData, isHistoricalData)
-                    .Set(x => x.HistoricalDataApproved, historicalDataApproved)
-                    .Set(x => x.HistoricalDataApprovedAtUtc, historicalDataApprovedAtUtc)
-                    .Set(x => x.HistoricalDataApprovedByUserId, historicalDataApprovedByUserId)
-                    .Set(x => x.LastReviewedAtUtc, now)
-                    .Set(x => x.ReviewerComment, req.ReviewerComment)
-                    .Set(x => x.AcceptedLateReason, lateReason)
-                    .Set(x => x.UpdatedAtUtc, now)
-                    .Set(x => x.UpdatedByUserId, actorUserId),
-                cancellationToken: ct);
-
-            period.Status = nextPeriodStatus;
-            period.IsOverdue = WorkReportPeriodStatusHelper.IsOverdue(nextPeriodStatus);
-            period.IsHistoricalData = isHistoricalData;
-            period.HistoricalDataApproved = historicalDataApproved;
-            period.HistoricalDataApprovedAtUtc = historicalDataApprovedAtUtc;
-            period.HistoricalDataApprovedByUserId = historicalDataApprovedByUserId;
-            period.LastReviewedAtUtc = now;
-            period.ReviewerComment = req.ReviewerComment;
-            period.AcceptedLateReason = lateReason;
-            period.UpdatedAtUtc = now;
-            period.UpdatedByUserId = actorUserId;
-        }
-
-        await InsertLogAsync(
-            workId: entity.WorkId,
-            workAssignmentId: entity.WorkAssignmentId,
-            workReportPeriodId: entity.WorkReportPeriodId,
-            workAssignmentReportId: entity.Id,
-            action: "APPROVE",
-            fromStatus: WorkAssignmentReportStatus.Submitted.ToString(),
-            toStatus: WorkAssignmentReportStatus.Approved.ToString(),
-            actionByUserId: actorUserId,
-            reason: null,
-            comment: req.ReviewerComment,
-            snapshotJson: null,
-            ct: ct);
-
-        await FinalizeReportStatusOperationAsync(
-            "APPROVE",
+        WorkReportLifecycleCommandContract.ApplyCompletionInMemory(
             entity,
-            period,
-            WorkAssignmentReportStatus.Submitted.ToString(),
-            WorkAssignmentReportStatus.Approved.ToString(),
-            actorUserId,
-            upsertQueue: false,
-            disableQueue: period is not null,
-            rebuildProjection: period is not null,
-            syncAssignment: true,
-            ct);
-
-        await _userActionLog.RecordAsync(new UserActionLogSeed
-        {
-            Action = UserActionLogActions.ReportApproved,
-            Scope = "report",
-            ActorUserId = actorUserId,
-            WorkId = entity.WorkId,
-            WorkAssignmentId = entity.WorkAssignmentId,
-            WorkReportPeriodId = entity.WorkReportPeriodId,
-            WorkAssignmentReportId = entity.Id,
-            TargetUserId = entity.AssigneeUserId,
-            Summary = $"Approved report {entity.PeriodInstanceKey}",
-            Data = new Dictionary<string, string>
-            {
-                { "fromStatus", WorkAssignmentReportStatus.Submitted.ToString() },
-                { "toStatus", WorkAssignmentReportStatus.Approved.ToString() },
-                { "isHistoricalData", isHistoricalData.ToString() },
-                { "historicalDataApproved", historicalDataApproved.ToString() }
-            },
-            OccurredAtUtc = now
-        }, CancellationToken.None);
-
-        return await MapToResponseAsync(entity, period, ct);
+            lifecycleCommand,
+            WorkAssignmentReportStatus.Approved,
+            resultIsActive: true);
+        await TryReconcileCommittedLifecycleProjectionAsync(entity.Id);
+        return await MapPayloadCommandReplayResponseAsync(entity.Id, actorUserId, CancellationToken.None);
     }
 
     public async Task<WorkAssignmentReportResponse> ReturnAsync(
@@ -3111,23 +5145,55 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
 
         req ??= new ReturnWorkAssignmentReportRequest();
 
-        if (string.IsNullOrWhiteSpace(req.ReturnReason))
-            throw AppExceptionFactory.BadRequest(
-                AppErrorCode.WORK_ASSIGNMENT_REPORT_RETURN_COMMENT_REQUIRED,
-                new { reportId = id, req.ReturnReason });
-
         var entity = await _ctx.WorkAssignmentReports
             .Find(x => x.Id == id && !x.IsDeleted)
             .FirstOrDefaultAsync(ct);
 
         if (entity is null)
             throw ReportNotFound(id);
+        var assignment = await _ctx.WorkAssignments
+            .Find(x => x.Id == entity.WorkAssignmentId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct)
+            ?? throw ReportAssignmentNotFound(entity.WorkAssignmentId);
+
+        await LoadReviewNodeAsync(assignment, actorUserId, ct);
         EnsureReportIsActive(entity);
+        await ValidateDynamicFlowMappingLifecycleMutationBoundaryAsync(
+            entity,
+            "LEGACY_RETURN",
+            ct,
+            DynamicFlowMappingIntegrityMode.AllowHistorical);
 
         if (entity.AssigneeUserId == actorUserId)
             throw AppExceptionFactory.Forbidden(
                 AppErrorCode.WORK_ASSIGNMENT_REPORT_REVIEW_SELF_FORBIDDEN,
                 ReportDetails(entity, actorUserId));
+
+        if (string.IsNullOrWhiteSpace(req.ReturnReason))
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_RETURN_COMMENT_REQUIRED,
+                new { reportId = id, req.ReturnReason });
+
+        var returnCommandHash = WorkReportLifecycleCommandContract.ComputeHash("LEGACY_RETURN", req);
+        var (lifecycleCommand, lifecycleResolution) = WorkReportLifecycleCommandContract.Resolve(
+            entity,
+            req.ExpectedLifecycleRevision,
+            req.ExpectedPayloadRevision,
+            req.CommandId,
+            "LEGACY_RETURN",
+            returnCommandHash);
+        if (lifecycleResolution == WorkReportLifecycleCommandResolution.CompletedReplay)
+        {
+            await TryReconcileCommittedLifecycleProjectionAsync(entity.Id);
+            return await MapPayloadCommandReplayResponseAsync(entity, actorUserId, CancellationToken.None);
+        }
+
+        await using var lifecycleSeriesLease = await _lifecycleSeriesLock.AcquireAsync(
+            entity.WorkAssignmentId,
+            lifecycleCommand.Operation,
+            ct);
+
+        await EnsureReportMutationScopeOpenAsync(assignment, actorUserId, ct);
 
         if (entity.Status != WorkAssignmentReportStatus.Submitted)
             throw InvalidReportStatus(
@@ -3136,21 +5202,11 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                 WorkAssignmentReportStatus.Submitted,
                 actorUserId);
 
-        var assignment = await _ctx.WorkAssignments
-            .Find(x => x.Id == entity.WorkAssignmentId && !x.IsDeleted)
-            .FirstOrDefaultAsync(ct)
-            ?? throw ReportAssignmentNotFound(entity.WorkAssignmentId);
-
-        await EnsureReportMutationScopeOpenAsync(assignment, actorUserId, ct);
-
-        await LoadReviewNodeAsync(assignment, actorUserId, ct);
-
         var now = DateTime.UtcNow;
         var returnReason = req.ReturnReason.Trim();
 
-        await _ctx.WorkAssignmentReports.UpdateOneAsync(
-            x => x.Id == id && !x.IsDeleted,
-            Builders<WorkAssignmentReport>.Update
+        var reportCommitUpdate = WorkReportLifecycleCommandContract.ApplyCompletion(
+                Builders<WorkAssignmentReport>.Update
                 .Set(x => x.Status, WorkAssignmentReportStatus.Draft)
                 .Set(x => x.ReturnReason, returnReason)
                 .Set(x => x.ReviewerComment, req.ReviewerComment)
@@ -3165,7 +5221,45 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                 .Set(x => x.AutoApprovalConfirmedByUserId, (string?)null)
                 .Set(x => x.UpdatedAtUtc, now)
                 .Set(x => x.UpdatedByUserId, actorUserId),
-            cancellationToken: ct);
+                lifecycleCommand,
+                WorkAssignmentReportStatus.Draft,
+                resultIsActive: true);
+        reportCommitUpdate = WorkReportLifecycleOutboxContract.Append(
+            reportCommitUpdate,
+            WorkReportLifecycleOutboxContract.FromCommand(
+                entity,
+                lifecycleCommand,
+                WorkAssignmentReportStatus.Draft,
+                resultIsActive: true,
+                actorUserId: actorUserId,
+                committedAtUtc: now,
+                resultPayloadHash: entity.PayloadHash,
+                businessReason: returnReason,
+                businessComment: req.ReviewerComment));
+
+        await lifecycleSeriesLease.RenewAsync(ct);
+        var reportCommit = await CommitLegacyLifecycleWithDirectSourceFenceAsync(
+            entity,
+            WorkReportLifecycleCommandContract.BuildCommitFilter(
+                entity,
+                lifecycleCommand,
+                WorkAssignmentReportStatus.Submitted),
+            reportCommitUpdate,
+            ct);
+
+        if (reportCommit.ModifiedCount != 1)
+        {
+            var current = await _ctx.WorkAssignmentReports
+                .Find(x => x.Id == id && !x.IsDeleted)
+                .FirstOrDefaultAsync(ct)
+                ?? throw ReportNotFound(id);
+            if (WorkReportLifecycleCommandContract.IsCompletedReplay(current, lifecycleCommand))
+            {
+                await TryReconcileCommittedLifecycleProjectionAsync(current.Id);
+                return await MapPayloadCommandReplayResponseAsync(current, actorUserId, CancellationToken.None);
+            }
+            throw WorkReportLifecycleCommandContract.Conflict(current, lifecycleCommand);
+        }
 
         entity.Status = WorkAssignmentReportStatus.Draft;
         entity.ReturnReason = returnReason;
@@ -3181,83 +5275,13 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         entity.AutoApprovalConfirmedByUserId = null;
         entity.UpdatedAtUtc = now;
         entity.UpdatedByUserId = actorUserId;
-
-        var period = await _ctx.WorkReportPeriods
-            .Find(x => x.Id == entity.WorkReportPeriodId && !x.IsDeleted)
-            .FirstOrDefaultAsync(ct);
-
-        if (period is not null)
-        {
-            var nextPeriodStatus = ResolveDraftPeriodStatus(period, entity, now);
-
-            await _ctx.WorkReportPeriods.UpdateOneAsync(
-                x => x.Id == period.Id && !x.IsDeleted,
-                Builders<WorkReportPeriod>.Update
-                    .Set(x => x.Status, nextPeriodStatus)
-                    .Set(x => x.IsOverdue, WorkReportPeriodStatusHelper.IsOverdue(nextPeriodStatus))
-                    .Set(x => x.LastReviewedAtUtc, now)
-                    .Set(x => x.ReturnReason, returnReason)
-                    .Set(x => x.ReviewerComment, req.ReviewerComment)
-                    .Set(x => x.UpdatedAtUtc, now)
-                    .Set(x => x.UpdatedByUserId, actorUserId),
-                cancellationToken: ct);
-
-            period.Status = nextPeriodStatus;
-            period.IsOverdue = WorkReportPeriodStatusHelper.IsOverdue(nextPeriodStatus);
-            period.LastReviewedAtUtc = now;
-            period.ReturnReason = returnReason;
-            period.ReviewerComment = req.ReviewerComment;
-            period.UpdatedAtUtc = now;
-            period.UpdatedByUserId = actorUserId;
-        }
-
-        await InsertLogAsync(
-            workId: entity.WorkId,
-            workAssignmentId: entity.WorkAssignmentId,
-            workReportPeriodId: entity.WorkReportPeriodId,
-            workAssignmentReportId: entity.Id,
-            action: "RETURN",
-            fromStatus: WorkAssignmentReportStatus.Submitted.ToString(),
-            toStatus: WorkAssignmentReportStatus.Draft.ToString(),
-            actionByUserId: actorUserId,
-            reason: returnReason,
-            comment: req.ReviewerComment,
-            snapshotJson: null,
-            ct: ct);
-
-        await FinalizeReportStatusOperationAsync(
-            "RETURN",
+        WorkReportLifecycleCommandContract.ApplyCompletionInMemory(
             entity,
-            period,
-            WorkAssignmentReportStatus.Submitted.ToString(),
-            WorkAssignmentReportStatus.Draft.ToString(),
-            actorUserId,
-            upsertQueue: period is not null,
-            disableQueue: false,
-            rebuildProjection: period is not null,
-            syncAssignment: true,
-            ct);
-
-        await _userActionLog.RecordAsync(new UserActionLogSeed
-        {
-            Action = UserActionLogActions.ReportReturned,
-            Scope = "report",
-            ActorUserId = actorUserId,
-            WorkId = entity.WorkId,
-            WorkAssignmentId = entity.WorkAssignmentId,
-            WorkReportPeriodId = entity.WorkReportPeriodId,
-            WorkAssignmentReportId = entity.Id,
-            TargetUserId = entity.AssigneeUserId,
-            Summary = $"Returned report {entity.PeriodInstanceKey}",
-            Data = new Dictionary<string, string>
-            {
-                { "fromStatus", WorkAssignmentReportStatus.Submitted.ToString() },
-                { "toStatus", WorkAssignmentReportStatus.Draft.ToString() }
-            },
-            OccurredAtUtc = now
-        }, CancellationToken.None);
-
-        return await MapToResponseAsync(entity, period, ct);
+            lifecycleCommand,
+            WorkAssignmentReportStatus.Draft,
+            resultIsActive: true);
+        await TryReconcileCommittedLifecycleProjectionAsync(entity.Id);
+        return await MapPayloadCommandReplayResponseAsync(entity.Id, actorUserId, CancellationToken.None);
     }
 
     public async Task<WorkAssignmentReportResponse> WithdrawSubmittedAsync(
@@ -3277,18 +5301,38 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             .Find(x => x.Id == id && !x.IsDeleted)
             .FirstOrDefaultAsync(ct)
             ?? throw ReportNotFound(id);
-        EnsureReportIsActive(entity);
-
-        if (entity.AssigneeUserId != actorUserId)
+        var reportAccess = await EnsureReportAccessAsync(entity, actorUserId, ct);
+        if (!reportAccess.isAssignee || entity.AssigneeUserId != actorUserId)
             throw AppExceptionFactory.Forbidden(
                 AppErrorCode.WORK_ASSIGNMENT_REPORT_WITHDRAW_FORBIDDEN,
                 ReportDetails(entity, actorUserId));
+        EnsureReportIsActive(entity);
+        await ValidateDynamicFlowMappingLifecycleMutationBoundaryAsync(
+            entity,
+            "WITHDRAW",
+            ct,
+            DynamicFlowMappingIntegrityMode.AllowHistorical);
 
-        var assignment = await _ctx.WorkAssignments
-            .Find(x => x.Id == entity.WorkAssignmentId && !x.IsDeleted)
-            .FirstOrDefaultAsync(ct)
-            ?? throw ReportAssignmentNotFound(entity.WorkAssignmentId);
+        var withdrawCommandHash = WorkReportLifecycleCommandContract.ComputeHash("WITHDRAW", req);
+        var (lifecycleCommand, lifecycleResolution) = WorkReportLifecycleCommandContract.Resolve(
+            entity,
+            req.ExpectedLifecycleRevision,
+            req.ExpectedPayloadRevision,
+            req.CommandId,
+            "WITHDRAW",
+            withdrawCommandHash);
+        if (lifecycleResolution == WorkReportLifecycleCommandResolution.CompletedReplay)
+        {
+            await TryReconcileCommittedLifecycleProjectionAsync(entity.Id);
+            return await MapPayloadCommandReplayResponseAsync(entity, actorUserId, CancellationToken.None);
+        }
 
+        await using var lifecycleSeriesLease = await _lifecycleSeriesLock.AcquireAsync(
+            entity.WorkAssignmentId,
+            lifecycleCommand.Operation,
+            ct);
+
+        var assignment = reportAccess.assignment;
         await EnsureReportMutationScopeOpenAsync(assignment, actorUserId, ct);
 
         var withdrawsAutoApproved = entity.Status == WorkAssignmentReportStatus.Approved &&
@@ -3314,9 +5358,8 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             : req.ReturnReason.Trim();
         var fromStatus = entity.Status;
 
-        await _ctx.WorkAssignmentReports.UpdateOneAsync(
-            x => x.Id == id && !x.IsDeleted,
-            Builders<WorkAssignmentReport>.Update
+        var reportCommitUpdate = WorkReportLifecycleCommandContract.ApplyCompletion(
+                Builders<WorkAssignmentReport>.Update
                 .Set(x => x.Status, WorkAssignmentReportStatus.Draft)
                 .Set(x => x.ReturnReason, withdrawReason)
                 .Set(x => x.ReturnedAtUtc, (DateTime?)null)
@@ -3330,7 +5373,45 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                 .Set(x => x.AutoApprovalConfirmedByUserId, (string?)null)
                 .Set(x => x.UpdatedAtUtc, now)
                 .Set(x => x.UpdatedByUserId, actorUserId),
-            cancellationToken: ct);
+                lifecycleCommand,
+                WorkAssignmentReportStatus.Draft,
+                resultIsActive: true);
+        reportCommitUpdate = WorkReportLifecycleOutboxContract.Append(
+            reportCommitUpdate,
+            WorkReportLifecycleOutboxContract.FromCommand(
+                entity,
+                lifecycleCommand,
+                WorkAssignmentReportStatus.Draft,
+                resultIsActive: true,
+                actorUserId: actorUserId,
+                committedAtUtc: now,
+                resultPayloadHash: entity.PayloadHash,
+                businessReason: withdrawReason,
+                businessComment: req.ReviewerComment));
+
+        await lifecycleSeriesLease.RenewAsync(ct);
+        var reportCommit = await CommitLegacyLifecycleWithDirectSourceFenceAsync(
+            entity,
+            WorkReportLifecycleCommandContract.BuildCommitFilter(
+                entity,
+                lifecycleCommand,
+                fromStatus),
+            reportCommitUpdate,
+            ct);
+
+        if (reportCommit.ModifiedCount != 1)
+        {
+            var current = await _ctx.WorkAssignmentReports
+                .Find(x => x.Id == id && !x.IsDeleted)
+                .FirstOrDefaultAsync(ct)
+                ?? throw ReportNotFound(id);
+            if (WorkReportLifecycleCommandContract.IsCompletedReplay(current, lifecycleCommand))
+            {
+                await TryReconcileCommittedLifecycleProjectionAsync(current.Id);
+                return await MapPayloadCommandReplayResponseAsync(current, actorUserId, CancellationToken.None);
+            }
+            throw WorkReportLifecycleCommandContract.Conflict(current, lifecycleCommand);
+        }
 
         entity.Status = WorkAssignmentReportStatus.Draft;
         entity.ReturnReason = withdrawReason;
@@ -3345,70 +5426,217 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         entity.AutoApprovalConfirmedByUserId = null;
         entity.UpdatedAtUtc = now;
         entity.UpdatedByUserId = actorUserId;
+        WorkReportLifecycleCommandContract.ApplyCompletionInMemory(
+            entity,
+            lifecycleCommand,
+            WorkAssignmentReportStatus.Draft,
+            resultIsActive: true);
+        await TryReconcileCommittedLifecycleProjectionAsync(entity.Id);
+        return await MapPayloadCommandReplayResponseAsync(entity.Id, actorUserId, CancellationToken.None);
+    }
 
-        if (period is not null)
+    private async Task<UpdateResult> CommitLegacyLifecycleWithDirectSourceFenceAsync(
+        WorkAssignmentReport expectedReport,
+        FilterDefinition<WorkAssignmentReport> reportCommitFilter,
+        UpdateDefinition<WorkAssignmentReport> reportCommitUpdate,
+        CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(expectedReport);
+        ArgumentNullException.ThrowIfNull(reportCommitFilter);
+        ArgumentNullException.ThrowIfNull(reportCommitUpdate);
+
+        var expectedWorkId = expectedReport.WorkId?.Trim();
+        if (string.IsNullOrWhiteSpace(expectedReport.Id) ||
+            string.IsNullOrWhiteSpace(expectedWorkId))
         {
-            var nextPeriodStatus = ResolveDraftPeriodStatus(period, entity, now);
-            var periodUpdate = Builders<WorkReportPeriod>.Update
-                .Set(x => x.Status, nextPeriodStatus)
-                .Set(x => x.IsOverdue, WorkReportPeriodStatusHelper.IsOverdue(nextPeriodStatus))
-                .Set(x => x.UpdatedAtUtc, now)
-                .Set(x => x.UpdatedByUserId, actorUserId);
-
-            if (withdrawsAutoApproved)
-            {
-                periodUpdate = periodUpdate
-                    .Set(x => x.LastReviewedAtUtc, (DateTime?)null)
-                    .Set(x => x.ReviewerComment, (string?)null)
-                    .Set(x => x.AcceptedLateReason, (string?)null);
-            }
-
-            await _ctx.WorkReportPeriods.UpdateOneAsync(
-                x => x.Id == period.Id && !x.IsDeleted,
-                periodUpdate,
-                cancellationToken: ct);
-
-            period.Status = nextPeriodStatus;
-            period.IsOverdue = WorkReportPeriodStatusHelper.IsOverdue(nextPeriodStatus);
-            if (withdrawsAutoApproved)
-            {
-                period.LastReviewedAtUtc = null;
-                period.ReviewerComment = null;
-                period.AcceptedLateReason = null;
-            }
-            period.UpdatedAtUtc = now;
-            period.UpdatedByUserId = actorUserId;
-
+            throw new InvalidOperationException(
+                "P9_DIRECT_SOURCE_FENCE_REPORT_WORK_REQUIRED");
         }
 
-        await InsertLogAsync(
-            workId: entity.WorkId,
-            workAssignmentId: entity.WorkAssignmentId,
-            workReportPeriodId: entity.WorkReportPeriodId,
-            workAssignmentReportId: entity.Id,
-            action: "Thu hồi báo cáo",
-            fromStatus: fromStatus.ToString(),
-            toStatus: WorkAssignmentReportStatus.Draft.ToString(),
-            actionByUserId: actorUserId,
-            reason: withdrawReason,
-            comment: req.ReviewerComment,
-            snapshotJson: null,
-            ct: ct);
+        var reportFilter = Builders<WorkAssignmentReport>.Filter;
+        var authoritativeCommitFilter =
+            reportCommitFilter &
+            reportFilter.Eq(report => report.Id, expectedReport.Id) &
+            reportFilter.Eq(report => report.WorkId, expectedWorkId) &
+            reportFilter.Eq(report => report.IsDeleted, false);
 
-        await FinalizeReportStatusOperationAsync(
-            withdrawsAutoApproved ? "WITHDRAW_AUTO_APPROVED" : "WITHDRAW_SUBMITTED",
-            entity,
-            period,
-            fromStatus.ToString(),
-            WorkAssignmentReportStatus.Draft.ToString(),
-            actorUserId,
-            upsertQueue: period is not null,
-            disableQueue: false,
-            rebuildProjection: period is not null,
-            syncAssignment: true,
+        return await _dynamicFlowTransactions.ExecuteAsync(
+            async (session, transactionCt) =>
+            {
+                var reportCommit =
+                    await _ctx.WorkAssignmentReports.UpdateOneAsync(
+                        session,
+                        authoritativeCommitFilter,
+                        reportCommitUpdate,
+                        cancellationToken: transactionCt);
+                if (reportCommit.ModifiedCount != 1)
+                    return reportCommit;
+
+                var authoritativeReportWorkId =
+                    await _ctx.WorkAssignmentReports
+                        .Find(
+                            session,
+                            report =>
+                                report.Id == expectedReport.Id &&
+                                report.WorkId == expectedWorkId &&
+                                !report.IsDeleted)
+                        .Project(report => report.WorkId)
+                        .FirstOrDefaultAsync(transactionCt);
+                if (!string.Equals(
+                        authoritativeReportWorkId,
+                        expectedWorkId,
+                        StringComparison.Ordinal))
+                {
+                    throw new InvalidOperationException(
+                        "P9_DIRECT_SOURCE_FENCE_REPORT_CONFLICT");
+                }
+
+                var authoritativeWorkId = await _ctx.Works
+                    .Find(
+                        session,
+                        work =>
+                            work.Id == authoritativeReportWorkId &&
+                            !work.IsDeleted)
+                    .Project(work => work.Id)
+                    .FirstOrDefaultAsync(transactionCt);
+                if (!string.Equals(
+                        authoritativeWorkId,
+                        expectedWorkId,
+                        StringComparison.Ordinal))
+                {
+                    throw new InvalidOperationException(
+                        "P9_DIRECT_SOURCE_FENCE_WORK_NOT_FOUND");
+                }
+
+                await WorkDirectSourceRevisionFence.IncrementAsync(
+                    _ctx,
+                    session,
+                    authoritativeWorkId,
+                    transactionCt);
+                return reportCommit;
+            },
             ct);
+    }
 
-        return await MapToResponseAsync(entity, period, ct);
+    private static WorkReportLifecycleCommand
+        BuildLegacySubmitLifecycleReplayCommand(
+            WorkAssignmentReport report,
+            int? expectedLifecycleRevision,
+            PayloadMutationCommand payloadCommand)
+    {
+        if (!expectedLifecycleRevision.HasValue ||
+            expectedLifecycleRevision.Value < 0)
+        {
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode
+                    .WORK_ASSIGNMENT_REPORT_LIFECYCLE_REVISION_REQUIRED,
+                new
+                {
+                    reportId = report.Id,
+                    expectedLifecycleRevision,
+                    currentLifecycleRevision = report.LifecycleRevision
+                });
+        }
+
+        return new WorkReportLifecycleCommand(
+            expectedLifecycleRevision.Value,
+            payloadCommand.ExpectedPayloadRevision,
+            payloadCommand.CommandId,
+            "SUBMIT",
+            payloadCommand.CommandHash,
+            PayloadRevisionDelta: 1);
+    }
+
+    private static WorkReportLifecycleCommand
+        BuildLegacyAutoApprovalLifecycleCommand(
+            WorkAssignmentReport report,
+            WorkReportLifecycleCommand submitCommand,
+            string approvalActorUserId,
+            string? autoApproveConditionSnapshotJson)
+    {
+        const string operation = "REVIEW_CONFIRM_AUTO_APPROVE";
+        var approvalLifecycleRevision =
+            submitCommand.ExpectedLifecycleRevision + 2;
+        var approvalPayloadRevision =
+            submitCommand.ExpectedPayloadRevision +
+            submitCommand.PayloadRevisionDelta;
+        var identityHash =
+            WorkReportLifecycleOutboxContract.ComputeEntryKey(
+                submitCommand.CommandId,
+                approvalLifecycleRevision,
+                operation);
+        var commandId = $"system:auto-approve:{identityHash}";
+        var commandHash = WorkReportLifecycleCommandContract.ComputeHash(
+            operation,
+            new
+            {
+                schemaVersion = "LEGACY_AUTO_APPROVE_LIFECYCLE_V1",
+                reportId = report.Id,
+                submitCommandId = submitCommand.CommandId,
+                submitCommandHash = submitCommand.CommandHash,
+                submitLifecycleRevision =
+                    submitCommand.ExpectedLifecycleRevision + 1,
+                approvalLifecycleRevision,
+                approvalPayloadRevision,
+                approvalActorUserId,
+                autoApproveConditionSnapshotJson
+            });
+
+        return new WorkReportLifecycleCommand(
+            ExpectedLifecycleRevision:
+                submitCommand.ExpectedLifecycleRevision + 1,
+            ExpectedPayloadRevision: approvalPayloadRevision,
+            CommandId: commandId,
+            Operation: operation,
+            CommandHash: commandHash,
+            PayloadRevisionDelta: 0);
+    }
+
+    private static bool IsCompletedLegacyAutoApprovalSubmitReplay(
+        WorkAssignmentReport report,
+        WorkReportLifecycleCommand submitCommand)
+    {
+        if (report.Status != WorkAssignmentReportStatus.Approved ||
+            !WorkAssignmentAutoApprovalState.IsAutoApproved(report) ||
+            string.IsNullOrWhiteSpace(report.AutoApprovedByUserId))
+        {
+            return false;
+        }
+
+        var approvalCommand = BuildLegacyAutoApprovalLifecycleCommand(
+            report,
+            submitCommand,
+            report.AutoApprovedByUserId,
+            report.AutoApproveConditionSnapshotJson);
+        return WorkReportLifecycleCommandContract.IsCompletedReplay(
+            report,
+            approvalCommand);
+    }
+
+    private static UpdateDefinition<WorkAssignmentReport>
+        AppendLegacySubmitLifecycleOutbox(
+            UpdateDefinition<WorkAssignmentReport> update,
+            WorkReportLifecycleOutboxSeed submitSeed,
+            WorkReportLifecycleOutboxSeed? autoApprovalSeed)
+    {
+        if (autoApprovalSeed is null)
+            return WorkReportLifecycleOutboxContract.Append(
+                update,
+                submitSeed);
+
+        var entries = new[]
+        {
+            WorkReportLifecycleOutboxContract.CreateEntry(submitSeed),
+            WorkReportLifecycleOutboxContract.CreateEntry(
+                autoApprovalSeed)
+        };
+        return update
+            .PushEach(
+                report => report.LifecycleProjectionOutbox,
+                entries)
+            .Set(
+                report => report.LifecycleProjectionLastError,
+                null);
     }
 
     // =======================
@@ -3468,9 +5696,12 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             WorkAssignmentId = period.WorkAssignmentId,
             WorkReportPeriodId = period.Id,
             AssigneeUserId = period.AssigneeUserId,
-            DynamicFormTemplateId = period.DynamicFormTemplateId,
-            DynamicFormTemplateCode = period.DynamicFormTemplateCode,
-            DynamicFormTemplateName = period.DynamicFormTemplateName,
+            DynamicFormTemplateId = period.DynamicFormTemplateId ?? assignment.DynamicFormTemplateId,
+            DynamicFormTemplateCode = period.DynamicFormTemplateCode ?? assignment.DynamicFormTemplateCode,
+            DynamicFormTemplateName = period.DynamicFormTemplateName ?? assignment.DynamicFormTemplateName,
+            DynamicFormFamilyId = period.DynamicFormFamilyId ?? assignment.DynamicFormFamilyId,
+            DynamicFormVersionNo = period.DynamicFormVersionNo ?? assignment.DynamicFormVersionNo,
+            DynamicFormSchemaHash = period.DynamicFormSchemaHash ?? assignment.DynamicFormSchemaHash,
 
             PeriodKey = period.PeriodKey,
             PeriodInstanceKey = periodInstanceKey,
@@ -3534,6 +5765,22 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         var detailFieldValuesJson = entity.FieldValuesJson;
         var detailTableValuesJson = entity.TableValuesJson;
         var detailSummarySourceJson = entity.SummarySourceJson;
+        entity.LifecycleProjectionOutbox =
+        [
+            WorkReportLifecycleOutboxContract.CreateEntry(
+                new WorkReportLifecycleOutboxSeed(
+                    CommandId: $"init-draft:{entity.Id}",
+                    LifecycleRevision: entity.LifecycleRevision,
+                    Operation: "INIT_DRAFT",
+                    ActorUserId: actorUserId,
+                    FromStatus: "NONE",
+                    ToStatus: WorkAssignmentReportStatus.Draft.ToString(),
+                    FromIsActive: false,
+                    ToIsActive: true,
+                    PayloadRevision: entity.PayloadRevision,
+                    PayloadHash: entity.PayloadHash,
+                    CreatedAtUtc: now))
+        ];
         CompactEmbeddedPayloadHeader(entity);
         await _ctx.WorkAssignmentReports.InsertOneAsync(entity, cancellationToken: ct);
         RestoreRuntimePayload(entity, detailValues1DJson, detailFieldValuesJson, detailTableValuesJson, detailSummarySourceJson);
@@ -3778,7 +6025,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         }
     }
 
-    private async Task ValidateRuntimeDataPayloadAsync(
+    private async Task<string?> ValidateRuntimeDataPayloadAsync(
         WorkAssignmentReport report,
         IReadOnlyList<object?>? values1D,
         string? fieldValuesJson,
@@ -3792,28 +6039,115 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                 ExtractRuntimeEnumCatalogIds(report.SpecJson),
                 ct);
             ValidateTopLevelRuntimeValues(report, values1D ?? Array.Empty<object?>(), topLevelOptionSets);
-            return;
+            return fieldValuesJson;
         }
 
         var form = await _ctx.DynamicFormTemplates
             .Find(x => x.Id == report.DynamicFormTemplateId && !x.IsDeleted)
             .FirstOrDefaultAsync(ct);
         if (form is null)
-        {
-            var topLevelOptionSets = await _enumCatalogs.LoadActiveOptionSetsAsync(
-                ExtractRuntimeEnumCatalogIds(report.SpecJson),
-                ct);
-            ValidateTopLevelRuntimeValues(report, values1D ?? Array.Empty<object?>(), topLevelOptionSets);
-            return;
-        }
+            throw InvalidReportRuntimePayload(report, "dynamicFormTemplate", "DYNAMIC_FORM_RUNTIME_FORM_NOT_FOUND");
 
-        var optionSets = await _enumCatalogs.LoadActiveOptionSetsAsync(
-            ExtractRuntimeEnumCatalogIds(report.SpecJson, form.FieldsJson, form.ExcelBlockJson, form.BlocksJson),
-            ct);
+        EnsureRuntimeFormVersionBinding(report, form);
+
+        var enumCatalogIds = ExtractRuntimeEnumCatalogIds(
+            report.SpecJson,
+            form.FieldsJson,
+            form.ExcelBlockJson,
+            form.BlocksJson);
+        await _enumCatalogs.ValidateVisibleActiveCatalogsAsync(enumCatalogIds, ct);
+        var optionSets = await _enumCatalogs.LoadActiveOptionSetsAsync(enumCatalogIds, ct);
 
         ValidateTopLevelRuntimeValues(report, values1D ?? Array.Empty<object?>(), optionSets);
-        ValidateDynamicFieldRuntimeValues(report, form, fieldValuesJson, validateRequiredFields, optionSets);
+        var canonicalFieldValuesJson = await CanonicalizeDynamicFieldRuntimeValuesAsync(
+            report,
+            form,
+            fieldValuesJson,
+            validateRequiredFields,
+            optionSets,
+            ct);
         ValidateDynamicTableRuntimeValues(report, form, tableValuesJson, optionSets);
+        return canonicalFieldValuesJson;
+    }
+
+    private static void EnsureRuntimeFormVersionBinding(
+        WorkAssignmentReport report,
+        DynamicFormTemplate form)
+    {
+        if (!form.IsPublished)
+            throw InvalidReportRuntimePayload(report, "dynamicFormTemplate", "DYNAMIC_FORM_RUNTIME_FORM_NOT_PUBLISHED");
+
+        if (!report.DynamicFormVersionNo.HasValue || report.DynamicFormVersionNo.Value != form.VersionNo)
+        {
+            throw InvalidReportRuntimePayload(
+                report,
+                "dynamicFormTemplate",
+                "DYNAMIC_FORM_RUNTIME_VERSION_MISMATCH");
+        }
+
+        var familyId = string.IsNullOrWhiteSpace(form.FamilyId) ? form.Id : form.FamilyId.Trim();
+        if (string.IsNullOrWhiteSpace(report.DynamicFormFamilyId) ||
+            !string.Equals(report.DynamicFormFamilyId.Trim(), familyId, StringComparison.Ordinal))
+        {
+            throw InvalidReportRuntimePayload(
+                report,
+                "dynamicFormTemplate",
+                "DYNAMIC_FORM_RUNTIME_FAMILY_MISMATCH");
+        }
+
+        if (!string.IsNullOrWhiteSpace(report.DynamicFormTemplateCode) &&
+            !string.Equals(report.DynamicFormTemplateCode.Trim(), form.Code?.Trim(), StringComparison.Ordinal))
+        {
+            throw InvalidReportRuntimePayload(
+                report,
+                "dynamicFormTemplate",
+                "DYNAMIC_FORM_RUNTIME_CODE_MISMATCH");
+        }
+
+        DynamicFormPublishedSchemaSnapshot snapshot;
+        try
+        {
+            snapshot = DynamicFormPublishedSchemaSnapshotBuilder.ValidateAgainstTemplate(form);
+        }
+        catch (InvalidOperationException)
+        {
+            throw InvalidReportRuntimePayload(
+                report,
+                "dynamicFormTemplate",
+                "DYNAMIC_FORM_RUNTIME_PUBLISHED_SCHEMA_INVALID");
+        }
+
+        if (string.IsNullOrWhiteSpace(report.DynamicFormSchemaHash) ||
+            !string.Equals(report.DynamicFormSchemaHash.Trim(), snapshot.Sha256, StringComparison.OrdinalIgnoreCase))
+        {
+            throw InvalidReportRuntimePayload(
+                report,
+                "dynamicFormTemplate",
+                "DYNAMIC_FORM_RUNTIME_SCHEMA_HASH_MISMATCH");
+        }
+    }
+
+    private static JsonDocument? ParseRuntimeJsonObjectOrThrow(
+        WorkAssignmentReport report,
+        string? json,
+        string scope)
+    {
+        if (string.IsNullOrWhiteSpace(json))
+            return null;
+
+        try
+        {
+            var document = JsonDocument.Parse(json);
+            if (document.RootElement.ValueKind == JsonValueKind.Object)
+                return document;
+
+            document.Dispose();
+            throw InvalidReportRuntimePayload(report, scope, "DYNAMIC_FORM_RUNTIME_JSON_OBJECT_REQUIRED");
+        }
+        catch (JsonException)
+        {
+            throw InvalidReportRuntimePayload(report, scope, "DYNAMIC_FORM_RUNTIME_JSON_INVALID");
+        }
     }
 
     private static void ValidateTopLevelRuntimeValues(
@@ -3821,7 +6155,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         IReadOnlyList<object?> values1D,
         IReadOnlyDictionary<string, RuntimeEnumOptionSet> optionSets)
     {
-        using var specDocument = TryParseRuntimeJsonObject(report.SpecJson);
+        using var specDocument = ParseRuntimeJsonObjectOrThrow(report, report.SpecJson, "specJson");
         var spec = specDocument?.RootElement;
         var inputCells = ResolveReportRuntimeInputCells(report, spec);
         var expectedLength = inputCells.Count;
@@ -3934,29 +6268,76 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         {
             using var document = JsonDocument.Parse(tableValuesJson);
             if (document.RootElement.ValueKind != JsonValueKind.Object)
-                throw RuntimeTableValuesInvalid(report, "tableValuesJson must be a JSON object.");
+                throw RuntimeTableValuesInvalid(report, "DYNAMIC_FORM_TABLE_VALUES_OBJECT_REQUIRED");
 
             if (!TryGetJsonProperty(document.RootElement, "blocks", out var blocks) ||
                 blocks.ValueKind != JsonValueKind.Array)
             {
-                return;
+                throw RuntimeTableValuesInvalid(report, "DYNAMIC_FORM_TABLE_BLOCKS_ARRAY_REQUIRED");
             }
 
+            var seenBlockIds = new HashSet<string>(StringComparer.Ordinal);
             foreach (var block in blocks.EnumerateArray())
             {
                 if (block.ValueKind != JsonValueKind.Object)
-                    continue;
+                    throw RuntimeTableValuesInvalid(report, "DYNAMIC_FORM_TABLE_BLOCK_OBJECT_REQUIRED");
+
+                var rawBlockId = ReadJsonString(block, "blockId") ?? ReadJsonString(block, "id");
+                if (string.IsNullOrWhiteSpace(rawBlockId))
+                    throw RuntimeTableValuesInvalid(report, "DYNAMIC_FORM_TABLE_BLOCK_ID_REQUIRED");
+
+                var blockId = NormalizeBlockId(rawBlockId);
+                if (!seenBlockIds.Add(blockId))
+                {
+                    throw RuntimeTableValuesInvalid(
+                        report,
+                        "DYNAMIC_FORM_TABLE_BLOCK_DUPLICATE",
+                        new { blockId });
+                }
+
+                if (!contracts.TryGetValue(blockId, out var contract))
+                {
+                    throw RuntimeTableValuesInvalid(
+                        report,
+                        "DYNAMIC_FORM_TABLE_BLOCK_NOT_PUBLISHED",
+                        new { blockId });
+                }
+
+                var contractMode = (ReadJsonString(contract.Block, "tableMode") ?? "FIXED_GRID")
+                    .Trim()
+                    .ToUpperInvariant();
+                var runtimeMode = ReadJsonString(block, "tableMode")?.Trim().ToUpperInvariant();
+                if (contractMode is not ("FIXED_GRID" or "APPEND_ROWS" or "APPEND_COLUMNS" or "MATRIX" or "SUMMARY_TEMPLATE"))
+                {
+                    throw RuntimeTableValuesInvalid(
+                        report,
+                        "DYNAMIC_FORM_TABLE_MODE_UNSUPPORTED",
+                        new { blockId, contractMode });
+                }
+                if (!string.Equals(runtimeMode, contractMode, StringComparison.Ordinal))
+                {
+                    throw RuntimeTableValuesInvalid(
+                        report,
+                        "DYNAMIC_FORM_TABLE_MODE_MISMATCH",
+                        new { blockId, runtimeMode, contractMode });
+                }
+
+                if (contractMode == "SUMMARY_TEMPLATE")
+                {
+                    throw RuntimeTableValuesInvalid(
+                        report,
+                        "DYNAMIC_FORM_SUMMARY_TEMPLATE_INPUT_FORBIDDEN",
+                        new { blockId });
+                }
 
                 var values = Values1DCompression.ReadBlockObjects(block, _jsonOptions);
                 if (values is null)
-                    continue;
-
-                var blockId = NormalizeBlockId(ReadJsonString(block, "blockId") ?? ReadJsonString(block, "id"));
-                var contract = contracts.TryGetValue(blockId, out var known)
-                    ? known
-                    : ParseRuntimeTableBlock(block);
-                if (contract is null)
-                    continue;
+                {
+                    throw RuntimeTableValuesInvalid(
+                        report,
+                        "DYNAMIC_FORM_TABLE_VALUES_ARRAY_REQUIRED",
+                        new { blockId });
+                }
 
                 var inputCells = ResolveRuntimeInputCells(contract.Block, contract.DataRect, contract.W, contract.H);
                 var expectedLength = inputCells.Count;
@@ -3964,8 +6345,11 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                 if (actualLength != expectedLength)
                     throw RuntimeTableValuesInvalid(
                         report,
-                        $"Block {blockId} values1D length does not match block dimensions.",
+                        "DYNAMIC_FORM_TABLE_VALUES_LENGTH_MISMATCH",
                         new { blockId, expectedLength, actualLength });
+
+                ValidateRuntimeTableValueSlots(report, blockId, block, contract, inputCells);
+                ValidateRuntimeTableProjectionConsistency(report, blockId, block, contractMode, values);
 
                 for (var index = 0; index < values.Count; index++)
                 {
@@ -3991,11 +6375,497 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                 }
             }
         }
-        catch (JsonException ex)
+        catch (JsonException)
         {
-            throw RuntimeTableValuesInvalid(report, ex.Message);
+            throw RuntimeTableValuesInvalid(report, "DYNAMIC_FORM_TABLE_VALUES_JSON_INVALID");
         }
     }
+
+    private async Task<string?> CanonicalizeDynamicFieldRuntimeValuesAsync(
+        WorkAssignmentReport report,
+        DynamicFormTemplate form,
+        string? fieldValuesJson,
+        bool validateRequiredFields,
+        IReadOnlyDictionary<string, RuntimeEnumOptionSet> optionSets,
+        CancellationToken ct)
+    {
+        var fields = ReadRuntimeFields(form.FieldsJson);
+        var submittedValues = ReadRuntimeFieldValues(report, fieldValuesJson);
+        var definitions = new List<ResolvedDynamicFormRuntimeFieldDefinition>(fields.Count);
+
+        foreach (var field in fields)
+        {
+            var selectedCodes = ReadRuntimeFieldSelectedCodes(field, submittedValues);
+            var allowedChoiceCodes = IsRuntimeChoiceFieldType(field.FieldType)
+                ? await ResolveRuntimeFieldAllowedChoiceCodesAsync(field, selectedCodes, optionSets, ct)
+                : null;
+
+            definitions.Add(new ResolvedDynamicFormRuntimeFieldDefinition(
+                field.Id,
+                field.FieldType,
+                field.Key,
+                field.Required,
+                allowedChoiceCodes));
+        }
+
+        try
+        {
+            var result = DynamicFormRuntimeFieldCanonicalizer.Canonicalize(
+                fieldValuesJson,
+                definitions,
+                validateRequiredFields);
+            return AttachRuntimeFieldSourceProvenance(
+                result.CanonicalFieldValuesJson,
+                fields,
+                submittedValues,
+                form.PublishedSchemaHash);
+        }
+        catch (DynamicFormRuntimeFieldValidationException ex)
+        {
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_VALUES_INVALID,
+                new
+                {
+                    reportId = report.Id,
+                    report.WorkId,
+                    report.WorkAssignmentId,
+                    report.WorkReportPeriodId,
+                    report.DynamicFormTemplateId,
+                    scope = "fieldValuesJson",
+                    fieldId = ex.FieldId,
+                    fieldType = ex.FieldType,
+                    valueProperty = ex.ValueProperty,
+                    reason = ex.Reason
+                });
+        }
+    }
+
+    private static bool IsRuntimeChoiceFieldType(string fieldType)
+        => fieldType is "shortText" or "singleSelect" or "multiSelect";
+
+    private static IReadOnlyList<string> ReadRuntimeFieldSelectedCodes(
+        RuntimeFieldContract field,
+        IReadOnlyDictionary<string, JsonElement> submittedValues)
+    {
+        if (!submittedValues.TryGetValue(field.Id, out var value) &&
+            (string.IsNullOrWhiteSpace(field.Key) || !submittedValues.TryGetValue(field.Key, out value)))
+        {
+            return Array.Empty<string>();
+        }
+
+        if (value.ValueKind == JsonValueKind.String)
+        {
+            var code = value.GetString()?.Trim();
+            return string.IsNullOrWhiteSpace(code) ? Array.Empty<string>() : new[] { code };
+        }
+
+        if (value.ValueKind != JsonValueKind.Array)
+            return Array.Empty<string>();
+
+        return value.EnumerateArray()
+            .Where(item => item.ValueKind == JsonValueKind.String)
+            .Select(item => item.GetString()?.Trim())
+            .Where(item => !string.IsNullOrWhiteSpace(item))
+            .Select(item => item!)
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+    }
+
+    private async Task<IReadOnlyCollection<string>> ResolveRuntimeFieldAllowedChoiceCodesAsync(
+        RuntimeFieldContract field,
+        IReadOnlyCollection<string> selectedCodes,
+        IReadOnlyDictionary<string, RuntimeEnumOptionSet> optionSets,
+        CancellationToken ct)
+    {
+        var sourceType = LabelValueSourceTypes.Normalize(field.ValueSourceType);
+        if (sourceType is LabelValueSourceTypes.None or LabelValueSourceTypes.FixedEnum)
+            return field.Options.Select(option => option.Code).Distinct(StringComparer.Ordinal).ToArray();
+
+        if (sourceType == LabelValueSourceTypes.EnumCatalog)
+        {
+            return !string.IsNullOrWhiteSpace(field.EnumCatalogId) &&
+                   optionSets.TryGetValue(field.EnumCatalogId.Trim(), out var optionSet)
+                ? optionSet.Codes.OrderBy(code => code, StringComparer.Ordinal).ToArray()
+                : Array.Empty<string>();
+        }
+
+        if (selectedCodes.Count == 0)
+            return Array.Empty<string>();
+
+        if (sourceType == LabelValueSourceTypes.SystemUnit)
+        {
+            var ids = selectedCodes
+                .Where(code => ObjectId.TryParse(code, out _))
+                .Distinct(StringComparer.Ordinal)
+                .ToList();
+            if (ids.Count == 0)
+                return Array.Empty<string>();
+            return await _ctx.Units
+                .Find(x => ids.Contains(x.Id) && !x.IsDeleted && x.Code != "ROOT")
+                .Project(x => x.Id)
+                .ToListAsync(ct);
+        }
+
+        if (sourceType == LabelValueSourceTypes.SystemUser)
+        {
+            var ids = selectedCodes
+                .Where(code => ObjectId.TryParse(code, out _))
+                .Distinct(StringComparer.Ordinal)
+                .ToList();
+            if (ids.Count == 0)
+                return Array.Empty<string>();
+            return await _ctx.Users
+                .Find(x => ids.Contains(x.Id) && !x.IsDeleted)
+                .Project(x => x.Id)
+                .ToListAsync(ct);
+        }
+
+        if (sourceType == LabelValueSourceTypes.SystemPosition)
+        {
+            var codes = selectedCodes.Distinct(StringComparer.Ordinal).ToList();
+            return await _ctx.Positions
+                .Find(x => codes.Contains(x.Code) && !x.IsDeleted)
+                .Project(x => x.Code)
+                .ToListAsync(ct);
+        }
+
+        if (sourceType == LabelValueSourceTypes.SystemUnitType)
+        {
+            var codes = selectedCodes.Distinct(StringComparer.Ordinal).ToList();
+            return await _ctx.UnitTypes
+                .Find(x => codes.Contains(x.Code) && !x.IsDeleted)
+                .Project(x => x.Code)
+                .ToListAsync(ct);
+        }
+
+        return Array.Empty<string>();
+    }
+
+    private static string AttachRuntimeFieldSourceProvenance(
+        string canonicalFieldValuesJson,
+        IReadOnlyCollection<RuntimeFieldContract> fields,
+        IReadOnlyDictionary<string, JsonElement> submittedValues,
+        string? schemaHash)
+    {
+        var root = JsonNode.Parse(canonicalFieldValuesJson) as JsonObject ?? new JsonObject();
+        var values = root["values"] as JsonObject ?? root;
+        var provenance = new JsonObject();
+
+        foreach (var field in fields.Where(field => IsRuntimeChoiceFieldType(field.FieldType)))
+        {
+            if (!values.ContainsKey(field.Id))
+                continue;
+
+            var selectedCodes = ReadRuntimeFieldSelectedCodes(field, submittedValues);
+            provenance[field.Id] = new JsonObject
+            {
+                ["sourceType"] = LabelValueSourceTypes.Normalize(field.ValueSourceType),
+                ["sourceId"] = field.EnumCatalogId,
+                ["sourceVersion"] = schemaHash,
+                ["codes"] = new JsonArray(selectedCodes.Select(code => JsonValue.Create(code)).ToArray())
+            };
+        }
+
+        if (provenance.Count == 0)
+            return canonicalFieldValuesJson;
+
+        if (ReferenceEquals(values, root))
+        {
+            var envelope = new JsonObject
+            {
+                ["sourceProvenance"] = provenance,
+                ["values"] = root.DeepClone()
+            };
+            return envelope.ToJsonString(_jsonOptions);
+        }
+
+        root["sourceProvenance"] = provenance;
+        return root.ToJsonString(_jsonOptions);
+    }
+
+    private static void ValidateRuntimeTableValueSlots(
+        WorkAssignmentReport report,
+        string blockId,
+        JsonElement block,
+        RuntimeTableBlockContract contract,
+        IReadOnlyList<RuntimeInputCellRef> inputCells)
+    {
+        if (!TryGetJsonProperty(block, "valueSlots", out var slots) || slots.ValueKind != JsonValueKind.Array)
+        {
+            throw RuntimeTableValuesInvalid(
+                report,
+                "DYNAMIC_FORM_TABLE_VALUE_SLOTS_REQUIRED",
+                new { blockId });
+        }
+
+        if (slots.GetArrayLength() != inputCells.Count)
+        {
+            throw RuntimeTableValuesInvalid(
+                report,
+                "DYNAMIC_FORM_TABLE_VALUE_SLOTS_LENGTH_MISMATCH",
+                new { blockId, expectedLength = inputCells.Count, actualLength = slots.GetArrayLength() });
+        }
+
+        var seenIndexes = new HashSet<int>();
+        foreach (var slot in slots.EnumerateArray())
+        {
+            if (slot.ValueKind != JsonValueKind.Object)
+            {
+                throw RuntimeTableValuesInvalid(
+                    report,
+                    "DYNAMIC_FORM_TABLE_VALUE_SLOT_OBJECT_REQUIRED",
+                    new { blockId });
+            }
+
+            var index = ReadJsonInt(slot, "index");
+            if (!index.HasValue || index.Value < 0 || index.Value >= inputCells.Count || !seenIndexes.Add(index.Value))
+            {
+                throw RuntimeTableValuesInvalid(
+                    report,
+                    "DYNAMIC_FORM_TABLE_VALUE_SLOT_INDEX_INVALID",
+                    new { blockId, index });
+            }
+
+            var expected = inputCells[index.Value];
+            var expectedRowKey = $"row_{expected.R - contract.DataRect.R0 + 1}";
+            var expectedColumnKey = $"col_{expected.C - contract.DataRect.C0 + 1}";
+            var rowKey = ReadJsonString(slot, "rowKey");
+            var columnKey = ReadJsonString(slot, "columnKey");
+            if (!string.Equals(rowKey, expectedRowKey, StringComparison.OrdinalIgnoreCase) ||
+                !string.Equals(columnKey, expectedColumnKey, StringComparison.OrdinalIgnoreCase))
+            {
+                throw RuntimeTableValuesInvalid(
+                    report,
+                    "DYNAMIC_FORM_TABLE_VALUE_SLOT_COORDINATE_MISMATCH",
+                    new { blockId, index, rowKey, columnKey, expectedRowKey, expectedColumnKey });
+            }
+
+            ValidateOptionalRuntimeSlotCoordinate(report, blockId, slot, "rowOffset", expected.R - contract.DataRect.R0, index.Value);
+            ValidateOptionalRuntimeSlotCoordinate(report, blockId, slot, "columnOffset", expected.C - contract.DataRect.C0, index.Value);
+            ValidateOptionalRuntimeSlotCoordinate(report, blockId, slot, "row", expected.R, index.Value);
+            ValidateOptionalRuntimeSlotCoordinate(report, blockId, slot, "column", expected.C, index.Value);
+        }
+    }
+
+    private static void ValidateOptionalRuntimeSlotCoordinate(
+        WorkAssignmentReport report,
+        string blockId,
+        JsonElement slot,
+        string propertyName,
+        int expected,
+        int index)
+    {
+        var actual = ReadJsonInt(slot, propertyName);
+        if (actual.HasValue && actual.Value != expected)
+        {
+            throw RuntimeTableValuesInvalid(
+                report,
+                "DYNAMIC_FORM_TABLE_VALUE_SLOT_COORDINATE_MISMATCH",
+                new { blockId, index, propertyName, expected, actual });
+        }
+    }
+
+    private static void ValidateRuntimeTableProjectionConsistency(
+        WorkAssignmentReport report,
+        string blockId,
+        JsonElement block,
+        string tableMode,
+        IReadOnlyList<object?> values)
+    {
+        EnsureRuntimeTableModeProjectionRequired(report, blockId, block, tableMode);
+        var canonicalValues = JsonSerializer.SerializeToNode(values, _jsonOptions) as JsonArray ?? new JsonArray();
+        var slotIndexes = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        if (TryGetJsonProperty(block, "valueSlots", out var slots) && slots.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var slot in slots.EnumerateArray())
+            {
+                var index = ReadJsonInt(slot, "index");
+                var rowKey = ReadJsonString(slot, "rowKey");
+                var columnKey = ReadJsonString(slot, "columnKey");
+                if (index.HasValue && !string.IsNullOrWhiteSpace(rowKey) && !string.IsNullOrWhiteSpace(columnKey))
+                    slotIndexes[RuntimeTableSlotKey(rowKey, columnKey)] = index.Value;
+            }
+        }
+
+        if (tableMode == "APPEND_ROWS" && TryGetJsonProperty(block, "rows", out var rows))
+        {
+            if (rows.ValueKind != JsonValueKind.Array)
+                throw RuntimeTableValuesInvalid(report, "DYNAMIC_FORM_TABLE_ROWS_ARRAY_REQUIRED", new { blockId });
+
+            var seenRows = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var seenRowInstanceIds = new HashSet<string>(StringComparer.Ordinal);
+            var rowIndex = 0;
+            foreach (var row in rows.EnumerateArray())
+            {
+                if (row.ValueKind != JsonValueKind.Object)
+                    throw RuntimeTableValuesInvalid(report, "DYNAMIC_FORM_TABLE_ROW_OBJECT_REQUIRED", new { blockId, rowIndex });
+
+                var rowInstanceId = ReadJsonString(row, "rowInstanceId");
+                if (string.IsNullOrWhiteSpace(rowInstanceId) || !seenRowInstanceIds.Add(rowInstanceId.Trim()))
+                    throw RuntimeTableValuesInvalid(report, "DYNAMIC_FORM_TABLE_ROW_INSTANCE_ID_INVALID", new { blockId, rowIndex, rowInstanceId });
+
+                var rowOrder = ReadJsonInt(row, "rowOrder") ?? 0;
+                var rowKey = $"row_{Math.Max(1, rowOrder)}";
+                if (rowOrder <= 0 || !seenRows.Add(rowKey))
+                    throw RuntimeTableValuesInvalid(report, "DYNAMIC_FORM_TABLE_ROW_ORDER_INVALID", new { blockId, rowIndex, rowOrder });
+                if (!slotIndexes.Keys.Any(key => key.StartsWith(rowKey + "\u001f", StringComparison.OrdinalIgnoreCase)))
+                    throw RuntimeTableValuesInvalid(report, "DYNAMIC_FORM_TABLE_ROW_SLOT_NOT_FOUND", new { blockId, rowIndex, rowOrder });
+
+                if (!TryGetJsonProperty(row, "cells", out var cells) || cells.ValueKind != JsonValueKind.Object)
+                    throw RuntimeTableValuesInvalid(report, "DYNAMIC_FORM_TABLE_ROW_CELLS_OBJECT_REQUIRED", new { blockId, rowIndex });
+                foreach (var cell in cells.EnumerateObject())
+                    ValidateRuntimeProjectionValue(report, blockId, "rows", rowKey, cell.Name, cell.Value, canonicalValues, slotIndexes);
+
+                foreach (var property in row.EnumerateObject())
+                {
+                    if (RuntimeAppendRowMetadataKeys.Contains(property.Name))
+                        continue;
+                    ValidateRuntimeProjectionValue(report, blockId, "rows", rowKey, property.Name, property.Value, canonicalValues, slotIndexes);
+                }
+
+                rowIndex++;
+            }
+        }
+
+        if (tableMode == "APPEND_COLUMNS" && TryGetJsonProperty(block, "columns", out var columns))
+        {
+            if (columns.ValueKind != JsonValueKind.Array)
+                throw RuntimeTableValuesInvalid(report, "DYNAMIC_FORM_TABLE_COLUMNS_ARRAY_REQUIRED", new { blockId });
+
+            var seenColumns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var seenColumnInstanceIds = new HashSet<string>(StringComparer.Ordinal);
+            var columnIndex = 0;
+            foreach (var column in columns.EnumerateArray())
+            {
+                if (column.ValueKind != JsonValueKind.Object)
+                    throw RuntimeTableValuesInvalid(report, "DYNAMIC_FORM_TABLE_COLUMN_OBJECT_REQUIRED", new { blockId, columnIndex });
+
+                var columnInstanceId = ReadJsonString(column, "columnInstanceId");
+                if (string.IsNullOrWhiteSpace(columnInstanceId) || !seenColumnInstanceIds.Add(columnInstanceId.Trim()))
+                    throw RuntimeTableValuesInvalid(report, "DYNAMIC_FORM_TABLE_COLUMN_INSTANCE_ID_INVALID", new { blockId, columnIndex, columnInstanceId });
+
+                var columnOrder = ReadJsonInt(column, "columnOrder") ?? 0;
+                var columnKey = $"col_{Math.Max(1, columnOrder)}";
+                if (columnOrder <= 0 || !seenColumns.Add(columnKey))
+                    throw RuntimeTableValuesInvalid(report, "DYNAMIC_FORM_TABLE_COLUMN_ORDER_INVALID", new { blockId, columnIndex, columnOrder });
+                if (!slotIndexes.Keys.Any(key => key.EndsWith("\u001f" + columnKey, StringComparison.OrdinalIgnoreCase)))
+                    throw RuntimeTableValuesInvalid(report, "DYNAMIC_FORM_TABLE_COLUMN_SLOT_NOT_FOUND", new { blockId, columnIndex, columnOrder });
+                if (!TryGetJsonProperty(column, "cells", out var cells) || cells.ValueKind != JsonValueKind.Object)
+                    throw RuntimeTableValuesInvalid(report, "DYNAMIC_FORM_TABLE_COLUMN_CELLS_OBJECT_REQUIRED", new { blockId, columnIndex });
+                foreach (var cell in cells.EnumerateObject())
+                    ValidateRuntimeProjectionValue(report, blockId, "columns", cell.Name, columnKey, cell.Value, canonicalValues, slotIndexes);
+
+                columnIndex++;
+            }
+        }
+
+        if (tableMode == "MATRIX" && TryGetJsonProperty(block, "cells", out var matrixCells))
+        {
+            if (matrixCells.ValueKind != JsonValueKind.Array)
+                throw RuntimeTableValuesInvalid(report, "DYNAMIC_FORM_TABLE_MATRIX_CELLS_ARRAY_REQUIRED", new { blockId });
+
+            var seenCells = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var cellIndex = 0;
+            foreach (var cell in matrixCells.EnumerateArray())
+            {
+                if (cell.ValueKind != JsonValueKind.Object)
+                    throw RuntimeTableValuesInvalid(report, "DYNAMIC_FORM_TABLE_MATRIX_CELL_OBJECT_REQUIRED", new { blockId, cellIndex });
+
+                var rowKey = ReadJsonString(cell, "rowKey");
+                var columnKey = ReadJsonString(cell, "columnKey");
+                var rowAxisKey = ReadJsonString(cell, "rowAxisKey");
+                var columnAxisKey = ReadJsonString(cell, "columnAxisKey");
+                var metricKey = ReadJsonString(cell, "metricKey");
+                if (string.IsNullOrWhiteSpace(rowKey) || string.IsNullOrWhiteSpace(columnKey) ||
+                    string.IsNullOrWhiteSpace(rowAxisKey) || string.IsNullOrWhiteSpace(columnAxisKey) ||
+                    string.IsNullOrWhiteSpace(metricKey) ||
+                    !TryGetJsonProperty(cell, "value", out var projectedValue))
+                {
+                    throw RuntimeTableValuesInvalid(report, "DYNAMIC_FORM_TABLE_MATRIX_CELL_COORDINATE_REQUIRED", new { blockId, cellIndex });
+                }
+                if (!seenCells.Add(RuntimeTableSlotKey(rowKey, columnKey)))
+                    throw RuntimeTableValuesInvalid(report, "DYNAMIC_FORM_TABLE_MATRIX_CELL_DUPLICATE", new { blockId, cellIndex, rowKey, columnKey });
+                ValidateRuntimeProjectionValue(report, blockId, "cells", rowKey, columnKey, projectedValue, canonicalValues, slotIndexes);
+                cellIndex++;
+            }
+        }
+    }
+
+    private static void EnsureRuntimeTableModeProjectionRequired(
+        WorkAssignmentReport report,
+        string blockId,
+        JsonElement block,
+        string tableMode)
+    {
+        var requiredProperty = tableMode switch
+        {
+            "APPEND_ROWS" => "rows",
+            "APPEND_COLUMNS" => "columns",
+            "MATRIX" => "cells",
+            "FIXED_GRID" => null,
+            _ => throw RuntimeTableValuesInvalid(
+                report,
+                "DYNAMIC_FORM_TABLE_MODE_UNSUPPORTED",
+                new { blockId, tableMode })
+        };
+
+        if (requiredProperty is not null && !TryGetJsonProperty(block, requiredProperty, out _))
+        {
+            throw RuntimeTableValuesInvalid(
+                report,
+                $"DYNAMIC_FORM_TABLE_{requiredProperty.ToUpperInvariant()}_REQUIRED",
+                new { blockId, tableMode });
+        }
+
+        if (tableMode == "FIXED_GRID" &&
+            (TryGetJsonProperty(block, "rows", out _) ||
+             TryGetJsonProperty(block, "columns", out _) ||
+             TryGetJsonProperty(block, "cells", out _)))
+        {
+            throw RuntimeTableValuesInvalid(
+                report,
+                "DYNAMIC_FORM_FIXED_GRID_PROJECTION_FORBIDDEN",
+                new { blockId, tableMode });
+        }
+    }
+
+    private static void ValidateRuntimeProjectionValue(
+        WorkAssignmentReport report,
+        string blockId,
+        string projection,
+        string rowKey,
+        string columnKey,
+        JsonElement projectedValue,
+        JsonArray canonicalValues,
+        IReadOnlyDictionary<string, int> slotIndexes)
+    {
+        if (!slotIndexes.TryGetValue(RuntimeTableSlotKey(rowKey, columnKey), out var index) ||
+            index < 0 || index >= canonicalValues.Count)
+        {
+            throw RuntimeTableValuesInvalid(
+                report,
+                "DYNAMIC_FORM_TABLE_PROJECTION_SLOT_NOT_FOUND",
+                new { blockId, projection, rowKey, columnKey });
+        }
+
+        var projectedNode = projectedValue.ValueKind == JsonValueKind.Null
+            ? null
+            : JsonNode.Parse(projectedValue.GetRawText());
+        if (!JsonNode.DeepEquals(canonicalValues[index], projectedNode))
+        {
+            throw RuntimeTableValuesInvalid(
+                report,
+                "DYNAMIC_FORM_TABLE_PROJECTION_VALUE_MISMATCH",
+                new { blockId, projection, rowKey, columnKey, index });
+        }
+    }
+
+    private static string RuntimeTableSlotKey(string rowKey, string columnKey)
+        => $"{rowKey.Trim()}\u001f{columnKey.Trim()}";
+
+    private static readonly HashSet<string> RuntimeAppendRowMetadataKeys = new(
+        new[] { "cells", "rowKey", "rowInstanceId", "rowOrder", "rowIndex", "joinKey", "id", "rowLabelCodes" },
+        StringComparer.OrdinalIgnoreCase);
 
     private static List<RuntimeFieldContract> ReadRuntimeFields(string? fieldsJson)
     {
@@ -4025,11 +6895,13 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                     ReadJsonString(item, "label") ??
                     key;
 
+                var fieldType = ReadJsonString(item, "type")?.Trim() ?? string.Empty;
                 result.Add(new RuntimeFieldContract(
                     id.Trim(),
                     key.Trim(),
                     string.IsNullOrWhiteSpace(displayName) ? key.Trim() : displayName.Trim(),
-                    NormalizeRuntimeFieldDataType(ReadJsonString(item, "type")),
+                    fieldType,
+                    NormalizeRuntimeFieldDataType(fieldType),
                     ReadJsonBool(item, "required") == true,
                     ReadRuntimeOptions(item),
                     ReadRuntimeEnumCatalogId(item),
@@ -4238,10 +7110,8 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             return null;
 
         var valueBlocks = ReadRuntimeTableValueBlockElements(tableValuesJson);
-        if (valueBlocks.Count == 0)
-            return null;
-
         Dictionary<string, RuntimeTableBlockContract>? templateContracts = null;
+        string? topLevelBlockId = null;
         if (!string.IsNullOrWhiteSpace(report.DynamicFormTemplateId))
         {
             var dynamicFormTemplateId = report.DynamicFormTemplateId.Trim();
@@ -4249,8 +7119,21 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                 .Find(x => x.Id == dynamicFormTemplateId && !x.IsDeleted)
                 .FirstOrDefaultAsync(ct);
             if (form is not null)
+            {
                 templateContracts = ReadRuntimeTableBlocks(form);
+                topLevelBlockId = ResolveTopLevelBlockId(form);
+            }
         }
+
+        if (templateContracts is not null &&
+            !string.IsNullOrWhiteSpace(topLevelBlockId) &&
+            templateContracts.TryGetValue(NormalizeBlockId(topLevelBlockId), out var topLevelContract))
+        {
+            return topLevelContract;
+        }
+
+        if (valueBlocks.Count == 0)
+            return null;
 
         foreach (var block in valueBlocks)
         {
@@ -4640,8 +7523,8 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             "date" => RuntimeDataTypeDate,
             "fullDate" => RuntimeDataTypeFullDate,
             "boolean" => RuntimeDataTypeBoolean,
-            "longText" => RuntimeDataTypeStringList,
-            "richText" => RuntimeDataTypeStringList,
+            "longText" => RuntimeDataTypeLongText,
+            "richText" => RuntimeDataTypeLongText,
             "stringList" => RuntimeDataTypeStringList,
             "singleSelect" => RuntimeDataTypeShortText,
             "multiSelect" => RuntimeDataTypeShortTextList,
@@ -4651,6 +7534,9 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
     private static string NormalizeRuntimeDataType(string? value)
     {
         var normalized = value?.Trim().ToUpperInvariant();
+        if (string.IsNullOrWhiteSpace(normalized))
+            return RuntimeDataTypeNumber;
+
         return normalized switch
         {
             RuntimeDataTypeNumber or "DECIMAL" or "NUMERIC" => RuntimeDataTypeNumber,
@@ -4658,11 +7544,11 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             RuntimeDataTypeFullDate or "FULLDATE" or "STRICT_DATE" => RuntimeDataTypeFullDate,
             RuntimeDataTypeBoolean or "BOOL" => RuntimeDataTypeBoolean,
             RuntimeDataTypeShortText or "TEXT" or "STRING" or "SHORTTEXT" => RuntimeDataTypeShortText,
-            RuntimeDataTypeLongText or "LONGTEXT" => RuntimeDataTypeStringList,
+            RuntimeDataTypeLongText or "LONGTEXT" => RuntimeDataTypeLongText,
             RuntimeDataTypeStringList or "STRINGLIST" => RuntimeDataTypeStringList,
             RuntimeDataTypeShortTextList or "MULTI_SELECT" or "MULTISELECT" => RuntimeDataTypeShortTextList,
             RuntimeDataTypeIgnore or "IGNORED" or "SKIP" => RuntimeDataTypeIgnore,
-            _ => RuntimeDataTypeNumber
+            _ => RuntimeDataTypeUnsupported
         };
     }
 
@@ -4692,13 +7578,12 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             RuntimeDataTypeNumber => IsRuntimeNumber(value),
             RuntimeDataTypeDate => value is string text && IsRuntimeDateTextValid(text, requireFullDate: false),
             RuntimeDataTypeFullDate => value is string text && IsRuntimeDateTextValid(text, requireFullDate: true),
-            RuntimeDataTypeBoolean => value is bool ||
-                                      IsRuntimeZeroOrOneNumber(value) ||
-                                      value is string text && TryParseRuntimeBooleanText(text, out _),
+            RuntimeDataTypeBoolean => value is bool,
             RuntimeDataTypeShortText => IsRuntimeShortTextValueValid(value, options),
             RuntimeDataTypeShortTextList => IsRuntimeShortTextListValueValid(value, options),
-            RuntimeDataTypeStringList or RuntimeDataTypeLongText => IsRuntimeFreeStringListValueValid(value),
-            _ => true
+            RuntimeDataTypeLongText => value is string,
+            RuntimeDataTypeStringList => IsRuntimeFreeStringListValueValid(value),
+            _ => false
         };
     }
 
@@ -4724,13 +7609,22 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         if (dataType == RuntimeDataTypeShortTextList)
         {
             if (value is IEnumerable<string> list)
-                return list.All(item => !string.IsNullOrWhiteSpace(item));
+            {
+                var values = list.ToArray();
+                return values.All(item => !string.IsNullOrWhiteSpace(item)) &&
+                       values.Distinct(StringComparer.Ordinal).Count() == values.Length;
+            }
             if (value is JsonElement element)
             {
-                return element.ValueKind == JsonValueKind.Array &&
-                       element.EnumerateArray().All(item =>
+                if (element.ValueKind != JsonValueKind.Array)
+                    return false;
+                var values = element.EnumerateArray().ToArray();
+                return values.All(item =>
                            item.ValueKind == JsonValueKind.String &&
-                           !string.IsNullOrWhiteSpace(item.GetString()));
+                           !string.IsNullOrWhiteSpace(item.GetString())) &&
+                       values.Select(item => item.GetString()!.Trim())
+                           .Distinct(StringComparer.Ordinal)
+                           .Count() == values.Length;
             }
             return false;
         }
@@ -4748,19 +7642,17 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
 
         return dataType switch
         {
-            RuntimeDataTypeNumber => value.ValueKind == JsonValueKind.Number ||
-                                     value.ValueKind == JsonValueKind.String && IsRuntimeNumberText(value.GetString()),
+            RuntimeDataTypeNumber => value.ValueKind == JsonValueKind.Number && value.TryGetDecimal(out _),
             RuntimeDataTypeDate => value.ValueKind == JsonValueKind.String &&
                                    IsRuntimeDateTextValid(value.GetString(), requireFullDate: false),
             RuntimeDataTypeFullDate => value.ValueKind == JsonValueKind.String &&
                                        IsRuntimeDateTextValid(value.GetString(), requireFullDate: true),
-            RuntimeDataTypeBoolean => value.ValueKind is JsonValueKind.True or JsonValueKind.False ||
-                                      value.ValueKind == JsonValueKind.Number && IsRuntimeZeroOrOneNumber(value) ||
-                                      value.ValueKind == JsonValueKind.String && TryParseRuntimeBooleanText(value.GetString(), out _),
+            RuntimeDataTypeBoolean => value.ValueKind is JsonValueKind.True or JsonValueKind.False,
             RuntimeDataTypeShortText => IsRuntimeShortTextJsonValid(value, options),
             RuntimeDataTypeShortTextList => IsRuntimeShortTextListJsonValid(value, options),
-            RuntimeDataTypeStringList or RuntimeDataTypeLongText => IsRuntimeFreeStringListJsonValid(value),
-            _ => true
+            RuntimeDataTypeLongText => value.ValueKind == JsonValueKind.String,
+            RuntimeDataTypeStringList => IsRuntimeFreeStringListJsonValid(value),
+            _ => false
         };
     }
 
@@ -4790,7 +7682,11 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         IReadOnlyCollection<RuntimeOption>? options)
     {
         if (value is IEnumerable<string> list)
-            return list.All(item => RuntimeOptionContains(options, item));
+        {
+            var values = list.ToArray();
+            return values.All(item => RuntimeOptionContains(options, item)) &&
+                   values.Distinct(StringComparer.Ordinal).Count() == values.Length;
+        }
 
         if (value is JsonElement element)
             return IsRuntimeShortTextListJsonValid(element, options);
@@ -4802,18 +7698,26 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         JsonElement value,
         IReadOnlyCollection<RuntimeOption>? options)
     {
-        return value.ValueKind == JsonValueKind.Array &&
-               value.EnumerateArray().All(item =>
+        if (value.ValueKind != JsonValueKind.Array)
+            return false;
+
+        var values = value.EnumerateArray().ToArray();
+        return values.All(item =>
                    item.ValueKind == JsonValueKind.String &&
-                   RuntimeOptionContains(options, item.GetString()));
+                   RuntimeOptionContains(options, item.GetString())) &&
+               values.Select(item => item.GetString()!.Trim())
+                   .Distinct(StringComparer.Ordinal)
+                   .Count() == values.Length;
     }
 
     private static bool IsRuntimeFreeStringListValueValid(object? value)
     {
-        if (value is string)
-            return true;
-        if (value is IEnumerable<string>)
-            return true;
+        if (value is IEnumerable<string> list)
+        {
+            var values = list.ToArray();
+            return values.All(item => !string.IsNullOrWhiteSpace(item)) &&
+                   values.Distinct(StringComparer.Ordinal).Count() == values.Length;
+        }
         if (value is JsonElement element)
             return IsRuntimeFreeStringListJsonValid(element);
         return false;
@@ -4821,11 +7725,16 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
 
     private static bool IsRuntimeFreeStringListJsonValid(JsonElement value)
     {
-        if (value.ValueKind == JsonValueKind.String)
-            return true;
+        if (value.ValueKind != JsonValueKind.Array)
+            return false;
 
-        return value.ValueKind == JsonValueKind.Array &&
-               value.EnumerateArray().All(item => item.ValueKind == JsonValueKind.String);
+        var values = value.EnumerateArray().ToArray();
+        return values.All(item =>
+                   item.ValueKind == JsonValueKind.String &&
+                   !string.IsNullOrWhiteSpace(item.GetString())) &&
+               values.Select(item => item.GetString()!.Trim())
+                   .Distinct(StringComparer.Ordinal)
+                   .Count() == values.Length;
     }
 
     private static bool RuntimeOptionContains(
@@ -4837,8 +7746,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
 
         var normalized = value.Trim();
         return options.Any(option =>
-            string.Equals(option.Code, normalized, StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(option.Label, normalized, StringComparison.OrdinalIgnoreCase));
+            string.Equals(option.Code, normalized, StringComparison.Ordinal));
     }
 
     private static bool IsBlankRuntimeValue(object? value)
@@ -4866,7 +7774,6 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             byte or sbyte or short or ushort or int or uint or long or ulong or decimal => true,
             float f => float.IsFinite(f),
             double d => double.IsFinite(d),
-            string text => IsRuntimeNumberText(text),
             JsonElement element => IsJsonRuntimeValueValid(element, RuntimeDataTypeNumber),
             _ => false
         };
@@ -5056,10 +7963,11 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             RuntimeDataTypeDate => "dd/MM/yyyy, MM/yyyy hoặc yyyy",
             RuntimeDataTypeFullDate => "dd/MM/yyyy",
             RuntimeDataTypeNumber => "number",
-            RuntimeDataTypeBoolean => "true/false hoặc 1/0",
+            RuntimeDataTypeBoolean => "true/false",
             RuntimeDataTypeShortText => "mã enum SHORT_TEXT",
             RuntimeDataTypeShortTextList => "mảng mã enum MULTI_SELECT",
-            RuntimeDataTypeStringList or RuntimeDataTypeLongText => "string[]",
+            RuntimeDataTypeLongText => "string",
+            RuntimeDataTypeStringList => "string[]",
             RuntimeDataTypeIgnore => "ignore",
             _ => dataType
         };
@@ -5428,29 +8336,66 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         return code;
     }
 
-    private async Task EnsureDynamicFlowReportWriteAllowedAsync(
+    private async Task<DynamicFlowReportWritablePayload> PrepareDynamicFlowReportWritePayloadAsync(
         WorkAssignment? assignment,
         WorkAssignmentReport report,
         string? nextFieldValuesJson,
         string? nextTableValuesJson,
         string actorUserId,
+        bool validateRequired,
         CancellationToken ct)
     {
         var permissions = await ResolveDynamicFlowReportPermissionsAsync(
             assignment,
-            isAfterSubmit: false,
+            report,
+            actorUserId,
+            isAfterSubmit: IsDynamicFlowReportAfterSubmit(report),
             ct);
         if (permissions is null)
-            return;
+            return new DynamicFlowReportWritablePayload(nextFieldValuesJson, nextTableValuesJson);
 
-        var violations = DynamicFlowReportPermissionEnforcer.FindWriteViolations(
+        var writablePayload = DynamicFlowReportPermissionEnforcer.PreserveUnreadableValues(
             permissions,
             report.FieldValuesJson,
             nextFieldValuesJson,
             report.TableValuesJson,
             nextTableValuesJson);
-        if (violations.Count == 0)
-            return;
+
+        var violations = DynamicFlowReportPermissionEnforcer.FindWriteViolations(
+            permissions,
+            report.FieldValuesJson,
+            writablePayload.FieldValuesJson,
+            report.TableValuesJson,
+            writablePayload.TableValuesJson);
+        if (violations.Count > 0)
+        {
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_VALUES_INVALID,
+                new
+                {
+                    reportId = report.Id,
+                    workAssignmentId = report.WorkAssignmentId,
+                    actorUserId,
+                    reason = "DYNAMIC_FLOW_REPORT_WRITE_FORBIDDEN",
+                    violations = violations.Take(20).Select(x => new
+                    {
+                        x.TargetKind,
+                        x.TargetKey,
+                        x.SourcePolicyId,
+                        x.Reason
+                    }).ToList()
+                });
+        }
+
+        if (!validateRequired)
+            return writablePayload;
+
+        var requiredViolations = DynamicFlowReportPermissionEnforcer.FindRequiredViolations(
+            permissions,
+            writablePayload.FieldValuesJson,
+            writablePayload.TableValuesJson);
+        if (requiredViolations.Count == 0)
+            return writablePayload;
 
         throw AppExceptionFactory.BadRequest(
             AppErrorCode.WORK_ASSIGNMENT_REPORT_VALUES_INVALID,
@@ -5459,8 +8404,8 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                 reportId = report.Id,
                 workAssignmentId = report.WorkAssignmentId,
                 actorUserId,
-                reason = "DYNAMIC_FLOW_REPORT_WRITE_FORBIDDEN",
-                violations = violations.Take(20).Select(x => new
+                reason = "DYNAMIC_FLOW_REPORT_REQUIRED_VALUE_MISSING",
+                violations = requiredViolations.Take(20).Select(x => new
                 {
                     x.TargetKind,
                     x.TargetKey,
@@ -5472,14 +8417,25 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
 
     private async Task<DynamicFlowPolicyEvaluationResult?> ResolveDynamicFlowReportPermissionsAsync(
         WorkAssignment? assignment,
+        WorkAssignmentReport report,
+        string actorUserId,
         bool isAfterSubmit,
         CancellationToken ct)
     {
         if (assignment is null ||
-            !DynamicFlowBranchVisibility.IsFlowAssignment(assignment) ||
-            string.IsNullOrWhiteSpace(assignment.FlowTemplateId) ||
+            !DynamicFlowBranchVisibility.IsFlowAssignment(assignment))
+        {
+            return null;
+        }
+
+        if (string.IsNullOrWhiteSpace(assignment.FlowTemplateId) ||
             !assignment.FlowTemplateVersionNo.HasValue)
         {
+            // Historical pre-policy Flow assignments remain readable/writable
+            // under their frozen legacy contract. P7 mapping itself never
+            // uses this compatibility path: its runtime resolver requires the
+            // exact locked version/instance/step/Form pins before policy
+            // evaluation or source hydration.
             return null;
         }
 
@@ -5488,27 +8444,126 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         var version = await _ctx.DynamicFlowTemplateVersions
             .Find(x => x.TemplateId == flowTemplateId &&
                        x.VersionNo == flowTemplateVersionNo &&
+                       x.Status == DynamicFlowTemplateVersionStatuses.Locked &&
                        !x.IsDeleted)
             .FirstOrDefaultAsync(ct);
         if (version is null)
+        {
             return null;
+        }
+        if (!DynamicFlowRuntimeEligibilityPolicy.IsP7MappingCatalog(
+                version.CatalogVersion,
+                version.CatalogSemanticHash) &&
+            string.Equals(
+                version.ExecutionEligibility,
+                DynamicFlowExecutionEligibilities.BlockedUntilTargetPhase,
+                StringComparison.Ordinal))
+        {
+            // Historical catalog snapshots that were frozen as non-executable
+            // pre-P7 definitions still need their original report lifecycle
+            // to reach the explicit runtime barrier. They cannot enter P7
+            // mapping because the exact mapping resolver rejects their pins.
+            return null;
+        }
 
-        return _dynamicFlowPolicyEvaluator.Evaluate(
+        var actorRole = ResolveDirectDynamicFlowActorRole(assignment, report, actorUserId);
+        if (actorRole is null)
+        {
+            if (await HasReviewReportReadAccessAsync(report, actorUserId, ct))
+            {
+                actorRole = "REVIEWER";
+            }
+            else if (await HasAggregateAncestorReadAccessAsync(assignment, actorUserId, ct))
+            {
+                actorRole = "FINALIZER";
+            }
+            else
+            {
+                throw AppExceptionFactory.Forbidden(
+                    AppErrorCode.WORK_ASSIGNMENT_REPORT_ACCESS_FORBIDDEN,
+                    new
+                    {
+                        reportId = report.Id,
+                        workAssignmentId = report.WorkAssignmentId,
+                        actorUserId,
+                        reason = "DYNAMIC_FLOW_REPORT_ACTOR_ROLE_UNRESOLVED"
+                    });
+            }
+        }
+
+        var evaluated = _dynamicFlowPolicyEvaluator.Evaluate(
             version.PayloadJson,
             new DynamicFlowPolicyEvaluationContext
             {
                 StepId = assignment.FlowStepId,
                 StepCode = assignment.FlowStepCode,
-                ActorRole = string.IsNullOrWhiteSpace(assignment.FlowRole)
-                    ? "ASSIGNEE"
-                    : assignment.FlowRole.Trim(),
+                ActorRole = actorRole,
                 IsAfterSubmit = isAfterSubmit
             });
+        if (evaluated.DenyAllFields &&
+            evaluated.DenyAllTableColumns &&
+            !DynamicFlowRuntimeEligibilityPolicy.IsP7MappingCatalog(
+                version.CatalogVersion,
+                version.CatalogSemanticHash))
+        {
+            // Exact pre-P7 runtime snapshots without policy metadata keep
+            // their frozen legacy behavior. A v1.4 mapping snapshot never
+            // receives this bypass, and mapping preview/apply use the stricter
+            // exact-runtime policy resolver above.
+            return null;
+        }
+
+        return evaluated;
     }
+
+    internal static string? ResolveDirectDynamicFlowActorRole(
+        WorkAssignment assignment,
+        WorkAssignmentReport report,
+        string actorUserId)
+    {
+        if (assignment is null || report is null || string.IsNullOrWhiteSpace(actorUserId))
+            return null;
+
+        var actorId = actorUserId.Trim();
+        var isBranchAssignee = string.Equals(report.AssigneeUserId, actorId, StringComparison.Ordinal) ||
+                               (assignment.Assignees ?? new List<UserRef>())
+                               .Any(user => string.Equals(user.UserId, actorId, StringComparison.Ordinal));
+        if (isBranchAssignee)
+            return NormalizeDynamicFlowActorRole(assignment.FlowRole) ?? "ASSIGNEE";
+
+        if (string.Equals(assignment.CreatedByUserId, actorId, StringComparison.Ordinal))
+            return "ISSUER";
+
+        if ((assignment.LeaderWatcherUserIds ?? new List<string>()).Contains(actorId, StringComparer.Ordinal) ||
+            (assignment.LeaderWatchers ?? new List<UserRef>())
+            .Any(user => string.Equals(user.UserId, actorId, StringComparison.Ordinal)))
+        {
+            return "COORDINATOR";
+        }
+
+        return null;
+    }
+
+    private static string? NormalizeDynamicFlowActorRole(string? role)
+    {
+        var normalized = role?.Trim().ToUpperInvariant();
+        return normalized is "ISSUER" or "ASSIGNEE" or "COORDINATOR" or "REVIEWER" or "FINALIZER"
+            ? normalized
+            : null;
+    }
+
+    internal static bool IsDynamicFlowReportAfterSubmit(WorkAssignmentReport report)
+        => report.Status != WorkAssignmentReportStatus.Draft ||
+           report.SubmittedAtUtc.HasValue ||
+           !string.IsNullOrWhiteSpace(report.SubmittedByUserId) ||
+           report.ReturnedAtUtc.HasValue ||
+           report.ApprovedAtUtc.HasValue ||
+           report.AutoApprovedAtUtc.HasValue;
 
     private async Task<WorkAssignmentReportResponse> MapToResponseAsync(
         WorkAssignmentReport x,
         WorkReportPeriod? period,
+        string actorUserId,
         CancellationToken ct)
     {
         DynamicExcelTemplate? template = null;
@@ -5541,8 +8596,39 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         var payload = await _payloadReader.LoadReportPayloadAsync(x, ct);
         var dynamicFlowPermissions = await ResolveDynamicFlowReportPermissionsAsync(
             assignment,
-            isAfterSubmit: x.Status != WorkAssignmentReportStatus.Draft,
+            x,
+            actorUserId,
+            isAfterSubmit: IsDynamicFlowReportAfterSubmit(x),
             ct);
+        var readablePayload = dynamicFlowPermissions is null
+            ? new DynamicFlowReportReadablePayload(
+                payload.Values1DJson,
+                payload.FieldValuesJson,
+                payload.TableValuesJson)
+            : DynamicFlowReportPermissionEnforcer.ApplyReadRestrictions(
+                dynamicFlowPermissions,
+                payload.Values1DJson,
+                payload.FieldValuesJson,
+                payload.TableValuesJson,
+                x.DynamicExcelTemplateId);
+        var actorOwnsReport = string.Equals(x.AssigneeUserId, actorUserId, StringComparison.Ordinal);
+        var mutationScopeOpen = assignment is not null &&
+                                await IsReportMutationScopeOpenAsync(assignment, ct);
+        var canMutate = actorOwnsReport && x.IsActive && mutationScopeOpen;
+        var lifecycleProjectionPending = (x.LifecycleProjectionOutbox ?? new List<WorkReportLifecycleProjectionOutboxEntry>())
+            .Any(entry => string.Equals(
+                entry.State,
+                WorkReportLifecycleProjectionOutboxStates.Pending,
+                StringComparison.Ordinal));
+        DynamicFlowMappingApplyReceipt? dynamicFlowMappingReceipt = null;
+        if (!string.IsNullOrWhiteSpace(x.DynamicFlowMappingReceiptId))
+        {
+            dynamicFlowMappingReceipt = await _ctx.DynamicFlowMappingApplyReceipts
+                .Find(receipt =>
+                    receipt.Id == x.DynamicFlowMappingReceiptId &&
+                    receipt.TargetReportId == x.Id)
+                .FirstOrDefaultAsync(ct);
+        }
 
         return new WorkAssignmentReportResponse
         {
@@ -5584,6 +8670,9 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             DynamicFormTemplateId = x.DynamicFormTemplateId ?? period?.DynamicFormTemplateId,
             DynamicFormTemplateCode = x.DynamicFormTemplateCode ?? period?.DynamicFormTemplateCode,
             DynamicFormTemplateName = x.DynamicFormTemplateName ?? period?.DynamicFormTemplateName,
+            DynamicFormFamilyId = x.DynamicFormFamilyId ?? period?.DynamicFormFamilyId,
+            DynamicFormVersionNo = x.DynamicFormVersionNo ?? period?.DynamicFormVersionNo,
+            DynamicFormSchemaHash = x.DynamicFormSchemaHash ?? period?.DynamicFormSchemaHash,
             SpecJson = string.IsNullOrWhiteSpace(x.SpecJson) ? template?.SpecJson ?? string.Empty : x.SpecJson,
 
             DataRectR0 = x.DataRectR0,
@@ -5593,14 +8682,38 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             W = x.W,
             H = x.H,
 
-            Values1DJson = payload.Values1DJson,
-            FieldValuesJson = payload.FieldValuesJson,
-            TableValuesJson = payload.TableValuesJson,
+            Values1DJson = readablePayload.Values1DJson ?? EmptyValues1DJson,
+            FieldValuesJson = readablePayload.FieldValuesJson,
+            TableValuesJson = readablePayload.TableValuesJson,
+            PayloadRevision = x.PayloadRevision,
+            LifecycleRevision = x.LifecycleRevision,
+            LifecycleCommitState = lifecycleProjectionPending
+                ? WorkReportLifecycleCommitStates.CommittedPendingProjection
+                : WorkReportLifecycleCommitStates.Committed,
+            LifecycleProjectionPending = lifecycleProjectionPending,
+            CanEditPayload = canMutate && x.Status == WorkAssignmentReportStatus.Draft,
+            CanSubmit = canMutate && x.Status == WorkAssignmentReportStatus.Draft,
+            CanWithdraw = canMutate &&
+                          (x.Status == WorkAssignmentReportStatus.Submitted ||
+                           WorkAssignmentAutoApprovalState.CanReporterWithdraw(x)),
+            PayloadHash = x.PayloadHash,
+            PayloadSizeBytes = x.PayloadSizeBytes,
+            PayloadStatus = x.PayloadStatus,
+            PayloadUpdatedAtUtc = x.PayloadUpdatedAtUtc,
+            DynamicFlowMappingApplyState =
+                dynamicFlowMappingReceipt?.State,
+            DynamicFlowMappingReceiptId =
+                dynamicFlowMappingReceipt?.Id,
+            DynamicFlowMappingCommandId =
+                dynamicFlowMappingReceipt?.CommandId,
+            DynamicFlowMappingResultSemanticHash =
+                dynamicFlowMappingReceipt?.ResultSemanticHash,
             DynamicFlowPermissions = dynamicFlowPermissions,
             DataOrigin = WorkReportDataOrigin.Normalize(x.DataOrigin),
             CumulativeContributionMode = WorkReportCumulativeContributionMode.Normalize(x.CumulativeContributionMode),
             CumulativeContributionPolicyJson = x.CumulativeContributionPolicyJson,
-            SummarySourceJson = payload.SummarySourceJson,
+            SummarySourceJson = DynamicFlowReportPermissionEnforcer.RedactSummarySourceValues(
+                payload.SummarySourceJson),
             AggregateSourceReportIds = x.AggregateSourceReportIds ?? new List<string>(),
             AggregateSourceAssignmentIds = x.AggregateSourceAssignmentIds ?? new List<string>(),
             AggregateSourceUpdatedAtUtc = x.AggregateSourceUpdatedAtUtc,
@@ -5649,6 +8762,8 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         CancellationToken ct)
     {
         var payload = await _payloadReader.LoadReportPayloadAsync(report, ct);
+        if (report.PayloadRevision > 0)
+            WorkReportPayloadConsistency.EnsureSnapshotFreshForStatisticProjection(report, payload);
         report.Values1DJson = payload.Values1DJson;
         report.FieldValuesJson = payload.FieldValuesJson;
         report.TableValuesJson = payload.TableValuesJson;
@@ -5666,6 +8781,307 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         report.PayloadStatus = result.PayloadStatus;
         report.PayloadUpdatedAtUtc = updatedAtUtc;
     }
+
+    private static PayloadMutationCommand ResolvePayloadMutationCommand(
+        WorkAssignmentReport report,
+        int? expectedPayloadRevision,
+        string? commandId,
+        string operation,
+        string commandHash)
+    {
+        if (!expectedPayloadRevision.HasValue || expectedPayloadRevision.Value < 0)
+        {
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_PAYLOAD_REVISION_REQUIRED,
+                new
+                {
+                    reportId = report.Id,
+                    expectedPayloadRevision,
+                    currentPayloadRevision = report.PayloadRevision
+                });
+        }
+
+        var normalizedCommandId = commandId?.Trim();
+        if (string.IsNullOrWhiteSpace(normalizedCommandId) || !PayloadCommandIdRegex.IsMatch(normalizedCommandId))
+        {
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_COMMAND_ID_REQUIRED,
+                new
+                {
+                    reportId = report.Id,
+                    commandId,
+                    minLength = 8,
+                    maxLength = 128
+                });
+        }
+
+        var command = new PayloadMutationCommand(
+            expectedPayloadRevision.Value,
+            normalizedCommandId,
+            operation,
+            commandHash);
+
+        if (string.Equals(report.LastPayloadCommandId, command.CommandId, StringComparison.Ordinal))
+        {
+            if (!string.Equals(report.LastPayloadCommandOperation, command.Operation, StringComparison.Ordinal) ||
+                !string.Equals(report.LastPayloadCommandHash, command.CommandHash, StringComparison.Ordinal) ||
+                report.LastPayloadCommandRevision != report.PayloadRevision ||
+                command.ExpectedPayloadRevision != report.PayloadRevision - 1)
+            {
+                throw PayloadCommandReplayMismatch(report, command);
+            }
+
+            return command;
+        }
+
+        if (command.ExpectedPayloadRevision != report.PayloadRevision)
+            throw PayloadRevisionConflict(report, command.ExpectedPayloadRevision);
+
+        if (string.Equals(report.PayloadMutationCommandId, command.CommandId, StringComparison.Ordinal) &&
+            (!string.Equals(report.PayloadMutationOperation, command.Operation, StringComparison.Ordinal) ||
+             !string.Equals(report.PayloadMutationCommandHash, command.CommandHash, StringComparison.Ordinal)))
+        {
+            throw PayloadCommandReplayMismatch(report, command);
+        }
+
+        return command;
+    }
+
+    private static bool IsCompletedPayloadCommandReplay(
+        WorkAssignmentReport report,
+        PayloadMutationCommand command)
+        => string.Equals(report.LastPayloadCommandId, command.CommandId, StringComparison.Ordinal)
+           && string.Equals(report.LastPayloadCommandOperation, command.Operation, StringComparison.Ordinal)
+           && string.Equals(report.LastPayloadCommandHash, command.CommandHash, StringComparison.Ordinal)
+           && report.LastPayloadCommandRevision == report.PayloadRevision
+           && command.ExpectedPayloadRevision == report.PayloadRevision - 1;
+
+    private async Task<PayloadCommandReservationOutcome> ReservePayloadMutationCommandAsync(
+        WorkAssignmentReport report,
+        PayloadMutationCommand command,
+        DateTime now,
+        CancellationToken ct,
+        WorkAssignmentReportStatus expectedStatus = WorkAssignmentReportStatus.Draft,
+        bool expectedIsActive = true)
+    {
+        var fb = Builders<WorkAssignmentReport>.Filter;
+        var sameCommand = fb.Eq(x => x.PayloadMutationCommandId, command.CommandId)
+                          & fb.Eq(x => x.PayloadMutationCommandHash, command.CommandHash)
+                          & fb.Eq(x => x.PayloadMutationOperation, command.Operation);
+        var noCommand = fb.Eq(x => x.PayloadMutationCommandId, null);
+        var payloadRevisionFilter = command.ExpectedPayloadRevision == 0
+            ? fb.Eq(x => x.PayloadRevision, 0) | fb.Exists(x => x.PayloadRevision, false)
+            : fb.Eq(x => x.PayloadRevision, command.ExpectedPayloadRevision);
+        var filter = fb.Eq(x => x.Id, report.Id)
+                      & fb.Eq(x => x.IsDeleted, false)
+                      & fb.Eq(x => x.AssigneeUserId, report.AssigneeUserId)
+                      & fb.Eq(x => x.IsActive, expectedIsActive)
+                     & fb.Eq(x => x.Status, expectedStatus)
+                     & payloadRevisionFilter
+                     & (noCommand | sameCommand);
+
+        var result = await _ctx.WorkAssignmentReports.UpdateOneAsync(
+            filter,
+            Builders<WorkAssignmentReport>.Update
+                .Set(x => x.PayloadMutationCommandId, command.CommandId)
+                .Set(x => x.PayloadMutationCommandHash, command.CommandHash)
+                .Set(x => x.PayloadMutationOperation, command.Operation)
+                .Set(x => x.PayloadMutationStartedAtUtc, now),
+            cancellationToken: ct);
+        if (result.MatchedCount == 1)
+        {
+            report.PayloadMutationCommandId = command.CommandId;
+            report.PayloadMutationCommandHash = command.CommandHash;
+            report.PayloadMutationOperation = command.Operation;
+            report.PayloadMutationStartedAtUtc = now;
+            return PayloadCommandReservationOutcome.Reserved;
+        }
+
+        var current = await _ctx.WorkAssignmentReports
+            .Find(x => x.Id == report.Id && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct);
+        if (current is null)
+            throw ReportNotFound(report.Id);
+        if (IsCompletedPayloadCommandReplay(current, command))
+            return PayloadCommandReservationOutcome.CompletedReplay;
+
+        if (string.Equals(current.PayloadMutationCommandId, command.CommandId, StringComparison.Ordinal) &&
+            (!string.Equals(current.PayloadMutationCommandHash, command.CommandHash, StringComparison.Ordinal) ||
+             !string.Equals(current.PayloadMutationOperation, command.Operation, StringComparison.Ordinal)))
+        {
+            throw PayloadCommandReplayMismatch(current, command);
+        }
+
+        throw PayloadRevisionConflict(current, command.ExpectedPayloadRevision);
+    }
+
+    private static FilterDefinition<WorkAssignmentReport> BuildPayloadMutationCommitFilter(
+        WorkAssignmentReport report,
+        PayloadMutationCommand command,
+        WorkAssignmentReportStatus expectedStatus = WorkAssignmentReportStatus.Draft,
+        bool expectedIsActive = true)
+    {
+        var fb = Builders<WorkAssignmentReport>.Filter;
+        var payloadRevisionFilter = command.ExpectedPayloadRevision == 0
+            ? fb.Eq(x => x.PayloadRevision, 0) | fb.Exists(x => x.PayloadRevision, false)
+            : fb.Eq(x => x.PayloadRevision, command.ExpectedPayloadRevision);
+        return fb.Eq(x => x.Id, report.Id)
+               & fb.Eq(x => x.IsDeleted, false)
+               & fb.Eq(x => x.AssigneeUserId, report.AssigneeUserId)
+               & fb.Eq(x => x.IsActive, expectedIsActive)
+               & fb.Eq(x => x.Status, expectedStatus)
+               & payloadRevisionFilter
+               & fb.Eq(x => x.PayloadMutationCommandId, command.CommandId)
+               & fb.Eq(x => x.PayloadMutationCommandHash, command.CommandHash)
+               & fb.Eq(x => x.PayloadMutationOperation, command.Operation);
+    }
+
+    private static UpdateDefinition<WorkAssignmentReport> ApplyPayloadCommandCompletion(
+        UpdateDefinition<WorkAssignmentReport> update,
+        PayloadMutationCommand command,
+        WorkReportPayloadWriteResult result)
+        => update
+            .Unset(x => x.PayloadMutationCommandId)
+            .Unset(x => x.PayloadMutationCommandHash)
+            .Unset(x => x.PayloadMutationOperation)
+            .Unset(x => x.PayloadMutationStartedAtUtc)
+            .Set(x => x.LastPayloadCommandId, command.CommandId)
+            .Set(x => x.LastPayloadCommandHash, command.CommandHash)
+            .Set(x => x.LastPayloadCommandOperation, command.Operation)
+            .Set(x => x.LastPayloadCommandRevision, result.PayloadRevision);
+
+    private static void ApplyPayloadCommandCompletionInMemory(
+        WorkAssignmentReport report,
+        PayloadMutationCommand command,
+        WorkReportPayloadWriteResult result)
+    {
+        report.PayloadMutationCommandId = null;
+        report.PayloadMutationCommandHash = null;
+        report.PayloadMutationOperation = null;
+        report.PayloadMutationStartedAtUtc = null;
+        report.LastPayloadCommandId = command.CommandId;
+        report.LastPayloadCommandHash = command.CommandHash;
+        report.LastPayloadCommandOperation = command.Operation;
+        report.LastPayloadCommandRevision = result.PayloadRevision;
+    }
+
+    private async Task<WorkAssignmentReportResponse> ResolvePayloadCommandCommitRaceAsync(
+        string reportId,
+        PayloadMutationCommand command,
+        string actorUserId,
+        CancellationToken ct)
+    {
+        var current = await _ctx.WorkAssignmentReports
+            .Find(x => x.Id == reportId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct);
+        if (current is null)
+            throw ReportNotFound(reportId);
+        if (!IsCompletedPayloadCommandReplay(current, command))
+            throw PayloadRevisionConflict(current, command.ExpectedPayloadRevision);
+
+        await TryReconcileCommittedLifecycleProjectionAsync(current.Id);
+        return await MapPayloadCommandReplayResponseAsync(current, actorUserId, CancellationToken.None);
+    }
+
+    private Task<bool> TryReconcileCommittedLifecycleProjectionAsync(string reportId)
+        => _lifecycleProjectionReconciler.ReconcileReportAsync(reportId, CancellationToken.None);
+
+    private async Task<WorkAssignmentReportResponse> MapPayloadCommandReplayResponseAsync(
+        string reportId,
+        string actorUserId,
+        CancellationToken ct)
+    {
+        var current = await _ctx.WorkAssignmentReports
+            .Find(x => x.Id == reportId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct);
+        if (current is null)
+            throw ReportNotFound(reportId);
+        return await MapPayloadCommandReplayResponseAsync(current, actorUserId, ct);
+    }
+
+    private async Task<WorkAssignmentReportResponse> MapPayloadCommandReplayResponseAsync(
+        WorkAssignmentReport report,
+        string actorUserId,
+        CancellationToken ct)
+    {
+        await HydrateReportPayloadAsync(report, ct);
+        var period = await _ctx.WorkReportPeriods
+            .Find(x => x.Id == report.WorkReportPeriodId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct);
+        return await MapToResponseAsync(report, period, actorUserId, ct);
+    }
+
+    private async Task<WorkAssignmentReport> LoadCompletedPayloadCommandReportAsync(
+        string reportId,
+        PayloadMutationCommand command,
+        CancellationToken ct)
+    {
+        var current = await _ctx.WorkAssignmentReports
+            .Find(x => x.Id == reportId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct);
+        if (current is null)
+            throw ReportNotFound(reportId);
+        if (!IsCompletedPayloadCommandReplay(current, command))
+            throw PayloadRevisionConflict(current, command.ExpectedPayloadRevision);
+
+        await HydrateReportPayloadAsync(current, ct);
+        return current;
+    }
+
+    private static string ComputeReportPayloadCommandHash(string operation, object request)
+        => WorkReportLifecycleCommandContract.ComputeHash(operation, request);
+
+    private static PayloadMutationCommand BuildSystemPayloadMutationCommand(
+        WorkAssignmentReport report,
+        string operation,
+        WorkReportPayloadWriteResult preflight)
+    {
+        var commandHash = WorkReportLifecycleCommandContract.ComputeHash(
+            operation,
+            new
+            {
+                reportId = report.Id,
+                expectedPayloadRevision = report.PayloadRevision,
+                nextPayloadRevision = preflight.PayloadRevision,
+                payloadHash = preflight.PayloadHash
+            });
+        var commandId = $"system:payload:{report.Id}:{report.PayloadRevision}:{commandHash[..24]}";
+        return new PayloadMutationCommand(
+            report.PayloadRevision,
+            commandId,
+            operation,
+            commandHash);
+    }
+
+    private static AppException PayloadRevisionConflict(
+        WorkAssignmentReport report,
+        int expectedPayloadRevision)
+        => AppExceptionFactory.Create(
+            AppErrorCode.WORK_ASSIGNMENT_REPORT_PAYLOAD_REVISION_CONFLICT,
+            new
+            {
+                reportId = report.Id,
+                expectedPayloadRevision,
+                currentPayloadRevision = report.PayloadRevision,
+                report.Status,
+                report.UpdatedAtUtc,
+                report.UpdatedByUserId,
+                inProgressCommand = !string.IsNullOrWhiteSpace(report.PayloadMutationCommandId)
+            });
+
+    private static AppException PayloadCommandReplayMismatch(
+        WorkAssignmentReport report,
+        PayloadMutationCommand command)
+        => AppExceptionFactory.Create(
+            AppErrorCode.WORK_ASSIGNMENT_REPORT_COMMAND_REPLAY_MISMATCH,
+            new
+            {
+                reportId = report.Id,
+                commandId = command.CommandId,
+                operation = command.Operation,
+                expectedPayloadRevision = command.ExpectedPayloadRevision,
+                currentPayloadRevision = report.PayloadRevision
+            });
 
     private static UpdateDefinition<WorkAssignmentReport> ApplyPayloadHeaderUpdate(
         UpdateDefinitionBuilder<WorkAssignmentReport> update,
@@ -5791,11 +9207,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
 
             if (ShouldRefreshAggregateDependents(fromStatus, toStatus))
             {
-                await RefreshDynamicFormAggregateDependentsRecursiveAsync(
-                    report,
-                    actorUserId,
-                    new HashSet<string>(StringComparer.Ordinal),
-                    ct);
+                await _aggregateDependentRecovery.RecoverPendingAsync(report.Id, actorUserId, ct);
             }
 
             await _advancedSummaryDirty.MarkReportStatusMutationDirtyAsync(
@@ -6039,6 +9451,32 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         string actorUserId,
         CancellationToken ct)
     {
+        var aggregateRefreshFence =
+            await AcquireAggregateRefreshLeaseIfDynamicFlowAsync(
+                candidate.WorkAssignmentId,
+                ct);
+        if (aggregateRefreshFence.BlockedByCompletedFlow)
+            return;
+        await using var aggregateRefreshLease = aggregateRefreshFence.Lease;
+        if (aggregateRefreshLease is not null)
+        {
+            var currentCandidate = await _ctx.WorkAssignmentReports
+                .Find(x =>
+                    x.Id == candidate.Id &&
+                    x.IsActive &&
+                    !x.IsDeleted)
+                .FirstOrDefaultAsync(ct);
+            if (currentCandidate is null)
+                return;
+            candidate = currentCandidate;
+            await aggregateRefreshLease.RenewAsync(ct);
+            await MarkAggregateSnapshotDirtyAsync(
+                candidate,
+                source,
+                actorUserId,
+                ct);
+        }
+
         try
         {
             await HydrateReportPayloadAsync(candidate, ct);
@@ -6054,6 +9492,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                 candidate,
                 summary,
                 actorUserId,
+                aggregateRefreshLease,
                 ct);
 
             if (refreshed is null)
@@ -6068,6 +9507,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                     refreshed,
                     actorUserId,
                     $"Nguồn tổng hợp thay đổi; sourceReportId={source.Id}",
+                    aggregateRefreshLease,
                     ct);
             }
         }
@@ -6079,6 +9519,8 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                 source.Id,
                 candidate.Id);
 
+            if (aggregateRefreshLease is not null)
+                await aggregateRefreshLease.RenewAsync(CancellationToken.None);
             await MarkAggregateSnapshotDirtyAsync(
                 candidate,
                 source,
@@ -6088,14 +9530,84 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         }
     }
 
+    private async Task<AggregateRefreshFence>
+        AcquireAggregateRefreshLeaseIfDynamicFlowAsync(
+            string workAssignmentId,
+            CancellationToken ct)
+    {
+        var assignment = await _ctx.WorkAssignments
+            .Find(x => x.Id == workAssignmentId && !x.IsDeleted)
+            .Project(x => new
+            {
+                x.FlowInstanceId,
+                x.CompletedAtUtc
+            })
+            .FirstOrDefaultAsync(ct);
+        if (assignment is null ||
+            string.IsNullOrWhiteSpace(assignment.FlowInstanceId))
+        {
+            return new AggregateRefreshFence(
+                BlockedByCompletedFlow: false,
+                Lease: null);
+        }
+        if (assignment.CompletedAtUtc.HasValue)
+        {
+            return new AggregateRefreshFence(
+                BlockedByCompletedFlow: true,
+                Lease: null);
+        }
+
+        return new AggregateRefreshFence(
+            BlockedByCompletedFlow: false,
+            Lease: await _lifecycleSeriesLock.AcquireAsync(
+                workAssignmentId,
+                WorkReportLifecycleSeriesOperations.AggregateRefresh,
+                ct));
+    }
+
     private async Task MoveApprovedAggregateReportBackToSubmittedAsync(
         WorkAssignmentReport report,
         string actorUserId,
         string reason,
+        WorkReportLifecycleSeriesLease? existingLifecycleSeriesLease,
         CancellationToken ct)
     {
         if (report.Status != WorkAssignmentReportStatus.Approved)
             return;
+
+        const string lifecycleOperation = "AUTO_AGGREGATE_REVIEW_INVALIDATED";
+        var normalizedReason = NormalizeOptionalTextOrNull(reason);
+        var lifecycleCommandHash = WorkReportLifecycleCommandContract.ComputeHash(
+            lifecycleOperation,
+            new
+            {
+                reportId = report.Id,
+                payloadRevision = report.PayloadRevision,
+                reason = normalizedReason
+            });
+        var lifecycleCommandId = $"system:lifecycle:{report.Id}:{report.PayloadRevision}:{lifecycleCommandHash[..24]}";
+        var (lifecycleCommand, lifecycleResolution) = WorkReportLifecycleCommandContract.Resolve(
+            report,
+            report.LifecycleRevision,
+            report.PayloadRevision,
+            lifecycleCommandId,
+            lifecycleOperation,
+            lifecycleCommandHash);
+        if (lifecycleResolution == WorkReportLifecycleCommandResolution.CompletedReplay)
+        {
+            await ReconcileLifecycleProjectionUnlessAggregateRecoveryAsync(report.Id, ct);
+            return;
+        }
+
+        await using var ownedLifecycleSeriesLease =
+            existingLifecycleSeriesLease is null
+                ? await _lifecycleSeriesLock.AcquireAsync(
+                    report.WorkAssignmentId,
+                    lifecycleCommand.Operation,
+                    ct)
+                : null;
+        var lifecycleSeriesLease =
+            existingLifecycleSeriesLease ?? ownedLifecycleSeriesLease!;
 
         var period = await _ctx.WorkReportPeriods
             .Find(x => x.Id == report.WorkReportPeriodId && !x.IsDeleted)
@@ -6104,79 +9616,83 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         var now = DateTime.UtcNow;
         var fromStatus = report.Status;
 
-        await _ctx.WorkAssignmentReports.UpdateOneAsync(
-            x => x.Id == report.Id && !x.IsDeleted,
-            Builders<WorkAssignmentReport>.Update
+        var reportCommitUpdate = WorkReportLifecycleCommandContract.ApplyCompletion(
+                Builders<WorkAssignmentReport>.Update
                 .Set(x => x.Status, WorkAssignmentReportStatus.Submitted)
                 .Set(x => x.ApprovedAtUtc, (DateTime?)null)
                 .Set(x => x.ApprovedByUserId, (string?)null)
-                .Set(x => x.ReviewerComment, reason)
+                .Set(x => x.ReviewerComment, normalizedReason)
+                .Set(x => x.AggregateSnapshotDirty, false)
+                .Set(x => x.AggregateSnapshotDirtyAtUtc, (DateTime?)null)
+                .Set(x => x.AggregateRefreshError, (string?)null)
                 .Set(x => x.UpdatedAtUtc, now)
                 .Set(x => x.UpdatedByUserId, actorUserId),
-            cancellationToken: ct);
+                lifecycleCommand,
+                WorkAssignmentReportStatus.Submitted,
+                resultIsActive: true);
+        reportCommitUpdate = WorkReportLifecycleOutboxContract.Append(
+            reportCommitUpdate,
+            WorkReportLifecycleOutboxContract.FromCommand(
+                report,
+                lifecycleCommand,
+                WorkAssignmentReportStatus.Submitted,
+                resultIsActive: true,
+                actorUserId: actorUserId,
+                committedAtUtc: now,
+                resultPayloadHash: report.PayloadHash,
+                businessReason: normalizedReason,
+                businessComment: normalizedReason));
+
+        await lifecycleSeriesLease.RenewAsync(ct);
+        var reportCommit = await CommitLegacyLifecycleWithDirectSourceFenceAsync(
+            report,
+            WorkReportLifecycleCommandContract.BuildCommitFilter(
+                report,
+                lifecycleCommand,
+                WorkAssignmentReportStatus.Approved),
+            reportCommitUpdate,
+            ct);
+
+        if (reportCommit.ModifiedCount != 1)
+        {
+            var current = await _ctx.WorkAssignmentReports
+                .Find(x => x.Id == report.Id && !x.IsDeleted)
+                .FirstOrDefaultAsync(ct)
+                ?? throw ReportNotFound(report.Id);
+            if (WorkReportLifecycleCommandContract.IsCompletedReplay(current, lifecycleCommand))
+            {
+                await ReconcileLifecycleProjectionUnlessAggregateRecoveryAsync(current.Id, ct);
+                return;
+            }
+
+            throw WorkReportLifecycleCommandContract.Conflict(current, lifecycleCommand);
+        }
 
         report.Status = WorkAssignmentReportStatus.Submitted;
         report.ApprovedAtUtc = null;
         report.ApprovedByUserId = null;
-        report.ReviewerComment = reason;
+        report.ReviewerComment = normalizedReason;
+        report.AggregateSnapshotDirty = false;
+        report.AggregateSnapshotDirtyAtUtc = null;
+        report.AggregateRefreshError = null;
         report.UpdatedAtUtc = now;
         report.UpdatedByUserId = actorUserId;
+        WorkReportLifecycleCommandContract.ApplyCompletionInMemory(
+            report,
+            lifecycleCommand,
+            WorkAssignmentReportStatus.Submitted,
+            resultIsActive: true);
+        await ReconcileLifecycleProjectionUnlessAggregateRecoveryAsync(report.Id, CancellationToken.None);
+    }
 
-        if (period is not null)
-        {
-            var nextPeriodStatus = ResolveSubmittedPeriodStatus(period, report, now);
+    private async Task ReconcileLifecycleProjectionUnlessAggregateRecoveryAsync(
+        string reportId,
+        CancellationToken ct)
+    {
+        if (WorkReportAggregateDependentRecoveryExecution.IsActive)
+            return;
 
-            await _ctx.WorkReportPeriods.UpdateOneAsync(
-                x => x.Id == period.Id && !x.IsDeleted,
-                Builders<WorkReportPeriod>.Update
-                    .Set(x => x.Status, nextPeriodStatus)
-                    .Set(x => x.IsOverdue, WorkReportPeriodStatusHelper.IsOverdue(nextPeriodStatus))
-                    .Set(x => x.LastReviewedAtUtc, (DateTime?)null)
-                    .Set(x => x.ReviewerComment, reason)
-                    .Set(x => x.UpdatedAtUtc, now)
-                    .Set(x => x.UpdatedByUserId, actorUserId),
-                cancellationToken: ct);
-
-            period.Status = nextPeriodStatus;
-            period.IsOverdue = WorkReportPeriodStatusHelper.IsOverdue(nextPeriodStatus);
-            period.LastReviewedAtUtc = null;
-            period.ReviewerComment = reason;
-            period.UpdatedAtUtc = now;
-            period.UpdatedByUserId = actorUserId;
-
-            await FinalizeReportStatusOperationAsync(
-                "AUTO_AGGREGATE_REVIEW_INVALIDATED",
-                report,
-                period,
-                fromStatus.ToString(),
-                WorkAssignmentReportStatus.Submitted.ToString(),
-                actorUserId,
-                upsertQueue: true,
-                disableQueue: false,
-                rebuildProjection: true,
-                syncAssignment: true,
-                ct);
-        }
-        else
-        {
-            await _statusSync.SyncFromAssignmentAsync(report.WorkAssignmentId, ct);
-            if (!string.IsNullOrWhiteSpace(report.WorkReportPeriodId))
-                await _docRoleReadModelProjection.RebuildReportPeriodAsync(report.WorkReportPeriodId, actorUserId, ct);
-        }
-
-        await InsertLogAsync(
-            workId: report.WorkId,
-            workAssignmentId: report.WorkAssignmentId,
-            workReportPeriodId: report.WorkReportPeriodId,
-            workAssignmentReportId: report.Id,
-            action: "AUTO_AGGREGATE_REVIEW_INVALIDATED",
-            fromStatus: fromStatus.ToString(),
-            toStatus: WorkAssignmentReportStatus.Submitted.ToString(),
-            actionByUserId: actorUserId,
-            reason: reason,
-            comment: reason,
-            snapshotJson: null,
-            ct: ct);
+        await TryReconcileCommittedLifecycleProjectionAsync(reportId);
     }
 
     private async Task MarkAggregateSnapshotDirtyAsync(
@@ -6257,6 +9773,36 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         if (!report.AggregateSnapshotDirty)
             return report;
 
+        AggregateRefreshFence aggregateRefreshFence;
+        try
+        {
+            aggregateRefreshFence =
+                await AcquireAggregateRefreshLeaseIfDynamicFlowAsync(
+                    report.WorkAssignmentId,
+                    ct);
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(
+                ex,
+                "Dynamic Flow aggregate snapshot refresh deferred by lifecycle fence. reportId={reportId} actorUserId={actorUserId}",
+                report.Id,
+                actorUserId);
+            return report;
+        }
+        if (aggregateRefreshFence.BlockedByCompletedFlow)
+            return report;
+        await using var aggregateRefreshLease = aggregateRefreshFence.Lease;
+        if (aggregateRefreshLease is not null)
+        {
+            var current = await _ctx.WorkAssignmentReports
+                .Find(x => x.Id == report.Id && !x.IsDeleted)
+                .FirstOrDefaultAsync(ct);
+            if (current is null || !current.AggregateSnapshotDirty)
+                return current ?? report;
+            report = current;
+        }
+
         await HydrateReportPayloadAsync(report, ct);
         var summary = TryReadAggregateDraftSummary(report.SummarySourceJson);
         if (summary is null)
@@ -6268,6 +9814,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                 report,
                 summary,
                 actorUserId,
+                aggregateRefreshLease,
                 ct) ?? report;
 
             if (refreshed.Status == WorkAssignmentReportStatus.Approved)
@@ -6276,6 +9823,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                     refreshed,
                     actorUserId,
                     "Nguồn tổng hợp đã thay đổi trước khi mở báo cáo.",
+                    aggregateRefreshLease,
                     ct);
             }
 
@@ -6283,6 +9831,8 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         }
         catch (Exception ex)
         {
+            if (aggregateRefreshLease is not null)
+                await aggregateRefreshLease.RenewAsync(CancellationToken.None);
             var now = DateTime.UtcNow;
             var error = NormalizeOptionalTextOrNull(ex.Message) ?? ex.GetType().Name;
             _log.LogWarning(
@@ -6425,6 +9975,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         WorkAssignmentReport report,
         AggregateDraftSummary summary,
         string actorUserId,
+        WorkReportLifecycleSeriesLease? aggregateRefreshLease,
         CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(report.DynamicFormTemplateId))
@@ -6460,6 +10011,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                 targetBlockId,
                 dataOrigin,
                 actorUserId,
+                aggregateRefreshLease,
                 ct);
         }
 
@@ -6504,19 +10056,64 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             summary.ReportMapConfigJson);
         var sourceSnapshot = ExtractAggregateSourceSnapshot(summarySourceJson);
         var now = DateTime.UtcNow;
+        var runtimeTopLevelBlock = await ResolveRuntimeTopLevelBlockShapeAsync(
+            report,
+            tableValuesJson,
+            Values1DCompression.DeserializeObjects(values1DJson, _jsonOptions).Count,
+            ct);
+        if (runtimeTopLevelBlock is not null)
+            ApplyRuntimeTopLevelShape(report, runtimeTopLevelBlock);
+        await ValidateRuntimeRowLabelsAsync(report, tableValuesJson, ct);
+        var canonicalFieldValuesJson = await ValidateRuntimeDataPayloadAsync(
+            report,
+            Values1DCompression.DeserializeObjects(values1DJson, _jsonOptions),
+            report.FieldValuesJson,
+            tableValuesJson,
+            validateRequiredFields: false,
+            ct);
+        var preflight = WorkReportPayloadService.PreflightReportPayload(
+            report,
+            values1DJson,
+            canonicalFieldValuesJson,
+            tableValuesJson,
+            summarySourceJson,
+            actorUserId,
+            now);
+        var expectedStatus = report.Status;
+        var payloadCommand = BuildSystemPayloadMutationCommand(
+            report,
+            "AUTO_REFRESH_AGGREGATE",
+            preflight);
+        if (aggregateRefreshLease is not null)
+            await aggregateRefreshLease.RenewAsync(ct);
+        var reservation = await ReservePayloadMutationCommandAsync(
+            report,
+            payloadCommand,
+            now,
+            ct,
+            expectedStatus);
+        if (reservation == PayloadCommandReservationOutcome.CompletedReplay)
+            return await LoadCompletedPayloadCommandReportAsync(report.Id, payloadCommand, ct);
+
         var payloadResult = await _payloadWriter.SaveReportPayloadAsync(
             report,
             values1DJson,
-            report.FieldValuesJson,
+            canonicalFieldValuesJson,
             tableValuesJson,
             summarySourceJson,
             actorUserId,
             now,
             ct);
 
-        await _ctx.WorkAssignmentReports.UpdateOneAsync(
-            x => x.Id == report.Id && !x.IsDeleted,
-            ApplyPayloadHeaderUpdate(
+        if (aggregateRefreshLease is not null)
+            await aggregateRefreshLease.RenewAsync(ct);
+        var preserveAggregateDirty =
+            aggregateRefreshLease is not null &&
+            expectedStatus == WorkAssignmentReportStatus.Approved;
+        var headerCommit = await _ctx.WorkAssignmentReports.UpdateOneAsync(
+            BuildPayloadMutationCommitFilter(report, payloadCommand, expectedStatus),
+            ApplyPayloadCommandCompletion(
+                ApplyPayloadHeaderUpdate(
                 Builders<WorkAssignmentReport>.Update,
                 payloadResult,
                 now)
@@ -6526,17 +10123,32 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                 .Set(x => x.AggregateSourceReportIds, sourceSnapshot.ReportIds)
                 .Set(x => x.AggregateSourceAssignmentIds, sourceSnapshot.AssignmentIds)
                 .Set(x => x.AggregateSourceUpdatedAtUtc, now)
-                .Set(x => x.AggregateSnapshotDirty, false)
-                .Set(x => x.AggregateSnapshotDirtyAtUtc, (DateTime?)null)
+                .Set(x => x.AggregateSnapshotDirty, preserveAggregateDirty)
+                .Set(
+                    x => x.AggregateSnapshotDirtyAtUtc,
+                    preserveAggregateDirty ? now : (DateTime?)null)
                 .Set(x => x.AggregateSnapshotRefreshedAtUtc, now)
                 .Set(x => x.AggregateRefreshError, (string?)null)
+                .Set(x => x.W, report.W)
+                .Set(x => x.H, report.H)
+                .Set(x => x.DataRectR0, report.DataRectR0)
+                .Set(x => x.DataRectC0, report.DataRectC0)
+                .Set(x => x.DataRectR1, report.DataRectR1)
+                .Set(x => x.DataRectC1, report.DataRectC1)
                 .Set(x => x.UpdatedAtUtc, now)
                 .Set(x => x.UpdatedByUserId, actorUserId),
+                payloadCommand,
+                payloadResult),
             cancellationToken: ct);
 
+        if (headerCommit.ModifiedCount != 1)
+            return await LoadCompletedPayloadCommandReportAsync(report.Id, payloadCommand, ct);
+
         report.Values1DJson = values1DJson;
+        report.FieldValuesJson = canonicalFieldValuesJson;
         report.TableValuesJson = tableValuesJson;
         ApplyPayloadMetadata(report, payloadResult, now);
+        ApplyPayloadCommandCompletionInMemory(report, payloadCommand, payloadResult);
         report.DataOrigin = dataOrigin;
         report.CumulativeContributionMode = WorkReportDataOrigin.DefaultContributionMode(dataOrigin);
         report.CumulativeContributionPolicyJson = contributionPolicyJson;
@@ -6544,12 +10156,21 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         report.AggregateSourceReportIds = sourceSnapshot.ReportIds;
         report.AggregateSourceAssignmentIds = sourceSnapshot.AssignmentIds;
         report.AggregateSourceUpdatedAtUtc = now;
-        report.AggregateSnapshotDirty = false;
-        report.AggregateSnapshotDirtyAtUtc = null;
+        report.AggregateSnapshotDirty = preserveAggregateDirty;
+        report.AggregateSnapshotDirtyAtUtc =
+            preserveAggregateDirty ? now : null;
         report.AggregateSnapshotRefreshedAtUtc = now;
         report.AggregateRefreshError = null;
         report.UpdatedAtUtc = now;
         report.UpdatedByUserId = actorUserId;
+
+        await _sectionProjection.ProjectAndVerifyAsync(
+            report,
+            report.FieldValuesJson,
+            report.TableValuesJson,
+            actorUserId,
+            now,
+            ct);
 
         await InsertLogAsync(
             workId: report.WorkId,
@@ -6593,6 +10214,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         string targetBlockId,
         string dataOrigin,
         string actorUserId,
+        WorkReportLifecycleSeriesLease? aggregateRefreshLease,
         CancellationToken ct)
     {
         if (!string.Equals(block.TableMode, "APPEND_ROWS", StringComparison.Ordinal))
@@ -6631,19 +10253,64 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             summary.ReportMapConfigJson);
         var sourceSnapshot = ExtractAggregateSourceSnapshot(summarySourceJson);
         var now = DateTime.UtcNow;
+        var runtimeTopLevelBlock = await ResolveRuntimeTopLevelBlockShapeAsync(
+            report,
+            tableValuesJson,
+            Values1DCompression.DeserializeObjects(values1DJson, _jsonOptions).Count,
+            ct);
+        if (runtimeTopLevelBlock is not null)
+            ApplyRuntimeTopLevelShape(report, runtimeTopLevelBlock);
+        await ValidateRuntimeRowLabelsAsync(report, tableValuesJson, ct);
+        var canonicalFieldValuesJson = await ValidateRuntimeDataPayloadAsync(
+            report,
+            Values1DCompression.DeserializeObjects(values1DJson, _jsonOptions),
+            report.FieldValuesJson,
+            tableValuesJson,
+            validateRequiredFields: false,
+            ct);
+        var preflight = WorkReportPayloadService.PreflightReportPayload(
+            report,
+            values1DJson,
+            canonicalFieldValuesJson,
+            tableValuesJson,
+            summarySourceJson,
+            actorUserId,
+            now);
+        var expectedStatus = report.Status;
+        var payloadCommand = BuildSystemPayloadMutationCommand(
+            report,
+            "REFRESH_AGGREGATE_STACKED_DRAFT",
+            preflight);
+        if (aggregateRefreshLease is not null)
+            await aggregateRefreshLease.RenewAsync(ct);
+        var reservation = await ReservePayloadMutationCommandAsync(
+            report,
+            payloadCommand,
+            now,
+            ct,
+            expectedStatus);
+        if (reservation == PayloadCommandReservationOutcome.CompletedReplay)
+            return await LoadCompletedPayloadCommandReportAsync(report.Id, payloadCommand, ct);
+
         var payloadResult = await _payloadWriter.SaveReportPayloadAsync(
             report,
             values1DJson,
-            report.FieldValuesJson,
+            canonicalFieldValuesJson,
             tableValuesJson,
             summarySourceJson,
             actorUserId,
             now,
             ct);
 
-        await _ctx.WorkAssignmentReports.UpdateOneAsync(
-            x => x.Id == report.Id && !x.IsDeleted,
-            ApplyPayloadHeaderUpdate(
+        if (aggregateRefreshLease is not null)
+            await aggregateRefreshLease.RenewAsync(ct);
+        var preserveAggregateDirty =
+            aggregateRefreshLease is not null &&
+            expectedStatus == WorkAssignmentReportStatus.Approved;
+        var headerCommit = await _ctx.WorkAssignmentReports.UpdateOneAsync(
+            BuildPayloadMutationCommitFilter(report, payloadCommand, expectedStatus),
+            ApplyPayloadCommandCompletion(
+                ApplyPayloadHeaderUpdate(
                 Builders<WorkAssignmentReport>.Update,
                 payloadResult,
                 now)
@@ -6653,17 +10320,32 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
                 .Set(x => x.AggregateSourceReportIds, sourceSnapshot.ReportIds)
                 .Set(x => x.AggregateSourceAssignmentIds, sourceSnapshot.AssignmentIds)
                 .Set(x => x.AggregateSourceUpdatedAtUtc, now)
-                .Set(x => x.AggregateSnapshotDirty, false)
-                .Set(x => x.AggregateSnapshotDirtyAtUtc, (DateTime?)null)
+                .Set(x => x.AggregateSnapshotDirty, preserveAggregateDirty)
+                .Set(
+                    x => x.AggregateSnapshotDirtyAtUtc,
+                    preserveAggregateDirty ? now : (DateTime?)null)
                 .Set(x => x.AggregateSnapshotRefreshedAtUtc, now)
                 .Set(x => x.AggregateRefreshError, (string?)null)
+                .Set(x => x.W, report.W)
+                .Set(x => x.H, report.H)
+                .Set(x => x.DataRectR0, report.DataRectR0)
+                .Set(x => x.DataRectC0, report.DataRectC0)
+                .Set(x => x.DataRectR1, report.DataRectR1)
+                .Set(x => x.DataRectC1, report.DataRectC1)
                 .Set(x => x.UpdatedAtUtc, now)
                 .Set(x => x.UpdatedByUserId, actorUserId),
+                payloadCommand,
+                payloadResult),
             cancellationToken: ct);
 
+        if (headerCommit.ModifiedCount != 1)
+            return await LoadCompletedPayloadCommandReportAsync(report.Id, payloadCommand, ct);
+
         report.Values1DJson = values1DJson;
+        report.FieldValuesJson = canonicalFieldValuesJson;
         report.TableValuesJson = tableValuesJson;
         ApplyPayloadMetadata(report, payloadResult, now);
+        ApplyPayloadCommandCompletionInMemory(report, payloadCommand, payloadResult);
         report.DataOrigin = dataOrigin;
         report.CumulativeContributionMode = WorkReportDataOrigin.DefaultContributionMode(dataOrigin);
         report.CumulativeContributionPolicyJson = contributionPolicyJson;
@@ -6671,12 +10353,21 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         report.AggregateSourceReportIds = sourceSnapshot.ReportIds;
         report.AggregateSourceAssignmentIds = sourceSnapshot.AssignmentIds;
         report.AggregateSourceUpdatedAtUtc = now;
-        report.AggregateSnapshotDirty = false;
-        report.AggregateSnapshotDirtyAtUtc = null;
+        report.AggregateSnapshotDirty = preserveAggregateDirty;
+        report.AggregateSnapshotDirtyAtUtc =
+            preserveAggregateDirty ? now : null;
         report.AggregateSnapshotRefreshedAtUtc = now;
         report.AggregateRefreshError = null;
         report.UpdatedAtUtc = now;
         report.UpdatedByUserId = actorUserId;
+
+        await _sectionProjection.ProjectAndVerifyAsync(
+            report,
+            report.FieldValuesJson,
+            report.TableValuesJson,
+            actorUserId,
+            now,
+            ct);
 
         await InsertLogAsync(
             workId: report.WorkId,
@@ -7510,6 +11201,9 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             DynamicFormTemplateId = x.DynamicFormTemplateId,
             DynamicFormTemplateCode = x.DynamicFormTemplateCode,
             DynamicFormTemplateName = x.DynamicFormTemplateName,
+            DynamicFormFamilyId = x.DynamicFormFamilyId,
+            DynamicFormVersionNo = x.DynamicFormVersionNo,
+            DynamicFormSchemaHash = x.DynamicFormSchemaHash,
             DataOrigin = WorkReportDataOrigin.Normalize(x.DataOrigin),
             AggregateSnapshotDirty = x.AggregateSnapshotDirty,
             AggregateSnapshotDirtyAtUtc = x.AggregateSnapshotDirtyAtUtc,
@@ -7568,6 +11262,9 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             DynamicFormTemplateId = x.DynamicFormTemplateId,
             DynamicFormTemplateCode = x.DynamicFormTemplateCode,
             DynamicFormTemplateName = x.DynamicFormTemplateName,
+            DynamicFormFamilyId = x.DynamicFormFamilyId,
+            DynamicFormVersionNo = x.DynamicFormVersionNo,
+            DynamicFormSchemaHash = x.DynamicFormSchemaHash,
             VersionNo = x.VersionNo,
             IsCurrent = x.IsCurrentReport,
             IsActive = x.ReportIsActive,
@@ -7611,6 +11308,18 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         string actorUserId,
         CancellationToken ct)
     {
+        if (await IsReportMutationScopeOpenAsync(assignment, ct))
+            return;
+
+        throw AppExceptionFactory.Create(
+            AppErrorCode.WORK_ASSIGNMENT_REPORT_SCOPE_COMPLETED_LOCKED,
+            new { assignmentId = assignment.Id, assignment.WorkId, actorUserId });
+    }
+
+    private async Task<bool> IsReportMutationScopeOpenAsync(
+        WorkAssignment assignment,
+        CancellationToken ct)
+    {
         var work = await _ctx.Works
             .Find(x => x.Id == assignment.WorkId && !x.IsDeleted)
             .FirstOrDefaultAsync(ct);
@@ -7620,14 +11329,12 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             work.Status == WorkStatus.S3 ||
             IsAssignmentManuallyCompleted(assignment))
         {
-            throw AppExceptionFactory.Create(
-                AppErrorCode.WORK_ASSIGNMENT_REPORT_SCOPE_COMPLETED_LOCKED,
-                new { assignmentId = assignment.Id, assignment.WorkId, actorUserId });
+            return false;
         }
 
         var ancestorIds = ResolveAncestorIds(assignment);
         if (ancestorIds.Count == 0)
-            return;
+            return true;
 
         var hasCompletedAncestor = await _ctx.WorkAssignments
             .Find(x =>
@@ -7639,10 +11346,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
             .Limit(1)
             .AnyAsync(ct);
 
-        if (hasCompletedAncestor)
-            throw AppExceptionFactory.Create(
-                AppErrorCode.WORK_ASSIGNMENT_REPORT_SCOPE_COMPLETED_LOCKED,
-                new { assignmentId = assignment.Id, assignment.WorkId, actorUserId });
+        return !hasCompletedAncestor;
     }
 
     private static bool IsAssignmentManuallyCompleted(WorkAssignment assignment)
@@ -7686,6 +11390,10 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         => AppExceptionFactory.NotFound(
             AppErrorCode.WORK_ASSIGNMENT_REPORT_NOT_FOUND,
             new { reportId });
+
+    internal static AppException RawReportReadAccessForbidden()
+        => AppExceptionFactory.Forbidden(
+            AppErrorCode.WORK_ASSIGNMENT_REPORT_ACCESS_FORBIDDEN);
 
     private static AppException ReportAssignmentNotFound(string? workAssignmentId)
         => AppExceptionFactory.NotFound(
@@ -7823,6 +11531,50 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         {
             return false;
         }
+    }
+
+    internal static bool IsDynamicFlowMappingSummary(string? summarySourceJson)
+    {
+        if (string.IsNullOrWhiteSpace(summarySourceJson))
+            return false;
+
+        try
+        {
+            using var document = JsonDocument.Parse(summarySourceJson);
+            return document.RootElement.ValueKind == JsonValueKind.Object &&
+                   string.Equals(
+                       ReadJsonString(document.RootElement, "kind"),
+                       "DYNAMIC_FLOW_MAPPING",
+                       StringComparison.OrdinalIgnoreCase);
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+    }
+
+    internal static void EnsureDynamicFlowMappingSummaryOverrideAllowed(
+        string? currentSummarySourceJson,
+        string? requestedSummarySourceJson,
+        string reportId,
+        string actorUserId)
+    {
+        if (requestedSummarySourceJson is null ||
+            IsDynamicFlowMappingSummary(currentSummarySourceJson) ||
+            !IsDynamicFlowMappingSummary(requestedSummarySourceJson))
+        {
+            return;
+        }
+
+        throw AppExceptionFactory.BadRequest(
+            AppErrorCode.WORK_ASSIGNMENT_REPORT_SUMMARY_SOURCE_JSON_INVALID,
+            new
+            {
+                reportId,
+                actorUserId,
+                field = "summarySourceJson",
+                reason = "DYNAMIC_FLOW_MAPPING_METADATA_SERVER_OWNED"
+            });
     }
 
     private static bool IsStackedAggregateSummary(AggregateDraftSummary summary)
@@ -9313,6 +13065,7 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         string Id,
         string Key,
         string DisplayName,
+        string FieldType,
         string DataType,
         bool Required,
         RuntimeOption[] Options,
@@ -9322,6 +13075,22 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
     private sealed record RuntimeOption(
         string Code,
         string Label);
+
+    private sealed record PayloadMutationCommand(
+        int ExpectedPayloadRevision,
+        string CommandId,
+        string Operation,
+        string CommandHash);
+
+    private sealed record AggregateRefreshFence(
+        bool BlockedByCompletedFlow,
+        WorkReportLifecycleSeriesLease? Lease);
+
+    private enum PayloadCommandReservationOutcome
+    {
+        Reserved,
+        CompletedReplay
+    }
 
     private sealed record RuntimeCellContract(
         string DataType,
@@ -9343,6 +13112,13 @@ public sealed class WorkAssignmentReportService : IWorkAssignmentReportService
         string ContributionMode,
         string? ContributionPolicyJson,
         string SummarySourceJson);
+
+    private sealed record DynamicFlowMappingProjectionResult(
+        DynamicFlowMappingPreviewResponse Projection,
+        string? TopLevelBlockId,
+        DynamicFlowMappingRuntimeContext Runtime,
+        IReadOnlyList<DynamicFlowMappingSourceReport> Sources,
+        DynamicFlowPolicyEvaluationResult Permissions);
 
     private sealed record PeriodDefinition(
         string PeriodKey,

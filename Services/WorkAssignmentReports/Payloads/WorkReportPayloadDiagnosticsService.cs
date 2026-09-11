@@ -547,7 +547,8 @@ public sealed class WorkReportPayloadDiagnosticsService : IWorkReportPayloadDiag
         CancellationToken ct)
     {
         var fb = Builders<WorkReportFieldStatValue>.Filter;
-        var filter = fb.Eq(x => x.IsDeleted, false);
+        var filter = fb.Eq(x => x.IsDeleted, false)
+                     & fb.Eq(x => x.DirectProjection, null);
         filter = ApplyStatScope(filter, fb, scope, scopedReportIds);
 
         return await _ctx.WorkReportFieldStatValues
@@ -574,7 +575,8 @@ public sealed class WorkReportPayloadDiagnosticsService : IWorkReportPayloadDiag
         CancellationToken ct)
     {
         var fb = Builders<WorkReportTableStatValue>.Filter;
-        var filter = fb.Eq(x => x.IsDeleted, false);
+        var filter = fb.Eq(x => x.IsDeleted, false)
+                     & fb.Eq(x => x.DirectProjection, null);
         filter = ApplyStatScope(filter, fb, scope, scopedReportIds);
 
         return await _ctx.WorkReportTableStatValues
@@ -601,7 +603,8 @@ public sealed class WorkReportPayloadDiagnosticsService : IWorkReportPayloadDiag
         CancellationToken ct)
     {
         var fb = Builders<WorkReportLabelStatValue>.Filter;
-        var filter = fb.Eq(x => x.IsDeleted, false);
+        var filter = fb.Eq(x => x.IsDeleted, false)
+                     & fb.Eq(x => x.DirectProjection, null);
         filter = ApplyStatScope(filter, fb, scope, scopedReportIds);
 
         return await _ctx.WorkReportLabelStatValues

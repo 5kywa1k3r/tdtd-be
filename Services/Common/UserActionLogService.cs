@@ -20,6 +20,10 @@ namespace tdtd_be.Services.Common;
 public interface IUserActionLogService
 {
     Task RecordAsync(UserActionLogSeed seed, CancellationToken ct = default);
+    Task RecordIdempotentAsync(
+        string idempotencyKey,
+        UserActionLogSeed seed,
+        CancellationToken ct = default);
     Task<int> ProcessPendingRetriesAsync(int maxJobs = 20, CancellationToken ct = default);
     Task<PagedResult<UserActionLogRow>> SearchAsync(
         UserActionLogSearchRequest request,
@@ -65,7 +69,7 @@ public sealed class UserActionLogService : IUserActionLogService
         try
         {
             var log = await BuildLogAsync(seed, ct);
-            await _ctx.UserActionLogs.InsertOneAsync(log, cancellationToken: ct);
+            await InsertBuiltLogAsync(log, seed.IdempotencyKey, ct);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -86,6 +90,20 @@ public sealed class UserActionLogService : IUserActionLogService
         }
     }
 
+    public async Task RecordIdempotentAsync(
+        string idempotencyKey,
+        UserActionLogSeed seed,
+        CancellationToken ct = default)
+    {
+        if (seed is null || string.IsNullOrWhiteSpace(seed.Action))
+            throw new ArgumentException("A user action is required.", nameof(seed));
+        if (string.IsNullOrWhiteSpace(idempotencyKey))
+            throw new ArgumentException("An idempotency key is required.", nameof(idempotencyKey));
+
+        var log = await BuildLogAsync(seed, ct);
+        await InsertBuiltLogAsync(log, idempotencyKey.Trim(), ct);
+    }
+
     public async Task<int> ProcessPendingRetriesAsync(int maxJobs = 20, CancellationToken ct = default)
     {
         maxJobs = Math.Clamp(maxJobs, 1, 200);
@@ -103,7 +121,7 @@ public sealed class UserActionLogService : IUserActionLogService
                            ?? throw AppExceptionFactory.BadRequest(AppErrorCode.OPERATIONS_RETRY_PAYLOAD_INVALID, new { job.Id });
 
                 var log = await BuildLogAsync(seed, ct);
-                await _ctx.UserActionLogs.InsertOneAsync(log, cancellationToken: ct);
+                await InsertBuiltLogAsync(log, seed.IdempotencyKey, ct);
                 await CompleteRetryJobAsync(job.Id, ct);
                 processed++;
             }
@@ -337,6 +355,35 @@ public sealed class UserActionLogService : IUserActionLogService
         };
 
         return log;
+    }
+
+    private async Task InsertBuiltLogAsync(
+        UserActionLog log,
+        string? idempotencyKey,
+        CancellationToken ct)
+    {
+        idempotencyKey = NullIfWhiteSpace(idempotencyKey);
+        if (idempotencyKey is not null)
+        {
+            log.IdempotencyKey = idempotencyKey;
+            log.Id = WorkAssignmentReports.Runtime.WorkReportLifecycleOutboxContract
+                .ComputeStableObjectId(idempotencyKey);
+        }
+
+        try
+        {
+            await _ctx.UserActionLogs.InsertOneAsync(log, cancellationToken: ct);
+        }
+        catch (MongoWriteException ex) when (
+            idempotencyKey is not null &&
+            ex.WriteError?.Category == ServerErrorCategory.DuplicateKey)
+        {
+            var exists = await _ctx.UserActionLogs
+                .Find(x => x.IdempotencyKey == idempotencyKey && !x.IsDeleted)
+                .AnyAsync(ct);
+            if (!exists)
+                throw;
+        }
     }
 
     private async Task<List<UserActionLogUserSnapshot>> BuildUserSnapshotsAsync(
@@ -833,7 +880,7 @@ public sealed class UserActionLogService : IUserActionLogService
     }
 
     private static string BuildDedupeKey(UserActionLogSeed seed)
-        => string.Join(
+        => NullIfWhiteSpace(seed.IdempotencyKey) ?? string.Join(
             ":",
             new[]
             {

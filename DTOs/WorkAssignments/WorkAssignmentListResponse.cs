@@ -14,6 +14,9 @@ public sealed class WorkAssignmentListResponse
     public string? DynamicFormTemplateId { get; set; }
     public string? DynamicFormTemplateCode { get; set; }
     public string? DynamicFormTemplateName { get; set; }
+    public string? DynamicFormFamilyId { get; set; }
+    public int? DynamicFormVersionNo { get; set; }
+    public string? DynamicFormSchemaHash { get; set; }
     public string? DynamicFormDataSourceRulesJson { get; set; }
     public string? AutoApproveConditionJson { get; set; }
 

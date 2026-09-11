@@ -7,97 +7,36 @@ using tdtd_be.Common.Errors;
 using tdtd_be.Data;
 using tdtd_be.DTOs.Auth;
 using tdtd_be.DTOs.Common;
+using tdtd_be.DTOs.StatisticsConfiguration;
 using tdtd_be.DTOs.WorkAssignments.SummaryTokens;
 using tdtd_be.Models;
+using tdtd_be.Services.StatisticsConfiguration;
 
 namespace tdtd_be.Services.WorkAssignments.SummaryTokens;
 
-public sealed class WorkSummaryTokenService : IWorkSummaryTokenService
+public sealed partial class WorkSummaryTokenService : IWorkSummaryTokenService
 {
     private const int MaxGrantUnits = 1000;
     private static readonly Regex MonthKeyRegex = new(@"^\d{4}-(0[1-9]|1[0-2])$", RegexOptions.Compiled);
 
     private readonly MongoDbContext _ctx;
+    private readonly IStatConfigTransactionRunner _transactions;
 
-    public WorkSummaryTokenService(MongoDbContext ctx)
+    public WorkSummaryTokenService(
+        MongoDbContext ctx,
+        IStatConfigTransactionRunner transactions)
     {
         _ctx = ctx;
+        _transactions = transactions;
     }
 
-    public async Task<WorkSummaryTokenGrantResponse> GrantAsync(
+    public Task<WorkSummaryTokenGrantResponse> GrantAsync(
         WorkSummaryTokenGrantRequest request,
         MeResponse issuer,
         CancellationToken ct)
-    {
-        EnsureActor(issuer);
-        request ??= new WorkSummaryTokenGrantRequest();
-
-        var ownerUnitId = NormalizeRequired(request.OwnerUnitId, "ownerUnitId");
-        var units = request.Units;
-        if (units <= 0 || units > MaxGrantUnits)
-        {
-            throw AppExceptionFactory.BadRequest(
-                AppErrorCode.WORK_SUMMARY_TOKEN_GRANT_UNITS_INVALID,
-                new { request.Units, min = 1, max = MaxGrantUnits });
-        }
-
-        var tokenKind = NormalizeTokenKind(request.TokenKind);
-        var monthKey = NormalizeMonthKey(request.PeriodMonthKey);
-        var ownerUnit = await LoadUnitRequiredAsync(ownerUnitId, ct);
-        EnsureCanGrantExtraQuota(issuer, ownerUnit);
-
-        var now = DateTime.UtcNow;
-        var grantedBefore = await CountMonthlyUnitsAsync(
-            ownerUnit.Id,
-            monthKey,
-            tokenKind,
-            WorkSummaryTokenDirections.Grant,
-            WorkSummaryTokenOutcomes.Success,
-            ct);
-        var used = await CountMonthlyUnitsAsync(
-            ownerUnit.Id,
-            monthKey,
-            tokenKind,
-            WorkSummaryTokenDirections.Consume,
-            WorkSummaryTokenOutcomes.Success,
-            ct);
-        var baseQuota = await CountActiveUsersInUnitAsync(ownerUnit.Id, ct);
-        var quota = BuildQuota(ownerUnit.Id, tokenKind, monthKey, baseQuota, grantedBefore + units, used);
-
-        var ledger = new WorkSummaryTokenLedger
-        {
-            Id = ObjectId.GenerateNewId().ToString(),
-            OwnerUnitId = ownerUnit.Id,
-            ActorUserId = issuer.Id,
-            IssuerUserId = issuer.Id,
-            TokenKind = tokenKind,
-            Direction = WorkSummaryTokenDirections.Grant,
-            Units = units,
-            MonthlyQuota = quota.MonthlyQuota,
-            PeriodMonthKey = monthKey,
-            Reason = NormalizeReason(request.Reason, "ADMIN_GRANT"),
-            Outcome = WorkSummaryTokenOutcomes.Success,
-            CreatedAtUtc = now,
-            UpdatedAtUtc = now,
-            CreatedByUserId = issuer.Id,
-            UpdatedByUserId = issuer.Id,
-            IsDeleted = false
-        };
-
-        await _ctx.WorkSummaryTokenLedgers.InsertOneAsync(ledger, cancellationToken: ct);
-
-        return new WorkSummaryTokenGrantResponse
-        {
-            LedgerId = ledger.Id,
-            OwnerUnitId = ownerUnit.Id,
-            IssuerUserId = issuer.Id,
-            TokenKind = tokenKind,
-            PeriodMonthKey = monthKey,
-            Units = units,
-            Quota = quota,
-            CreatedAtUtc = now
-        };
-    }
+        => throw P805LegacyMutationBlocked(
+            "WORK_SUMMARY_TOKEN_LEGACY_GRANT_BLOCKED",
+            "GrantP8Async");
 
     public async Task<WorkSummaryTokenQuotaResponse> GetQuotaAsync(
         string ownerUnitId,
@@ -115,7 +54,7 @@ public sealed class WorkSummaryTokenService : IWorkSummaryTokenService
 
         var kind = NormalizeTokenKind(tokenKind);
         var monthKey = NormalizeMonthKey(periodMonthKey);
-        return await BuildQuotaAsync(ownerUnit.Id, kind, monthKey, ct);
+        return await BuildQuotaP8ReadAsync(ownerUnit.Id, kind, monthKey, ct);
     }
 
     public async Task<PagedResult<WorkSummaryTokenLedgerRow>> SearchLedgerAsync(
@@ -129,7 +68,9 @@ public sealed class WorkSummaryTokenService : IWorkSummaryTokenService
         var page = Math.Max(0, request.Page);
         var pageSize = Math.Clamp(request.PageSize <= 0 ? 50 : request.PageSize, 1, 100);
         var fb = Builders<WorkSummaryTokenLedger>.Filter;
-        var filter = fb.Eq(x => x.IsDeleted, false);
+        var filter =
+            fb.Eq(x => x.IsDeleted, false) &
+            fb.Ne(x => x.RecordKind, WorkSummaryTokenLedgerRecordKinds.Pool);
         var canReadAll = CanReadAllLedgers(actor);
 
         var ownerUnitId = NormalizeOptionalText(request.OwnerUnitId);
@@ -186,109 +127,36 @@ public sealed class WorkSummaryTokenService : IWorkSummaryTokenService
             pageSize);
     }
 
-    public async Task<WorkSummaryTokenConsumeResult> ConsumeAdvancedConfigLockAsync(
+    public Task<WorkSummaryTokenConsumeResult> ConsumeAdvancedConfigLockAsync(
         WorkAssignmentAdvancedSummaryConfig config,
         long existingLockedConfigCount,
         string actorUserId,
         string? requestTokenId,
         CancellationToken ct)
-    {
-        var now = DateTime.UtcNow;
-        var monthKey = ToMonthKey(now);
-        var tokenKind = WorkSummaryTokenKinds.AdvancedSummaryConfigLock;
-        var isFree = existingLockedConfigCount <= 0;
-        var units = isFree ? 0 : 1;
-        var actor = await LoadUserAsync(actorUserId, ct);
-        var actorUnitId = NormalizeRequired(actor.UnitId, "ownerUnitId");
-        var quota = await BuildQuotaAsync(actorUnitId, tokenKind, monthKey, ct);
-        var usedBefore = quota.UsedUnits;
+        => throw P805LegacyMutationBlocked(
+            "WORK_SUMMARY_TOKEN_LEGACY_CONSUME_BLOCKED",
+            "ConsumeAdvancedConfigLockP8Async");
 
-        if (WouldExceedQuota(usedBefore, units, quota.MonthlyQuota))
-        {
-            throw AppExceptionFactory.Create(
-                AppErrorCode.WORK_SUMMARY_TOKEN_QUOTA_EXCEEDED,
-                new
-                {
-                    actorUserId,
-                    ownerUnitId = actorUnitId,
-                    monthKey,
-                    monthlyQuota = quota.MonthlyQuota,
-                    baseMonthlyQuota = quota.BaseMonthlyQuota,
-                    grantedUnits = quota.GrantedUnits,
-                    usedBefore,
-                    requestedUnits = units,
-                    tokenKind,
-                    configId = config.Id,
-                    config.WorkId,
-                    config.AssignmentId,
-                    config.DynamicFormTemplateId,
-                    config.SectionId
-                });
-        }
-
-        var ledger = new WorkSummaryTokenLedger
-        {
-            Id = ObjectId.GenerateNewId().ToString(),
-            OwnerUserId = actorUserId,
-            OwnerUnitId = actorUnitId,
-            ActorUserId = actorUserId,
-            TokenKind = tokenKind,
-            Direction = isFree ? WorkSummaryTokenDirections.Free : WorkSummaryTokenDirections.Consume,
-            Units = units,
-            MonthlyQuota = quota.MonthlyQuota,
-            PeriodMonthKey = monthKey,
-            RequestTokenId = NormalizeOptionalText(requestTokenId),
-            WorkId = config.WorkId,
-            WorkAssignmentId = config.AssignmentId,
-            DynamicFormTemplateId = config.DynamicFormTemplateId,
-            SectionId = config.SectionId,
-            ConfigId = config.Id,
-            ConfigVersionNo = config.VersionNo,
-            ConfigHash = config.ConfigHash,
-            Reason = isFree
-                ? "INITIAL_ADVANCED_SUMMARY_CONFIG_LOCK"
-                : "CHANGE_ADVANCED_SUMMARY_CONFIG_LOCK",
-            Outcome = WorkSummaryTokenOutcomes.Success,
-            CreatedAtUtc = now,
-            UpdatedAtUtc = now,
-            CreatedByUserId = actorUserId,
-            UpdatedByUserId = actorUserId,
-            IsDeleted = false
-        };
-
-        await _ctx.WorkSummaryTokenLedgers.InsertOneAsync(ledger, cancellationToken: ct);
-
-        return new WorkSummaryTokenConsumeResult(
-            ledger.Id,
-            units,
-            quota.MonthlyQuota,
-            usedBefore,
-            usedBefore + units,
-            isFree);
-    }
-
-    public async Task MarkFailedAsync(
+    public Task MarkFailedAsync(
         string ledgerId,
         string actorUserId,
         string error,
         CancellationToken ct)
-    {
-        ledgerId = ledgerId?.Trim() ?? string.Empty;
-        if (string.IsNullOrWhiteSpace(ledgerId))
-            return;
+        => throw P805LegacyMutationBlocked(
+            "WORK_SUMMARY_TOKEN_LEGACY_MARK_FAILED_BLOCKED",
+            "CompensateP8Async");
 
-        var now = DateTime.UtcNow;
-        var update = Builders<WorkSummaryTokenLedger>.Update
-            .Set(x => x.Outcome, WorkSummaryTokenOutcomes.Failed)
-            .Set(x => x.Error, NormalizeError(error))
-            .Set(x => x.UpdatedAtUtc, now)
-            .Set(x => x.UpdatedByUserId, actorUserId);
-
-        await _ctx.WorkSummaryTokenLedgers.UpdateOneAsync(
-            x => x.Id == ledgerId && !x.IsDeleted,
-            update,
-            cancellationToken: ct);
-    }
+    private static AppException P805LegacyMutationBlocked(
+        string reason,
+        string replacement)
+        => AppExceptionFactory.BadRequest(
+            AppErrorCode.STAT_CONFIG_SCHEMA_INVALID,
+            new
+            {
+                path = "$.operation",
+                reason,
+                replacement
+            });
 
     private async Task<WorkSummaryTokenQuotaResponse> BuildQuotaAsync(
         string ownerUnitId,
@@ -474,6 +342,8 @@ public sealed class WorkSummaryTokenService : IWorkSummaryTokenService
         => new()
         {
             Id = x.Id,
+            RecordKind = string.IsNullOrWhiteSpace(x.RecordKind)
+                ? WorkSummaryTokenLedgerRecordKinds.Entry : x.RecordKind,
             OwnerUserId = x.OwnerUserId,
             OwnerUnitId = x.OwnerUnitId,
             ActorUserId = x.ActorUserId,
@@ -482,8 +352,13 @@ public sealed class WorkSummaryTokenService : IWorkSummaryTokenService
             Direction = x.Direction,
             Units = x.Units,
             MonthlyQuota = x.MonthlyQuota,
+            BaseMonthlyQuota = x.BaseMonthlyQuota,
+            GrantedUnits = x.GrantedUnits,
+            UsedUnits = x.UsedUnits,
+            Revision = x.Revision,
             PeriodMonthKey = x.PeriodMonthKey,
             RequestTokenId = x.RequestTokenId,
+            RequestHash = x.RequestHash,
             WorkId = x.WorkId,
             WorkAssignmentId = x.WorkAssignmentId,
             DynamicFormTemplateId = x.DynamicFormTemplateId,
@@ -491,6 +366,13 @@ public sealed class WorkSummaryTokenService : IWorkSummaryTokenService
             ConfigId = x.ConfigId,
             ConfigVersionNo = x.ConfigVersionNo,
             ConfigHash = x.ConfigHash,
+            PoolId = x.PoolId,
+            PoolRevisionBefore = x.PoolRevisionBefore,
+            PoolRevisionAfter = x.PoolRevisionAfter,
+            PoolHashBefore = x.PoolHashBefore,
+            PoolHashAfter = x.PoolHashAfter,
+            CommandReceiptId = x.CommandReceiptId,
+            CompensatesLedgerId = x.CompensatesLedgerId,
             JobId = x.JobId,
             Reason = x.Reason,
             Outcome = x.Outcome,

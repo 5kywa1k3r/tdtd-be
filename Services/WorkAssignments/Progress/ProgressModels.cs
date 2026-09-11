@@ -17,13 +17,20 @@ internal sealed class LeafProgressFacts
     public DateTime? LatestDueAtUtc { get; set; }
 }
 
-public sealed class ProgressComputeResult
+public class ProgressComputeResult
 {
     public int ProgressStatus { get; set; }
     public bool HasAnyDuePeriod { get; set; }
     public bool HasOverduePeriod { get; set; }
     public string? LatestPeriodKey { get; set; }
     public DateTime? LatestDueAtUtc { get; set; }
+}
+
+public sealed class ProgressProjectionResult : ProgressComputeResult
+{
+    public int? WorstPeriodStatus { get; set; }
+    public string? WorstOverdueReasonCode { get; set; }
+    public string? WorstOverdueReasonLabel { get; set; }
 }
 
 public sealed class ProgressRecomputeResult

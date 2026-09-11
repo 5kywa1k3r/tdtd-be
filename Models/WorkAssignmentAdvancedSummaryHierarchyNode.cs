@@ -29,11 +29,42 @@ public abstract class WorkAssignmentAdvancedSummaryHierarchyNodeBase : BaseEntit
     [BsonRepresentation(BsonType.ObjectId)]
     public string ConfigId { get; set; } = default!;
 
+    [BsonElement("configVersionId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string ConfigVersionId { get; set; } = default!;
+
     [BsonElement("configVersionNo")]
     public int ConfigVersionNo { get; set; }
 
+    [BsonElement("configRevision")]
+    public long ConfigRevision { get; set; }
+
     [BsonElement("configHash")]
     public string ConfigHash { get; set; } = default!;
+
+    [BsonElement("dependencyPins")]
+    public List<string> DependencyPins { get; set; } = new();
+
+    [BsonElement("timeAxis")]
+    public string TimeAxis { get; set; } = "UTC_GREGORIAN";
+
+    [BsonElement("candidateChainId")]
+    public string CandidateChainId { get; set; } = default!;
+
+    [BsonElement("candidatePromptId")]
+    public string CandidatePromptId { get; set; } = default!;
+
+    [BsonElement("candidateStage")]
+    public int CandidateStage { get; set; }
+
+    [BsonElement("candidateCatalogRawSha256")]
+    public string CandidateCatalogRawSha256 { get; set; } = default!;
+
+    [BsonElement("candidateCatalogSemanticSha256")]
+    public string CandidateCatalogSemanticSha256 { get; set; } = default!;
+
+    [BsonElement("candidateStageLockSha256")]
+    public string CandidateStageLockSha256 { get; set; } = default!;
 
     [BsonElement("grain")]
     public string Grain { get; set; } = default!;
@@ -85,6 +116,32 @@ public abstract class WorkAssignmentAdvancedSummaryHierarchyNodeBase : BaseEntit
 
     [BsonElement("buildCorrelationId")]
     public string? BuildCorrelationId { get; set; }
+
+    [BsonElement("buildCommandId")]
+    public string? BuildCommandId { get; set; }
+
+    [BsonElement("buildRequestHash")]
+    public string? BuildRequestHash { get; set; }
+
+    [BsonElement("buildReceiptId")]
+    public string? BuildReceiptId { get; set; }
+
+    [BsonElement("quotaLedgerId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? QuotaLedgerId { get; set; }
+
+    [BsonElement("buildAttemptNo")]
+    public int BuildAttemptNo { get; set; }
+
+    [BsonElement("leaseOwner")]
+    public string? LeaseOwner { get; set; }
+
+    [BsonElement("leaseExpiresAtUtc")]
+    [BsonDateTimeOptions(Kind = DateTimeKind.Utc)]
+    public DateTime? LeaseExpiresAtUtc { get; set; }
+
+    [BsonElement("fenceToken")]
+    public long FenceToken { get; set; }
 
     [BsonElement("buildError")]
     public string? BuildError { get; set; }

@@ -1,10 +1,13 @@
 using MongoDB.Driver;
 using Microsoft.Extensions.Logging;
+using tdtd_be.Common.Errors;
 using tdtd_be.Data;
 using tdtd_be.Enum;
 using tdtd_be.Models;
 using tdtd_be.Models.Enums;
 using tdtd_be.Services.Common;
+using tdtd_be.Services.DynamicFlows;
+using tdtd_be.Services.WorkAssignmentReports.Runtime;
 using tdtd_be.Services.WorkAssignments.Internal;
 using tdtd_be.Services.WorkAssignments.Queue;
 
@@ -16,6 +19,8 @@ public sealed class WorkAssignmentQueueJobService : IWorkAssignmentQueueJobServi
     private readonly IWorkAssignmentStatusSyncService _sync;
     private readonly IDocRoleReadModelProjectionService _docRoleReadModelProjection;
     private readonly IWorkStatusOperationLogService _statusLog;
+    private readonly IWorkReportLifecycleSeriesLockService _lifecycleSeriesLock;
+    private readonly IDynamicFlowDefinitionTransactionRunner _transactions;
     private readonly ILogger<WorkAssignmentQueueJobService> _log;
 
     public WorkAssignmentQueueJobService(
@@ -23,12 +28,16 @@ public sealed class WorkAssignmentQueueJobService : IWorkAssignmentQueueJobServi
         IWorkAssignmentStatusSyncService sync,
         IDocRoleReadModelProjectionService docRoleReadModelProjection,
         IWorkStatusOperationLogService statusLog,
+        IWorkReportLifecycleSeriesLockService lifecycleSeriesLock,
+        IDynamicFlowDefinitionTransactionRunner transactions,
         ILogger<WorkAssignmentQueueJobService> log)
     {
         _ctx = ctx;
         _sync = sync;
         _docRoleReadModelProjection = docRoleReadModelProjection;
         _statusLog = statusLog;
+        _lifecycleSeriesLock = lifecycleSeriesLock;
+        _transactions = transactions;
         _log = log;
     }
 
@@ -102,6 +111,7 @@ public sealed class WorkAssignmentQueueJobService : IWorkAssignmentQueueJobServi
         foreach (var item in queueItems)
         {
             scanned++;
+            WorkReportLifecycleSeriesLease? lifecycleSeriesLease = null;
             try
             {
                 assignmentById.TryGetValue(item.WorkAssignmentId, out var assignment);
@@ -112,9 +122,52 @@ public sealed class WorkAssignmentQueueJobService : IWorkAssignmentQueueJobServi
                     !assignment.IsActive ||
                     IsCompletionLocked(assignment, work, completedAssignmentIds))
                 {
-                    await DisableQueueItemAsync(item.Id!, now, ct);
-                    disabled++;
+                    if (await DisableQueueItemAsync(item, now, ct))
+                        disabled++;
                     continue;
+                }
+
+                if (!string.IsNullOrWhiteSpace(assignment.FlowInstanceId))
+                {
+                    try
+                    {
+                        lifecycleSeriesLease = await _lifecycleSeriesLock.AcquireAsync(
+                            assignment.Id!,
+                            WorkReportLifecycleSeriesOperations.QueueDueScan,
+                            ct);
+                    }
+                    catch (AppException ex) when (
+                        ex.Code ==
+                        AppErrorCode.WORK_ASSIGNMENT_REPORT_LIFECYCLE_REVISION_CONFLICT)
+                    {
+                        // A report transition, completion, or runtime repair owns this
+                        // assignment series. Leave the observed queue row untouched so the
+                        // next bounded scan derives from the committed lifecycle state.
+                        continue;
+                    }
+
+                    assignment = await _ctx.WorkAssignments
+                        .Find(x => x.Id == item.WorkAssignmentId && !x.IsDeleted)
+                        .FirstOrDefaultAsync(ct);
+                    work = assignment is null
+                        ? null
+                        : await _ctx.Works
+                            .Find(x => x.Id == assignment.WorkId && !x.IsDeleted)
+                            .FirstOrDefaultAsync(ct);
+                    var freshCompletedAssignmentIds = assignment is null
+                        ? new HashSet<string>(StringComparer.Ordinal)
+                        : await LoadCompletedAncestorIdsAsync(assignment, ct);
+                    if (assignment is null ||
+                        !assignment.IsActive ||
+                        IsCompletionLocked(
+                            assignment,
+                            work,
+                            freshCompletedAssignmentIds))
+                    {
+                        if (await DisableQueueItemAsync(item, now, ct))
+                            disabled++;
+                        continue;
+                    }
                 }
 
                 var period = await _ctx.WorkReportPeriods
@@ -127,9 +180,9 @@ public sealed class WorkAssignmentQueueJobService : IWorkAssignmentQueueJobServi
 
                 if (period is null || !period.IsActive)
                 {
-                    await DisableQueueItemAsync(item.Id!, now, ct);
+                    if (await DisableQueueItemAsync(item, now, ct))
+                        disabled++;
                     missingPeriod++;
-                    disabled++;
                     continue;
                 }
 
@@ -157,23 +210,26 @@ public sealed class WorkAssignmentQueueJobService : IWorkAssignmentQueueJobServi
                         period.Status != healedStatus ||
                         period.IsOverdue != healedIsOverdue)
                     {
-                        await _ctx.WorkReportPeriods.UpdateOneAsync(
-                            x => x.Id == period.Id,
+                        var periodUpdated =
+                            await UpdatePeriodWithProgressFenceAsync(
+                            period,
                             Builders<WorkReportPeriod>.Update
                                 .Set(x => x.IsHistoricalData, true)
                                 .Set(x => x.Status, healedStatus)
                                 .Set(x => x.IsOverdue, healedIsOverdue)
                                 .Set(x => x.UpdatedAtUtc, now)
                                 .Set(x => x.UpdatedByUserId, null),
-                            cancellationToken: ct);
+                            ct);
+                        if (!periodUpdated)
+                            continue;
 
                         await _sync.SyncFromAssignmentAsync(period.WorkAssignmentId, ct);
                         await _docRoleReadModelProjection.RebuildReportPeriodAsync(period.Id, "system", ct);
                         changed++;
                     }
 
-                    await DisableQueueItemAsync(item.Id!, now, ct);
-                    disabled++;
+                    if (await DisableQueueItemAsync(item, now, ct))
+                        disabled++;
                     continue;
                 }
 
@@ -186,14 +242,17 @@ public sealed class WorkAssignmentQueueJobService : IWorkAssignmentQueueJobServi
 
                 if (nextStatus != oldStatus)
                 {
-                    await _ctx.WorkReportPeriods.UpdateOneAsync(
-                        x => x.Id == period.Id,
+                    var periodUpdated =
+                        await UpdatePeriodWithProgressFenceAsync(
+                        period,
                         Builders<WorkReportPeriod>.Update
                             .Set(x => x.Status, nextStatus)
                             .Set(x => x.IsOverdue, WorkReportPeriodStatusHelper.IsOverdue(nextStatus))
                             .Set(x => x.UpdatedAtUtc, now)
                             .Set(x => x.UpdatedByUserId, null),
-                        cancellationToken: ct);
+                        ct);
+                    if (!periodUpdated)
+                        continue;
 
                     await _sync.SyncFromAssignmentAsync(period.WorkAssignmentId, ct);
                     await _docRoleReadModelProjection.RebuildReportPeriodAsync(period.Id, "system", ct);
@@ -212,12 +271,12 @@ public sealed class WorkAssignmentQueueJobService : IWorkAssignmentQueueJobServi
                     ? queueUpdate.Set(x => x.IsActive, false)
                     : queueUpdate.Set(x => x.NextScanAtUtc, period.DueAtUtc ?? now.AddHours(6));
 
-                await _ctx.WorkAssignmentQueueItems.UpdateOneAsync(
-                    x => x.Id == item.Id,
+                var queueResult = await _ctx.WorkAssignmentQueueItems.UpdateOneAsync(
+                    BuildObservedQueueFilter(item),
                     queueUpdate,
                     cancellationToken: ct);
 
-                if (shouldDisableQueue)
+                if (shouldDisableQueue && queueResult.MatchedCount == 1)
                     disabled++;
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
@@ -249,6 +308,11 @@ public sealed class WorkAssignmentQueueJobService : IWorkAssignmentQueueJobServi
                     StartedAtUtc = startedAtUtc
                 }, startedAtUtc, ct);
             }
+            finally
+            {
+                if (lifecycleSeriesLease is not null)
+                    await lifecycleSeriesLease.DisposeAsync();
+            }
         }
 
         if (scanned > 0)
@@ -274,17 +338,108 @@ public sealed class WorkAssignmentQueueJobService : IWorkAssignmentQueueJobServi
         }
     }
 
-    private async Task DisableQueueItemAsync(string queueItemId, DateTime now, CancellationToken ct)
+    private async Task<bool> DisableQueueItemAsync(
+        WorkAssignmentQueueItem item,
+        DateTime now,
+        CancellationToken ct)
     {
-        await _ctx.WorkAssignmentQueueItems.UpdateOneAsync(
-            x => x.Id == queueItemId,
+        var result = await _ctx.WorkAssignmentQueueItems.UpdateOneAsync(
+            BuildObservedQueueFilter(item),
             Builders<WorkAssignmentQueueItem>.Update
                 .Set(x => x.IsActive, false)
                 .Set(x => x.LastScannedAtUtc, now)
                 .Set(x => x.UpdatedAtUtc, now)
                 .Set(x => x.UpdatedByUserId, null),
             cancellationToken: ct);
+        return result.MatchedCount == 1;
     }
+
+    private static FilterDefinition<WorkReportPeriod> BuildObservedPeriodFilter(
+        WorkReportPeriod period)
+    {
+        var fb = Builders<WorkReportPeriod>.Filter;
+        return fb.Eq(x => x.Id, period.Id) &
+               fb.Eq(x => x.IsActive, period.IsActive) &
+               fb.Eq(x => x.IsDeleted, false) &
+               fb.Eq(x => x.Status, period.Status) &
+               fb.Eq(x => x.IsOverdue, period.IsOverdue) &
+               fb.Eq(x => x.IsHistoricalData, period.IsHistoricalData) &
+               fb.Eq(x => x.CurrentReportId, period.CurrentReportId) &
+               fb.Eq(x => x.SourceLifecycleReportId, period.SourceLifecycleReportId) &
+               fb.Eq(x => x.SourceLifecycleRevision, period.SourceLifecycleRevision) &
+               fb.Eq(x => x.UpdatedAtUtc, period.UpdatedAtUtc);
+    }
+
+    private static FilterDefinition<WorkAssignmentQueueItem> BuildObservedQueueFilter(
+        WorkAssignmentQueueItem item)
+    {
+        var fb = Builders<WorkAssignmentQueueItem>.Filter;
+        return fb.Eq(x => x.Id, item.Id) &
+               fb.Eq(x => x.IsActive, item.IsActive) &
+               fb.Eq(x => x.IsDeleted, false) &
+               fb.Eq(x => x.NextScanAtUtc, item.NextScanAtUtc) &
+               fb.Eq(x => x.LastScannedAtUtc, item.LastScannedAtUtc) &
+               fb.Eq(x => x.LastObservedPeriodStatus, item.LastObservedPeriodStatus) &
+               fb.Eq(x => x.UpdatedAtUtc, item.UpdatedAtUtc);
+    }
+
+    private async Task<HashSet<string>> LoadCompletedAncestorIdsAsync(
+        WorkAssignment assignment,
+        CancellationToken ct)
+    {
+        var ancestorIds = ResolveAncestorIds(assignment);
+        if (ancestorIds.Count == 0)
+            return new HashSet<string>(StringComparer.Ordinal);
+
+        return (await _ctx.WorkAssignments
+                .Find(x =>
+                    ancestorIds.Contains(x.Id) &&
+                    !x.IsDeleted &&
+                    (x.CompletedAtUtc != null ||
+                     (x.ProgressStatus == (int)WorkAssignmentProgressStatus.Completed &&
+                      x.CompletedDate != null)))
+                .Project(x => x.Id)
+                .ToListAsync(ct))
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .ToHashSet(StringComparer.Ordinal);
+    }
+
+    private Task<bool> UpdatePeriodWithProgressFenceAsync(
+        WorkReportPeriod period,
+        UpdateDefinition<WorkReportPeriod> update,
+        CancellationToken ct)
+        => _transactions.ExecuteAsync(
+            async (session, transactionCt) =>
+            {
+                var periodUpdate = await _ctx.WorkReportPeriods.UpdateOneAsync(
+                    session,
+                    BuildObservedPeriodFilter(period),
+                    update,
+                    cancellationToken: transactionCt);
+                if (periodUpdate.MatchedCount != 1)
+                    return false;
+                var sourceRevision = await _ctx.WorkAssignments.UpdateOneAsync(
+                    session,
+                    x =>
+                        x.Id == period.WorkAssignmentId &&
+                        !x.IsDeleted,
+                    Builders<WorkAssignment>.Update.Inc(
+                        x => x.ReportLifecycleSeriesRevision,
+                        1),
+                    cancellationToken: transactionCt);
+                if (sourceRevision.MatchedCount != 1)
+                {
+                    throw new InvalidOperationException(
+                        "WORK_ASSIGNMENT_QUEUE_PROGRESS_SOURCE_MISSING");
+                }
+                await WorkDirectSourceRevisionFence.IncrementAsync(
+                    _ctx,
+                    session,
+                    period.WorkId,
+                    transactionCt);
+                return true;
+            },
+            ct);
 
     private static bool IsCompletionLocked(
         WorkAssignment assignment,

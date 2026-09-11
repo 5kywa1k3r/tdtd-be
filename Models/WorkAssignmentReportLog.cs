@@ -64,4 +64,8 @@ public sealed class WorkAssignmentReportLog : BaseEntity
 
     [BsonElement("snapshotJson")]
     public string? SnapshotJson { get; set; }
+
+    [BsonElement("lifecycleEventKey")]
+    [BsonIgnoreIfNull]
+    public string? LifecycleEventKey { get; set; }
 }

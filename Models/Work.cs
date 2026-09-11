@@ -121,4 +121,41 @@ public sealed class Work : BaseEntity
     [BsonElement("worstEvaluationLabel")]
     public string? WorstEvaluationLabel { get; set; }
 
+    /// <summary>
+    /// Durable, mutually exclusive owner of assignment topology on this Work.
+    /// A Work is either legacy-assignment-owned or owned by one P5 runtime
+    /// instance; writers claim this value atomically before creating topology.
+    /// </summary>
+    [BsonElement("assignmentTopologyOwner")]
+    [BsonIgnoreIfNull]
+    public string? AssignmentTopologyOwner { get; set; }
+
+    [BsonElement("dynamicFlowRuntimeInstanceId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    [BsonIgnoreIfNull]
+    public string? DynamicFlowRuntimeInstanceId { get; set; }
+
+    /// <summary>
+    /// Monotonic fence shared by every report lifecycle mutation that can alter
+    /// official Direct membership for this Work. Projection publication must
+    /// compare this value in the same transaction that makes a generation current.
+    /// </summary>
+    [BsonElement("directSourceRevision")]
+    [BsonIgnoreIfDefault]
+    public long DirectSourceRevision { get; set; }
+
+    /// <summary>
+    /// Monotonic observation counter for successful Direct publication swaps.
+    /// It is advanced with the source-revision CAS and is not a value ledger.
+    /// </summary>
+    [BsonElement("directPublicationRevision")]
+    [BsonIgnoreIfDefault]
+    public long DirectPublicationRevision { get; set; }
+
+}
+
+public static class WorkAssignmentTopologyOwners
+{
+    public const string Legacy = "LEGACY";
+    public const string P5FlowRuntime = "P5_FLOW_RUNTIME";
 }

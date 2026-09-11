@@ -49,6 +49,9 @@ public sealed class WorkReportFieldStatAggregate : BaseEntity
     [BsonElement("fieldType")]
     public string FieldType { get; set; } = default!;
 
+    [BsonElement("statisticLabelCodes")]
+    public List<string> StatisticLabelCodes { get; set; } = new();
+
     [BsonElement("showInTree")]
     public bool ShowInTree { get; set; }
 
@@ -123,4 +126,8 @@ public sealed class WorkReportFieldStatAggregate : BaseEntity
 
     [BsonElement("reportCount")]
     public long ReportCount { get; set; }
+
+    [BsonElement("directProjection")]
+    [BsonIgnoreIfNull]
+    public WorkReportDirectProjectionPin? DirectProjection { get; set; }
 }

@@ -42,6 +42,9 @@ internal static class WorkAssignmentResponseMapper
             DynamicFormTemplateId = entity.DynamicFormTemplateId,
             DynamicFormTemplateCode = entity.DynamicFormTemplateCode,
             DynamicFormTemplateName = entity.DynamicFormTemplateName,
+            DynamicFormFamilyId = entity.DynamicFormFamilyId,
+            DynamicFormVersionNo = entity.DynamicFormVersionNo,
+            DynamicFormSchemaHash = entity.DynamicFormSchemaHash,
             DynamicFormDataSourceRulesJson = entity.DynamicFormDataSourceRulesJson,
             AutoApproveConditionJson = entity.AutoApproveConditionJson,
 

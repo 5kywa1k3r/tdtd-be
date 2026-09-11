@@ -15,14 +15,14 @@ namespace tdtd_be.Services
         private readonly MongoDbContext _ctx;
         private readonly IOptions<MongoOptions> _opt;
         private readonly JwtService _jwt;
-        private readonly RedisUserCache _cache;
+        private readonly IUserSessionCache _cache;
         private readonly IPasswordHasher<AppUser> _hasher;
 
         public AuthService(
             MongoDbContext ctx,
             IOptions<MongoOptions> opt,
             JwtService jwt,
-            RedisUserCache cache,
+            IUserSessionCache cache,
             IPasswordHasher<AppUser> hasher)
         {
             _ctx = ctx;

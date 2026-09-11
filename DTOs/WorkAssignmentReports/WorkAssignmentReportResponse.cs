@@ -80,6 +80,9 @@ public sealed class WorkAssignmentReportResponse
     public string? DynamicFormTemplateId { get; set; }
     public string? DynamicFormTemplateCode { get; set; }
     public string? DynamicFormTemplateName { get; set; }
+    public string? DynamicFormFamilyId { get; set; }
+    public int? DynamicFormVersionNo { get; set; }
+    public string? DynamicFormSchemaHash { get; set; }
     public string SpecJson { get; set; } = string.Empty;
 
     public int DataRectR0 { get; set; }
@@ -92,6 +95,21 @@ public sealed class WorkAssignmentReportResponse
     public string Values1DJson { get; set; } = string.Empty;
     public string? FieldValuesJson { get; set; }
     public string? TableValuesJson { get; set; }
+    public int PayloadRevision { get; set; }
+    public int LifecycleRevision { get; set; }
+    public string LifecycleCommitState { get; set; } = WorkReportLifecycleCommitStates.Committed;
+    public bool LifecycleProjectionPending { get; set; }
+    public bool CanEditPayload { get; set; }
+    public bool CanSubmit { get; set; }
+    public bool CanWithdraw { get; set; }
+    public string? PayloadHash { get; set; }
+    public long PayloadSizeBytes { get; set; }
+    public string? PayloadStatus { get; set; }
+    public DateTime? PayloadUpdatedAtUtc { get; set; }
+    public string? DynamicFlowMappingApplyState { get; set; }
+    public string? DynamicFlowMappingReceiptId { get; set; }
+    public string? DynamicFlowMappingCommandId { get; set; }
+    public string? DynamicFlowMappingResultSemanticHash { get; set; }
     public DynamicFlowPolicyEvaluationResult? DynamicFlowPermissions { get; set; }
     public string DataOrigin { get; set; } = string.Empty;
     public string CumulativeContributionMode { get; set; } = string.Empty;
@@ -141,4 +159,11 @@ public sealed class WorkAssignmentReportResponse
 
     public DateTime CreatedAtUtc { get; set; }
     public DateTime UpdatedAtUtc { get; set; }
+}
+
+public static class WorkReportLifecycleCommitStates
+{
+    public const string Committed = "COMMITTED";
+    public const string CommittedPendingProjection = "COMMITTED_PENDING_PROJECTION";
+    public const string NoChange = "NO_CHANGE";
 }

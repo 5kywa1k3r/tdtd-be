@@ -32,6 +32,8 @@ public sealed class ReviewReportFlatRowDto
 
     public string? ReportId { get; set; }
     public int? ReportStatus { get; set; }
+    public int PayloadRevision { get; set; }
+    public int LifecycleRevision { get; set; }
     public bool ReportIsActive { get; set; } = true;
     public DateTime? ReportDeactivatedAtUtc { get; set; }
     public string? ReportDeactivationReason { get; set; }

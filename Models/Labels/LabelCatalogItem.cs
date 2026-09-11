@@ -68,6 +68,98 @@ public sealed class LabelCatalogItem : BaseEntity
 
     [BsonElement("isActive")]
     public bool IsActive { get; set; } = true;
+
+    [BsonElement("configId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? ConfigId { get; set; }
+
+    [BsonElement("versionId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? VersionId { get; set; }
+
+    [BsonElement("previousVersionId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? PreviousVersionId { get; set; }
+
+    [BsonElement("versionNo")]
+    public int VersionNo { get; set; } = 1;
+
+    [BsonElement("revision")]
+    public long Revision { get; set; } = 1;
+
+    [BsonElement("configHash")]
+    public string? ConfigHash { get; set; }
+
+    [BsonElement("dependencyPins")]
+    public List<string> DependencyPins { get; set; } = new();
+
+    [BsonElement("versionSnapshots")]
+    public List<LabelConfigVersionSnapshot> VersionSnapshots { get; set; } =
+        new();
+}
+
+[BsonIgnoreExtraElements]
+public sealed class LabelConfigVersionSnapshot
+{
+    [BsonElement("labelId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string LabelId { get; set; } = default!;
+
+    [BsonElement("versionId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string VersionId { get; set; } = default!;
+
+    [BsonElement("previousVersionId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? PreviousVersionId { get; set; }
+
+    [BsonElement("versionNo")]
+    public int VersionNo { get; set; }
+
+    [BsonElement("revision")]
+    public long Revision { get; set; }
+
+    [BsonElement("status")]
+    public string Status { get; set; } = string.Empty;
+
+    [BsonElement("configHash")]
+    public string ConfigHash { get; set; } = string.Empty;
+
+    [BsonElement("code")]
+    public string Code { get; set; } = string.Empty;
+
+    [BsonElement("name")]
+    public string Name { get; set; } = string.Empty;
+
+    [BsonElement("usage")]
+    public string Usage { get; set; } = string.Empty;
+
+    [BsonElement("dataType")]
+    public string DataType { get; set; } = string.Empty;
+
+    [BsonElement("valueSourceType")]
+    public string ValueSourceType { get; set; } = string.Empty;
+
+    [BsonElement("scopeType")]
+    public string ScopeType { get; set; } = string.Empty;
+
+    [BsonElement("scopeId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? ScopeId { get; set; }
+
+    [BsonElement("isActive")]
+    public bool IsActive { get; set; }
+
+    [BsonElement("dependencyPins")]
+    public List<string> DependencyPins { get; set; } = new();
+
+    [BsonElement("createdAtUtc")]
+    [BsonDateTimeOptions(Kind = DateTimeKind.Utc)]
+    public DateTime CreatedAtUtc { get; set; }
+
+    [BsonElement("createdByUserId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string CreatedByUserId { get; set; } = default!;
 }
 
 public static class LabelScopeTypes

@@ -174,7 +174,9 @@ public sealed class DynamicExcelService : IDynamicExcelService
         var pageSize = Math.Clamp(req.PageSize, 1, 100);
 
         var f = Builders<DynamicExcelTemplate>.Filter;
-        var filter = f.Eq(x => x.IsDeleted, false) & f.Eq(x => x.CreatedByUserId, me.Id);
+        var filter = f.Eq(x => x.IsDeleted, false);
+        if (!RoleGuard.IsSystemAdmin(me))
+            filter &= f.Eq(x => x.CreatedByUserId, me.Id);
 
         if (!string.IsNullOrWhiteSpace(req.Code))
         {
@@ -1887,7 +1889,8 @@ public sealed class DynamicExcelService : IDynamicExcelService
 
     private async Task EnsureCanReadAsync(MeResponse me, DynamicExcelTemplate doc, CancellationToken ct)
     {
-        if (string.Equals(doc.CreatedByUserId, me.Id, StringComparison.Ordinal))
+        if (RoleGuard.IsSystemAdmin(me) ||
+            string.Equals(doc.CreatedByUserId, me.Id, StringComparison.Ordinal))
             return;
 
         if (await HasDirectRuntimeReadGrantAsync(doc.Id, me.Id, ct))
@@ -1913,6 +1916,7 @@ public sealed class DynamicExcelService : IDynamicExcelService
                 .Find(x =>
                     x.DynamicExcelId == templateId &&
                     x.AssigneeUserId == userId &&
+                    x.IsActive &&
                     !x.IsDeleted)
                 .Limit(1)
                 .AnyAsync(ct))
@@ -1931,6 +1935,8 @@ public sealed class DynamicExcelService : IDynamicExcelService
                 .Find(x =>
                     x.DynamicExcelId == templateId &&
                     x.CreatedByUserId == userId &&
+                    x.IsActive &&
+                    (x.FlowEffectiveStatus == null || x.FlowEffectiveStatus == DynamicFlowEffectiveStatuses.Effective) &&
                     !x.IsDeleted)
                 .Limit(1)
                 .AnyAsync(ct))
@@ -1940,6 +1946,7 @@ public sealed class DynamicExcelService : IDynamicExcelService
             .Find(x =>
                 x.DynamicExcelId == templateId &&
                 x.ReviewerUserId == userId &&
+                x.ReportIsActive &&
                 !x.IsDeleted)
             .Limit(1)
             .AnyAsync(ct);
@@ -1990,6 +1997,7 @@ public sealed class DynamicExcelService : IDynamicExcelService
                 x.AssigneeUserId == userId &&
                 x.DynamicFormTemplateId != null &&
                 x.DynamicFormTemplateId != string.Empty &&
+                x.IsActive &&
                 !x.IsDeleted)
             .Project(x => x.DynamicFormTemplateId)
             .ToListAsync(ct));
@@ -2008,6 +2016,8 @@ public sealed class DynamicExcelService : IDynamicExcelService
                 x.CreatedByUserId == userId &&
                 x.DynamicFormTemplateId != null &&
                 x.DynamicFormTemplateId != string.Empty &&
+                x.IsActive &&
+                (x.FlowEffectiveStatus == null || x.FlowEffectiveStatus == DynamicFlowEffectiveStatuses.Effective) &&
                 !x.IsDeleted)
             .Project(x => x.DynamicFormTemplateId)
             .ToListAsync(ct));
@@ -2017,6 +2027,7 @@ public sealed class DynamicExcelService : IDynamicExcelService
                 x.ReviewerUserId == userId &&
                 x.DynamicFormTemplateId != null &&
                 x.DynamicFormTemplateId != string.Empty &&
+                x.ReportIsActive &&
                 !x.IsDeleted)
             .Project(x => x.DynamicFormTemplateId)
             .ToListAsync(ct));

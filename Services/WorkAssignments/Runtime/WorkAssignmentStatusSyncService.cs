@@ -31,7 +31,36 @@ public sealed class WorkAssignmentStatusSyncService : IWorkAssignmentStatusSyncS
         _log = log;
     }
 
-    public async Task SyncFromAssignmentAsync(string workAssignmentId, CancellationToken ct = default)
+    public Task SyncFromAssignmentAsync(
+        string workAssignmentId,
+        CancellationToken ct = default)
+        => SyncFromAssignmentCoreAsync(
+            workAssignmentId,
+            idempotencyKey: null,
+            ct);
+
+    public Task SyncFromAssignmentIdempotentAsync(
+        string workAssignmentId,
+        string idempotencyKey,
+        CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(idempotencyKey))
+        {
+            throw new ArgumentException(
+                "An idempotency key is required.",
+                nameof(idempotencyKey));
+        }
+
+        return SyncFromAssignmentCoreAsync(
+            workAssignmentId,
+            idempotencyKey.Trim(),
+            ct);
+    }
+
+    private async Task SyncFromAssignmentCoreAsync(
+        string workAssignmentId,
+        string? idempotencyKey,
+        CancellationToken ct)
     {
         var startedAtUtc = DateTime.UtcNow;
         string? workId = null;
@@ -62,7 +91,7 @@ public sealed class WorkAssignmentStatusSyncService : IWorkAssignmentStatusSyncS
                     WorkAssignmentId = workAssignmentId,
                     Summary = "Assignment not found or deleted.",
                     StartedAtUtc = startedAtUtc
-                }, startedAtUtc, ct);
+                }, startedAtUtc, idempotencyKey, ct);
                 return;
             }
 
@@ -126,7 +155,7 @@ public sealed class WorkAssignmentStatusSyncService : IWorkAssignmentStatusSyncS
                 WorkToStatus = workToStatus,
                 Summary = $"rebuiltAssignments={rebuiltAssignmentCount};parentDepth={parentDepth}",
                 StartedAtUtc = startedAtUtc
-            }, startedAtUtc, ct);
+            }, startedAtUtc, idempotencyKey, ct);
         }
         catch (Exception ex)
         {
@@ -158,7 +187,7 @@ public sealed class WorkAssignmentStatusSyncService : IWorkAssignmentStatusSyncS
                 ErrorMessage = ex.Message,
                 ErrorStackTrace = ex.ToString(),
                 StartedAtUtc = startedAtUtc
-            }, startedAtUtc, ct);
+            }, startedAtUtc, idempotencyKey, ct);
 
             throw;
         }
@@ -242,12 +271,22 @@ public sealed class WorkAssignmentStatusSyncService : IWorkAssignmentStatusSyncS
     private async Task WriteStatusLogAsync(
         WorkStatusOperationLog log,
         DateTime startedAtUtc,
+        string? idempotencyKey,
         CancellationToken ct)
     {
         var completedAtUtc = DateTime.UtcNow;
         log.CompletedAtUtc = completedAtUtc;
         log.DurationMs = (long)(completedAtUtc - startedAtUtc).TotalMilliseconds;
-        await _statusLog.WriteAsync(log, ct);
+        if (string.IsNullOrWhiteSpace(idempotencyKey))
+        {
+            await _statusLog.WriteAsync(log, ct);
+            return;
+        }
+
+        await _statusLog.WriteIdempotentAsync(
+            $"{idempotencyKey}:{log.Result.Trim().ToUpperInvariant()}",
+            log,
+            ct);
     }
 
     private static WorkStatus MapToWorkStatus(WorkProgressCountSnapshot snapshot)

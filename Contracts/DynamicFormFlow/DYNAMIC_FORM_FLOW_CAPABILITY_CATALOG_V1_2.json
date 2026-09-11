@@ -1,0 +1,380 @@
+{
+  "$schema": "./DYNAMIC_FORM_FLOW_CAPABILITY_CATALOG_V1_2.schema.json",
+  "catalogVersion": "1.2",
+  "approvedAt": "2026-07-24",
+  "terminology": {
+    "flowScopeName": "BPMN_LITE_12_ARCHETYPES",
+    "fullBpmnClaimAllowed": false
+  },
+  "defaults": {
+    "publishedFormSchemaMutable": false,
+    "assignmentBindsFormVersionId": true,
+    "emptyFlowPolicy": "DENY",
+    "runtimeRoleSource": "SERVER_DERIVED",
+    "rawSourceReportAccess": "EXPLICIT_PERMISSION_ONLY",
+    "mappedTargetStatisticContribution": "EXCLUDE",
+    "flowStatisticProfile": "INTENTIONAL_BLOCK"
+  },
+  "uiGate": {
+    "continuous": true,
+    "requiredStates": [
+      "LOADING",
+      "EMPTY",
+      "ERROR",
+      "FORBIDDEN",
+      "READONLY",
+      "LOCKED",
+      "STALE_CONFLICT",
+      "SUCCESS",
+      "RETRYING",
+      "UNSUPPORTED"
+    ],
+    "requiredActors": [
+      "OWNER",
+      "ISSUER",
+      "REPORTER",
+      "REVIEWER",
+      "COORDINATOR",
+      "SYSTEM_ADMIN",
+      "OUTSIDER"
+    ],
+    "requiredEvidence": [
+      "COMPONENT_TEST",
+      "BROWSER_TEST",
+      "ACCESSIBILITY_SMOKE",
+      "RESPONSIVE_REVIEW",
+      "SCREENSHOT",
+      "TRACE"
+    ]
+  },
+  "domains": {
+    "dynamicFormFieldTypes": [
+      {
+        "id": "shortText",
+        "name": "Nội dung cố định",
+        "status": "SUPPORTED",
+        "targetPhase": "P3",
+        "testPrefix": "DF-FIELD-SHORT_TEXT",
+        "uiSurface": "FORM_BUILDER_AND_REPORT_RUNTIME",
+        "notes": "Một option code; không phải free text một dòng."
+      },
+      {
+        "id": "longText",
+        "name": "Nội dung nhiều dòng",
+        "status": "SUPPORTED",
+        "targetPhase": "P3",
+        "testPrefix": "DF-FIELD-LONG_TEXT",
+        "uiSurface": "FORM_BUILDER_AND_REPORT_RUNTIME"
+      },
+      {
+        "id": "richText",
+        "name": "Soạn thảo văn bản",
+        "status": "SUPPORTED",
+        "targetPhase": "P3",
+        "testPrefix": "DF-FIELD-RICH_TEXT",
+        "uiSurface": "FORM_BUILDER_AND_REPORT_RUNTIME",
+        "notes": "Phải sanitize; không là statistic target trong v1."
+      },
+      {
+        "id": "stringList",
+        "name": "Danh sách nội dung",
+        "status": "SUPPORTED",
+        "targetPhase": "P3",
+        "testPrefix": "DF-FIELD-STRING_LIST",
+        "uiSurface": "FORM_BUILDER_AND_REPORT_RUNTIME"
+      },
+      {
+        "id": "number",
+        "name": "Số",
+        "status": "SUPPORTED",
+        "targetPhase": "P3",
+        "testPrefix": "DF-FIELD-NUMBER",
+        "uiSurface": "FORM_BUILDER_AND_REPORT_RUNTIME"
+      },
+      {
+        "id": "date",
+        "name": "Ngày hoặc kỳ linh hoạt",
+        "status": "SUPPORTED",
+        "targetPhase": "P3",
+        "testPrefix": "DF-FIELD-DATE",
+        "uiSurface": "FORM_BUILDER_AND_REPORT_RUNTIME"
+      },
+      {
+        "id": "fullDate",
+        "name": "Ngày đầy đủ",
+        "status": "SUPPORTED",
+        "targetPhase": "P3",
+        "testPrefix": "DF-FIELD-FULL_DATE",
+        "uiSurface": "FORM_BUILDER_AND_REPORT_RUNTIME"
+      },
+      {
+        "id": "singleSelect",
+        "name": "Chọn một",
+        "status": "SUPPORTED",
+        "targetPhase": "P3",
+        "testPrefix": "DF-FIELD-SINGLE_SELECT",
+        "uiSurface": "FORM_BUILDER_AND_REPORT_RUNTIME"
+      },
+      {
+        "id": "multiSelect",
+        "name": "Chọn nhiều",
+        "status": "SUPPORTED",
+        "targetPhase": "P3",
+        "testPrefix": "DF-FIELD-MULTI_SELECT",
+        "uiSurface": "FORM_BUILDER_AND_REPORT_RUNTIME"
+      },
+      {
+        "id": "boolean",
+        "name": "Có hoặc không",
+        "status": "SUPPORTED",
+        "targetPhase": "P3",
+        "testPrefix": "DF-FIELD-BOOLEAN",
+        "uiSurface": "FORM_BUILDER_AND_REPORT_RUNTIME"
+      }
+    ],
+    "dynamicFormValueSources": [
+      {
+        "id": "FIXED_ENUM",
+        "name": "Danh sách cố định trong biểu mẫu",
+        "status": "SUPPORTED",
+        "targetPhase": "P3",
+        "testPrefix": "DF-SOURCE-01",
+        "uiSurface": "FORM_FIELD_SOURCE_EDITOR"
+      },
+      {
+        "id": "ENUM_CATALOG",
+        "name": "Danh mục enum dùng chung",
+        "status": "SUPPORTED",
+        "targetPhase": "P3",
+        "testPrefix": "DF-SOURCE-02",
+        "uiSurface": "FORM_FIELD_SOURCE_EDITOR"
+      },
+      {
+        "id": "SYSTEM_UNIT",
+        "name": "Đơn vị hệ thống",
+        "status": "SUPPORTED",
+        "targetPhase": "P3",
+        "testPrefix": "DF-SOURCE-03",
+        "uiSurface": "FORM_FIELD_SOURCE_EDITOR"
+      },
+      {
+        "id": "SYSTEM_USER",
+        "name": "Người dùng hệ thống",
+        "status": "SUPPORTED",
+        "targetPhase": "P3",
+        "testPrefix": "DF-SOURCE-04",
+        "uiSurface": "FORM_FIELD_SOURCE_EDITOR"
+      },
+      {
+        "id": "SYSTEM_POSITION",
+        "name": "Chức vụ hệ thống",
+        "status": "SUPPORTED",
+        "targetPhase": "P3",
+        "testPrefix": "DF-SOURCE-05",
+        "uiSurface": "FORM_FIELD_SOURCE_EDITOR"
+      },
+      {
+        "id": "SYSTEM_UNIT_TYPE",
+        "name": "Loại đơn vị hệ thống",
+        "status": "SUPPORTED",
+        "targetPhase": "P3",
+        "testPrefix": "DF-SOURCE-06",
+        "uiSurface": "FORM_FIELD_SOURCE_EDITOR"
+      }
+    ],
+    "dynamicFormTableModes": [
+      {
+        "id": "FIXED_GRID",
+        "name": "Lưới cố định",
+        "status": "SUPPORTED",
+        "targetPhase": "P3",
+        "testPrefix": "DF-BLOCK-FIXED_GRID",
+        "uiSurface": "FORM_TABLE_BUILDER_AND_REPORT_RUNTIME"
+      },
+      {
+        "id": "APPEND_ROWS",
+        "name": "Thêm dòng",
+        "status": "SUPPORTED",
+        "targetPhase": "P3",
+        "testPrefix": "DF-BLOCK-APPEND_ROWS",
+        "uiSurface": "FORM_TABLE_BUILDER_AND_REPORT_RUNTIME"
+      },
+      {
+        "id": "APPEND_COLUMNS",
+        "name": "Thêm cột",
+        "status": "SUPPORTED",
+        "targetPhase": "P3",
+        "testPrefix": "DF-BLOCK-APPEND_COLUMNS",
+        "uiSurface": "FORM_TABLE_BUILDER_AND_REPORT_RUNTIME",
+        "notes": "Form runtime target; flow mapping chỉ được công bố sau P7."
+      },
+      {
+        "id": "MATRIX",
+        "name": "Ma trận",
+        "status": "SUPPORTED",
+        "targetPhase": "P3",
+        "testPrefix": "DF-BLOCK-MATRIX",
+        "uiSurface": "FORM_TABLE_BUILDER_AND_REPORT_RUNTIME"
+      },
+      {
+        "id": "SUMMARY_TEMPLATE",
+        "name": "Mẫu kết quả tổng hợp",
+        "status": "SUPPORTED",
+        "targetPhase": "P3",
+        "testPrefix": "DF-BLOCK-SUMMARY_TEMPLATE",
+        "uiSurface": "FORM_TABLE_BUILDER_AND_SUMMARY_RESULT",
+        "notes": "Read-only output; không dùng làm nguồn nhập trực tiếp."
+      }
+    ],
+    "dynamicFlowArchetypes": [
+      {
+        "id": "FLOW-T01",
+        "name": "Một bước, một form, một đơn vị",
+        "status": "SUPPORTED",
+        "targetPhase": "P5",
+        "testPrefix": "FLOW-T01",
+        "uiSurface": "FLOW_BUILDER_AND_INSTANCE_RUNTIME"
+      },
+      {
+        "id": "FLOW-T02",
+        "name": "Một bước fan-out nhiều đơn vị",
+        "status": "SUPPORTED",
+        "targetPhase": "P5",
+        "testPrefix": "FLOW-T02",
+        "uiSurface": "FLOW_BUILDER_AND_INSTANCE_RUNTIME",
+        "notes": "Phải atomic hoặc durable-saga và idempotent."
+      },
+      {
+        "id": "FLOW-T03",
+        "name": "Tuần tự A đến B đến C, nhiều form",
+        "status": "TARGET",
+        "targetPhase": "P6",
+        "testPrefix": "FLOW-T03",
+        "uiSurface": "FLOW_TOPOLOGY_AND_STEP_RUNTIME"
+      },
+      {
+        "id": "FLOW-T04",
+        "name": "Fork song song",
+        "status": "TARGET",
+        "targetPhase": "P6",
+        "testPrefix": "FLOW-T04",
+        "uiSurface": "FLOW_TOPOLOGY_AND_INSTANCE_TREE"
+      },
+      {
+        "id": "FLOW-T05",
+        "name": "Fan-in ALL",
+        "status": "TARGET",
+        "targetPhase": "P6",
+        "testPrefix": "FLOW-T05",
+        "uiSurface": "FLOW_GATEWAY_EDITOR_AND_INSTANCE_TREE"
+      },
+      {
+        "id": "FLOW-T06",
+        "name": "Fan-in ANY hoặc N_OF_M",
+        "status": "TARGET",
+        "targetPhase": "P6",
+        "testPrefix": "FLOW-T06",
+        "uiSurface": "FLOW_GATEWAY_EDITOR_AND_INSTANCE_TREE"
+      },
+      {
+        "id": "FLOW-T07",
+        "name": "Gateway điều kiện có kiểu",
+        "status": "TARGET",
+        "targetPhase": "P6",
+        "testPrefix": "FLOW-T07",
+        "uiSurface": "FLOW_CONDITION_EDITOR_AND_INSTANCE_TIMELINE"
+      },
+      {
+        "id": "FLOW-T08",
+        "name": "Review, trả lại và gửi lại",
+        "status": "TARGET",
+        "targetPhase": "P6",
+        "testPrefix": "FLOW-T08",
+        "uiSurface": "REPORT_REVIEW_AND_STEP_TIMELINE"
+      },
+      {
+        "id": "FLOW-T09",
+        "name": "Subflow",
+        "status": "TARGET",
+        "targetPhase": "P6",
+        "testPrefix": "FLOW-T09",
+        "uiSurface": "FLOW_SUBFLOW_EDITOR_AND_INSTANCE_TREE"
+      },
+      {
+        "id": "FLOW-T10",
+        "name": "Instance định kỳ",
+        "status": "TARGET",
+        "targetPhase": "P6",
+        "testPrefix": "FLOW-T10",
+        "uiSurface": "FLOW_SCHEDULE_EDITOR_AND_INSTANCE_LIST"
+      },
+      {
+        "id": "FLOW-T11",
+        "name": "Bước bổ sung có kiểm soát",
+        "status": "TARGET",
+        "targetPhase": "P6",
+        "testPrefix": "FLOW-T11",
+        "uiSurface": "FLOW_STEP_ACTION_AND_TIMELINE"
+      },
+      {
+        "id": "FLOW-T12",
+        "name": "Rollback, terminate, restart và finalize",
+        "status": "PATCH_REQUIRED",
+        "targetPhase": "P6",
+        "testPrefix": "FLOW-T12",
+        "uiSurface": "FLOW_INSTANCE_ACTIONS_AND_TIMELINE"
+      }
+    ],
+    "statisticsCapabilities": [
+      {
+        "id": "DIRECT_FIELD_TABLE_LABEL",
+        "name": "Projection và thống kê trực tiếp field, table, label",
+        "status": "PATCH_REQUIRED",
+        "targetPhase": "P9",
+        "testPrefix": "STAT-DIRECT",
+        "uiSurface": "STAT_RESULT_AND_DRILLDOWN"
+      },
+      {
+        "id": "BASIC_SUMMARY",
+        "name": "Tổng hợp cơ bản",
+        "status": "PATCH_REQUIRED",
+        "targetPhase": "P9",
+        "testPrefix": "STAT-BASIC",
+        "uiSurface": "STAT_CONFIG_JOB_AND_RESULT"
+      },
+      {
+        "id": "ADVANCED_SUMMARY",
+        "name": "Tổng hợp nâng cao",
+        "status": "PATCH_REQUIRED",
+        "targetPhase": "P9",
+        "testPrefix": "STAT-ADVANCED",
+        "uiSurface": "STAT_CONFIG_JOB_AND_RESULT"
+      },
+      {
+        "id": "DIFF",
+        "name": "So sánh sai khác",
+        "status": "PATCH_REQUIRED",
+        "targetPhase": "P9",
+        "testPrefix": "STAT-DIFF",
+        "uiSurface": "STAT_DIFF_CONFIG_AND_RESULT"
+      },
+      {
+        "id": "FLOW_SCOPES",
+        "name": "FLOW_BRANCH, FLOW_STEP, FLOW_EFFECTIVE_PATH và FLOW_FINAL",
+        "status": "PATCH_REQUIRED",
+        "targetPhase": "P9",
+        "testPrefix": "STAT-FLOW",
+        "uiSurface": "STAT_SCOPE_CONFIG_JOB_AND_RESULT"
+      },
+      {
+        "id": "FLOW_STATISTIC_PROFILE",
+        "name": "Flow statisticProfile executor",
+        "status": "INTENTIONAL_BLOCK",
+        "targetPhase": null,
+        "testPrefix": "STAT-PROFILE-BLOCK",
+        "uiSurface": "FLOW_STATISTIC_PROFILE_DISABLED",
+        "notes": "Giữ chặn cho tới khi có executor versioned, rebuild, permission và UAT riêng."
+      }
+    ]
+  }
+}

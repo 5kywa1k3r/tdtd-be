@@ -51,8 +51,8 @@ public sealed class WorkAssignmentReviewController : ControllerBase
         [FromBody] ApproveReportRequest req,
         CancellationToken ct)
     {
-        await _service.ApproveReportAsync(reportId, req, ct);
-        return Ok();
+        var result = await _service.ApproveReportAsync(reportId, req, ct);
+        return result.LifecycleProjectionPending ? Accepted(result) : Ok(result);
     }
 
     [HttpPost("reports/{reportId}/return")]
@@ -61,8 +61,8 @@ public sealed class WorkAssignmentReviewController : ControllerBase
         [FromBody] ReturnReportRequest req,
         CancellationToken ct)
     {
-        await _service.ReturnReportAsync(reportId, req, ct);
-        return Ok();
+        var result = await _service.ReturnReportAsync(reportId, req, ct);
+        return result.LifecycleProjectionPending ? Accepted(result) : Ok(result);
     }
 
     [HttpPost("reports/{reportId}/recall-approved")]
@@ -71,8 +71,8 @@ public sealed class WorkAssignmentReviewController : ControllerBase
         [FromBody] ReturnReportRequest req,
         CancellationToken ct)
     {
-        await _service.RecallApprovedReportAsync(reportId, req, ct);
-        return Ok();
+        var result = await _service.RecallApprovedReportAsync(reportId, req, ct);
+        return result.LifecycleProjectionPending ? Accepted(result) : Ok(result);
     }
 
     [HttpPost("reports/{reportId}/deactivate")]
@@ -81,8 +81,8 @@ public sealed class WorkAssignmentReviewController : ControllerBase
         [FromBody] ReportActiveRequest req,
         CancellationToken ct)
     {
-        await _service.DeactivateReportAsync(reportId, req, ct);
-        return Ok();
+        var result = await _service.DeactivateReportAsync(reportId, req, ct);
+        return result.LifecycleProjectionPending ? Accepted(result) : Ok(result);
     }
 
     [HttpPost("reports/{reportId}/reactivate")]
@@ -91,8 +91,8 @@ public sealed class WorkAssignmentReviewController : ControllerBase
         [FromBody] ReportActiveRequest req,
         CancellationToken ct)
     {
-        await _service.ReactivateReportAsync(reportId, req, ct);
-        return Ok();
+        var result = await _service.ReactivateReportAsync(reportId, req, ct);
+        return result.LifecycleProjectionPending ? Accepted(result) : Ok(result);
     }
 
     [HttpPost("assignments/{assignmentId}/evaluate")]

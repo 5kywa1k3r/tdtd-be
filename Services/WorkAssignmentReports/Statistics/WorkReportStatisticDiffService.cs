@@ -2,16 +2,19 @@ using System.Globalization;
 using System.Text.Json;
 using MongoDB.Bson;
 using MongoDB.Driver;
+using tdtd_be.Common.Auth;
 using tdtd_be.Common.Errors;
 using tdtd_be.Data;
 using tdtd_be.DTOs.Statistics;
 using tdtd_be.Models;
 using tdtd_be.Models.Statistics;
 using tdtd_be.Services.WorkAssignments.Internal;
+using tdtd_be.Services.StatisticsConfiguration;
+using tdtd_be.Services.StatisticsRun;
 
 namespace tdtd_be.Services.WorkAssignmentReports.Statistics;
 
-public sealed class WorkReportStatisticDiffService : IWorkReportStatisticDiffService
+public sealed partial class WorkReportStatisticDiffService : IWorkReportStatisticDiffService
 {
     private const string StatisticKind = "DIFF";
     private const int DefaultLimit = 100;
@@ -20,10 +23,20 @@ public sealed class WorkReportStatisticDiffService : IWorkReportStatisticDiffSer
     private const int MaxProjectionScanLimit = 20000;
 
     private readonly MongoDbContext _ctx;
+    private readonly MeAccessor _me;
+    private readonly IStatConfigTransactionRunner _statConfigTransactions;
+    private readonly IStatRunCandidateActivation _candidateActivation;
 
-    public WorkReportStatisticDiffService(MongoDbContext ctx)
+    public WorkReportStatisticDiffService(
+        MongoDbContext ctx,
+        MeAccessor me,
+        IStatConfigTransactionRunner statConfigTransactions,
+        IStatRunCandidateActivation candidateActivation)
     {
         _ctx = ctx;
+        _me = me;
+        _statConfigTransactions = statConfigTransactions;
+        _candidateActivation = candidateActivation;
     }
 
     public async Task<List<WorkReportStatisticDiffConfigDto>> ListConfigsAsync(
@@ -32,27 +45,9 @@ public sealed class WorkReportStatisticDiffService : IWorkReportStatisticDiffSer
         string? dynamicFormTemplateId,
         CancellationToken ct = default)
     {
-        var normalizedWorkId = NormalizeRequired(workId, "workId");
-        var fb = Builders<WorkReportStatisticDiffConfig>.Filter;
-        var filter = fb.Eq(x => x.WorkId, normalizedWorkId) &
-                     fb.Eq(x => x.IsDeleted, false) &
-                     fb.Eq(x => x.IsActive, true);
-
-        var normalizedAssignmentId = NormalizeOptionalText(assignmentId);
-        if (normalizedAssignmentId is not null)
-            filter &= fb.Eq(x => x.AssignmentId, normalizedAssignmentId);
-
-        var normalizedTemplateId = NormalizeOptionalText(dynamicFormTemplateId);
-        if (normalizedTemplateId is not null)
-            filter &= fb.Eq(x => x.DynamicFormTemplateId, normalizedTemplateId);
-
-        var configs = await _ctx.WorkReportStatisticDiffConfigs
-            .Find(filter)
-            .SortByDescending(x => x.UpdatedAtUtc)
-            .ThenBy(x => x.Name)
-            .ToListAsync(ct);
-
-        return configs.Select(ToDto).ToList();
+        _ = _me.RequireMe();
+        throw P806LegacyBlocked(
+            "DIFF_LEGACY_CONFIG_ROUTE_BLOCKED");
     }
 
     public async Task<WorkReportStatisticDiffConfigDto> SaveConfigAsync(
@@ -60,58 +55,9 @@ public sealed class WorkReportStatisticDiffService : IWorkReportStatisticDiffSer
         string? actorUserId,
         CancellationToken ct = default)
     {
-        req ??= new WorkReportStatisticDiffSaveRequest();
-        var workId = NormalizeRequired(req.WorkId, "workId");
-        var assignmentId = NormalizeRequired(req.AssignmentId, "assignmentId");
-        var dynamicFormTemplateId = NormalizeOptionalText(req.DynamicFormTemplateId);
-        var current = NormalizeTarget(req.Current, dynamicFormTemplateId, "current");
-        var comparison = NormalizeTarget(req.Comparison, dynamicFormTemplateId, "comparison");
-        var periodCompareMode = NormalizePeriodCompareMode(req.PeriodCompareMode);
-        var op = NormalizeOperator(req.Operator);
-        var joinKey = NormalizeJoinKey(req.JoinKey);
-        var requireSameConcept = req.RequireSameConcept ?? true;
-
-        EnsureRowJoinCompatible(current, comparison, joinKey);
-        EnsureConceptCompatible(current.ConceptCode, comparison.ConceptCode, requireSameConcept);
-
-        var now = DateTime.UtcNow;
-        var id = NormalizeOptionalText(req.Id);
-        var entity = id is null
-            ? null
-            : await _ctx.WorkReportStatisticDiffConfigs
-                .Find(x => x.Id == id && !x.IsDeleted)
-                .FirstOrDefaultAsync(ct);
-
-        entity ??= new WorkReportStatisticDiffConfig
-        {
-            Id = ObjectId.GenerateNewId().ToString(),
-            CreatedAtUtc = now,
-            CreatedByUserId = actorUserId
-        };
-
-        entity.WorkId = workId;
-        entity.AssignmentId = assignmentId;
-        entity.DynamicFormTemplateId = dynamicFormTemplateId;
-        entity.Name = string.IsNullOrWhiteSpace(req.Name) ? "So sánh thống kê" : req.Name.Trim();
-        entity.Current = ToSourceConfig(current);
-        entity.Comparison = ToSourceConfig(comparison);
-        entity.PeriodCompareMode = periodCompareMode;
-        entity.Operator = op;
-        entity.JoinKey = joinKey;
-        entity.RequireSameConcept = requireSameConcept;
-        entity.ConfigJson = NormalizeConfigJson(req.ConfigJson, entity);
-        entity.IsActive = true;
-        entity.IsDeleted = false;
-        entity.UpdatedAtUtc = now;
-        entity.UpdatedByUserId = actorUserId;
-
-        await _ctx.WorkReportStatisticDiffConfigs.ReplaceOneAsync(
-            x => x.Id == entity.Id,
-            entity,
-            new ReplaceOptions { IsUpsert = true },
-            ct);
-
-        return ToDto(entity);
+        _ = _me.RequireMe();
+        throw P806LegacyBlocked(
+            "DIFF_LEGACY_MUTATION_BLOCKED_USE_CAS_CONFIG_ROUTE");
     }
 
     public async Task DeleteConfigAsync(
@@ -119,95 +65,18 @@ public sealed class WorkReportStatisticDiffService : IWorkReportStatisticDiffSer
         string? actorUserId,
         CancellationToken ct = default)
     {
-        var id = NormalizeRequired(configId, "configId");
-        var update = Builders<WorkReportStatisticDiffConfig>.Update
-            .Set(x => x.IsDeleted, true)
-            .Set(x => x.IsActive, false)
-            .Set(x => x.DeletedAtUtc, DateTime.UtcNow)
-            .Set(x => x.DeletedByUserId, actorUserId)
-            .Set(x => x.UpdatedAtUtc, DateTime.UtcNow)
-            .Set(x => x.UpdatedByUserId, actorUserId);
-
-        await _ctx.WorkReportStatisticDiffConfigs.UpdateOneAsync(
-            x => x.Id == id && !x.IsDeleted,
-            update,
-            cancellationToken: ct);
+        _ = _me.RequireMe();
+        throw P806LegacyBlocked(
+            "DIFF_LEGACY_DELETE_BLOCKED_USE_CAS_CONFIG_ROUTE");
     }
 
     public async Task<WorkReportStatisticDiffRunResponse> RunAsync(
         WorkReportStatisticDiffRunRequest req,
         CancellationToken ct = default)
     {
-        req ??= new WorkReportStatisticDiffRunRequest();
-        var normalized = await NormalizeRunRequestAsync(req, ct);
-        var limit = NormalizeLimit(normalized.Limit);
-        var scanLimit = NormalizeProjectionScanLimit(limit);
-
-        var scope = await _ctx.WorkAssignments
-            .Find(x => x.Id == normalized.AssignmentId && x.WorkId == normalized.WorkId && !x.IsDeleted)
-            .FirstOrDefaultAsync(ct);
-        if (scope is null)
-            throw ReportStatisticExceptions.AssignmentNotFound(
-                StatisticKind,
-                normalized.WorkId,
-                "ASSIGNMENT",
-                normalized.AssignmentId);
-
-        var currentAssignmentIds = await LoadSourceAssignmentIdsAsync(
-            scope,
-            normalized.Current,
-            normalized.SelectedUnitIds,
-            ct);
-        var comparisonAssignmentIds = await LoadSourceAssignmentIdsAsync(
-            scope,
-            normalized.Comparison,
-            normalized.SelectedUnitIds,
-            ct);
-
-        var currentFacts = await LoadFactsAsync(
-            normalized.Current,
-            currentAssignmentIds,
-            normalized.WorkId,
-            normalized.CurrentPeriodKey,
-            normalized.AssigneeUserId,
-            normalized.ReportStatus,
-            normalized.JoinKey,
-            scanLimit,
-            ct);
-        var comparisonFacts = await LoadFactsAsync(
-            normalized.Comparison,
-            comparisonAssignmentIds,
-            normalized.WorkId,
-            normalized.ComparisonPeriodKey,
-            normalized.AssigneeUserId,
-            normalized.ReportStatus,
-            normalized.JoinKey,
-            scanLimit,
-            ct);
-
-        var rows = BuildDiffRows(normalized, currentFacts.Groups, comparisonFacts.Groups, limit);
-
-        return new WorkReportStatisticDiffRunResponse
-        {
-            WorkId = normalized.WorkId,
-            AssignmentId = normalized.AssignmentId,
-            ConfigId = normalized.ConfigId,
-            CurrentPeriodKey = normalized.CurrentPeriodKey,
-            ComparisonPeriodKey = normalized.ComparisonPeriodKey,
-            PeriodCompareMode = normalized.PeriodCompareMode,
-            Operator = normalized.Operator,
-            JoinKey = normalized.JoinKey,
-            RequireSameConcept = normalized.RequireSameConcept,
-            CurrentSourceAssignmentCount = currentAssignmentIds.Count,
-            ComparisonSourceAssignmentCount = comparisonAssignmentIds.Count,
-            CurrentProjectionCount = currentFacts.LoadedProjectionRows,
-            ComparisonProjectionCount = comparisonFacts.LoadedProjectionRows,
-            ComparedRowCount = rows.Count,
-            MatchedOperatorCount = rows.Count(x => x.MatchesOperator),
-            Truncated = currentFacts.Truncated || comparisonFacts.Truncated ||
-                        rows.Count >= limit && (currentFacts.Groups.Count > limit || comparisonFacts.Groups.Count > limit),
-            Rows = rows
-        };
+        StatConfigIsolationGuard.RejectResultMaterializer(
+            "WORK_REPORT_STATISTIC_DIFF_RUN");
+        throw new InvalidOperationException("Unreachable P9 barrier.");
     }
 
     private async Task<NormalizedRunRequest> NormalizeRunRequestAsync(
@@ -326,6 +195,7 @@ public sealed class WorkReportStatisticDiffService : IWorkReportStatisticDiffSer
         var fb = Builders<WorkReportFieldStatValue>.Filter;
         var filter = fb.Eq(x => x.WorkId, workId) &
                      fb.Eq(x => x.IsDeleted, false) &
+                     fb.Eq(x => x.DirectProjection, null) &
                      fb.In(x => x.WorkAssignmentId, assignmentIds) &
                      fb.Eq(x => x.PeriodKey, periodKey);
 
@@ -335,6 +205,8 @@ public sealed class WorkReportStatisticDiffService : IWorkReportStatisticDiffSer
             filter &= fb.Eq(x => x.FieldId, target.FieldId);
         if (!string.IsNullOrWhiteSpace(target.FieldKey))
             filter &= fb.Eq(x => x.FieldKey, target.FieldKey);
+        if (!string.IsNullOrWhiteSpace(target.StatisticLabelCode))
+            filter &= fb.AnyEq(x => x.StatisticLabelCodes, target.StatisticLabelCode);
         if (!string.IsNullOrWhiteSpace(target.ConceptCode))
             filter &= fb.Eq(x => x.ConceptCode, target.ConceptCode);
         if (!string.IsNullOrWhiteSpace(target.BucketKey))
@@ -388,6 +260,7 @@ public sealed class WorkReportStatisticDiffService : IWorkReportStatisticDiffSer
         var fb = Builders<WorkReportTableStatValue>.Filter;
         var filter = fb.Eq(x => x.WorkId, workId) &
                      fb.Eq(x => x.IsDeleted, false) &
+                     fb.Eq(x => x.DirectProjection, null) &
                      fb.In(x => x.WorkAssignmentId, assignmentIds) &
                      fb.Eq(x => x.PeriodKey, periodKey);
 
@@ -537,6 +410,7 @@ public sealed class WorkReportStatisticDiffService : IWorkReportStatisticDiffSer
             DynamicFormTemplateId = dynamicFormTemplateId,
             FieldId = NormalizeOptionalText(target.FieldId),
             FieldKey = NormalizeOptionalText(target.FieldKey),
+            StatisticLabelCode = NormalizeOptionalText(target.StatisticLabelCode)?.ToLowerInvariant(),
             BlockId = NormalizeOptionalText(target.BlockId),
             MetricKey = NormalizeOptionalText(target.MetricKey),
             MetricLabelCode = NormalizeOptionalText(target.MetricLabelCode),
@@ -553,6 +427,7 @@ public sealed class WorkReportStatisticDiffService : IWorkReportStatisticDiffSer
 
         var hasFieldSelector = !string.IsNullOrWhiteSpace(normalized.FieldId) ||
                                !string.IsNullOrWhiteSpace(normalized.FieldKey) ||
+                               !string.IsNullOrWhiteSpace(normalized.StatisticLabelCode) ||
                                !string.IsNullOrWhiteSpace(normalized.ConceptCode);
         var hasTableSelector = !string.IsNullOrWhiteSpace(normalized.BlockId) ||
                                !string.IsNullOrWhiteSpace(normalized.MetricKey) ||
@@ -784,6 +659,7 @@ public sealed class WorkReportStatisticDiffService : IWorkReportStatisticDiffSer
             DynamicFormTemplateId = x.DynamicFormTemplateId,
             FieldId = x.FieldId,
             FieldKey = x.FieldKey,
+            StatisticLabelCode = x.StatisticLabelCode,
             BlockId = x.BlockId,
             MetricKey = x.MetricKey,
             MetricLabelCode = x.MetricLabelCode,
@@ -805,6 +681,7 @@ public sealed class WorkReportStatisticDiffService : IWorkReportStatisticDiffSer
             DynamicFormTemplateId = x.DynamicFormTemplateId,
             FieldId = x.FieldId,
             FieldKey = x.FieldKey,
+            StatisticLabelCode = x.StatisticLabelCode,
             BlockId = x.BlockId,
             MetricKey = x.MetricKey,
             MetricLabelCode = x.MetricLabelCode,

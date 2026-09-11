@@ -192,6 +192,16 @@ public sealed class AssignmentListDocRole : DocRoleReadModelBase
     [BsonElement("dynamicFormTemplateName")]
     public string? DynamicFormTemplateName { get; set; }
 
+    [BsonElement("dynamicFormFamilyId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? DynamicFormFamilyId { get; set; }
+
+    [BsonElement("dynamicFormVersionNo")]
+    public int? DynamicFormVersionNo { get; set; }
+
+    [BsonElement("dynamicFormSchemaHash")]
+    public string? DynamicFormSchemaHash { get; set; }
+
     [BsonElement("dynamicFormDataSourceRulesJson")]
     public string? DynamicFormDataSourceRulesJson { get; set; }
 
@@ -422,6 +432,16 @@ public sealed class MyReportPeriodListDocRole : DocRoleReadModelBase
     [BsonElement("dynamicFormTemplateName")]
     public string? DynamicFormTemplateName { get; set; }
 
+    [BsonElement("dynamicFormFamilyId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? DynamicFormFamilyId { get; set; }
+
+    [BsonElement("dynamicFormVersionNo")]
+    public int? DynamicFormVersionNo { get; set; }
+
+    [BsonElement("dynamicFormSchemaHash")]
+    public string? DynamicFormSchemaHash { get; set; }
+
     [BsonElement("periodKey")]
     public string PeriodKey { get; set; } = string.Empty;
 
@@ -571,6 +591,16 @@ public sealed class ReviewReportListDocRole : DocRoleReadModelBase
     [BsonElement("dynamicFormTemplateName")]
     public string? DynamicFormTemplateName { get; set; }
 
+    [BsonElement("dynamicFormFamilyId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? DynamicFormFamilyId { get; set; }
+
+    [BsonElement("dynamicFormVersionNo")]
+    public int? DynamicFormVersionNo { get; set; }
+
+    [BsonElement("dynamicFormSchemaHash")]
+    public string? DynamicFormSchemaHash { get; set; }
+
     [BsonElement("assigneeUserId")]
     [BsonRepresentation(BsonType.ObjectId)]
     public string AssigneeUserId { get; set; } = default!;
@@ -642,6 +672,12 @@ public sealed class ReviewReportListDocRole : DocRoleReadModelBase
 
     [BsonElement("reportStatus")]
     public WorkAssignmentReportStatus? ReportStatus { get; set; }
+
+    [BsonElement("payloadRevision")]
+    public int PayloadRevision { get; set; }
+
+    [BsonElement("lifecycleRevision")]
+    public int LifecycleRevision { get; set; }
 
     [BsonElement("reportIsActive")]
     public bool ReportIsActive { get; set; } = true;

@@ -130,4 +130,8 @@ public sealed class WorkReportTableStatAggregate : BaseEntity
     [BsonElement("latestDateUtc")]
     [BsonDateTimeOptions(Kind = DateTimeKind.Utc)]
     public DateTime? LatestDateUtc { get; set; }
+
+    [BsonElement("directProjection")]
+    [BsonIgnoreIfNull]
+    public WorkReportDirectProjectionPin? DirectProjection { get; set; }
 }

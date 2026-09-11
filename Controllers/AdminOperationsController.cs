@@ -2,9 +2,11 @@ using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using tdtd_be.Common.Auth;
 using tdtd_be.DTOs.Operations;
+using tdtd_be.DTOs.StatisticsConfiguration;
 using tdtd_be.DTOs.WorkAssignments.AdvancedSummary;
 using tdtd_be.Models;
 using tdtd_be.Services.Common;
+using tdtd_be.Services.StatisticsConfiguration;
 using tdtd_be.Services.WorkAssignmentReports.Payloads;
 
 namespace tdtd_be.Controllers;
@@ -278,6 +280,39 @@ public sealed class AdminOperationsController : ControllerBase
         return Ok(new { ok = true, processed, maxJobs = Math.Clamp(maxJobs, 1, 200) });
     }
 
+    [HttpPost("job-runs/lifecycle-projection-outbox/process")]
+    public async Task<IActionResult> ProcessLifecycleProjectionOutbox(
+        [FromQuery] int maxReports = 20,
+        CancellationToken ct = default)
+    {
+        RequireSystemAdmin();
+
+        var clamped = Math.Clamp(maxReports, 1, 200);
+        var processed = await _jobRuns.ProcessWorkReportLifecycleProjectionOutboxAsync(clamped, ct);
+        return Ok(new { ok = true, processed, maxReports = clamped });
+    }
+
+    [HttpPost("job-runs/dynamic-flow-mapping-outbox/process")]
+    public async Task<IActionResult> ProcessDynamicFlowMappingOutbox(
+        [FromQuery] int maxItems = 20,
+        CancellationToken ct = default)
+    {
+        RequireSystemAdmin();
+
+        var clamped = Math.Clamp(maxItems, 1, 200);
+        var processed =
+            await _jobRuns.ProcessDynamicFlowMappingOutboxAsync(
+                clamped,
+                ct);
+        return Ok(
+            new
+            {
+                ok = true,
+                processed,
+                maxItems = clamped
+            });
+    }
+
     [HttpGet("job-runs/statistic-rebuild-jobs")]
     public async Task<IActionResult> SearchStatisticRebuildJobs(
         [FromQuery] string? status = null,
@@ -295,6 +330,7 @@ public sealed class AdminOperationsController : ControllerBase
         CancellationToken ct = default)
     {
         RequireSystemAdmin();
+        StatConfigPhaseBarrier.Reject(StatConfigPhaseBarrierEntries.P9Projection);
 
         return Ok(await _jobRuns.SearchStatisticRebuildJobsAsync(new JobRunSearchRequest
         {
@@ -321,6 +357,7 @@ public sealed class AdminOperationsController : ControllerBase
     {
         var me = _me.RequireMe();
         RoleGuard.RequireSystemAdmin(me);
+        StatConfigPhaseBarrier.Reject(StatConfigPhaseBarrierEntries.P9Projection);
         var startedAtUtc = DateTime.UtcNow;
 
         try
@@ -350,6 +387,7 @@ public sealed class AdminOperationsController : ControllerBase
     {
         var me = _me.RequireMe();
         RoleGuard.RequireSystemAdmin(me);
+        StatConfigPhaseBarrier.Reject(StatConfigPhaseBarrierEntries.P9Projection);
         var startedAtUtc = DateTime.UtcNow;
 
         try
@@ -381,6 +419,7 @@ public sealed class AdminOperationsController : ControllerBase
         CancellationToken ct = default)
     {
         RequireSystemAdmin();
+        StatConfigPhaseBarrier.Reject(StatConfigPhaseBarrierEntries.P9Projection);
 
         return Ok(await _jobRuns.DiagnoseFlowStatisticProjectionAsync(
             new FlowStatisticProjectionDiagnosticsRequest
@@ -409,6 +448,7 @@ public sealed class AdminOperationsController : ControllerBase
         CancellationToken ct = default)
     {
         RequireSystemAdmin();
+        StatConfigPhaseBarrier.Reject(StatConfigPhaseBarrierEntries.P9Result);
 
         return Ok(await _jobRuns.SearchBasicSummaryJobsAsync(new JobRunSearchRequest
         {
@@ -431,6 +471,7 @@ public sealed class AdminOperationsController : ControllerBase
     {
         var me = _me.RequireMe();
         RoleGuard.RequireSystemAdmin(me);
+        StatConfigPhaseBarrier.Reject(StatConfigPhaseBarrierEntries.P9Result);
 
         return Ok(await _jobRuns.ResetBasicSummaryJobAsync(snapshotId, me.Id, ct));
     }
@@ -452,6 +493,7 @@ public sealed class AdminOperationsController : ControllerBase
         CancellationToken ct = default)
     {
         RequireSystemAdmin();
+        StatConfigPhaseBarrier.Reject(StatConfigPhaseBarrierEntries.P9Result);
 
         return Ok(await _jobRuns.SearchAdvancedSummaryNodesAsync(new JobRunSearchRequest
         {
@@ -478,6 +520,7 @@ public sealed class AdminOperationsController : ControllerBase
     {
         var me = _me.RequireMe();
         RoleGuard.RequireSystemAdmin(me);
+        StatConfigPhaseBarrier.Reject(StatConfigPhaseBarrierEntries.P9Result);
 
         return Ok(await _jobRuns.ResetAdvancedSummaryNodeAsync(grain, nodeId, me.Id, ct));
     }
@@ -489,6 +532,7 @@ public sealed class AdminOperationsController : ControllerBase
     {
         var me = _me.RequireMe();
         RoleGuard.RequireSystemAdmin(me);
+        StatConfigPhaseBarrier.Reject(StatConfigPhaseBarrierEntries.P9Result);
         request ??= new AdvancedSummaryNodeCleanupRequest();
         var startedAtUtc = DateTime.UtcNow;
 
@@ -512,6 +556,7 @@ public sealed class AdminOperationsController : ControllerBase
     {
         var me = _me.RequireMe();
         RoleGuard.RequireSystemAdmin(me);
+        StatConfigPhaseBarrier.Reject(StatConfigPhaseBarrierEntries.P9Result);
         request ??= new DiagnoseWorkAssignmentAdvancedSummaryDayNodeRequest();
 
         return Ok(await _jobRuns.DiagnoseAdvancedSummaryDayNodeAsync(
@@ -529,6 +574,7 @@ public sealed class AdminOperationsController : ControllerBase
     {
         var me = _me.RequireMe();
         RoleGuard.RequireSystemAdmin(me);
+        StatConfigPhaseBarrier.Reject(StatConfigPhaseBarrierEntries.P9Result);
         request ??= new DiagnoseWorkAssignmentAdvancedSummaryMonthNodeRequest();
 
         return Ok(await _jobRuns.DiagnoseAdvancedSummaryMonthNodeAsync(
@@ -546,6 +592,7 @@ public sealed class AdminOperationsController : ControllerBase
     {
         var me = _me.RequireMe();
         RoleGuard.RequireSystemAdmin(me);
+        StatConfigPhaseBarrier.Reject(StatConfigPhaseBarrierEntries.P9Result);
         request ??= new DiagnoseWorkAssignmentAdvancedSummaryYearNodeRequest();
 
         return Ok(await _jobRuns.DiagnoseAdvancedSummaryYearNodeAsync(

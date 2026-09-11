@@ -76,6 +76,7 @@ public sealed class UserActionLogUnitDto
 
 public sealed class UserActionLogSeed
 {
+    public string? IdempotencyKey { get; init; }
     public string Action { get; init; } = string.Empty;
     public string Scope { get; init; } = string.Empty;
     public string? ActorUserId { get; init; }

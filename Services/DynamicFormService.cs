@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
@@ -11,9 +12,10 @@ using tdtd_be.DTOs.Auth;
 using tdtd_be.DTOs.Common;
 using tdtd_be.DTOs.DynamicExcel;
 using tdtd_be.DTOs.DynamicForms;
-using tdtd_be.Jobs;
+using tdtd_be.DTOs.StatisticsConfiguration;
 using tdtd_be.Models;
-using tdtd_be.Services.WorkAssignmentReports.Statistics;
+using tdtd_be.Services.DynamicForms;
+using tdtd_be.Services.StatisticsConfiguration;
 
 namespace tdtd_be.Services;
 
@@ -23,16 +25,31 @@ public interface IDynamicFormService
     Task<DynamicFormDetail> GetByIdAsync(string id, CancellationToken ct);
     Task<NextCodeResp> GetNextCodeAsync(int? year, CancellationToken ct);
     Task<DynamicFormDetail> CreateAsync(CreateDynamicFormReq req, CancellationToken ct);
-    Task<DynamicFormDetail> UpdateAsync(string id, UpdateDynamicFormReq req, CancellationToken ct);
-    Task<DynamicFormStatisticConfigUpdateResp> UpdateStatisticConfigAsync(
+    Task<DynamicFormVersionHistoryResp> GetVersionHistoryAsync(string id, CancellationToken ct);
+    Task<DynamicFormDetail> CreateNextVersionAsync(
         string id,
-        UpdateDynamicFormStatisticConfigReq req,
+        CreateDynamicFormVersionReq req,
         CancellationToken ct);
-    Task<DynamicFormDetail> PublishAsync(string id, CancellationToken ct);
+    Task<DynamicFormDetail> UpdateAsync(string id, UpdateDynamicFormReq req, CancellationToken ct);
+    Task<DynamicFormStatisticConfigResult> GetStatisticsAsync(
+        string id,
+        CancellationToken ct);
+    Task<DynamicFormStatisticConfigResult> PatchStatisticsAsync(
+        string id,
+        JsonElement body,
+        CancellationToken ct);
+    Task<DynamicFormStatisticConfigResult> GetStatisticConfigAsync(
+        string id,
+        CancellationToken ct);
+    Task<DynamicFormStatisticConfigResult> UpdateStatisticConfigAsync(
+        string id,
+        JsonElement body,
+        CancellationToken ct);
+    Task<DynamicFormDetail> PublishAsync(string id, PublishDynamicFormReq? req, CancellationToken ct);
     Task<DynamicFormDetail> CloneAsync(string id, CloneDynamicFormReq req, CancellationToken ct);
     Task<DynamicFormDetail> WrapDynamicExcelAsync(WrapDynamicExcelAsFormReq req, CancellationToken ct);
     Task<DynamicFormDetail> ImportDynamicExcelBlockAsync(string id, ImportDynamicExcelBlockReq req, CancellationToken ct);
-    Task DeleteAsync(string id, CancellationToken ct);
+    Task DeleteAsync(string id, int? expectedRevision, CancellationToken ct);
 }
 
 public sealed class DynamicFormService : IDynamicFormService
@@ -68,8 +85,40 @@ public sealed class DynamicFormService : IDynamicFormService
         "co khong"
     };
     private const int MaxFieldsPerForm = 200;
+    private const int MaxOptionsPerSelectField = 100;
     private const int MaxTableBlocksPerForm = 30;
     private const int MaxLabelStatisticTargetsPerForm = 30;
+    private const int MaxSchemaPayloadBytes = 1024 * 1024;
+    private const int MaxSearchTermLength = 200;
+    private const int MaxSearchOffset = 100_000;
+    private static readonly HashSet<string> AllowedFieldTypes = new(StringComparer.Ordinal)
+    {
+        "shortText",
+        "longText",
+        "richText",
+        "stringList",
+        "number",
+        "date",
+        "fullDate",
+        "singleSelect",
+        "multiSelect",
+        "boolean"
+    };
+    private static readonly HashSet<string> ChoiceFieldTypes = new(StringComparer.Ordinal)
+    {
+        "shortText",
+        "singleSelect",
+        "multiSelect"
+    };
+    private static readonly HashSet<string> AllowedFieldValueSourceTypes = new(StringComparer.Ordinal)
+    {
+        LabelValueSourceTypes.FixedEnum,
+        LabelValueSourceTypes.EnumCatalog,
+        LabelValueSourceTypes.SystemUnit,
+        LabelValueSourceTypes.SystemUser,
+        LabelValueSourceTypes.SystemPosition,
+        LabelValueSourceTypes.SystemUnitType
+    };
     private static readonly HashSet<string> AllowedTableModes = new(StringComparer.OrdinalIgnoreCase)
     {
         "FIXED_GRID",
@@ -102,18 +151,18 @@ public sealed class DynamicFormService : IDynamicFormService
 
     private readonly MongoDbContext _ctx;
     private readonly MeAccessor _me;
-    private readonly IWorkReportStatisticRebuildJobService _statisticRebuildJobs;
+    private readonly IDynamicFormStatisticConfigCommandService _statisticConfig;
     private readonly ILabelEnumCatalogService _enumCatalogs;
 
     public DynamicFormService(
         MongoDbContext ctx,
         MeAccessor me,
-        IWorkReportStatisticRebuildJobService statisticRebuildJobs,
+        IDynamicFormStatisticConfigCommandService statisticConfig,
         ILabelEnumCatalogService enumCatalogs)
     {
         _ctx = ctx;
         _me = me;
-        _statisticRebuildJobs = statisticRebuildJobs;
+        _statisticConfig = statisticConfig;
         _enumCatalogs = enumCatalogs;
     }
 
@@ -129,30 +178,45 @@ public sealed class DynamicFormService : IDynamicFormService
         var me = _me.RequireMe();
         var page = Math.Max(0, req.Page);
         var pageSize = Math.Clamp(req.PageSize, 1, 100);
+        var searchOffset = (long)page * pageSize;
+        if (searchOffset > MaxSearchOffset)
+        {
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.COMMON_VALIDATION_FAILED,
+                new
+                {
+                    reason = "DYNAMIC_FORM_SEARCH_OFFSET_TOO_LARGE",
+                    page,
+                    pageSize,
+                    maxOffset = MaxSearchOffset
+                });
+        }
 
         var f = Builders<DynamicFormTemplate>.Filter;
         var filter = f.Eq(x => x.IsDeleted, false);
         var approvedIds = await LoadApprovedCloneTemplateIdsAsync(me.Id, ct);
-        filter &= BuildVisibleFilter(me.Id, approvedIds);
+        filter &= BuildVisibleFilter(me, approvedIds);
 
         if (!string.IsNullOrWhiteSpace(req.Code))
         {
-            filter &= f.Regex("code", new BsonRegularExpression(req.Code.Trim(), "i"));
+            filter &= f.Regex("code", BuildLiteralSearchRegex(req.Code, nameof(req.Code)));
         }
 
         if (!string.IsNullOrWhiteSpace(req.Name))
         {
-            filter &= f.Regex("name", new BsonRegularExpression(req.Name.Trim(), "i"));
+            filter &= f.Regex("name", BuildLiteralSearchRegex(req.Name, nameof(req.Name)));
         }
 
         if (!string.IsNullOrWhiteSpace(req.CreatedBy))
         {
-            filter &= f.Regex("createdByUsername", new BsonRegularExpression(req.CreatedBy.Trim(), "i"));
+            filter &= f.Regex(
+                "createdByUsername",
+                BuildLiteralSearchRegex(req.CreatedBy, nameof(req.CreatedBy)));
         }
 
         if (!string.IsNullOrWhiteSpace(req.Q))
         {
-            var rx = new BsonRegularExpression(req.Q.Trim(), "i");
+            var rx = BuildLiteralSearchRegex(req.Q, nameof(req.Q));
             filter &= f.Regex("code", rx) | f.Regex("name", rx);
         }
 
@@ -178,7 +242,7 @@ public sealed class DynamicFormService : IDynamicFormService
         var docs = await _ctx.DynamicFormTemplates
             .Find(filter)
             .Sort(sort)
-            .Skip(page * pageSize)
+            .Skip((int)searchOffset)
             .Limit(pageSize)
             .ToListAsync(ct);
 
@@ -194,9 +258,148 @@ public sealed class DynamicFormService : IDynamicFormService
         return await ToDetailAsync(doc, me, ct);
     }
 
+    public async Task<DynamicFormVersionHistoryResp> GetVersionHistoryAsync(
+        string id,
+        CancellationToken ct)
+    {
+        var me = _me.RequireMe();
+        var source = await LoadAsync(id, ct);
+        RequireCanReadVersionHistory(me, source);
+
+        var familyId = EffectiveFamilyId(source);
+        var versions = await _ctx.DynamicFormTemplates
+            .Find(BuildFamilyFilter(familyId))
+            .SortByDescending(x => x.VersionNo)
+            .ThenByDescending(x => x.CreatedAtUtc)
+            .ToListAsync(ct);
+        var rows = versions
+            .Select(x => ToRow(x, me, new HashSet<string>(StringComparer.Ordinal)))
+            .ToArray();
+        return new DynamicFormVersionHistoryResp(familyId, source.Code, rows);
+    }
+
+    public async Task<DynamicFormDetail> CreateNextVersionAsync(
+        string id,
+        CreateDynamicFormVersionReq req,
+        CancellationToken ct)
+    {
+        var me = _me.RequireMe();
+        var source = await LoadAsync(id, ct);
+        RequireCanMutate(me, source);
+        var expectedRevision = RequireExpectedRevision(req.ExpectedRevision, source);
+        if (!source.IsPublished)
+        {
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.DYNAMIC_FORM_PUBLISHED_REQUIRED,
+                DynamicFormDetails(source, me.Id));
+        }
+
+        _ = RequirePublishedSchemaIntegrity(source);
+
+        var familyId = EffectiveFamilyId(source);
+        var latest = await _ctx.DynamicFormTemplates
+            .Find(BuildFamilyFilter(familyId))
+            .SortByDescending(x => x.VersionNo)
+            .ThenByDescending(x => x.CreatedAtUtc)
+            .FirstOrDefaultAsync(ct);
+        if (latest is null ||
+            !string.Equals(latest.Id, source.Id, StringComparison.Ordinal) ||
+            !latest.IsPublished)
+        {
+            throw AppExceptionFactory.Create(
+                AppErrorCode.DYNAMIC_FORM_VERSION_CONFLICT,
+                new
+                {
+                    familyId,
+                    sourceVersionId = source.Id,
+                    sourceRevision = expectedRevision,
+                    latestVersionId = latest?.Id,
+                    latestVersionNo = latest?.VersionNo,
+                    latestIsPublished = latest?.IsPublished,
+                    reason = latest is not null && !latest.IsPublished
+                        ? "DYNAMIC_FORM_VERSION_DRAFT_EXISTS"
+                        : "DYNAMIC_FORM_VERSION_SOURCE_NOT_LATEST"
+                });
+        }
+
+        EnsureFieldsLimit(source.FieldsJson);
+        EnsureFieldDisplayNames(source.FieldsJson);
+        EnsureFieldSchemaContract(source.FieldsJson, source.SectionsJson);
+        var retainedDynamicExcelTemplateIds = ExtractDynamicExcelTemplateIds(source.BlocksJson, source.ExcelBlockJson);
+        var blocksJson = NormalizeBlocksJson(source.BlocksJson, source.ExcelBlockJson);
+        blocksJson = NormalizeBlocksForSections(blocksJson, source.SectionsJson);
+        blocksJson = await NormalizeBlocksForDynamicExcelTemplatesAsync(
+            me,
+            blocksJson,
+            ct,
+            retainedDynamicExcelTemplateIds);
+        blocksJson = CarryForwardTableStatisticMetadata(
+            source.BlocksJson,
+            blocksJson);
+        var excelBlockJson = ExtractFirstBlockJson(blocksJson);
+        EnsureTableStatisticContract(excelBlockJson, "ExcelBlockJson");
+        EnsureBlocksTableStatisticContract(blocksJson, "BlocksJson");
+        EnsureSchemaPayloadBudget(source.SectionsJson, source.FieldsJson, blocksJson);
+        EnsureTypedSchemaProjection(
+            source.SectionsJson,
+            source.FieldsJson,
+            excelBlockJson,
+            blocksJson);
+
+        var now = DateTime.UtcNow;
+        var versionId = ObjectId.GenerateNewId().ToString();
+        var next = new DynamicFormTemplate
+        {
+            Id = versionId,
+            Code = source.Code,
+            Name = string.IsNullOrWhiteSpace(req.Name) ? source.Name : NormalizeName(req.Name),
+            Description = req.Description is null ? source.Description : NormalizeOptionalText(req.Description),
+            TagCodes = source.TagCodes,
+            // A version remains owned by the same form family. The actor can be an
+            // administrator, but creating a successor must not silently transfer
+            // owner permissions away from the family owner.
+            CreatedByUsername = source.CreatedByUsername,
+            SchemaVersion = source.SchemaVersion,
+            VersionNo = Math.Max(1, source.VersionNo) + 1,
+            FamilyId = familyId,
+            PreviousVersionId = source.Id,
+            LineageStatus = DynamicFormLineageStatuses.Version,
+            Revision = 1,
+            IsActive = true,
+            IsPublished = false,
+            SectionsJson = source.SectionsJson,
+            FieldsJson = source.FieldsJson,
+            ExcelBlockJson = excelBlockJson,
+            BlocksJson = blocksJson,
+            ExcelBlockDynamicExcelTemplateId =
+                source.ExcelBlockDynamicExcelTemplateId
+                ?? ExtractPrimaryBlockDynamicExcelTemplateId(excelBlockJson, blocksJson),
+            CreatedAtUtc = now,
+            UpdatedAtUtc = now,
+            CreatedByUserId = source.CreatedByUserId,
+            UpdatedByUserId = me.Id,
+            IsDeleted = false,
+        };
+
+        await ReserveNextVersionAsync(source, expectedRevision, me.Id, now, ct);
+        await InsertDynamicFormVersionAsync(next, source, expectedRevision, ct);
+        return await ToDetailAsync(next, me, ct);
+    }
+
     public async Task<DynamicFormDetail> CreateAsync(CreateDynamicFormReq req, CancellationToken ct)
     {
         var me = _me.RequireMe();
+        var schemaInput = DynamicFormSchemaAdapter.ResolveInput(
+            req.Schema,
+            req.SectionsJson,
+            req.FieldsJson,
+            req.ExcelBlockJson,
+            req.BlocksJson);
+        EnsureTypedSchemaProjection(
+            schemaInput.SectionsJson,
+            schemaInput.FieldsJson,
+            schemaInput.ExcelBlockJson,
+            schemaInput.BlocksJson);
         var now = DateTime.UtcNow;
         var code = NormalizeCode(req.Code);
         if (string.IsNullOrWhiteSpace(code))
@@ -206,13 +409,17 @@ public sealed class DynamicFormService : IDynamicFormService
         }
 
         var tagCodes = NormalizeLabelCodes(req.TagCodes);
-        var sectionsJson = NormalizeJsonArray(req.SectionsJson, "SectionsJson");
-        var fieldsJson = NormalizeJsonArray(req.FieldsJson, "FieldsJson");
+        var sectionsJson = NormalizeJsonArray(schemaInput.SectionsJson, "SectionsJson");
+        var fieldsJson = NormalizeJsonArray(schemaInput.FieldsJson, "FieldsJson");
         EnsureFieldsLimit(fieldsJson);
         EnsureFieldDisplayNames(fieldsJson);
-        fieldsJson = NormalizeFieldPayload(fieldsJson, existingFieldsJson: null);
-        var excelBlockJson = NormalizeOptionalJsonObject(req.ExcelBlockJson, "ExcelBlockJson");
-        var blocksJson = NormalizeBlocksJson(req.BlocksJson, excelBlockJson);
+        fieldsJson = NormalizeFieldPayload(fieldsJson, existingFieldsJson: null)
+                     ?? "[]";
+        EnsureNoAlternateFieldStatisticCreate(fieldsJson);
+        EnsureFieldSchemaContract(fieldsJson, sectionsJson);
+        var excelBlockJson = NormalizeOptionalJsonObject(schemaInput.ExcelBlockJson, "ExcelBlockJson");
+        var blocksJson = NormalizeBlocksJson(schemaInput.BlocksJson, excelBlockJson);
+        EnsureNoAlternateTableStatisticCreate(blocksJson);
         blocksJson = NormalizeBlocksForSections(blocksJson, sectionsJson);
         blocksJson = await NormalizeBlocksForDynamicExcelTemplatesAsync(me, blocksJson, ct);
         excelBlockJson = ExtractFirstBlockJson(blocksJson);
@@ -221,9 +428,13 @@ public sealed class DynamicFormService : IDynamicFormService
         await EnsureLabelReferencesAsync(me, tagCodes, sectionsJson, fieldsJson, excelBlockJson, blocksJson, ct);
         await _enumCatalogs.ValidateVisibleActiveCatalogsAsync(ExtractEnumCatalogIds(fieldsJson, excelBlockJson, blocksJson), ct);
         EnsureUniqueLabelStatisticTargets(fieldsJson, blocksJson);
+        EnsureSchemaPayloadBudget(sectionsJson, fieldsJson, blocksJson);
+        EnsureTypedSchemaProjection(sectionsJson, fieldsJson, excelBlockJson, blocksJson);
 
+        var docId = ObjectId.GenerateNewId().ToString();
         var doc = new DynamicFormTemplate
         {
+            Id = docId,
             Code = code,
             Name = NormalizeName(req.Name),
             Description = NormalizeOptionalText(req.Description),
@@ -231,6 +442,9 @@ public sealed class DynamicFormService : IDynamicFormService
             CreatedByUsername = me.Username,
             SchemaVersion = Math.Max(1, req.SchemaVersion ?? 1),
             VersionNo = 1,
+            FamilyId = docId,
+            LineageStatus = DynamicFormLineageStatuses.Root,
+            Revision = 1,
             IsActive = req.IsActive,
             IsPublished = false,
             SectionsJson = sectionsJson,
@@ -245,7 +459,7 @@ public sealed class DynamicFormService : IDynamicFormService
             IsDeleted = false,
         };
 
-        await _ctx.DynamicFormTemplates.InsertOneAsync(doc, cancellationToken: ct);
+        await InsertDynamicFormAsync(doc, ct);
         return await ToDetailAsync(doc, me, ct);
     }
 
@@ -255,27 +469,51 @@ public sealed class DynamicFormService : IDynamicFormService
         var doc = await LoadAsync(id, ct);
 
         RequireCanMutate(me, doc);
+        var expectedRevision = RequireExpectedRevision(req.ExpectedRevision, doc);
         EnsureDraftTemplate(doc);
         await EnsureNotLinkedToRuntimeAsync(id, ct);
+        var schemaInput = DynamicFormSchemaAdapter.ResolveInput(
+            req.Schema,
+            req.SectionsJson,
+            req.FieldsJson,
+            req.ExcelBlockJson,
+            req.BlocksJson);
+        EnsureTypedSchemaProjection(
+            schemaInput.SectionsJson,
+            schemaInput.FieldsJson,
+            schemaInput.ExcelBlockJson,
+            schemaInput.BlocksJson);
         var retainedDynamicExcelTemplateIds = ExtractDynamicExcelTemplateIds(doc.BlocksJson, doc.ExcelBlockJson);
 
         var now = DateTime.UtcNow;
         var tagCodes = NormalizeLabelCodes(req.TagCodes);
-        var sectionsJson = NormalizeJsonArray(req.SectionsJson, "SectionsJson");
-        var fieldsJson = NormalizeJsonArray(req.FieldsJson, "FieldsJson");
+        var sectionsJson = NormalizeJsonArray(schemaInput.SectionsJson, "SectionsJson");
+        var fieldsJson = NormalizeJsonArray(schemaInput.FieldsJson, "FieldsJson");
         EnsureFieldsLimit(fieldsJson);
         EnsureFieldDisplayNames(fieldsJson);
-        fieldsJson = NormalizeFieldPayload(fieldsJson, doc.FieldsJson);
-        var excelBlockJson = NormalizeOptionalJsonObject(req.ExcelBlockJson, "ExcelBlockJson");
-        var blocksJson = NormalizeBlocksJson(req.BlocksJson, excelBlockJson);
+        fieldsJson = NormalizeFieldPayload(fieldsJson, doc.FieldsJson)
+                     ?? "[]";
+        EnsureNoAlternateFieldStatisticUpdate(doc.FieldsJson, fieldsJson);
+        EnsureFieldSchemaContract(fieldsJson, sectionsJson);
+        var excelBlockJson = NormalizeOptionalJsonObject(schemaInput.ExcelBlockJson, "ExcelBlockJson");
+        var blocksJson = NormalizeBlocksJson(schemaInput.BlocksJson, excelBlockJson);
+        EnsureNoAlternateTableStatisticUpdate(
+            NormalizeBlocksJson(doc.BlocksJson, doc.ExcelBlockJson),
+            blocksJson,
+            doc.StatisticConfigSections?.TableSectionJson);
         blocksJson = NormalizeBlocksForSections(blocksJson, sectionsJson);
         blocksJson = await NormalizeBlocksForDynamicExcelTemplatesAsync(me, blocksJson, ct, retainedDynamicExcelTemplateIds);
+        blocksJson = CarryForwardTableStatisticMetadata(
+            doc.BlocksJson,
+            blocksJson);
         excelBlockJson = ExtractFirstBlockJson(blocksJson);
         EnsureTableStatisticContract(excelBlockJson, "ExcelBlockJson");
         EnsureBlocksTableStatisticContract(blocksJson, "BlocksJson");
         await EnsureLabelReferencesAsync(me, tagCodes, sectionsJson, fieldsJson, excelBlockJson, blocksJson, ct);
         await _enumCatalogs.ValidateVisibleActiveCatalogsAsync(ExtractEnumCatalogIds(fieldsJson, excelBlockJson, blocksJson), ct);
         EnsureUniqueLabelStatisticTargets(fieldsJson, blocksJson);
+        EnsureSchemaPayloadBudget(sectionsJson, fieldsJson, blocksJson);
+        EnsureTypedSchemaProjection(sectionsJson, fieldsJson, excelBlockJson, blocksJson);
 
         var update = Builders<DynamicFormTemplate>.Update
             .Set(x => x.Name, NormalizeName(req.Name))
@@ -289,100 +527,64 @@ public sealed class DynamicFormService : IDynamicFormService
             .Set(x => x.BlocksJson, blocksJson)
             .Set(x => x.ExcelBlockDynamicExcelTemplateId, ExtractPrimaryBlockDynamicExcelTemplateId(excelBlockJson, blocksJson))
             .Set(x => x.UpdatedAtUtc, now)
-            .Set(x => x.UpdatedByUserId, me.Id);
+            .Set(x => x.UpdatedByUserId, me.Id)
+            .Set(x => x.Revision, expectedRevision + 1);
 
-        var res = await _ctx.DynamicFormTemplates.UpdateOneAsync(
-            x => x.Id == id && !x.IsDeleted,
-            update,
-            cancellationToken: ct);
+        UpdateResult res;
+        try
+        {
+            res = await _ctx.DynamicFormTemplates.UpdateOneAsync(
+                BuildRevisionFilter(id, expectedRevision, requireDraft: true),
+                update,
+                cancellationToken: ct);
+        }
+        catch (MongoWriteException ex) when (
+            !string.IsNullOrWhiteSpace(doc.WrapReuseKey) &&
+            req.IsActive &&
+            ex.WriteError?.Category == ServerErrorCategory.DuplicateKey)
+        {
+            throw new AppException(
+                AppErrorCode.DYNAMIC_FORM_WRAP_REUSE_CONFLICT,
+                new
+                {
+                    reason = "DYNAMIC_FORM_ACTIVE_WRAP_REUSE_EXISTS",
+                    action = "RELOAD_DYNAMIC_FORM_LIST",
+                },
+                innerException: ex);
+        }
 
         if (res.MatchedCount == 0)
-            throw DynamicFormNotFound(id);
+            throw await ResolveRevisionFailureAsync(id, expectedRevision, ct);
 
         return await GetByIdAsync(id, ct);
     }
 
-    public async Task<DynamicFormStatisticConfigUpdateResp> UpdateStatisticConfigAsync(
+    public Task<DynamicFormStatisticConfigResult> GetStatisticsAsync(
         string id,
-        UpdateDynamicFormStatisticConfigReq req,
         CancellationToken ct)
-    {
-        var me = _me.RequireMe();
-        var doc = await LoadAsync(id, ct);
-        var isSystemAdmin = RoleGuard.IsSystemAdmin(me);
-        RequireCanUpdateStatisticConfig(me, doc, isSystemAdmin);
+        => _statisticConfig.GetAsync(id, ct);
 
-        var now = DateTime.UtcNow;
-        var retainedDynamicExcelTemplateIds = ExtractDynamicExcelTemplateIds(doc.BlocksJson, doc.ExcelBlockJson);
-        var monthKey = BuildStatisticConfigMonthKey(now);
-        if (!isSystemAdmin && string.Equals(doc.StatisticConfigUpdateMonthKey, monthKey, StringComparison.Ordinal))
-            throw AppExceptionFactory.BadRequest(
-                AppErrorCode.DYNAMIC_FORM_STATISTIC_CONFIG_RATE_LIMITED,
-                DynamicFormDetails(doc, me.Id));
+    public Task<DynamicFormStatisticConfigResult> PatchStatisticsAsync(
+        string id,
+        JsonElement body,
+        CancellationToken ct)
+        => _statisticConfig.PatchAsync(id, body, ct);
 
-        var fieldsJson = NormalizeJsonArray(req.FieldsJson, "FieldsJson");
-        EnsureFieldsLimit(fieldsJson);
-        EnsureFieldDisplayNames(fieldsJson);
-        fieldsJson = NormalizeFieldPayload(fieldsJson, doc.FieldsJson);
-        var excelBlockJson = NormalizeOptionalJsonObject(req.ExcelBlockJson, "ExcelBlockJson");
-        var blocksJson = NormalizeBlocksJson(req.BlocksJson, excelBlockJson);
-        blocksJson = NormalizeBlocksForSections(blocksJson, doc.SectionsJson);
-        blocksJson = await NormalizeBlocksForDynamicExcelTemplatesAsync(me, blocksJson, ct, retainedDynamicExcelTemplateIds);
-        excelBlockJson = ExtractFirstBlockJson(blocksJson);
+    public Task<DynamicFormStatisticConfigResult> GetStatisticConfigAsync(
+        string id,
+        CancellationToken ct)
+        => GetStatisticsAsync(id, ct);
 
-        var currentBlocksJson = NormalizeBlocksJson(doc.BlocksJson, doc.ExcelBlockJson);
-        currentBlocksJson = NormalizeBlocksForSections(currentBlocksJson, doc.SectionsJson);
-        currentBlocksJson = await NormalizeBlocksForDynamicExcelTemplatesAsync(me, currentBlocksJson, ct, retainedDynamicExcelTemplateIds);
-        EnsureStatisticConfigOnlyChange(doc.FieldsJson, fieldsJson, "FieldsJson");
-        EnsureStatisticConfigOnlyChange(currentBlocksJson, blocksJson, "BlocksJson");
-        EnsureTableStatisticContract(excelBlockJson, "ExcelBlockJson");
-        EnsureBlocksTableStatisticContract(blocksJson, "BlocksJson");
-        await EnsureLabelReferencesAsync(me, doc.TagCodes, doc.SectionsJson, fieldsJson, excelBlockJson, blocksJson, ct);
-        await _enumCatalogs.ValidateVisibleActiveCatalogsAsync(ExtractEnumCatalogIds(fieldsJson, excelBlockJson, blocksJson), ct);
-        EnsureUniqueLabelStatisticTargets(fieldsJson, blocksJson);
+    public Task<DynamicFormStatisticConfigResult> UpdateStatisticConfigAsync(
+        string id,
+        JsonElement body,
+        CancellationToken ct)
+        => PatchStatisticsAsync(id, body, ct);
 
-        var update = Builders<DynamicFormTemplate>.Update
-            .Set(x => x.FieldsJson, fieldsJson)
-            .Set(x => x.ExcelBlockJson, excelBlockJson)
-            .Set(x => x.BlocksJson, blocksJson)
-            .Set(x => x.ExcelBlockDynamicExcelTemplateId, ExtractPrimaryBlockDynamicExcelTemplateId(excelBlockJson, blocksJson))
-            .Set(x => x.StatisticConfigUpdatedAtUtc, now)
-            .Set(x => x.StatisticConfigUpdatedByUserId, me.Id)
-            .Set(x => x.UpdatedAtUtc, now)
-            .Set(x => x.UpdatedByUserId, me.Id);
-
-        if (!isSystemAdmin)
-            update = update.Set(x => x.StatisticConfigUpdateMonthKey, monthKey);
-
-        var res = await _ctx.DynamicFormTemplates.UpdateOneAsync(
-            x => x.Id == id && !x.IsDeleted,
-            update,
-            cancellationToken: ct);
-
-        if (res.MatchedCount == 0)
-            throw DynamicFormNotFound(id);
-
-        var detail = await GetByIdAsync(id, ct);
-        var rebuildJob = await _statisticRebuildJobs.EnqueueForTemplateStatisticConfigAsync(
-            doc,
-            me.Id,
-            isSystemAdmin,
-            ct);
-        if (isSystemAdmin)
-            HangfireRecurringJobRegistrar.TriggerDynamicFormStatisticRebuildNow();
-
-        return new DynamicFormStatisticConfigUpdateResp(
-            detail,
-            rebuildJob.JobId,
-            rebuildJob.QueuedReportCount,
-            rebuildJob.ScheduledAtUtc,
-            rebuildJob.RunsImmediately,
-            detail.StatisticConfigUpdatedAtUtc,
-            detail.StatisticConfigUpdatedByUserId,
-            detail.StatisticConfigUpdateMonthKey);
-    }
-
-    public async Task<DynamicFormDetail> PublishAsync(string id, CancellationToken ct)
+    public async Task<DynamicFormDetail> PublishAsync(
+        string id,
+        PublishDynamicFormReq? req,
+        CancellationToken ct)
     {
         var me = _me.RequireMe();
         var doc = await LoadAsync(id, ct);
@@ -392,12 +594,23 @@ public sealed class DynamicFormService : IDynamicFormService
         if (doc.IsPublished)
             return await ToDetailAsync(doc, me, ct);
 
+        var expectedRevision = RequireExpectedRevision(req?.ExpectedRevision, doc);
+
+        EnsureTypedSchemaProjection(
+            doc.SectionsJson,
+            doc.FieldsJson,
+            doc.ExcelBlockJson,
+            doc.BlocksJson);
         EnsureFieldsLimit(doc.FieldsJson);
         EnsureFieldDisplayNames(doc.FieldsJson);
+        EnsureFieldSchemaContract(doc.FieldsJson, doc.SectionsJson);
         var retainedDynamicExcelTemplateIds = ExtractDynamicExcelTemplateIds(doc.BlocksJson, doc.ExcelBlockJson);
         var blocksJson = NormalizeBlocksJson(doc.BlocksJson, doc.ExcelBlockJson);
         blocksJson = NormalizeBlocksForSections(blocksJson, doc.SectionsJson);
         blocksJson = await NormalizeBlocksForDynamicExcelTemplatesAsync(me, blocksJson, ct, retainedDynamicExcelTemplateIds);
+        blocksJson = CarryForwardTableStatisticMetadata(
+            doc.BlocksJson,
+            blocksJson);
         var excelBlockJson = ExtractFirstBlockJson(blocksJson);
         await EnsureLabelReferencesAsync(
             me,
@@ -407,9 +620,22 @@ public sealed class DynamicFormService : IDynamicFormService
             excelBlockJson,
             blocksJson,
             ct);
+        await _enumCatalogs.ValidateVisibleActiveCatalogsAsync(
+            ExtractEnumCatalogIds(doc.FieldsJson, excelBlockJson, blocksJson),
+            ct);
         EnsureTableStatisticContract(excelBlockJson, "ExcelBlockJson");
         EnsureBlocksTableStatisticContract(blocksJson, "BlocksJson");
         EnsureUniqueLabelStatisticTargets(doc.FieldsJson, blocksJson);
+        EnsureSchemaPayloadBudget(doc.SectionsJson, doc.FieldsJson, blocksJson);
+        EnsurePublishableSchema(doc.SectionsJson, doc.FieldsJson, blocksJson);
+        EnsureTypedSchemaProjection(doc.SectionsJson, doc.FieldsJson, excelBlockJson, blocksJson);
+        var publishedSnapshot = DynamicFormPublishedSchemaSnapshotBuilder.Build(
+            doc.SchemaVersion,
+            doc.SectionsJson,
+            doc.FieldsJson,
+            blocksJson);
+        var lockedStatisticSnapshots =
+            PrepareStatisticConfigForPublish(doc);
 
         var now = DateTime.UtcNow;
         var update = Builders<DynamicFormTemplate>.Update
@@ -418,18 +644,43 @@ public sealed class DynamicFormService : IDynamicFormService
             .Set(x => x.ExcelBlockJson, excelBlockJson)
             .Set(x => x.BlocksJson, blocksJson)
             .Set(x => x.ExcelBlockDynamicExcelTemplateId, ExtractPrimaryBlockDynamicExcelTemplateId(excelBlockJson, blocksJson))
+            .Set(x => x.FamilyId, EffectiveFamilyId(doc))
+            .Set(x => x.LineageStatus, EffectiveLineageStatus(doc))
+            .Set(x => x.PublishedSchemaSnapshotJson, publishedSnapshot.Json)
+            .Set(x => x.PublishedSchemaHash, publishedSnapshot.Sha256)
             .Set(x => x.PublishedAtUtc, now)
             .Set(x => x.PublishedByUserId, me.Id)
             .Set(x => x.UpdatedAtUtc, now)
-            .Set(x => x.UpdatedByUserId, me.Id);
+            .Set(x => x.UpdatedByUserId, me.Id)
+            .Set(x => x.Revision, expectedRevision + 1);
+        if (lockedStatisticSnapshots is not null)
+        {
+            update = update
+                .Set(
+                    x => x.StatisticConfigStatus,
+                    StatConfigStatuses.Locked)
+                .Set(
+                    x => x.StatisticConfigSnapshots,
+                    lockedStatisticSnapshots);
+        }
 
         var res = await _ctx.DynamicFormTemplates.UpdateOneAsync(
-            x => x.Id == id && !x.IsDeleted,
+            BuildRevisionFilter(id, expectedRevision, requireDraft: true),
             update,
             cancellationToken: ct);
 
         if (res.MatchedCount == 0)
-            throw DynamicFormNotFound(id);
+        {
+            // Publishing is idempotent across racing callers: exactly one CAS
+            // transition wins, while other authorized callers observe that same
+            // immutable published version instead of surfacing a false conflict.
+            var current = await LoadAsync(id, ct);
+            RequireCanMutate(me, current);
+            if (current.IsPublished)
+                return await ToDetailAsync(current, me, ct);
+
+            throw await ResolveRevisionFailureAsync(id, expectedRevision, ct);
+        }
 
         return await GetByIdAsync(id, ct);
     }
@@ -439,6 +690,14 @@ public sealed class DynamicFormService : IDynamicFormService
         var me = _me.RequireMe();
         var source = await LoadAsync(id, ct);
         await RequireCanCloneAsync(me, source, ct);
+        if (source.IsPublished)
+            _ = RequirePublishedSchemaIntegrity(source);
+        EnsureTypedSchemaProjection(
+            source.SectionsJson,
+            source.FieldsJson,
+            source.ExcelBlockJson,
+            source.BlocksJson);
+        EnsureFieldSchemaContract(source.FieldsJson, source.SectionsJson);
         var now = DateTime.UtcNow;
         var code = NormalizeCode(req.Code);
         if (string.IsNullOrWhiteSpace(code))
@@ -455,18 +714,33 @@ public sealed class DynamicFormService : IDynamicFormService
             sourceBlocksJson,
             ct,
             retainedDynamicExcelTemplateIds);
+        sourceBlocksJson = CarryForwardTableStatisticMetadata(
+            source.BlocksJson,
+            sourceBlocksJson);
         var sourceExcelBlockJson = ExtractFirstBlockJson(sourceBlocksJson);
         EnsureTableStatisticContract(sourceExcelBlockJson, "ExcelBlockJson");
         EnsureBlocksTableStatisticContract(sourceBlocksJson, "BlocksJson");
+        EnsureSchemaPayloadBudget(source.SectionsJson, source.FieldsJson, sourceBlocksJson);
+        EnsureTypedSchemaProjection(
+            source.SectionsJson,
+            source.FieldsJson,
+            sourceExcelBlockJson,
+            sourceBlocksJson);
+        var cloneId = ObjectId.GenerateNewId().ToString();
         var clone = new DynamicFormTemplate
         {
+            Id = cloneId,
             Code = code,
             Name = string.IsNullOrWhiteSpace(req.Name) ? $"{source.Name} - Copy" : NormalizeName(req.Name),
             Description = source.Description,
             TagCodes = source.TagCodes,
             CreatedByUsername = me.Username,
             SchemaVersion = source.SchemaVersion,
-            VersionNo = source.VersionNo + 1,
+            VersionNo = 1,
+            FamilyId = cloneId,
+            ClonedFromVersionId = source.Id,
+            LineageStatus = DynamicFormLineageStatuses.Clone,
+            Revision = 1,
             IsActive = true,
             IsPublished = false,
             SectionsJson = source.SectionsJson,
@@ -483,7 +757,7 @@ public sealed class DynamicFormService : IDynamicFormService
             IsDeleted = false,
         };
 
-        await _ctx.DynamicFormTemplates.InsertOneAsync(clone, cancellationToken: ct);
+        await InsertDynamicFormAsync(clone, ct);
         return await ToDetailAsync(clone, me, ct);
     }
 
@@ -492,9 +766,7 @@ public sealed class DynamicFormService : IDynamicFormService
         CancellationToken ct)
     {
         var me = _me.RequireMe();
-        var dynamicExcelId = req.DynamicExcelTemplateId?.Trim();
-        if (string.IsNullOrWhiteSpace(dynamicExcelId))
-            throw DynamicExcelIdRequired(dynamicExcelId);
+        var dynamicExcelId = NormalizeDynamicExcelTemplateId(req.DynamicExcelTemplateId);
 
         var excel = await _ctx.DynamicExcelTemplates
             .Find(x => x.Id == dynamicExcelId && !x.IsDeleted)
@@ -502,14 +774,17 @@ public sealed class DynamicFormService : IDynamicFormService
             ?? throw DynamicExcelNotFound(dynamicExcelId);
         RequireCanReadDynamicExcel(me, excel);
 
-        if (ShouldReuseExistingWrap(req))
+        var wrapReuseKey = ShouldReuseExistingWrap(req)
+            ? BuildWrapReuseKey(me.Id, dynamicExcelId)
+            : null;
+        if (wrapReuseKey is not null)
         {
             var existing = await _ctx.DynamicFormTemplates
                 .Find(x =>
-                    x.ExcelBlockDynamicExcelTemplateId == dynamicExcelId &&
-                    x.CreatedByUserId == me.Id &&
+                    x.WrapReuseKey == wrapReuseKey &&
                     !x.IsDeleted &&
-                    x.IsActive)
+                    x.IsActive &&
+                    !x.IsPublished)
                 .SortBy(x => x.CreatedAtUtc)
                 .FirstOrDefaultAsync(ct);
 
@@ -543,8 +818,10 @@ public sealed class DynamicFormService : IDynamicFormService
         var excelBlockJson = JsonSerializer.Serialize(snapshot, JsonOptions);
         var blocksJson = JsonSerializer.Serialize(new[] { snapshot }, JsonOptions);
 
+        var docId = ObjectId.GenerateNewId().ToString();
         var doc = new DynamicFormTemplate
         {
+            Id = docId,
             Code = code,
             Name = string.IsNullOrWhiteSpace(req.Name) ? excel.Name : NormalizeName(req.Name!),
             Description = NormalizeOptionalText(req.Description),
@@ -552,10 +829,12 @@ public sealed class DynamicFormService : IDynamicFormService
             CreatedByUsername = me.Username,
             SchemaVersion = 1,
             VersionNo = 1,
+            FamilyId = docId,
+            LineageStatus = DynamicFormLineageStatuses.Wrapped,
+            WrapReuseKey = wrapReuseKey,
+            Revision = 1,
             IsActive = true,
-            IsPublished = true,
-            PublishedAtUtc = now,
-            PublishedByUserId = me.Id,
+            IsPublished = false,
             SectionsJson = JsonSerializer.Serialize(section, JsonOptions),
             FieldsJson = "[]",
             ExcelBlockJson = excelBlockJson,
@@ -571,9 +850,36 @@ public sealed class DynamicFormService : IDynamicFormService
         await EnsureLabelReferencesAsync(me, tagCodes, doc.SectionsJson, doc.FieldsJson, doc.ExcelBlockJson, doc.BlocksJson, ct);
         EnsureFieldsLimit(doc.FieldsJson);
         EnsureFieldDisplayNames(doc.FieldsJson);
+        EnsureFieldSchemaContract(doc.FieldsJson, doc.SectionsJson);
         EnsureUniqueLabelStatisticTargets(doc.FieldsJson, doc.BlocksJson);
+        EnsureSchemaPayloadBudget(doc.SectionsJson, doc.FieldsJson, doc.BlocksJson);
+        EnsureTypedSchemaProjection(
+            doc.SectionsJson,
+            doc.FieldsJson,
+            doc.ExcelBlockJson,
+            doc.BlocksJson);
 
-        await _ctx.DynamicFormTemplates.InsertOneAsync(doc, cancellationToken: ct);
+        try
+        {
+            await InsertDynamicFormAsync(doc, ct);
+        }
+        catch (AppException ex) when (
+            wrapReuseKey is not null &&
+            ex.Code == AppErrorCode.DYNAMIC_FORM_CODE_CONFLICT)
+        {
+            var winner = await _ctx.DynamicFormTemplates
+                .Find(x =>
+                    x.WrapReuseKey == wrapReuseKey &&
+                    !x.IsDeleted &&
+                    x.IsActive &&
+                    !x.IsPublished)
+                .FirstOrDefaultAsync(ct);
+            if (winner is not null)
+                return await ToDetailAsync(winner, me, ct);
+
+            throw;
+        }
+
         return await ToDetailAsync(doc, me, ct);
 
         static string createStableSectionId(string id) => $"excel_{id}";
@@ -583,6 +889,9 @@ public sealed class DynamicFormService : IDynamicFormService
                && string.IsNullOrWhiteSpace(request.Name)
                && string.IsNullOrWhiteSpace(request.Description)
                && (request.TagCodes is null || request.TagCodes.Length == 0);
+
+        static string BuildWrapReuseKey(string actorUserId, string templateId)
+            => $"{actorUserId}:{templateId}";
     }
 
     public async Task<DynamicFormDetail> ImportDynamicExcelBlockAsync(
@@ -594,13 +903,17 @@ public sealed class DynamicFormService : IDynamicFormService
         var doc = await LoadAsync(id, ct);
 
         RequireCanMutate(me, doc);
+        var expectedRevision = RequireExpectedRevision(req.ExpectedRevision, doc);
         EnsureDraftTemplate(doc);
         await EnsureNotLinkedToRuntimeAsync(id, ct);
+        EnsureTypedSchemaProjection(
+            doc.SectionsJson,
+            doc.FieldsJson,
+            doc.ExcelBlockJson,
+            doc.BlocksJson);
         var retainedDynamicExcelTemplateIds = ExtractDynamicExcelTemplateIds(doc.BlocksJson, doc.ExcelBlockJson);
 
-        var dynamicExcelId = req.DynamicExcelTemplateId?.Trim();
-        if (string.IsNullOrWhiteSpace(dynamicExcelId))
-            throw DynamicExcelIdRequired(dynamicExcelId);
+        var dynamicExcelId = NormalizeDynamicExcelTemplateId(req.DynamicExcelTemplateId);
 
         var excel = await _ctx.DynamicExcelTemplates
             .Find(x => x.Id == dynamicExcelId && !x.IsDeleted)
@@ -611,16 +924,25 @@ public sealed class DynamicFormService : IDynamicFormService
         var currentBlocksJson = NormalizeBlocksJson(doc.BlocksJson, doc.ExcelBlockJson);
         EnsureFieldsLimit(doc.FieldsJson);
         EnsureFieldDisplayNames(doc.FieldsJson);
+        EnsureFieldSchemaContract(doc.FieldsJson, doc.SectionsJson);
         currentBlocksJson = NormalizeBlocksForSections(currentBlocksJson, doc.SectionsJson);
         var sectionId = NormalizeImportSectionId(req.SectionId, doc.SectionsJson);
         var snapshot = BuildDynamicExcelBlockSnapshot(excel, sectionId);
         var blocksJson = AppendDynamicExcelBlock(currentBlocksJson, snapshot);
         blocksJson = NormalizeBlocksForSections(blocksJson, doc.SectionsJson);
         blocksJson = await NormalizeBlocksForDynamicExcelTemplatesAsync(me, blocksJson, ct, retainedDynamicExcelTemplateIds);
+        blocksJson = CarryForwardTableStatisticMetadata(
+            doc.BlocksJson,
+            blocksJson);
         var excelBlockJson = ExtractFirstBlockJson(blocksJson);
         EnsureBlocksTableStatisticContract(blocksJson, "BlocksJson");
         await EnsureLabelReferencesAsync(me, doc.TagCodes, doc.SectionsJson, doc.FieldsJson, excelBlockJson, blocksJson, ct);
+        await _enumCatalogs.ValidateVisibleActiveCatalogsAsync(
+            ExtractEnumCatalogIds(doc.FieldsJson, excelBlockJson, blocksJson),
+            ct);
         EnsureUniqueLabelStatisticTargets(doc.FieldsJson, blocksJson);
+        EnsureSchemaPayloadBudget(doc.SectionsJson, doc.FieldsJson, blocksJson);
+        EnsureTypedSchemaProjection(doc.SectionsJson, doc.FieldsJson, excelBlockJson, blocksJson);
 
         var now = DateTime.UtcNow;
         var update = Builders<DynamicFormTemplate>.Update
@@ -628,26 +950,28 @@ public sealed class DynamicFormService : IDynamicFormService
             .Set(x => x.ExcelBlockJson, excelBlockJson)
             .Set(x => x.ExcelBlockDynamicExcelTemplateId, ExtractPrimaryBlockDynamicExcelTemplateId(excelBlockJson, blocksJson))
             .Set(x => x.UpdatedAtUtc, now)
-            .Set(x => x.UpdatedByUserId, me.Id);
+            .Set(x => x.UpdatedByUserId, me.Id)
+            .Set(x => x.Revision, expectedRevision + 1);
 
         var res = await _ctx.DynamicFormTemplates.UpdateOneAsync(
-            x => x.Id == id && !x.IsDeleted,
+            BuildRevisionFilter(id, expectedRevision, requireDraft: true),
             update,
             cancellationToken: ct);
 
         if (res.MatchedCount == 0)
-            throw DynamicFormNotFound(id);
+            throw await ResolveRevisionFailureAsync(id, expectedRevision, ct);
 
         return await GetByIdAsync(id, ct);
     }
 
-    public async Task DeleteAsync(string id, CancellationToken ct)
+    public async Task DeleteAsync(string id, int? expectedRevision, CancellationToken ct)
     {
         var me = _me.RequireMe();
         var doc = await LoadAsync(id, ct);
 
         RequireCanMutate(me, doc);
         EnsureDraftTemplate(doc);
+        var requiredRevision = RequireExpectedRevision(expectedRevision, doc);
         await EnsureNotLinkedToRuntimeAsync(id, ct);
 
         var now = DateTime.UtcNow;
@@ -656,31 +980,204 @@ public sealed class DynamicFormService : IDynamicFormService
             .Set(x => x.DeletedAtUtc, now)
             .Set(x => x.DeletedByUserId, me.Id)
             .Set(x => x.UpdatedAtUtc, now)
-            .Set(x => x.UpdatedByUserId, me.Id);
+            .Set(x => x.UpdatedByUserId, me.Id)
+            .Set(x => x.Revision, requiredRevision + 1);
 
         var res = await _ctx.DynamicFormTemplates.UpdateOneAsync(
-            x => x.Id == id && !x.IsDeleted,
+            BuildRevisionFilter(id, requiredRevision, requireDraft: true),
             update,
             cancellationToken: ct);
 
         if (res.MatchedCount == 0)
-            throw DynamicFormNotFound(id);
+            throw await ResolveRevisionFailureAsync(id, requiredRevision, ct);
     }
 
     private async Task<DynamicFormTemplate> LoadAsync(string id, CancellationToken ct)
     {
-        if (string.IsNullOrWhiteSpace(id))
-            throw DynamicFormIdRequired(id);
+        var normalizedId = NormalizeDynamicFormTemplateId(id);
 
         return await _ctx.DynamicFormTemplates
-            .Find(x => x.Id == id && !x.IsDeleted)
+            .Find(x => x.Id == normalizedId && !x.IsDeleted)
             .FirstOrDefaultAsync(ct)
-            ?? throw DynamicFormNotFound(id);
+            ?? throw DynamicFormNotFound(normalizedId);
     }
+
+    private static BsonRegularExpression BuildLiteralSearchRegex(string value, string field)
+    {
+        var normalized = value.Trim();
+        if (normalized.Length > MaxSearchTermLength)
+        {
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.COMMON_VALIDATION_FAILED,
+                new
+                {
+                    field,
+                    reason = "DYNAMIC_FORM_SEARCH_TERM_TOO_LONG",
+                    maxLength = MaxSearchTermLength
+                });
+        }
+
+        return new BsonRegularExpression(Regex.Escape(normalized), "i");
+    }
+
+    private async Task InsertDynamicFormAsync(DynamicFormTemplate doc, CancellationToken ct)
+    {
+        try
+        {
+            await _ctx.DynamicFormTemplates.InsertOneAsync(doc, cancellationToken: ct);
+        }
+        catch (MongoWriteException ex) when (ex.WriteError?.Category == ServerErrorCategory.DuplicateKey)
+        {
+            throw new AppException(
+                AppErrorCode.DYNAMIC_FORM_CODE_CONFLICT,
+                new { doc.Code },
+                innerException: ex);
+        }
+    }
+
+    private async Task InsertDynamicFormVersionAsync(
+        DynamicFormTemplate next,
+        DynamicFormTemplate source,
+        int expectedRevision,
+        CancellationToken ct)
+    {
+        try
+        {
+            await _ctx.DynamicFormTemplates.InsertOneAsync(next, cancellationToken: ct);
+        }
+        catch (MongoWriteException ex) when (ex.WriteError?.Category == ServerErrorCategory.DuplicateKey)
+        {
+            throw new AppException(
+                AppErrorCode.DYNAMIC_FORM_VERSION_CONFLICT,
+                new
+                {
+                    familyId = EffectiveFamilyId(source),
+                    sourceVersionId = source.Id,
+                    sourceRevision = expectedRevision,
+                    nextVersionNo = next.VersionNo,
+                    reason = "DYNAMIC_FORM_VERSION_ALREADY_EXISTS"
+                },
+                innerException: ex);
+        }
+    }
+
+    private async Task ReserveNextVersionAsync(
+        DynamicFormTemplate source,
+        int expectedRevision,
+        string actorUserId,
+        DateTime now,
+        CancellationToken ct)
+    {
+        var filter = BuildRevisionFilter(source.Id, expectedRevision, requireDraft: false)
+                     & Builders<DynamicFormTemplate>.Filter.Eq(x => x.IsPublished, true);
+        var update = Builders<DynamicFormTemplate>.Update
+            .Set(x => x.Revision, expectedRevision + 1)
+            .Set(x => x.UpdatedAtUtc, now)
+            .Set(x => x.UpdatedByUserId, actorUserId);
+
+        var result = await _ctx.DynamicFormTemplates.UpdateOneAsync(
+            filter,
+            update,
+            cancellationToken: ct);
+        if (result.MatchedCount == 0)
+            throw await ResolveRevisionFailureAsync(source.Id, expectedRevision, ct);
+    }
+
+    private static int EffectiveRevision(DynamicFormTemplate doc)
+        => Math.Max(1, doc.Revision);
+
+    private static string EffectiveFamilyId(DynamicFormTemplate doc)
+        => string.IsNullOrWhiteSpace(doc.FamilyId) ? doc.Id : doc.FamilyId;
+
+    private static string EffectiveLineageStatus(DynamicFormTemplate doc)
+        => string.IsNullOrWhiteSpace(doc.LineageStatus)
+            ? DynamicFormLineageStatuses.Legacy
+            : doc.LineageStatus;
+
+    private static FilterDefinition<DynamicFormTemplate> BuildFamilyFilter(string familyId)
+    {
+        var f = Builders<DynamicFormTemplate>.Filter;
+        var legacyRoot = f.Eq(x => x.Id, familyId)
+                         & (f.Exists("familyId", false) | f.Eq(x => x.FamilyId, null));
+        return f.Eq(x => x.IsDeleted, false)
+               & (f.Eq(x => x.FamilyId, familyId) | legacyRoot);
+    }
+
+    private static int RequireExpectedRevision(int? expectedRevision, DynamicFormTemplate doc)
+    {
+        if (!expectedRevision.HasValue || expectedRevision.Value <= 0)
+        {
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.DYNAMIC_FORM_REVISION_REQUIRED,
+                new
+                {
+                    dynamicFormTemplateId = doc.Id,
+                    expectedRevision,
+                    currentRevision = EffectiveRevision(doc)
+                });
+        }
+
+        var currentRevision = EffectiveRevision(doc);
+        if (expectedRevision.Value != currentRevision)
+            throw RevisionConflict(doc, expectedRevision.Value);
+
+        return expectedRevision.Value;
+    }
+
+    private static FilterDefinition<DynamicFormTemplate> BuildRevisionFilter(
+        string id,
+        int expectedRevision,
+        bool requireDraft)
+    {
+        var f = Builders<DynamicFormTemplate>.Filter;
+        var revisionFilter = f.Eq(x => x.Revision, expectedRevision);
+        if (expectedRevision == 1)
+        {
+            revisionFilter |= f.Exists("revision", false);
+            revisionFilter |= f.Lte(x => x.Revision, 0);
+        }
+
+        var filter = f.Eq(x => x.Id, id)
+                     & f.Eq(x => x.IsDeleted, false)
+                     & revisionFilter;
+        if (requireDraft)
+            filter &= f.Eq(x => x.IsPublished, false);
+
+        return filter;
+    }
+
+    private async Task<AppException> ResolveRevisionFailureAsync(
+        string id,
+        int expectedRevision,
+        CancellationToken ct)
+    {
+        var current = await _ctx.DynamicFormTemplates
+            .Find(x => x.Id == id && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct);
+
+        return current is null
+            ? DynamicFormNotFound(id)
+            : RevisionConflict(current, expectedRevision);
+    }
+
+    private static AppException RevisionConflict(DynamicFormTemplate current, int expectedRevision)
+        => AppExceptionFactory.Create(
+            AppErrorCode.DYNAMIC_FORM_REVISION_CONFLICT,
+            new
+            {
+                dynamicFormTemplateId = current.Id,
+                expectedRevision,
+                currentRevision = EffectiveRevision(current),
+                current.IsPublished,
+                current.UpdatedAtUtc,
+                current.UpdatedByUserId
+            });
 
     private async Task<DynamicFormDetail> ToDetailAsync(DynamicFormTemplate x, MeResponse me, CancellationToken ct)
     {
         var canViewByCloneGrant = await HasApprovedCloneGrantAsync(x.Id, me.Id, ct);
+        var blocksJson = NormalizeBlocksJson(x.BlocksJson, x.ExcelBlockJson);
+        var publishedSnapshot = ResolvePublishedSnapshot(x);
         return new DynamicFormDetail(
             x.Id,
             x.Code,
@@ -689,6 +1186,11 @@ public sealed class DynamicFormService : IDynamicFormService
             x.TagCodes,
             x.SchemaVersion,
             x.VersionNo,
+            EffectiveFamilyId(x),
+            x.PreviousVersionId,
+            x.ClonedFromVersionId,
+            EffectiveLineageStatus(x),
+            EffectiveRevision(x),
             x.IsActive,
             x.IsPublished,
             x.CreatedByUserId,
@@ -699,14 +1201,22 @@ public sealed class DynamicFormService : IDynamicFormService
             x.SectionsJson,
             x.FieldsJson,
             x.ExcelBlockJson,
-            NormalizeBlocksJson(x.BlocksJson, x.ExcelBlockJson),
+            blocksJson,
             x.ExcelBlockDynamicExcelTemplateId,
             x.StatisticConfigUpdatedAtUtc,
             x.StatisticConfigUpdatedByUserId,
             x.StatisticConfigUpdateMonthKey,
             CanMutate(me, x),
             CanClone(me, x, canViewByCloneGrant),
-            canViewByCloneGrant);
+            canViewByCloneGrant,
+            publishedSnapshot?.Json,
+            publishedSnapshot?.Sha256,
+            BuildActionCapabilities(me, x, canViewByCloneGrant),
+            DynamicFormSchemaAdapter.FromLegacy(
+                x.SectionsJson,
+                x.FieldsJson,
+                x.ExcelBlockJson,
+                blocksJson));
     }
 
     private static DynamicFormRow ToRow(
@@ -723,6 +1233,11 @@ public sealed class DynamicFormService : IDynamicFormService
             x.TagCodes,
             x.SchemaVersion,
             x.VersionNo,
+            EffectiveFamilyId(x),
+            x.PreviousVersionId,
+            x.ClonedFromVersionId,
+            EffectiveLineageStatus(x),
+            EffectiveRevision(x),
             x.IsActive,
             x.IsPublished,
             x.CreatedByUserId,
@@ -730,13 +1245,59 @@ public sealed class DynamicFormService : IDynamicFormService
             x.CreatedAtUtc,
             CanMutate(me, x),
             CanClone(me, x, canViewByCloneGrant),
-            canViewByCloneGrant);
+            canViewByCloneGrant,
+            ResolvePublishedSnapshot(x)?.Sha256,
+            BuildActionCapabilities(me, x, canViewByCloneGrant));
+    }
+
+    private static DynamicFormPublishedSchemaSnapshot? ResolvePublishedSnapshot(
+        DynamicFormTemplate doc)
+    {
+        if (!doc.IsPublished)
+            return null;
+
+        return RequirePublishedSchemaIntegrity(doc);
+    }
+
+    private static DynamicFormPublishedSchemaSnapshot RequirePublishedSchemaIntegrity(
+        DynamicFormTemplate doc)
+    {
+        try
+        {
+            return DynamicFormPublishedSchemaSnapshotBuilder.ValidateAgainstTemplate(doc);
+        }
+        catch (InvalidOperationException ex)
+        {
+            throw new AppException(
+                AppErrorCode.DYNAMIC_FORM_PUBLISHED_SCHEMA_INTEGRITY_FAILED,
+                new
+                {
+                    dynamicFormTemplateId = doc.Id,
+                    reason = "PUBLISHED_SCHEMA_SNAPSHOT_OR_LIVE_STRUCTURE_MISMATCH"
+                },
+                innerException: ex);
+        }
     }
 
     private static AppException DynamicFormIdRequired(string? dynamicFormTemplateId)
         => AppExceptionFactory.BadRequest(
             AppErrorCode.DYNAMIC_FORM_TEMPLATE_ID_REQUIRED,
             new { dynamicFormTemplateId });
+
+    private static string NormalizeDynamicFormTemplateId(string? dynamicFormTemplateId)
+    {
+        if (string.IsNullOrWhiteSpace(dynamicFormTemplateId))
+            throw DynamicFormIdRequired(dynamicFormTemplateId);
+        if (!ObjectId.TryParse(dynamicFormTemplateId, out var objectId))
+        {
+            throw DynamicFormValidation(
+                AppErrorCode.COMMON_VALIDATION_FAILED,
+                "DYNAMIC_FORM_TEMPLATE_ID_INVALID",
+                new { fieldName = "dynamicFormTemplateId" });
+        }
+
+        return objectId.ToString();
+    }
 
     private static AppException DynamicFormNotFound(string? dynamicFormTemplateId)
         => AppExceptionFactory.NotFound(
@@ -752,6 +1313,21 @@ public sealed class DynamicFormService : IDynamicFormService
         => AppExceptionFactory.BadRequest(
             AppErrorCode.DYNAMIC_EXCEL_TEMPLATE_ID_REQUIRED,
             new { dynamicExcelTemplateId });
+
+    private static string NormalizeDynamicExcelTemplateId(string? dynamicExcelTemplateId)
+    {
+        if (string.IsNullOrWhiteSpace(dynamicExcelTemplateId))
+            throw DynamicExcelIdRequired(dynamicExcelTemplateId);
+        if (!ObjectId.TryParse(dynamicExcelTemplateId, out var objectId))
+        {
+            throw DynamicFormValidation(
+                AppErrorCode.COMMON_VALIDATION_FAILED,
+                "DYNAMIC_EXCEL_TEMPLATE_ID_INVALID",
+                new { fieldName = "dynamicExcelTemplateId" });
+        }
+
+        return objectId.ToString();
+    }
 
     private static AppException DynamicExcelNotFound(string? dynamicExcelTemplateId)
         => AppExceptionFactory.NotFound(
@@ -769,12 +1345,22 @@ public sealed class DynamicFormService : IDynamicFormService
             actorUserId
         };
 
+    private static object ForbiddenDetails(string action)
+        => new
+        {
+            reason = "DYNAMIC_FORM_ACCESS_FORBIDDEN",
+            action
+        };
+
     private static FilterDefinition<DynamicFormTemplate> BuildVisibleFilter(
-        string userId,
+        MeResponse me,
         IReadOnlySet<string> approvedCloneTemplateIds)
     {
         var f = Builders<DynamicFormTemplate>.Filter;
-        var filter = f.Eq(x => x.CreatedByUserId, userId);
+        if (RoleGuard.IsSystemAdmin(me))
+            return f.Empty;
+
+        var filter = f.Eq(x => x.CreatedByUserId, me.Id);
 
         if (approvedCloneTemplateIds.Count > 0)
             filter |= f.In(x => x.Id, approvedCloneTemplateIds);
@@ -809,7 +1395,8 @@ public sealed class DynamicFormService : IDynamicFormService
 
     private async Task RequireCanReadAsync(MeResponse me, DynamicFormTemplate doc, CancellationToken ct)
     {
-        if (string.Equals(doc.CreatedByUserId, me.Id, StringComparison.Ordinal))
+        if (RoleGuard.IsSystemAdmin(me) ||
+            string.Equals(doc.CreatedByUserId, me.Id, StringComparison.Ordinal))
             return;
 
         if (await HasApprovedCloneGrantAsync(doc.Id, me.Id, ct))
@@ -820,7 +1407,18 @@ public sealed class DynamicFormService : IDynamicFormService
 
         throw AppExceptionFactory.Forbidden(
             AppErrorCode.DYNAMIC_FORM_READ_FORBIDDEN,
-            DynamicFormDetails(doc, me.Id));
+            ForbiddenDetails("READ_DYNAMIC_FORM"));
+    }
+
+    private static void RequireCanReadVersionHistory(MeResponse me, DynamicFormTemplate doc)
+    {
+        if (RoleGuard.IsSystemAdmin(me) ||
+            string.Equals(doc.CreatedByUserId, me.Id, StringComparison.Ordinal))
+            return;
+
+        throw AppExceptionFactory.Forbidden(
+            AppErrorCode.DYNAMIC_FORM_READ_FORBIDDEN,
+            ForbiddenDetails("READ_VERSION_HISTORY"));
     }
 
     private async Task<bool> HasRuntimeReadGrantAsync(
@@ -835,6 +1433,7 @@ public sealed class DynamicFormService : IDynamicFormService
                 .Find(x =>
                     x.DynamicFormTemplateId == templateId &&
                     x.AssigneeUserId == userId &&
+                    x.IsActive &&
                     !x.IsDeleted)
                 .Limit(1)
                 .AnyAsync(ct))
@@ -853,6 +1452,8 @@ public sealed class DynamicFormService : IDynamicFormService
                 .Find(x =>
                     x.DynamicFormTemplateId == templateId &&
                     x.CreatedByUserId == userId &&
+                    x.IsActive &&
+                    (x.FlowEffectiveStatus == null || x.FlowEffectiveStatus == DynamicFlowEffectiveStatuses.Effective) &&
                     !x.IsDeleted)
                 .Limit(1)
                 .AnyAsync(ct))
@@ -862,6 +1463,7 @@ public sealed class DynamicFormService : IDynamicFormService
             .Find(x =>
                 x.DynamicFormTemplateId == templateId &&
                 x.ReviewerUserId == userId &&
+                x.ReportIsActive &&
                 !x.IsDeleted)
             .Limit(1)
             .AnyAsync(ct);
@@ -869,7 +1471,8 @@ public sealed class DynamicFormService : IDynamicFormService
 
     private async Task RequireCanCloneAsync(MeResponse me, DynamicFormTemplate doc, CancellationToken ct)
     {
-        if (string.Equals(doc.CreatedByUserId, me.Id, StringComparison.Ordinal))
+        if (RoleGuard.IsSystemAdmin(me) ||
+            string.Equals(doc.CreatedByUserId, me.Id, StringComparison.Ordinal))
             return;
 
         if (await HasApprovedCloneGrantAsync(doc.Id, me.Id, ct))
@@ -877,28 +1480,44 @@ public sealed class DynamicFormService : IDynamicFormService
 
         throw AppExceptionFactory.Forbidden(
             AppErrorCode.DYNAMIC_FORM_CLONE_FORBIDDEN,
-            DynamicFormDetails(doc, me.Id));
+            ForbiddenDetails("CLONE_DYNAMIC_FORM"));
     }
 
     private static bool CanMutate(MeResponse me, DynamicFormTemplate doc)
         => string.Equals(doc.CreatedByUserId, me.Id, StringComparison.Ordinal) || RoleGuard.IsSystemAdmin(me);
 
     private static bool CanClone(MeResponse me, DynamicFormTemplate doc, bool canViewByCloneGrant)
-        => string.Equals(doc.CreatedByUserId, me.Id, StringComparison.Ordinal) || canViewByCloneGrant;
+        => RoleGuard.IsSystemAdmin(me)
+           || string.Equals(doc.CreatedByUserId, me.Id, StringComparison.Ordinal)
+           || canViewByCloneGrant;
+
+    private static DynamicFormActionCapabilities BuildActionCapabilities(
+        MeResponse me,
+        DynamicFormTemplate doc,
+        bool canViewByCloneGrant)
+    {
+        var canMutate = CanMutate(me, doc);
+        var isDraft = !doc.IsPublished;
+        return new DynamicFormActionCapabilities(
+            CanRead: true,
+            CanUpdate: canMutate && isDraft,
+            CanDelete: canMutate && isDraft,
+            CanPublish: canMutate && isDraft,
+            CanCreateVersion: canMutate && doc.IsPublished,
+            CanViewHistory: RoleGuard.IsSystemAdmin(me) ||
+                            string.Equals(doc.CreatedByUserId, me.Id, StringComparison.Ordinal),
+            CanClone: CanClone(me, doc, canViewByCloneGrant),
+            CanImport: canMutate && isDraft,
+            CanUpdateStatistics: canMutate);
+    }
 
     private static void RequireCanReadDynamicExcel(MeResponse me, DynamicExcelTemplate doc)
     {
-        if (!string.Equals(doc.CreatedByUserId, me.Id, StringComparison.Ordinal))
+        if (!RoleGuard.IsSystemAdmin(me) &&
+            !string.Equals(doc.CreatedByUserId, me.Id, StringComparison.Ordinal))
             throw AppExceptionFactory.Forbidden(
                 AppErrorCode.DYNAMIC_EXCEL_READ_FORBIDDEN,
-                new
-                {
-                    dynamicExcelTemplateId = doc.Id,
-                    doc.Code,
-                    doc.Name,
-                    doc.CreatedByUserId,
-                    actorUserId = me.Id
-                });
+                new { reason = "DYNAMIC_EXCEL_ACCESS_FORBIDDEN" });
     }
 
     private static AppException DynamicFormValidation(
@@ -964,7 +1583,7 @@ public sealed class DynamicFormService : IDynamicFormService
         if (!string.Equals(doc.CreatedByUserId, me.Id, StringComparison.Ordinal))
             throw AppExceptionFactory.Forbidden(
                 AppErrorCode.DYNAMIC_FORM_MUTATE_FORBIDDEN,
-                DynamicFormDetails(doc, me.Id));
+                ForbiddenDetails("MUTATE_DYNAMIC_FORM"));
     }
 
     private static void RequireCanUpdateStatisticConfig(
@@ -978,7 +1597,7 @@ public sealed class DynamicFormService : IDynamicFormService
         if (!string.Equals(doc.CreatedByUserId, me.Id, StringComparison.Ordinal))
             throw AppExceptionFactory.Forbidden(
                 AppErrorCode.DYNAMIC_FORM_STATISTIC_CONFIG_FORBIDDEN,
-                DynamicFormDetails(doc, me.Id));
+                ForbiddenDetails("UPDATE_DYNAMIC_FORM_STATISTICS"));
     }
 
     private static string BuildStatisticConfigMonthKey(DateTime utc)
@@ -1005,6 +1624,9 @@ public sealed class DynamicFormService : IDynamicFormService
 
         if (await ContainsDynamicFormTemplateIdAsync(_ctx.WorkAssignmentReports.CollectionNamespace.CollectionName, templateId, ct))
             throw DynamicFormInUse(AppErrorCode.DYNAMIC_FORM_IN_USE_BY_REPORT, templateId);
+
+        if (await ContainsDynamicFlowReferenceAsync(templateId, ct))
+            throw DynamicFormInUse(AppErrorCode.DYNAMIC_FORM_IN_USE_BY_FLOW, templateId);
     }
 
     private async Task<bool> ContainsDynamicFormTemplateIdAsync(
@@ -1014,15 +1636,50 @@ public sealed class DynamicFormService : IDynamicFormService
     {
         var collection = _ctx.Db.GetCollection<BsonDocument>(collectionName);
         var f = Builders<BsonDocument>.Filter;
-        var idFilter = ObjectId.TryParse(templateId, out var objectId)
-            ? f.Or(
-                f.Eq("dynamicFormTemplateId", objectId),
-                f.Eq("dynamicFormTemplateId", templateId))
-            : f.Eq("dynamicFormTemplateId", templateId);
+        var idFilter = BuildObjectIdOrStringFilter(f, "dynamicFormTemplateId", templateId);
         var filter = idFilter & f.Ne("isDeleted", true);
 
         return await collection.Find(filter).Limit(1).AnyAsync(ct);
     }
+
+    private async Task<bool> ContainsDynamicFlowReferenceAsync(
+        string templateId,
+        CancellationToken ct)
+    {
+        var f = Builders<BsonDocument>.Filter;
+        var active = f.Ne("isDeleted", true);
+        var rootReference = BuildObjectIdOrStringFilter(
+            f,
+            "rootDynamicFormTemplateId",
+            templateId);
+
+        var templates = _ctx.Db.GetCollection<BsonDocument>(
+            _ctx.DynamicFlowTemplates.CollectionNamespace.CollectionName);
+        if (await templates.Find(active & rootReference).Limit(1).AnyAsync(ct))
+            return true;
+
+        var payloadReferencePattern =
+            "\\\"(?:rootDynamicFormTemplateId|dynamicFormTemplateId|formTemplateId|" +
+            "sourceDynamicFormTemplateId|sourceFormTemplateId|" +
+            "targetDynamicFormTemplateId|targetFormTemplateId)\\\"" +
+            "\\s*:\\s*\\\"" + Regex.Escape(templateId) + "\\\"";
+        var versions = _ctx.Db.GetCollection<BsonDocument>(
+            _ctx.DynamicFlowTemplateVersions.CollectionNamespace.CollectionName);
+        var versionReference = rootReference |
+                               f.Regex(
+                                   "payloadJson",
+                                   new BsonRegularExpression(payloadReferencePattern));
+
+        return await versions.Find(active & versionReference).Limit(1).AnyAsync(ct);
+    }
+
+    private static FilterDefinition<BsonDocument> BuildObjectIdOrStringFilter(
+        FilterDefinitionBuilder<BsonDocument> filters,
+        string field,
+        string value)
+        => ObjectId.TryParse(value, out var objectId)
+            ? filters.Or(filters.Eq(field, objectId), filters.Eq(field, value))
+            : filters.Eq(field, value);
 
     private async Task<(string prefix, int nextSeq, string nextCode)> ComputeNextCodeAsync(
         int year,
@@ -1063,13 +1720,17 @@ public sealed class DynamicFormService : IDynamicFormService
             _ => "createdAtUtc",
         };
 
-        var sort = string.Equals(dir, "asc", StringComparison.OrdinalIgnoreCase)
+        var sortAscending = string.Equals(dir, "asc", StringComparison.OrdinalIgnoreCase);
+        var sort = sortAscending
             ? Builders<DynamicFormTemplate>.Sort.Ascending(sortField)
             : Builders<DynamicFormTemplate>.Sort.Descending(sortField);
 
-        return Builders<DynamicFormTemplate>.Sort.Combine(
-            sort,
-            Builders<DynamicFormTemplate>.Sort.Descending(x => x.CreatedAtUtc));
+        var stableSorts = new List<SortDefinition<DynamicFormTemplate>> { sort };
+        if (!string.Equals(sortField, "createdAtUtc", StringComparison.Ordinal))
+            stableSorts.Add(Builders<DynamicFormTemplate>.Sort.Descending(x => x.CreatedAtUtc));
+
+        stableSorts.Add(Builders<DynamicFormTemplate>.Sort.Descending("_id"));
+        return Builders<DynamicFormTemplate>.Sort.Combine(stableSorts);
     }
 
     private static string NormalizeName(string value)
@@ -2255,6 +2916,276 @@ public sealed class DynamicFormService : IDynamicFormService
             });
     }
 
+    private static void EnsureFieldSchemaContract(string? fieldsJson, string sectionsJson)
+    {
+        var sectionIds = ReadSectionIds(sectionsJson).ToHashSet(StringComparer.Ordinal);
+        if (string.IsNullOrWhiteSpace(fieldsJson))
+            return;
+
+        using var document = ParseJson(fieldsJson, "FieldsJson");
+        if (document.RootElement.ValueKind != JsonValueKind.Array)
+            throw DynamicFormJsonKindInvalid(
+                "FieldsJson",
+                "array",
+                document.RootElement.ValueKind,
+                "FieldsJson phai la JSON array.");
+
+        var fieldIds = new HashSet<string>(StringComparer.Ordinal);
+        var index = 0;
+        foreach (var field in document.RootElement.EnumerateArray())
+        {
+            var path = $"FieldsJson[{index}]";
+            if (field.ValueKind != JsonValueKind.Object)
+                throw DynamicFormFieldConfigInvalid(
+                    path,
+                    $"{path} phai la JSON object.",
+                    new { actualKind = field.ValueKind.ToString() });
+
+            var id = ReadOptionalString(field, "id");
+            if (string.IsNullOrWhiteSpace(id))
+                throw DynamicFormFieldConfigInvalid(
+                    $"{path}.id",
+                    "Field id khong duoc trong.");
+            if (!fieldIds.Add(id))
+                throw DynamicFormFieldConfigInvalid(
+                    $"{path}.id",
+                    "Field id bi trung trong cung Dynamic Form.",
+                    new { fieldId = id });
+
+            var sectionId = ReadOptionalString(field, "sectionId");
+            if (string.IsNullOrWhiteSpace(sectionId) || !sectionIds.Contains(sectionId))
+                throw DynamicFormFieldConfigInvalid(
+                    $"{path}.sectionId",
+                    "Field phai tro den section ton tai trong Dynamic Form.",
+                    new { fieldId = id, sectionId });
+
+            var type = ReadOptionalString(field, "type");
+            if (string.IsNullOrWhiteSpace(type) || !AllowedFieldTypes.Contains(type))
+                throw DynamicFormFieldConfigInvalid(
+                    $"{path}.type",
+                    "Field type nam ngoai 10 kieu duoc cong bo.",
+                    new { fieldId = id, type, allowedTypes = AllowedFieldTypes.OrderBy(x => x, StringComparer.Ordinal).ToArray() });
+
+            EnsureOptionalBooleanProperty(field, "required", path, id);
+            EnsureOptionalBooleanProperty(field, "isStatistic", path, id);
+
+            var hasFieldOptions = field.TryGetProperty("options", out var fieldOptions)
+                                  && fieldOptions.ValueKind != JsonValueKind.Null;
+            var fieldOptionCount = ValidateFieldOptions(field, "options", path, id);
+            var hasValueSource = field.TryGetProperty("valueSource", out var valueSource)
+                                 && valueSource.ValueKind != JsonValueKind.Null;
+            var valueSourceType = (string?)null;
+            var sourceOptionCount = 0;
+
+            if (hasValueSource)
+            {
+                if (valueSource.ValueKind != JsonValueKind.Object)
+                    throw DynamicFormFieldConfigInvalid(
+                        $"{path}.valueSource",
+                        "valueSource phai la JSON object.",
+                        new { fieldId = id, actualKind = valueSource.ValueKind.ToString() });
+
+                valueSourceType = ReadOptionalString(valueSource, "sourceType");
+                if (string.IsNullOrWhiteSpace(valueSourceType) || !AllowedFieldValueSourceTypes.Contains(valueSourceType))
+                    throw DynamicFormFieldConfigInvalid(
+                        $"{path}.valueSource.sourceType",
+                        "valueSource.sourceType nam ngoai 6 nguon duoc cong bo.",
+                        new
+                        {
+                            fieldId = id,
+                            sourceType = valueSourceType,
+                            allowedSourceTypes = AllowedFieldValueSourceTypes.OrderBy(x => x, StringComparer.Ordinal).ToArray()
+                        });
+
+                sourceOptionCount = ValidateFieldOptions(valueSource, "options", $"{path}.valueSource", id);
+                var hasSourceOptions = valueSource.TryGetProperty("options", out var sourceOptions)
+                                       && sourceOptions.ValueKind != JsonValueKind.Null;
+                if (!string.Equals(valueSourceType, LabelValueSourceTypes.FixedEnum, StringComparison.Ordinal)
+                    && hasSourceOptions)
+                {
+                    throw DynamicFormFieldConfigInvalid(
+                        $"{path}.valueSource.options",
+                        "Chi FIXED_ENUM duoc khai bao options trong valueSource.",
+                        new { fieldId = id, sourceType = valueSourceType });
+                }
+
+                if (string.Equals(valueSourceType, LabelValueSourceTypes.EnumCatalog, StringComparison.Ordinal)
+                    && string.IsNullOrWhiteSpace(ReadOptionalString(valueSource, "catalogId")))
+                {
+                    throw DynamicFormFieldConfigInvalid(
+                        $"{path}.valueSource.catalogId",
+                        "ENUM_CATALOG phai khai bao catalogId.",
+                        new { fieldId = id });
+                }
+
+                if (string.Equals(valueSourceType, LabelValueSourceTypes.FixedEnum, StringComparison.Ordinal)
+                    && hasFieldOptions
+                    && hasSourceOptions
+                    && !HaveEquivalentFieldOptions(fieldOptions, sourceOptions))
+                {
+                    throw DynamicFormFieldConfigInvalid(
+                        $"{path}.valueSource.options",
+                        "options o field va FIXED_ENUM valueSource phai trung khop neu cung duoc khai bao.",
+                        new { fieldId = id });
+                }
+            }
+
+            var isChoice = ChoiceFieldTypes.Contains(type);
+            if (!isChoice && (hasFieldOptions || hasValueSource))
+                throw DynamicFormFieldConfigInvalid(
+                    path,
+                    "Chi shortText, singleSelect va multiSelect duoc khai bao options/valueSource.",
+                    new { fieldId = id, type });
+
+            if (isChoice
+                && !hasValueSource
+                && fieldOptionCount == 0)
+            {
+                throw DynamicFormFieldConfigInvalid(
+                    $"{path}.options",
+                    "Field lua chon dung options cuc bo phai co it nhat mot option.",
+                    new { fieldId = id, type });
+            }
+
+            if (isChoice
+                && string.Equals(valueSourceType, LabelValueSourceTypes.FixedEnum, StringComparison.Ordinal)
+                && fieldOptionCount + sourceOptionCount == 0)
+            {
+                throw DynamicFormFieldConfigInvalid(
+                    $"{path}.valueSource.options",
+                    "FIXED_ENUM phai co it nhat mot option o field hoac valueSource.",
+                    new { fieldId = id, type });
+            }
+
+            if (string.Equals(type, "richText", StringComparison.Ordinal)
+                && (ReadBoolean(field, "isStatistic")
+                    || ReadLabelCodes(field, "statisticLabelCodes").Count > 0
+                    || field.TryGetProperty("statistic", out var statistic) && statistic.ValueKind != JsonValueKind.Null))
+            {
+                throw DynamicFormFieldConfigInvalid(
+                    path,
+                    "richText khong duoc lam statistic target trong contract v1.",
+                    new { fieldId = id });
+            }
+
+            index++;
+        }
+    }
+
+    private static int ValidateFieldOptions(
+        JsonElement owner,
+        string propertyName,
+        string ownerPath,
+        string fieldId)
+    {
+        if (!owner.TryGetProperty(propertyName, out var options) || options.ValueKind == JsonValueKind.Null)
+            return 0;
+
+        var path = $"{ownerPath}.{propertyName}";
+        if (options.ValueKind != JsonValueKind.Array)
+            throw DynamicFormFieldConfigInvalid(
+                path,
+                $"{path} phai la JSON array.",
+                new { fieldId, actualKind = options.ValueKind.ToString() });
+
+        var count = options.GetArrayLength();
+        if (count > MaxOptionsPerSelectField)
+            throw DynamicFormLimitExceeded(
+                "fieldOptions",
+                MaxOptionsPerSelectField,
+                count,
+                $"Field chi duoc co toi da {MaxOptionsPerSelectField} options.");
+
+        var optionCodes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var optionIndex = 0;
+        foreach (var option in options.EnumerateArray())
+        {
+            var optionPath = $"{path}[{optionIndex}]";
+            if (option.ValueKind != JsonValueKind.Object)
+                throw DynamicFormFieldConfigInvalid(
+                    optionPath,
+                    $"{optionPath} phai la JSON object.",
+                    new { fieldId, actualKind = option.ValueKind.ToString() });
+
+            var code = ReadOptionalString(option, "code");
+            var label = ReadOptionalString(option, "label");
+            if (string.IsNullOrWhiteSpace(code))
+                throw DynamicFormFieldConfigInvalid(
+                    $"{optionPath}.code",
+                    "Option code khong duoc trong.",
+                    new { fieldId });
+            if (!optionCodes.Add(code))
+                throw DynamicFormFieldConfigInvalid(
+                    $"{optionPath}.code",
+                    "Option code bi trung trong cung field.",
+                    new { fieldId, optionCode = code });
+            if (string.IsNullOrWhiteSpace(label))
+                throw DynamicFormFieldConfigInvalid(
+                    $"{optionPath}.label",
+                    "Option label khong duoc trong.",
+                    new { fieldId, optionCode = code });
+
+            optionIndex++;
+        }
+
+        return count;
+    }
+
+    private static bool HaveEquivalentFieldOptions(JsonElement fieldOptions, JsonElement sourceOptions)
+    {
+        if (fieldOptions.ValueKind != JsonValueKind.Array || sourceOptions.ValueKind != JsonValueKind.Array)
+            return false;
+
+        var fieldRows = fieldOptions.EnumerateArray().ToArray();
+        var sourceRows = sourceOptions.EnumerateArray().ToArray();
+        if (fieldRows.Length != sourceRows.Length)
+            return false;
+
+        for (var index = 0; index < fieldRows.Length; index++)
+        {
+            if (!string.Equals(
+                    ReadOptionalString(fieldRows[index], "code"),
+                    ReadOptionalString(sourceRows[index], "code"),
+                    StringComparison.OrdinalIgnoreCase)
+                || !string.Equals(
+                    ReadOptionalString(fieldRows[index], "label"),
+                    ReadOptionalString(sourceRows[index], "label"),
+                    StringComparison.Ordinal))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static void EnsureOptionalBooleanProperty(
+        JsonElement field,
+        string propertyName,
+        string fieldPath,
+        string fieldId)
+    {
+        if (!field.TryGetProperty(propertyName, out var value))
+            return;
+
+        if (value.ValueKind is JsonValueKind.True or JsonValueKind.False)
+            return;
+
+        throw DynamicFormFieldConfigInvalid(
+            $"{fieldPath}.{propertyName}",
+            $"{propertyName} phai la boolean.",
+            new { fieldId, actualKind = value.ValueKind.ToString() });
+    }
+
+    private static AppException DynamicFormFieldConfigInvalid(
+        string path,
+        string reason,
+        object? details = null)
+        => DynamicFormValidation(
+            AppErrorCode.DYNAMIC_FORM_FIELD_CONFIG_INVALID,
+            reason,
+            new { path, details });
+
     private static void EnsureFieldsLimit(string? fieldsJson)
     {
         if (string.IsNullOrWhiteSpace(fieldsJson))
@@ -2274,6 +3205,76 @@ public sealed class DynamicFormService : IDynamicFormService
                 MaxFieldsPerForm,
                 document.RootElement.GetArrayLength(),
                 $"Dynamic Form chi toi da {MaxFieldsPerForm} fields.");
+    }
+
+    private static void EnsureSchemaPayloadBudget(
+        string? sectionsJson,
+        string? fieldsJson,
+        string? blocksJson)
+    {
+        var actualBytes = Encoding.UTF8.GetByteCount(sectionsJson ?? "[]")
+                          + Encoding.UTF8.GetByteCount(fieldsJson ?? "[]")
+                          + Encoding.UTF8.GetByteCount(blocksJson ?? "[]")
+                          + 64;
+        if (actualBytes <= MaxSchemaPayloadBytes)
+            return;
+
+        throw DynamicFormLimitExceeded(
+            "schemaPayloadBytes",
+            MaxSchemaPayloadBytes,
+            actualBytes,
+            $"Dynamic Form schema chi toi da {MaxSchemaPayloadBytes} UTF-8 bytes.");
+    }
+
+    private static void EnsureTypedSchemaProjection(
+        string? sectionsJson,
+        string? fieldsJson,
+        string? excelBlockJson,
+        string? blocksJson)
+    {
+        try
+        {
+            _ = DynamicFormSchemaAdapter.FromLegacy(
+                sectionsJson,
+                fieldsJson,
+                excelBlockJson,
+                blocksJson);
+        }
+        catch (Exception ex) when (
+            ex is JsonException or NotSupportedException or ArgumentException)
+        {
+            var jsonPath = (ex as JsonException)?.Path;
+            throw DynamicFormValidation(
+                AppErrorCode.DYNAMIC_FORM_JSON_KIND_INVALID,
+                "DYNAMIC_FORM_TYPED_SCHEMA_KIND_INVALID",
+                new
+                {
+                    path = string.IsNullOrWhiteSpace(jsonPath) ? null : jsonPath,
+                    contract = "DynamicFormSchema"
+                },
+                ex);
+        }
+    }
+
+    private static void EnsurePublishableSchema(
+        string sectionsJson,
+        string fieldsJson,
+        string blocksJson)
+    {
+        using var sections = ParseJson(sectionsJson, "SectionsJson");
+        using var fields = ParseJson(fieldsJson, "FieldsJson");
+        using var blocks = ParseJson(blocksJson, "BlocksJson");
+        if (sections.RootElement.GetArrayLength() == 0)
+            throw DynamicFormValidation(
+                AppErrorCode.DYNAMIC_FORM_SECTION_CONFIG_INVALID,
+                "Bieu mau can it nhat mot section truoc khi cong bo.",
+                new { path = "SectionsJson" });
+
+        if (fields.RootElement.GetArrayLength() == 0 && blocks.RootElement.GetArrayLength() == 0)
+            throw DynamicFormValidation(
+                AppErrorCode.DYNAMIC_FORM_FIELD_CONFIG_INVALID,
+                "Bieu mau can it nhat mot field hoac table block truoc khi cong bo.",
+                new { path = "FieldsJson" });
     }
 
     private static void EnsureFieldDisplayNames(string? fieldsJson)
@@ -2428,9 +3429,31 @@ public sealed class DynamicFormService : IDynamicFormService
                 ? retainedKey
                 : null;
             var type = ReadOptionalString(field, "type");
-            var baseKey = NormalizeFieldTechnicalKey(requestedKey ?? existingKey ?? id ?? type)
+            var normalizedRequestedKey = NormalizeFieldTechnicalKey(requestedKey);
+            var normalizedExistingKey = NormalizeFieldTechnicalKey(existingKey);
+            if (!string.IsNullOrWhiteSpace(normalizedExistingKey) &&
+                !string.IsNullOrWhiteSpace(normalizedRequestedKey) &&
+                !string.Equals(normalizedExistingKey, normalizedRequestedKey, StringComparison.OrdinalIgnoreCase))
+            {
+                throw DynamicFormFieldConfigInvalid(
+                    $"FieldsJson[{index}].key",
+                    "Field key khong duoc doi cho cung field id.",
+                    new { fieldId = id, existingKey = normalizedExistingKey, requestedKey = normalizedRequestedKey });
+            }
+
+            var baseKey = normalizedExistingKey
+                          ?? normalizedRequestedKey
+                          ?? NormalizeFieldTechnicalKey(id ?? type)
                           ?? $"field_{index + 1}";
-            field["key"] = MakeUniqueFieldTechnicalKey(baseKey, usedKeys);
+            if (!usedKeys.Add(baseKey))
+            {
+                throw DynamicFormFieldConfigInvalid(
+                    $"FieldsJson[{index}].key",
+                    "Field key bi trung trong cung bieu mau.",
+                    new { fieldId = id, fieldKey = baseKey });
+            }
+
+            field["key"] = baseKey;
             index++;
         }
 
@@ -2488,25 +3511,6 @@ public sealed class DynamicFormService : IDynamicFormService
         return normalized.Length <= 96 ? normalized : normalized[..96].TrimEnd('_', '.', '-');
     }
 
-    private static string MakeUniqueFieldTechnicalKey(string baseKey, HashSet<string> usedKeys)
-    {
-        var normalizedBase = string.IsNullOrWhiteSpace(baseKey) ? "field" : baseKey;
-        var candidate = normalizedBase;
-        var suffix = 2;
-        while (!usedKeys.Add(candidate))
-        {
-            var suffixText = $"_{suffix}";
-            var maxBaseLength = Math.Max(1, 96 - suffixText.Length);
-            var prefix = normalizedBase.Length <= maxBaseLength
-                ? normalizedBase
-                : normalizedBase[..maxBaseLength].TrimEnd('_', '.', '-');
-            candidate = $"{prefix}{suffixText}";
-            suffix++;
-        }
-
-        return candidate;
-    }
-
     private static bool IsGenericFieldDisplayName(string? fieldType, string displayName)
     {
         var normalized = NormalizeForComparison(displayName);
@@ -2547,63 +3551,625 @@ public sealed class DynamicFormService : IDynamicFormService
         string fieldName,
         bool removeFieldStatisticLabels)
     {
-        if (string.IsNullOrWhiteSpace(json))
-            return string.Empty;
-
-        JsonNode? node;
         try
         {
-            node = JsonNode.Parse(json);
+            return DynamicFormPublishedSchemaSnapshotBuilder.CanonicalizeStructureForComparison(
+                json,
+                stripStatisticConfig: true,
+                removeFieldStatisticLabels);
         }
-        catch (JsonException ex)
+        catch (InvalidOperationException ex)
         {
             throw DynamicFormJsonInvalid(fieldName, $"{fieldName} khong phai JSON hop le.", ex);
         }
-
-        if (node is null)
-            throw DynamicFormJsonInvalid(fieldName, $"{fieldName} khong phai JSON hop le.");
-
-        StripStatisticConfig(node, removeFieldStatisticLabels);
-        return node.ToJsonString(JsonOptions);
     }
 
-    private static void StripStatisticConfig(JsonNode? node, bool removeFieldStatisticLabels)
+    private static void EnsureNoAlternateFieldStatisticCreate(
+        string fieldsJson)
     {
-        if (node is JsonObject obj)
+        using var document = ParseJson(fieldsJson, "FieldsJson");
+        var index = 0;
+        foreach (var field in document.RootElement.EnumerateArray())
         {
-            obj.Remove("isStatistic");
-            obj.Remove("statistic");
-            if (removeFieldStatisticLabels)
+            var changedProperty = FirstConfiguredStatisticProperty(field);
+            if (changedProperty is not null)
             {
-                if (IsDynamicFormFieldObject(obj))
-                {
-                    obj.Remove("name");
-                    obj.Remove("displayName");
-                    obj.Remove("label");
-                }
-
-                obj.Remove("statisticLabelCodes");
+                throw AlternateStatisticWriter(
+                    $"$.schema.fields[{index}].{changedProperty}",
+                    "USE_CANONICAL_STATISTICS_PATCH");
             }
-            obj.Remove("statisticColumns");
-            obj.Remove("statisticColumnLabels");
-            obj.Remove("metricLabelTargets");
+            index++;
+        }
+    }
 
-            foreach (var child in obj.ToList())
-                StripStatisticConfig(child.Value, removeFieldStatisticLabels);
+    private static void EnsureNoAlternateFieldStatisticUpdate(
+        string currentFieldsJson,
+        string nextFieldsJson)
+    {
+        using var currentDocument = ParseJson(
+            currentFieldsJson,
+            "FieldsJson");
+        using var nextDocument = ParseJson(nextFieldsJson, "FieldsJson");
+        var currentById = currentDocument.RootElement
+            .EnumerateArray()
+            .Where(item => item.ValueKind == JsonValueKind.Object)
+            .Select(item => (id: FieldIdentity(item), item))
+            .Where(pair => !string.IsNullOrWhiteSpace(pair.id))
+            .ToDictionary(
+                pair => pair.id!,
+                pair => pair.item.Clone(),
+                StringComparer.Ordinal);
+
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var nextIndex = 0;
+        foreach (var nextField in nextDocument.RootElement.EnumerateArray())
+        {
+            var fieldId = FieldIdentity(nextField);
+            if (string.IsNullOrWhiteSpace(fieldId) ||
+                !currentById.TryGetValue(fieldId, out var currentField))
+            {
+                var configuredProperty =
+                    FirstConfiguredStatisticProperty(nextField);
+                if (configuredProperty is not null)
+                {
+                    throw AlternateStatisticWriter(
+                        $"$.schema.fields[{nextIndex}].{configuredProperty}",
+                        "USE_CANONICAL_STATISTICS_PATCH");
+                }
+                nextIndex++;
+                continue;
+            }
+
+            seen.Add(fieldId);
+            var statisticProperty = FirstDifferentStatisticProperty(
+                currentField,
+                nextField);
+            if (statisticProperty is not null)
+            {
+                throw AlternateStatisticWriter(
+                    $"$.schema.fields[{nextIndex}].{statisticProperty}",
+                    "USE_CANONICAL_STATISTICS_PATCH");
+            }
+
+            if (ReadBoolean(currentField, "isStatistic"))
+            {
+                var structureProperty = FirstDifferentFieldStructureProperty(
+                    currentField,
+                    nextField);
+                if (structureProperty is not null)
+                {
+                    throw AlternateStatisticWriter(
+                        $"$.schema.fields[{nextIndex}].{structureProperty}",
+                        "CONFIGURED_STATISTIC_TARGET_STRUCTURE_IMMUTABLE");
+                }
+            }
+            nextIndex++;
+        }
+
+        foreach (var current in currentById)
+        {
+            if (!seen.Contains(current.Key) &&
+                ReadBoolean(current.Value, "isStatistic"))
+            {
+                throw AlternateStatisticWriter(
+                    "$.schema.fields",
+                    "CONFIGURED_STATISTIC_TARGET_REMOVAL_FORBIDDEN");
+            }
+        }
+    }
+
+    private static void EnsureNoAlternateTableStatisticCreate(
+        string blocksJson)
+    {
+        using var document = ParseJson(blocksJson, "BlocksJson");
+        if (document.RootElement.ValueKind != JsonValueKind.Array)
+        {
+            throw DynamicFormJsonKindInvalid(
+                "BlocksJson",
+                "array",
+                document.RootElement.ValueKind,
+                "BlocksJson phai la JSON array.");
+        }
+
+        var blockIndex = 0;
+        foreach (var block in document.RootElement.EnumerateArray())
+        {
+            var configuredProperty =
+                FirstCallerSuppliedTableStatisticProperty(block);
+            if (configuredProperty is not null)
+            {
+                throw AlternateStatisticWriter(
+                    $"$.schema.blocks[{blockIndex}]." +
+                    configuredProperty,
+                    "USE_CANONICAL_STATISTICS_PATCH");
+            }
+            blockIndex++;
+        }
+    }
+
+    private static void EnsureNoAlternateTableStatisticUpdate(
+        string currentBlocksJson,
+        string nextBlocksJson,
+        string? tableSectionJson)
+    {
+        using var currentDocument = ParseJson(
+            currentBlocksJson,
+            "BlocksJson");
+        using var nextDocument = ParseJson(
+            nextBlocksJson,
+            "BlocksJson");
+        if (currentDocument.RootElement.ValueKind !=
+                JsonValueKind.Array ||
+            nextDocument.RootElement.ValueKind !=
+                JsonValueKind.Array)
+        {
+            throw AlternateStatisticWriter(
+                "$.schema.blocks",
+                "TABLE_BLOCKS_ARRAY_REQUIRED");
+        }
+
+        var currentById =
+            new Dictionary<string, JsonElement>(
+                StringComparer.Ordinal);
+        foreach (var block in
+                 currentDocument.RootElement.EnumerateArray())
+        {
+            var blockId = ReadOptionalString(block, "blockId");
+            if (!string.IsNullOrWhiteSpace(blockId))
+                currentById.TryAdd(blockId, block.Clone());
+        }
+        var configuredBlockIds =
+            ReadConfiguredTableStatisticBlockIds(tableSectionJson);
+        foreach (var item in currentById)
+        {
+            if (HasActiveTableStatisticMetadata(item.Value))
+                configuredBlockIds.Add(item.Key);
+        }
+
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var blockIndex = 0;
+        foreach (var nextBlock in
+                 nextDocument.RootElement.EnumerateArray())
+        {
+            var configuredProperty =
+                FirstCallerSuppliedTableStatisticProperty(nextBlock);
+            if (configuredProperty is not null)
+            {
+                throw AlternateStatisticWriter(
+                    $"$.schema.blocks[{blockIndex}]." +
+                    configuredProperty,
+                    "USE_CANONICAL_STATISTICS_PATCH");
+            }
+
+            var blockId =
+                ReadOptionalString(nextBlock, "blockId");
+            if (!string.IsNullOrWhiteSpace(blockId))
+                seen.Add(blockId);
+            if (!string.IsNullOrWhiteSpace(blockId) &&
+                configuredBlockIds.Contains(blockId) &&
+                currentById.TryGetValue(
+                    blockId,
+                    out var currentBlock) &&
+                !string.Equals(
+                    CanonicalizeTableBlockStructure(currentBlock),
+                    CanonicalizeTableBlockStructure(nextBlock),
+                    StringComparison.Ordinal))
+            {
+                throw AlternateStatisticWriter(
+                    $"$.schema.blocks[{blockIndex}]",
+                    "CONFIGURED_TABLE_STATISTIC_STRUCTURE_IMMUTABLE");
+            }
+            blockIndex++;
+        }
+
+        foreach (var blockId in configuredBlockIds)
+        {
+            if (!seen.Contains(blockId))
+            {
+                throw AlternateStatisticWriter(
+                    "$.schema.blocks",
+                    "CONFIGURED_TABLE_STATISTIC_REMOVAL_FORBIDDEN");
+            }
+        }
+    }
+
+    private static string?
+        FirstCallerSuppliedTableStatisticProperty(
+            JsonElement block)
+    {
+        foreach (var property in new[]
+                 {
+                     "metricLabelTargets",
+                     "allowedRowLabelCodes",
+                     "statisticsDisabled",
+                     "statisticsDisabledReason",
+                     "statisticColumns",
+                     "statisticColumnLabels"
+                 })
+        {
+            if (block.TryGetProperty(property, out _))
+                return property;
+        }
+        if (!block.TryGetProperty(
+                "metricRules",
+                out var metricRules) ||
+            metricRules.ValueKind != JsonValueKind.Array)
+        {
+            return null;
+        }
+
+        var metricIndex = 0;
+        foreach (var metric in metricRules.EnumerateArray())
+        {
+            if (metric.ValueKind == JsonValueKind.Object &&
+                metric.TryGetProperty("aggregateOps", out _))
+            {
+                return $"metricRules[{metricIndex}].aggregateOps";
+            }
+            metricIndex++;
+        }
+        return null;
+    }
+
+    private static bool HasActiveTableStatisticMetadata(
+        JsonElement block)
+    {
+        if (ReadBoolean(block, "statisticsDisabled"))
+            return true;
+        foreach (var property in new[]
+                 {
+                     "metricLabelTargets",
+                     "allowedRowLabelCodes",
+                     "statisticColumns",
+                     "statisticColumnLabels"
+                 })
+        {
+            if (block.TryGetProperty(property, out var value) &&
+                value.ValueKind == JsonValueKind.Array &&
+                value.GetArrayLength() > 0)
+            {
+                return true;
+            }
+        }
+        if (block.TryGetProperty(
+                "metricRules",
+                out var metricRules) &&
+            metricRules.ValueKind == JsonValueKind.Array)
+        {
+            return metricRules.EnumerateArray().Any(metric =>
+                metric.ValueKind == JsonValueKind.Object &&
+                metric.TryGetProperty(
+                    "aggregateOps",
+                    out var operations) &&
+                operations.ValueKind == JsonValueKind.Array &&
+                operations.GetArrayLength() > 0);
+        }
+        return false;
+    }
+
+    private static HashSet<string>
+        ReadConfiguredTableStatisticBlockIds(
+            string? tableSectionJson)
+    {
+        var result =
+            new HashSet<string>(StringComparer.Ordinal);
+        if (string.IsNullOrWhiteSpace(tableSectionJson))
+            return result;
+        using var document = ParseJson(
+            tableSectionJson,
+            "StatisticConfigSections.TableSectionJson");
+        if (document.RootElement.ValueKind != JsonValueKind.Array)
+        {
+            throw AlternateStatisticWriter(
+                "$.tableConfig",
+                "TABLE_SECTION_SCHEMA_INVALID");
+        }
+        foreach (var table in document.RootElement.EnumerateArray())
+        {
+            var blockId = ReadOptionalString(table, "blockId");
+            if (!string.IsNullOrWhiteSpace(blockId))
+                result.Add(blockId);
+        }
+        return result;
+    }
+
+    private static string CanonicalizeTableBlockStructure(
+        JsonElement block)
+        => DynamicFormPublishedSchemaSnapshotBuilder
+            .CanonicalizeStructureForComparison(
+                $"[{block.GetRawText()}]",
+                stripStatisticConfig: true,
+                removeFieldStatisticLabels: false);
+
+    private static string CarryForwardTableStatisticMetadata(
+        string currentBlocksJson,
+        string nextBlocksJson)
+    {
+        using var currentDocument = ParseJson(
+            currentBlocksJson,
+            "BlocksJson");
+        var currentById =
+            currentDocument.RootElement
+                .EnumerateArray()
+                .Where(block =>
+                    block.ValueKind == JsonValueKind.Object)
+                .Select(block =>
+                    (
+                        BlockId:
+                            ReadOptionalString(block, "blockId"),
+                        Block: block.Clone()))
+                .Where(item =>
+                    !string.IsNullOrWhiteSpace(item.BlockId))
+                .ToDictionary(
+                    item => item.BlockId!,
+                    item => item.Block,
+                    StringComparer.Ordinal);
+        var nextNode = JsonNode.Parse(nextBlocksJson);
+        if (nextNode is not JsonArray nextBlocks)
+        {
+            throw AlternateStatisticWriter(
+                "$.schema.blocks",
+                "TABLE_BLOCKS_ARRAY_REQUIRED");
+        }
+
+        foreach (var nextBlock in
+                 nextBlocks.OfType<JsonObject>())
+        {
+            var blockId =
+                ReadJsonObjectString(nextBlock, "blockId");
+            if (string.IsNullOrWhiteSpace(blockId) ||
+                !currentById.TryGetValue(
+                    blockId,
+                    out var currentBlock))
+            {
+                continue;
+            }
+
+            foreach (var property in new[]
+                     {
+                         "metricLabelTargets",
+                         "allowedRowLabelCodes",
+                         "statisticColumns",
+                         "statisticColumnLabels"
+                     })
+            {
+                CopyTableStatisticProperty(
+                    currentBlock,
+                    nextBlock,
+                    property);
+            }
+            if (ReadBoolean(
+                    currentBlock,
+                    "statisticsDisabled"))
+            {
+                nextBlock["statisticsDisabled"] = true;
+                CopyTableStatisticProperty(
+                    currentBlock,
+                    nextBlock,
+                    "statisticsDisabledReason");
+            }
+            CarryForwardMetricAggregateOperations(
+                currentBlock,
+                nextBlock);
+        }
+
+        return nextBlocks.ToJsonString(JsonOptions);
+    }
+
+    private static void CopyTableStatisticProperty(
+        JsonElement currentBlock,
+        JsonObject nextBlock,
+        string propertyName)
+    {
+        if (!currentBlock.TryGetProperty(
+                propertyName,
+                out var value))
+        {
             return;
         }
+        nextBlock[propertyName] =
+            JsonNode.Parse(value.GetRawText());
+    }
 
-        if (node is JsonArray arr)
+    private static void CarryForwardMetricAggregateOperations(
+        JsonElement currentBlock,
+        JsonObject nextBlock)
+    {
+        if (!currentBlock.TryGetProperty(
+                "metricRules",
+                out var currentRules) ||
+            currentRules.ValueKind != JsonValueKind.Array ||
+            nextBlock["metricRules"] is not JsonArray nextRules)
         {
-            foreach (var item in arr)
-                StripStatisticConfig(item, removeFieldStatisticLabels);
+            return;
+        }
+        var operationsByMetricKey = currentRules
+            .EnumerateArray()
+            .Where(rule =>
+                rule.ValueKind == JsonValueKind.Object &&
+                !string.IsNullOrWhiteSpace(
+                    ReadOptionalString(rule, "metricKey")) &&
+                rule.TryGetProperty("aggregateOps", out _))
+            .ToDictionary(
+                rule => ReadOptionalString(rule, "metricKey")!,
+                rule => rule.GetProperty("aggregateOps").Clone(),
+                StringComparer.Ordinal);
+        foreach (var nextRule in nextRules.OfType<JsonObject>())
+        {
+            var metricKey =
+                ReadJsonObjectString(nextRule, "metricKey");
+            if (!string.IsNullOrWhiteSpace(metricKey) &&
+                operationsByMetricKey.TryGetValue(
+                    metricKey,
+                    out var operations))
+            {
+                nextRule["aggregateOps"] =
+                    JsonNode.Parse(operations.GetRawText());
+            }
         }
     }
 
-    private static bool IsDynamicFormFieldObject(JsonObject obj)
-        => obj.ContainsKey("id")
-           && obj.ContainsKey("type")
-           && (obj.ContainsKey("key") || obj.ContainsKey("sectionId"));
+    private static string? FirstConfiguredStatisticProperty(
+        JsonElement field)
+    {
+        if (ReadBoolean(field, "isStatistic"))
+            return "isStatistic";
+        if (ReadLabelCodes(field, "statisticLabelCodes").Count > 0)
+            return "statisticLabelCodes";
+        if (field.TryGetProperty("statistic", out var statistic) &&
+            statistic.ValueKind is not JsonValueKind.Null and
+                not JsonValueKind.Undefined)
+        {
+            return "statistic";
+        }
+        return null;
+    }
+
+    private static string? FirstDifferentStatisticProperty(
+        JsonElement current,
+        JsonElement next)
+    {
+        foreach (var property in new[]
+                 {
+                     "isStatistic",
+                     "statisticLabelCodes",
+                     "statistic"
+                 })
+        {
+            if (!CanonicalPropertyEquals(current, next, property))
+                return property;
+        }
+        return null;
+    }
+
+    private static string? FirstDifferentFieldStructureProperty(
+        JsonElement current,
+        JsonElement next)
+    {
+        var statisticProperties = new HashSet<string>(
+            new[] { "isStatistic", "statisticLabelCodes", "statistic" },
+            StringComparer.Ordinal);
+        var names = current.EnumerateObject()
+            .Select(property => property.Name)
+            .Concat(next.EnumerateObject().Select(property => property.Name))
+            .Where(name => !statisticProperties.Contains(name))
+            .Distinct(StringComparer.Ordinal)
+            .OrderBy(name => name, StringComparer.Ordinal);
+        foreach (var name in names)
+        {
+            if (!CanonicalPropertyEquals(current, next, name))
+                return name;
+        }
+        return null;
+    }
+
+    private static bool CanonicalPropertyEquals(
+        JsonElement left,
+        JsonElement right,
+        string propertyName)
+    {
+        var hasLeft = left.TryGetProperty(propertyName, out var leftValue);
+        var hasRight = right.TryGetProperty(propertyName, out var rightValue);
+        if (!hasLeft || !hasRight)
+            return hasLeft == hasRight;
+        return string.Equals(
+            StatConfigCanonicalJson.CanonicalizeElement(leftValue),
+            StatConfigCanonicalJson.CanonicalizeElement(rightValue),
+            StringComparison.Ordinal);
+    }
+
+    private static string? FieldIdentity(JsonElement field)
+        => ReadOptionalString(field, "id") ??
+           ReadOptionalString(field, "key");
+
+    private static AppException AlternateStatisticWriter(
+        string path,
+        string reason)
+        => AppExceptionFactory.BadRequest(
+            AppErrorCode.DYNAMIC_FORM_STATISTIC_CONFIG_STRUCTURE_INVALID,
+            new { path, reason });
+
+    private static List<DynamicFormStatisticConfigVersionSnapshot>?
+        PrepareStatisticConfigForPublish(
+            DynamicFormTemplate owner)
+    {
+        var hasPersistedIdentity =
+            !string.IsNullOrWhiteSpace(owner.StatisticConfigId) ||
+            !string.IsNullOrWhiteSpace(
+                owner.StatisticConfigVersionId) ||
+            owner.StatisticConfigVersionNo > 0 ||
+            owner.StatisticConfigRevision > 0 ||
+            !string.IsNullOrWhiteSpace(
+                owner.StatisticConfigHash);
+        if (!hasPersistedIdentity)
+            return null;
+
+        if (string.IsNullOrWhiteSpace(owner.StatisticConfigId) ||
+            string.IsNullOrWhiteSpace(
+                owner.StatisticConfigVersionId) ||
+            owner.StatisticConfigVersionNo < 1 ||
+            owner.StatisticConfigRevision < 1 ||
+            string.IsNullOrWhiteSpace(owner.StatisticConfigHash) ||
+            !string.Equals(
+                owner.StatisticConfigStatus,
+                StatConfigStatuses.Draft,
+                StringComparison.Ordinal))
+        {
+            throw StatisticConfigIntegrityConflict(
+                owner.Id,
+                "PUBLISH_IDENTITY");
+        }
+
+        var snapshots = owner.StatisticConfigSnapshots ?? new();
+        var currentSnapshots = snapshots
+            .Where(snapshot =>
+                string.Equals(
+                    snapshot.VersionId,
+                    owner.StatisticConfigVersionId,
+                    StringComparison.Ordinal) &&
+                snapshot.VersionNo ==
+                owner.StatisticConfigVersionNo)
+            .ToList();
+        if (snapshots.Count != owner.StatisticConfigVersionNo ||
+            currentSnapshots.Count != 1)
+        {
+            throw StatisticConfigIntegrityConflict(
+                owner.Id,
+                "PUBLISH_SNAPSHOT_IDENTITY");
+        }
+
+        var current = currentSnapshots[0];
+        if (current.Revision != owner.StatisticConfigRevision ||
+            !string.Equals(
+                current.ConfigHash,
+                owner.StatisticConfigHash,
+                StringComparison.Ordinal) ||
+            !string.Equals(
+                current.Status,
+                StatConfigStatuses.Draft,
+                StringComparison.Ordinal))
+        {
+            throw StatisticConfigIntegrityConflict(
+                owner.Id,
+                "PUBLISH_CURRENT_SNAPSHOT");
+        }
+
+        current.Status = StatConfigStatuses.Locked;
+        return snapshots;
+    }
+
+    private static AppException StatisticConfigIntegrityConflict(
+        string ownerId,
+        string reason)
+        => AppExceptionFactory.Create(
+            AppErrorCode.STAT_CONFIG_CAS_CONFLICT,
+            new
+            {
+                ownerKind = StatConfigOwnerKinds.DynamicForm,
+                ownerId,
+                reason =
+                    $"DYNAMIC_FORM_STATISTIC_{reason}_INTEGRITY"
+            });
 
     private static IEnumerable<LabelStatisticTarget> ReadLabelPropertyTargets(
         string fieldName,
@@ -3336,7 +4902,8 @@ public sealed class DynamicFormService : IDynamicFormService
                 new { fieldName = "BlocksJson" });
 
         var knownSectionIds = sectionIds.ToHashSet(StringComparer.Ordinal);
-        var fallbackSectionId = sectionIds[0];
+        var knownBlockIds = new HashSet<string>(StringComparer.Ordinal);
+        var blockIndex = 0;
 
         foreach (var item in blocks)
         {
@@ -3349,18 +4916,39 @@ public sealed class DynamicFormService : IDynamicFormService
             RemoveRawTemplatePayload(block);
             RemoveLegacyStatisticColumnPayload(block);
 
+            var blockId = ReadJsonObjectString(block, "blockId")
+                          ?? ReadJsonObjectString(block, "BlockId");
+            if (string.IsNullOrWhiteSpace(blockId))
+                throw DynamicFormValidation(
+                    AppErrorCode.DYNAMIC_FORM_EXCEL_BLOCK_INVALID,
+                    "BlockId khong duoc trong.",
+                    new { path = $"BlocksJson[{blockIndex}].blockId" });
+            if (!knownBlockIds.Add(blockId))
+                throw DynamicFormValidation(
+                    AppErrorCode.DYNAMIC_FORM_BLOCK_DUPLICATE,
+                    "BlockId bi trung trong cung bieu mau.",
+                    new { path = $"BlocksJson[{blockIndex}].blockId", blockId });
+
             var sectionId = ReadJsonObjectString(block, "sectionId")
-                            ?? ReadJsonObjectString(block, "SectionId")
-                            ?? fallbackSectionId;
+                            ?? ReadJsonObjectString(block, "SectionId");
+
+            if (string.IsNullOrWhiteSpace(sectionId))
+                throw DynamicFormValidation(
+                    AppErrorCode.DYNAMIC_FORM_SECTION_CONFIG_INVALID,
+                    "Block sectionId khong duoc trong.",
+                    new { path = $"BlocksJson[{blockIndex}].sectionId", blockId });
 
             if (!knownSectionIds.Contains(sectionId))
                 throw DynamicFormValidation(
                     AppErrorCode.DYNAMIC_FORM_SECTION_CONFIG_INVALID,
                     "Phần chứa bảng Excel động không tồn tại trong biểu mẫu động.",
-                    new { sectionId });
+                    new { path = $"BlocksJson[{blockIndex}].sectionId", blockId, sectionId });
 
+            block.Remove("BlockId");
+            block["blockId"] = blockId;
             block.Remove("SectionId");
             block["sectionId"] = sectionId;
+            blockIndex++;
         }
 
         return blocks.ToJsonString(JsonOptions);
@@ -3387,11 +4975,25 @@ public sealed class DynamicFormService : IDynamicFormService
 
         EnsureUniqueDynamicExcelTemplateBlocks(blocks);
 
+        foreach (var block in blocks.OfType<JsonObject>())
+        {
+            var rawId = ReadJsonObjectString(block, "dynamicExcelTemplateId")
+                        ?? ReadJsonObjectString(block, "DynamicExcelTemplateId")
+                        ?? ReadJsonObjectString(block, "excelBlockDynamicExcelTemplateId")
+                        ?? ReadJsonObjectString(block, "ExcelBlockDynamicExcelTemplateId");
+            if (string.IsNullOrWhiteSpace(rawId))
+                continue;
+
+            var normalizedId = NormalizeDynamicExcelTemplateId(rawId);
+            block.Remove("DynamicExcelTemplateId");
+            block.Remove("excelBlockDynamicExcelTemplateId");
+            block.Remove("ExcelBlockDynamicExcelTemplateId");
+            block["dynamicExcelTemplateId"] = normalizedId;
+        }
+
         var ids = blocks
             .OfType<JsonObject>()
-            .Select(block =>
-                ReadJsonObjectString(block, "dynamicExcelTemplateId")
-                ?? ReadJsonObjectString(block, "DynamicExcelTemplateId"))
+            .Select(block => ReadJsonObjectString(block, "dynamicExcelTemplateId"))
             .Where(id => !string.IsNullOrWhiteSpace(id))
             .Select(id => id!)
             .Distinct(StringComparer.Ordinal)
@@ -3417,8 +5019,7 @@ public sealed class DynamicFormService : IDynamicFormService
 
         foreach (var block in blocks.OfType<JsonObject>())
         {
-            var id = ReadJsonObjectString(block, "dynamicExcelTemplateId")
-                     ?? ReadJsonObjectString(block, "DynamicExcelTemplateId");
+            var id = ReadJsonObjectString(block, "dynamicExcelTemplateId");
             if (string.IsNullOrWhiteSpace(id) || !byId.TryGetValue(id, out var template))
                 continue;
 
@@ -3433,10 +5034,27 @@ public sealed class DynamicFormService : IDynamicFormService
                         dynamicExcelName = template.Name,
                     });
 
+            var expectedTableMode = NormalizeDynamicExcelTemplateTableMode(template.TableMode, specKind);
+            var requestedTableMode = ReadJsonObjectString(block, "tableMode")
+                                     ?? ReadJsonObjectString(block, "TableMode");
+            if (!string.IsNullOrWhiteSpace(requestedTableMode) &&
+                !string.Equals(requestedTableMode.Trim(), expectedTableMode, StringComparison.OrdinalIgnoreCase))
+            {
+                throw DynamicFormValidation(
+                    AppErrorCode.DYNAMIC_FORM_TABLE_MODE_MISMATCH,
+                    "TableMode cua block khong khop voi Dynamic Excel template.",
+                    new
+                    {
+                        dynamicExcelTemplateId = id,
+                        requestedTableMode,
+                        expectedTableMode
+                    });
+            }
+
             block.Remove("ExcelSpecKind");
             block["excelSpecKind"] = specKind;
             block.Remove("TableMode");
-            block["tableMode"] = NormalizeDynamicExcelTemplateTableMode(template.TableMode, specKind);
+            block["tableMode"] = expectedTableMode;
             ApplyDynamicExcelTypeMetadata(block, template);
         }
 

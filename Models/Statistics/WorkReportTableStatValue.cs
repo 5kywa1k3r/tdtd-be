@@ -76,6 +76,9 @@ public sealed class WorkReportTableStatValue : BaseEntity
     [BsonElement("flowRole")]
     public string? FlowRole { get; set; }
 
+    [BsonElement("isFlowFinalNode")]
+    public bool IsFlowFinalNode { get; set; }
+
     [BsonElement("flowEffectiveStatus")]
     public string? FlowEffectiveStatus { get; set; }
 
@@ -132,6 +135,9 @@ public sealed class WorkReportTableStatValue : BaseEntity
     [BsonElement("dataType")]
     public string DataType { get; set; } = "NUMBER";
 
+    [BsonElement("valueKind")]
+    public string ValueKind { get; set; } = "NUMBER";
+
     [BsonElement("bucketKey")]
     public string? BucketKey { get; set; }
 
@@ -182,9 +188,17 @@ public sealed class WorkReportTableStatValue : BaseEntity
     [BsonElement("value")]
     public decimal Value { get; set; }
 
+    [BsonElement("numericValue")]
+    [BsonIgnoreIfNull]
+    public decimal? NumericValue { get; set; }
+
     [BsonElement("sourcePayloadRevision")]
     public int SourcePayloadRevision { get; set; }
 
     [BsonElement("sourcePayloadHash")]
     public string? SourcePayloadHash { get; set; }
+
+    [BsonElement("directProjection")]
+    [BsonIgnoreIfNull]
+    public WorkReportDirectProjectionPin? DirectProjection { get; set; }
 }

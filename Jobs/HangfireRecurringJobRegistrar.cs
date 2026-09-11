@@ -3,9 +3,11 @@ using Hangfire.Common;
 using Hangfire.States;
 using Hangfire.Storage;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Logging;
 using tdtd_be.Common.Time;
 using tdtd_be.Services.Common;
 using tdtd_be.Services.WorkAssignmentReports.Statistics;
+using tdtd_be.Services.WorkAssignmentReports.Runtime;
 using tdtd_be.Services.WorkAssignments.Queue;
 using tdtd_be.Services.WorkAssignments.Runtime;
 using tdtd_be.Services.Notifications;
@@ -15,6 +17,8 @@ namespace tdtd_be.Jobs;
 
 public static class HangfireRecurringJobRegistrar
 {
+    private static int _recurringRegistrationReady;
+
     public const string WorkAssignmentMaterializeJobId = "work-assignment:materialize-scan";
     public const string HangfireHistoryArchiveJobId = "hangfire:history-archive";
     public const string MinioCleanupJobId = "uploads:minio-filedoc-cleanup";
@@ -26,9 +30,18 @@ public static class HangfireRecurringJobRegistrar
     public const string DocRoleProjectionRetryNightJobId = "docrole:projection-retry:night";
     public const string UserActionLogRetryJobId = "user-action-log:retry";
     public const string DynamicFormStatisticRebuildJobId = "dynamic-form:statistic-rebuild";
+    public const string StatRunFoundationDirectJobId =
+        "statistics-run:foundation-direct";
+    public const string StatisticReconciliationProductionJobId =
+        "statistics:reconciliation-production";
+    public const string WorkReportLifecycleProjectionOutboxJobId = "work-report:lifecycle-projection-outbox";
+    public const string DynamicFlowMappingOutboxJobId =
+        "dynamic-flow:mapping-outbox";
+    public const string DynamicFlowRuntimeOutboxJobId = "dynamic-flow:runtime-outbox";
 
     public static void Register(IConfiguration cfg, IAppTimeService time)
     {
+        Volatile.Write(ref _recurringRegistrationReady, 0);
         var tz = time.ApplicationTimeZone;
         var hour = Math.Clamp(cfg.GetValue<int?>("UploadCleanup:LocalHour") ?? 21, 0, 23);
         var minute = Math.Clamp(cfg.GetValue<int?>("UploadCleanup:LocalMinute") ?? 0, 0, 59);
@@ -162,6 +175,80 @@ public static class HangfireRecurringJobRegistrar
             statisticRebuildCron,
             new RecurringJobOptions { TimeZone = tz });
 
+        var foundationCron =
+            cfg["StatRunFoundationWorker:Cron"] ?? "*/1 * * * *";
+        var foundationMaxJobs = Math.Clamp(
+            cfg.GetValue<int?>(
+                "StatRunFoundationWorker:MaxJobsPerRun") ?? 3,
+            1,
+            20);
+        RecurringJob.AddOrUpdate<NonOverlappingRecurringJobRunner>(
+            StatRunFoundationDirectJobId,
+            job => job.ProcessStatRunFoundationDirectJobsAsync(
+                foundationMaxJobs,
+                CancellationToken.None),
+            foundationCron,
+            new RecurringJobOptions { TimeZone = tz });
+
+        var reconciliationCron =
+            cfg["StatisticReconciliation:ProductionWorker:Cron"] ??
+            "*/1 * * * *";
+        var reconciliationMaxJobs = Math.Clamp(
+            cfg.GetValue<int?>(
+                "StatisticReconciliation:ProductionWorker:MaxJobsPerRun") ?? 20,
+            1,
+            200);
+        RecurringJob.AddOrUpdate<NonOverlappingRecurringJobRunner>(
+            StatisticReconciliationProductionJobId,
+            job => job.ProcessStatisticReconciliationAsync(
+                reconciliationMaxJobs,
+                CancellationToken.None),
+            reconciliationCron,
+            new RecurringJobOptions { TimeZone = tz });
+
+        var lifecycleProjectionCron = cfg["WorkReportLifecycleProjectionOutbox:Cron"] ?? "*/1 * * * *";
+        var lifecycleProjectionMaxReports = Math.Clamp(
+            cfg.GetValue<int?>("WorkReportLifecycleProjectionOutbox:MaxReportsPerRun") ?? 20,
+            1,
+            200);
+
+        RecurringJob.AddOrUpdate<NonOverlappingRecurringJobRunner>(
+            WorkReportLifecycleProjectionOutboxJobId,
+            job => job.ProcessWorkReportLifecycleProjectionOutboxAsync(lifecycleProjectionMaxReports, CancellationToken.None),
+            lifecycleProjectionCron,
+            new RecurringJobOptions { TimeZone = tz });
+
+        var mappingOutboxCron =
+            cfg["DynamicFlowMapping:OutboxCron"] ??
+            "*/1 * * * *";
+        var mappingOutboxMaxItems = Math.Clamp(
+            cfg.GetValue<int?>(
+                "DynamicFlowMapping:MaxOutboxItemsPerRun") ??
+            20,
+            1,
+            200);
+        RecurringJob.AddOrUpdate<NonOverlappingRecurringJobRunner>(
+            DynamicFlowMappingOutboxJobId,
+            job => job.ProcessDynamicFlowMappingOutboxAsync(
+                mappingOutboxMaxItems,
+                CancellationToken.None),
+            mappingOutboxCron,
+            new RecurringJobOptions { TimeZone = tz });
+
+        var dynamicFlowRuntimeCron = cfg["DynamicFlowRuntime:OutboxCron"] ?? "*/1 * * * *";
+        var dynamicFlowRuntimeMaxItems = Math.Clamp(
+            cfg.GetValue<int?>("DynamicFlowRuntime:MaxOutboxItemsPerRun") ?? 50,
+            1,
+            200);
+        RecurringJob.AddOrUpdate<NonOverlappingRecurringJobRunner>(
+            DynamicFlowRuntimeOutboxJobId,
+            job => job.ProcessDynamicFlowRuntimeOutboxAsync(
+                dynamicFlowRuntimeMaxItems,
+                CancellationToken.None),
+            dynamicFlowRuntimeCron,
+            new RecurringJobOptions { TimeZone = tz });
+
+        Volatile.Write(ref _recurringRegistrationReady, 1);
     }
 
     public static void TriggerMinioCleanupNow()
@@ -185,8 +272,63 @@ public static class HangfireRecurringJobRegistrar
     }
     public static void TriggerUserActionLogRetryNow()
         => RecurringJob.TriggerJob(UserActionLogRetryJobId);
-    public static void TriggerDynamicFormStatisticRebuildNow()
-        => RecurringJob.TriggerJob(DynamicFormStatisticRebuildJobId);
+    public static void TriggerWorkReportLifecycleProjectionOutboxNow()
+        => RecurringJob.TriggerJob(WorkReportLifecycleProjectionOutboxJobId);
+    public static void TriggerDynamicFlowMappingOutboxNow()
+        => RecurringJob.TriggerJob(DynamicFlowMappingOutboxJobId);
+    public static bool TryTriggerDynamicFormStatisticRebuildNow(
+        bool recurringRegistrationEnabled,
+        ILogger? logger = null)
+        => TryTriggerDynamicFormStatisticRebuildNow(
+            recurringRegistrationEnabled,
+            Volatile.Read(ref _recurringRegistrationReady) == 1,
+            TriggerRecurringJobIfRegistered,
+            (reason, exception) =>
+            {
+                if (logger is null)
+                    return;
+
+                if (exception is null)
+                {
+                    logger.LogWarning(
+                        "Skipped best-effort trigger for recurring job {RecurringJobId}: {Reason}",
+                        DynamicFormStatisticRebuildJobId,
+                        reason);
+                }
+                else
+                {
+                    logger.LogWarning(
+                        exception,
+                        "Best-effort trigger failed for recurring job {RecurringJobId}: {Reason}",
+                        DynamicFormStatisticRebuildJobId,
+                        reason);
+                }
+            });
+
+    internal static bool TryTriggerDynamicFormStatisticRebuildNow(
+        bool recurringRegistrationEnabled,
+        bool recurringRegistrationReady,
+        Func<string, bool> triggerIfRegistered,
+        Action<string, Exception?>? onFailure = null)
+    {
+        ArgumentNullException.ThrowIfNull(triggerIfRegistered);
+        if (!recurringRegistrationEnabled || !recurringRegistrationReady)
+            return false;
+
+        try
+        {
+            if (triggerIfRegistered(DynamicFormStatisticRebuildJobId))
+                return true;
+
+            onFailure?.Invoke("RECURRING_JOB_NOT_REGISTERED", null);
+            return false;
+        }
+        catch (Exception ex)
+        {
+            onFailure?.Invoke("RECURRING_JOB_TRIGGER_FAILED", ex);
+            return false;
+        }
+    }
 
     public static void EnqueueTusTempCleanupNow(IBackgroundJobClient client)
     {
@@ -195,10 +337,13 @@ public static class HangfireRecurringJobRegistrar
             new EnqueuedState("default"));
     }
 
-    private static void TriggerRecurringJobIfRegistered(string recurringJobId)
+    private static bool TriggerRecurringJobIfRegistered(string recurringJobId)
     {
         using var connection = JobStorage.Current.GetConnection();
-        if (connection.GetRecurringJobs().Any(x => string.Equals(x.Id, recurringJobId, StringComparison.Ordinal)))
-            RecurringJob.TriggerJob(recurringJobId);
+        if (!connection.GetRecurringJobs().Any(x => string.Equals(x.Id, recurringJobId, StringComparison.Ordinal)))
+            return false;
+
+        RecurringJob.TriggerJob(recurringJobId);
+        return true;
     }
 }

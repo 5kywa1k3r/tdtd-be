@@ -103,6 +103,21 @@ public sealed class UserActionLog : BaseEntity
     [BsonElement("dynamicFormTemplateName")]
     public string? DynamicFormTemplateName { get; set; }
 
+    [BsonElement("dynamicFlowFamilyId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    [BsonIgnoreIfNull]
+    public string? DynamicFlowFamilyId { get; set; }
+
+    [BsonElement("dynamicFlowVersionId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    [BsonIgnoreIfNull]
+    public string? DynamicFlowVersionId { get; set; }
+
+    [BsonElement("dynamicFlowCommandReceiptId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    [BsonIgnoreIfNull]
+    public string? DynamicFlowCommandReceiptId { get; set; }
+
     [BsonElement("workReportPeriodId")]
     [BsonRepresentation(BsonType.ObjectId)]
     public string? WorkReportPeriodId { get; set; }
@@ -128,6 +143,10 @@ public sealed class UserActionLog : BaseEntity
 
     [BsonElement("data")]
     public Dictionary<string, string>? Data { get; set; }
+
+    [BsonElement("idempotencyKey")]
+    [BsonIgnoreIfNull]
+    public string? IdempotencyKey { get; set; }
 }
 
 [BsonIgnoreExtraElements]
@@ -184,6 +203,7 @@ public static class UserActionLogActions
     public const string ReportReturned = "REPORT_RETURNED";
     public const string ReportDeactivated = "REPORT_DEACTIVATED";
     public const string ReportReactivated = "REPORT_REACTIVATED";
+    public const string DynamicFlowDefinitionMutated = "DYNAMIC_FLOW_DEFINITION_MUTATED";
 }
 
 public static class UserActionLogResults

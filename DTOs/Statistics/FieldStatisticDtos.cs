@@ -5,9 +5,11 @@ public sealed class FieldStatisticSummaryRequest
     public string? WorkId { get; set; }
     public string? ScopeType { get; set; }
     public string? ScopeId { get; set; }
+    public string? GenerationId { get; set; }
     public string? DynamicFormTemplateId { get; set; }
     public string? FieldId { get; set; }
     public string? FieldKey { get; set; }
+    public string? StatisticLabelCode { get; set; }
     public string? FieldType { get; set; }
     public string? BucketKey { get; set; }
     public bool? ShowInTree { get; set; }
@@ -17,6 +19,7 @@ public sealed class FieldStatisticSummaryRequest
     public string? PeriodKeyTo { get; set; }
     public string? PeriodInstanceKey { get; set; }
     public int? ReportStatus { get; set; }
+    public bool IncludeDrilldown { get; set; }
     public int Page { get; set; } = 0;
     public int PageSize { get; set; } = 50;
 }
@@ -34,6 +37,7 @@ public sealed class FieldStatisticSummaryRow
     public string FieldKey { get; set; } = default!;
     public string FieldLabel { get; set; } = default!;
     public string FieldType { get; set; } = default!;
+    public List<string> StatisticLabelCodes { get; set; } = new();
     public bool ShowInTree { get; set; }
     public bool ShowInDetail { get; set; }
     public string? BucketKey { get; set; }
@@ -58,7 +62,12 @@ public sealed class FieldStatisticSummaryRow
 
 public sealed class FieldStatisticSummaryResponse
 {
+    public P9DirectResultMetadata Metadata { get; set; } = new();
     public List<FieldStatisticSummaryRow> Rows { get; set; } = new();
+    public List<P9DirectDrilldownRow> DrilldownRows { get; set; } = new();
+    public int Page { get; set; }
+    public int PageSize { get; set; }
+    public int ReturnedRows { get; set; }
     public long TotalRows { get; set; }
     public long TotalValueCount { get; set; }
     public decimal TotalSum { get; set; }
@@ -134,6 +143,7 @@ public sealed class FieldTextConcatItem
 
 public sealed class FieldTextConcatResponse
 {
+    public P9DirectResultMetadata Metadata { get; set; } = new();
     public string WorkId { get; set; } = default!;
     public string ScopeType { get; set; } = default!;
     public string? ScopeId { get; set; }

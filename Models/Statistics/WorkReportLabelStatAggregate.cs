@@ -12,6 +12,10 @@ public sealed class WorkReportLabelStatAggregate : BaseEntity
     [BsonRepresentation(BsonType.ObjectId)]
     public string Id { get; set; } = default!;
 
+    [BsonElement("directProjection")]
+    [BsonIgnoreIfNull]
+    public WorkReportDirectProjectionPin? DirectProjection { get; set; }
+
     [BsonElement("workId")]
     [BsonRepresentation(BsonType.ObjectId)]
     public string WorkId { get; set; } = default!;

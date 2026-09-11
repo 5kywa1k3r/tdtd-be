@@ -35,6 +35,16 @@ public sealed class WorkAssignment : BaseEntity
     [BsonElement("dynamicFormTemplateName")]
     public string? DynamicFormTemplateName { get; set; }
 
+    [BsonElement("dynamicFormFamilyId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? DynamicFormFamilyId { get; set; }
+
+    [BsonElement("dynamicFormVersionNo")]
+    public int? DynamicFormVersionNo { get; set; }
+
+    [BsonElement("dynamicFormSchemaHash")]
+    public string? DynamicFormSchemaHash { get; set; }
+
     [BsonElement("dynamicFormDataSourceRulesJson")]
     public string? DynamicFormDataSourceRulesJson { get; set; }
 
@@ -126,6 +136,9 @@ public sealed class WorkAssignment : BaseEntity
 
     [BsonElement("flowAttemptNo")]
     public int? FlowAttemptNo { get; set; }
+
+    [BsonElement("flowExecutionEpoch")]
+    public int? FlowExecutionEpoch { get; set; }
 
     [BsonElement("flowRole")]
     public string? FlowRole { get; set; }
@@ -221,4 +234,28 @@ public sealed class WorkAssignment : BaseEntity
     public string? WorstEvaluationLabel { get; set; }
     [BsonElement("dueAtUtc")]
     public DateTime? DueAtUtc { get; set; }
+
+    /// <summary>
+    /// Short-lived lease serializing report lifecycle guards and commits for this
+    /// assignment. It prevents cross-report TOCTOU races (for example approving a
+    /// later period while recalling an earlier one). Expired leases are reclaimable.
+    /// </summary>
+    [BsonElement("reportLifecycleLeaseId")]
+    [BsonIgnoreIfNull]
+    public string? ReportLifecycleLeaseId { get; set; }
+
+    [BsonElement("reportLifecycleLeaseExpiresAtUtc")]
+    [BsonIgnoreIfNull]
+    public DateTime? ReportLifecycleLeaseExpiresAtUtc { get; set; }
+
+    [BsonElement("reportLifecycleSeriesRevision")]
+    public long ReportLifecycleSeriesRevision { get; set; }
+
+    /// <summary>
+    /// Internal write-fence touched by every P5 materialization side effect.
+    /// Assignment completion CASes the same value so a stale outbox worker
+    /// cannot commit child artifacts after completion.
+    /// </summary>
+    [BsonElement("dynamicFlowMaterializationRevision")]
+    public long DynamicFlowMaterializationRevision { get; set; }
 }

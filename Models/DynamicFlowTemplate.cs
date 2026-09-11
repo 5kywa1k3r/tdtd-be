@@ -21,9 +21,35 @@ public sealed class DynamicFlowTemplate : BaseEntity
     [BsonElement("description")]
     public string? Description { get; set; }
 
-    [BsonElement("dynamicFormTemplateId")]
+    [BsonElement("familyRevision")]
+    public int FamilyRevision { get; set; } = 1;
+
+    [BsonElement("ownerUserId")]
     [BsonRepresentation(BsonType.ObjectId)]
-    public string? DynamicFormTemplateId { get; set; }
+    public string? OwnerUserId { get; set; }
+
+    [BsonElement("ownerUnitId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? OwnerUnitId { get; set; }
+
+    [BsonElement("originFamilyId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? OriginFamilyId { get; set; }
+
+    [BsonElement("originVersionId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? OriginVersionId { get; set; }
+
+    [BsonElement("rootDynamicFormTemplateId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? RootDynamicFormTemplateId { get; set; }
+
+    [BsonIgnore]
+    public string? DynamicFormTemplateId
+    {
+        get => RootDynamicFormTemplateId;
+        set => RootDynamicFormTemplateId = value;
+    }
 
     [BsonElement("status")]
     public string Status { get; set; } = DynamicFlowTemplateStatuses.Draft;
@@ -37,6 +63,17 @@ public sealed class DynamicFlowTemplate : BaseEntity
 
     [BsonElement("currentVersionHash")]
     public string? CurrentVersionHash { get; set; }
+
+    [BsonElement("hasLockedVersion")]
+    public bool HasLockedVersion { get; set; }
+
+    [BsonElement("archivedAtUtc")]
+    [BsonDateTimeOptions(Kind = DateTimeKind.Utc)]
+    public DateTime? ArchivedAtUtc { get; set; }
+
+    [BsonElement("archivedByUserId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? ArchivedByUserId { get; set; }
 }
 
 [BsonIgnoreExtraElements]
@@ -51,9 +88,16 @@ public sealed class DynamicFlowTemplateVersion : BaseEntity
     [BsonRepresentation(BsonType.ObjectId)]
     public string TemplateId { get; set; } = default!;
 
-    [BsonElement("dynamicFormTemplateId")]
+    [BsonElement("rootDynamicFormTemplateId")]
     [BsonRepresentation(BsonType.ObjectId)]
-    public string? DynamicFormTemplateId { get; set; }
+    public string? RootDynamicFormTemplateId { get; set; }
+
+    [BsonIgnore]
+    public string? DynamicFormTemplateId
+    {
+        get => RootDynamicFormTemplateId;
+        set => RootDynamicFormTemplateId = value;
+    }
 
     [BsonElement("versionNo")]
     public int VersionNo { get; set; } = 1;
@@ -64,11 +108,58 @@ public sealed class DynamicFlowTemplateVersion : BaseEntity
     [BsonElement("draftRevision")]
     public int DraftRevision { get; set; } = 1;
 
+    [BsonElement("schemaVersion")]
+    public int SchemaVersion { get; set; } = DynamicFlowDefinitionSchema.CurrentVersion;
+
+    [BsonElement("adapterVersion")]
+    public int AdapterVersion { get; set; } = DynamicFlowDefinitionSchema.CurrentAdapterVersion;
+
+    [BsonElement("catalogVersion")]
+    public string CatalogVersion { get; set; } = string.Empty;
+
+    [BsonElement("catalogSemanticHash")]
+    public string CatalogSemanticHash { get; set; } = string.Empty;
+
+    [BsonElement("originFamilyId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? OriginFamilyId { get; set; }
+
+    [BsonElement("originVersionId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? OriginVersionId { get; set; }
+
     [BsonElement("payloadJson")]
     public string PayloadJson { get; set; } = "{}";
 
     [BsonElement("payloadHash")]
     public string PayloadHash { get; set; } = string.Empty;
+
+    [BsonElement("contributionPolicy")]
+    [BsonIgnoreIfNull]
+    public string? ContributionPolicy { get; set; }
+
+    [BsonElement("contributionPolicyHash")]
+    [BsonIgnoreIfNull]
+    public string? ContributionPolicyHash { get; set; }
+
+    [BsonElement("contributionWarning")]
+    [BsonIgnoreIfNull]
+    public string? ContributionWarning { get; set; }
+
+    [BsonElement("definitionLockable")]
+    public bool DefinitionLockable { get; set; }
+
+    [BsonElement("executionEligibility")]
+    public string ExecutionEligibility { get; set; } = DynamicFlowExecutionEligibilities.BlockedUntilTargetPhase;
+
+    [BsonElement("executionBlockedReason")]
+    public string? ExecutionBlockedReason { get; set; } = DynamicFlowExecutionBlockedReasons.TargetPhaseNotImplemented;
+
+    [BsonElement("blockedUntilPhase")]
+    public string? BlockedUntilPhase { get; set; }
+
+    [BsonElement("migrationState")]
+    public string MigrationState { get; set; } = DynamicFlowDefinitionMigrationStates.Canonical;
 
     [BsonElement("lockedAtUtc")]
     [BsonDateTimeOptions(Kind = DateTimeKind.Utc)]
@@ -99,4 +190,26 @@ public static class DynamicFlowTemplateVersionStatuses
     public const string Draft = "DRAFT";
     public const string Locked = "LOCKED";
     public const string Archived = "ARCHIVED";
+}
+
+public static class DynamicFlowDefinitionSchema
+{
+    public const int CurrentVersion = 2;
+    public const int CurrentAdapterVersion = 1;
+}
+
+public static class DynamicFlowExecutionEligibilities
+{
+    public const string BlockedUntilTargetPhase = "BLOCKED_UNTIL_TARGET_PHASE";
+}
+
+public static class DynamicFlowExecutionBlockedReasons
+{
+    public const string TargetPhaseNotImplemented = "TARGET_PHASE_NOT_IMPLEMENTED";
+}
+
+public static class DynamicFlowDefinitionMigrationStates
+{
+    public const string Canonical = "CANONICAL";
+    public const string RequiresReview = "REQUIRES_REVIEW";
 }

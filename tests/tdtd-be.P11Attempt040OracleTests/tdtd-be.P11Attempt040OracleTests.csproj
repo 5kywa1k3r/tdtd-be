@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net8.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable><AssemblyName>tdtd-be.Tests</AssemblyName><TreatWarningsAsErrors>true</TreatWarningsAsErrors><RestoreIgnoreFailedSources>true</RestoreIgnoreFailedSources></PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../tdtd-be.IntegrationTests/tdtd-be.IntegrationTests.csproj" />
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <Compile Include="../tdtd-be.P11FreshnessLifecyclePriorTests/CanonicalVerdictFixture.cs" Link="CanonicalVerdictFixture.cs" />
+    <Compile Include="../tdtd-be.P10T24T26LifecycleBridgeTests/LifecycleFixture.Core.cs" Link="LifecycleFixture.Core.cs" />
+    <Compile Include="../tdtd-be.P10T24T26LifecycleBridgeTests/LifecycleFixture.Actual.cs" Link="LifecycleFixture.Actual.cs" />
+    <Compile Include="../tdtd-be.P10T24T26LifecycleBridgeTests/LifecycleFixture.Audit.cs" Link="LifecycleFixture.Audit.cs" />
+    <Compile Include="../tdtd-be.P10T24T26LifecycleBridgeTests/LifecycleFixture.Evidence.cs" Link="LifecycleFixture.Evidence.cs" />
+  </ItemGroup>
+</Project>

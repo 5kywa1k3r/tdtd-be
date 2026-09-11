@@ -1,8 +1,12 @@
+using System.Text.Json;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using tdtd_be.Common.Auth;
+using tdtd_be.Common.Errors;
+using tdtd_be.DTOs.StatisticsConfiguration;
 using tdtd_be.DTOs.WorkAssignments.SummaryTokens;
 using tdtd_be.Services.WorkAssignments.SummaryTokens;
+using tdtd_be.Services.StatisticsConfiguration;
 
 namespace tdtd_be.Controllers;
 
@@ -23,10 +27,50 @@ public sealed class WorkSummaryTokensController : ControllerBase
     }
 
     [HttpPost("grants")]
-    public async Task<IActionResult> Grant(
+    public Task<IActionResult> Grant(
         [FromBody] WorkSummaryTokenGrantRequest request,
         CancellationToken ct)
-        => Ok(await _tokens.GrantAsync(request ?? new WorkSummaryTokenGrantRequest(), _me.RequireMe(), ct));
+        => throw AppExceptionFactory.BadRequest(
+            AppErrorCode.STAT_CONFIG_SCHEMA_INVALID,
+            new
+            {
+                path = "$.operation",
+                reason = "WORK_SUMMARY_TOKEN_LEGACY_GRANT_BLOCKED",
+                replacement =
+                    "POST /api/work-summary-tokens/pools/{ownerUnitId}/grants"
+            });
+
+    [HttpPost("pools/{ownerUnitId}/grants")]
+    public async Task<IActionResult> GrantP8(
+        [FromRoute] string ownerUnitId,
+        [FromBody] JsonElement body,
+        CancellationToken ct)
+    {
+        var command = StatConfigCanonicalJson.DeserializeStrict<
+            StatConfigMutationEnvelope<
+                WorkSummaryTokenGrantP8Payload>>(body);
+        return Ok(await _tokens.GrantP8Async(
+            ownerUnitId,
+            command,
+            _me.RequireMe(),
+            ct));
+    }
+
+    [HttpPost("entries/{ledgerId}/compensations")]
+    public async Task<IActionResult> CompensateP8(
+        [FromRoute] string ledgerId,
+        [FromBody] JsonElement body,
+        CancellationToken ct)
+    {
+        var command = StatConfigCanonicalJson.DeserializeStrict<
+            StatConfigMutationEnvelope<
+                WorkSummaryTokenCompensationP8Payload>>(body);
+        return Ok(await _tokens.CompensateP8Async(
+            ledgerId,
+            command,
+            _me.RequireMe(),
+            ct));
+    }
 
     [HttpGet("quota")]
     public async Task<IActionResult> GetQuota(

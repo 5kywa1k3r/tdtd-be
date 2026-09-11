@@ -6,6 +6,9 @@
 /// </summary>
 public sealed class AcceptWorkAssignmentReportRequest
 {
+    public int? ExpectedPayloadRevision { get; set; }
+    public int? ExpectedLifecycleRevision { get; set; }
+    public string? CommandId { get; set; }
     public string? ReviewerComment { get; set; }
 
     /// <summary>

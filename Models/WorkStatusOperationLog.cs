@@ -80,4 +80,8 @@ public sealed class WorkStatusOperationLog : BaseEntity
 
     [BsonElement("durationMs")]
     public long DurationMs { get; set; }
+
+    [BsonElement("lifecycleEventKey")]
+    [BsonIgnoreIfNull]
+    public string? LifecycleEventKey { get; set; }
 }

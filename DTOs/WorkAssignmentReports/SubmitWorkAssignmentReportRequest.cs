@@ -6,6 +6,9 @@
 /// </summary>
 public sealed class SubmitWorkAssignmentReportRequest
 {
+    public int? ExpectedPayloadRevision { get; set; }
+    public int? ExpectedLifecycleRevision { get; set; }
+    public string? CommandId { get; set; }
     public List<object?>? Values1D { get; set; } = default!;
     public string? FieldValuesJson { get; set; }
     public string? TableValuesJson { get; set; }

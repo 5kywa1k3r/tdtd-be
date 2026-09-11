@@ -7,6 +7,19 @@
 public sealed class SaveWorkAssignmentReportDraftRequest
 {
     /// <summary>
+    /// Revision payload mà editor đã mở. Draft mới bắt đầu ở revision 0.
+    /// Backend dùng giá trị này cho compare-and-swap; không tự suy ra từ bản mới nhất.
+    /// </summary>
+    public int? ExpectedPayloadRevision { get; set; }
+
+    /// <summary>
+    /// Id ổn định cho một lần bấm lưu/retry. Cùng commandId chỉ được replay khi payload giống hệt.
+    /// </summary>
+    public string? CommandId { get; set; }
+
+    internal string? CommandHashOverride { get; set; }
+
+    /// <summary>
     /// Dữ liệu 1D đã trải phẳng từ vùng dataRect.
     /// Giá trị giữ theo kiểu cấu hình của Dynamic Excel: number/text/date/boolean/null.
     /// </summary>

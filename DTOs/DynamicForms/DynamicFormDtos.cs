@@ -1,5 +1,7 @@
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using tdtd_be.DTOs.DynamicExcel;
+using tdtd_be.OpenApi;
 
 namespace tdtd_be.DTOs.DynamicForms;
 
@@ -11,6 +13,11 @@ public sealed record DynamicFormRow(
     string[] TagCodes,
     int SchemaVersion,
     int VersionNo,
+    string FamilyId,
+    string? PreviousVersionId,
+    string? ClonedFromVersionId,
+    string LineageStatus,
+    int Revision,
     bool IsActive,
     bool IsPublished,
     string? CreatedByUserId,
@@ -18,7 +25,21 @@ public sealed record DynamicFormRow(
     DateTime CreatedAtUtc,
     bool CanMutate,
     bool CanClone,
-    bool CanViewByCloneGrant
+    bool CanViewByCloneGrant,
+    string? PublishedSchemaHash,
+    DynamicFormActionCapabilities Actions
+);
+
+public sealed record DynamicFormActionCapabilities(
+    bool CanRead,
+    bool CanUpdate,
+    bool CanDelete,
+    bool CanPublish,
+    bool CanCreateVersion,
+    bool CanViewHistory,
+    bool CanClone,
+    bool CanImport,
+    bool CanUpdateStatistics
 );
 
 public sealed record DynamicFormDetail(
@@ -29,6 +50,11 @@ public sealed record DynamicFormDetail(
     string[] TagCodes,
     int SchemaVersion,
     int VersionNo,
+    string FamilyId,
+    string? PreviousVersionId,
+    string? ClonedFromVersionId,
+    string LineageStatus,
+    int Revision,
     bool IsActive,
     bool IsPublished,
     string? CreatedByUserId,
@@ -36,17 +62,33 @@ public sealed record DynamicFormDetail(
     DateTime CreatedAtUtc,
     DateTime UpdatedAtUtc,
     DateTime? PublishedAtUtc,
-    string SectionsJson,
-    string FieldsJson,
-    string? ExcelBlockJson,
-    string BlocksJson,
+    [property: DeprecatedSchemaProperty("Use schema.sections instead.")] string SectionsJson,
+    [property: DeprecatedSchemaProperty("Use schema.fields instead.")] string FieldsJson,
+    [property: DeprecatedSchemaProperty("Use schema.blocks[0] instead.")] string? ExcelBlockJson,
+    [property: DeprecatedSchemaProperty("Use schema.blocks instead.")] string BlocksJson,
     string? ExcelBlockDynamicExcelTemplateId,
     DateTime? StatisticConfigUpdatedAtUtc,
     string? StatisticConfigUpdatedByUserId,
     string? StatisticConfigUpdateMonthKey,
     bool CanMutate,
     bool CanClone,
-    bool CanViewByCloneGrant
+    bool CanViewByCloneGrant,
+    string? PublishedSchemaSnapshotJson,
+    string? PublishedSchemaHash,
+    DynamicFormActionCapabilities Actions,
+    DynamicFormSchemaDto? Schema = null
+);
+
+public sealed record CreateDynamicFormVersionReq(
+    int? ExpectedRevision = null,
+    string? Name = null,
+    string? Description = null
+);
+
+public sealed record DynamicFormVersionHistoryResp(
+    string FamilyId,
+    string Code,
+    IReadOnlyList<DynamicFormRow> Versions
 );
 
 public sealed record CreateDynamicFormReq(
@@ -55,11 +97,12 @@ public sealed record CreateDynamicFormReq(
     string? Description,
     string[]? TagCodes,
     int? SchemaVersion,
-    string? SectionsJson,
-    string? FieldsJson,
-    string? ExcelBlockJson,
-    string? BlocksJson,
-    bool IsActive = true
+    [property: DeprecatedSchemaProperty("Use schema.sections instead.")] string? SectionsJson,
+    [property: DeprecatedSchemaProperty("Use schema.fields instead.")] string? FieldsJson,
+    [property: DeprecatedSchemaProperty("Use schema.blocks[0] instead.")] string? ExcelBlockJson,
+    [property: DeprecatedSchemaProperty("Use schema.blocks instead.")] string? BlocksJson,
+    bool IsActive = true,
+    DynamicFormSchemaDto? Schema = null
 );
 
 public sealed record UpdateDynamicFormReq(
@@ -67,28 +110,98 @@ public sealed record UpdateDynamicFormReq(
     string? Description,
     string[]? TagCodes,
     int? SchemaVersion,
-    string? SectionsJson,
-    string? FieldsJson,
-    string? ExcelBlockJson,
-    string? BlocksJson,
-    bool IsActive = true
+    [property: DeprecatedSchemaProperty("Use schema.sections instead.")] string? SectionsJson,
+    [property: DeprecatedSchemaProperty("Use schema.fields instead.")] string? FieldsJson,
+    [property: DeprecatedSchemaProperty("Use schema.blocks[0] instead.")] string? ExcelBlockJson,
+    [property: DeprecatedSchemaProperty("Use schema.blocks instead.")] string? BlocksJson,
+    bool IsActive = true,
+    DynamicFormSchemaDto? Schema = null,
+    int? ExpectedRevision = null
 );
 
-public sealed record UpdateDynamicFormStatisticConfigReq(
-    string? FieldsJson,
-    string? ExcelBlockJson,
-    string? BlocksJson
-);
+public sealed record DynamicFormSchemaDto
+{
+    public List<DynamicFormSectionDto>? Sections { get; init; } = [];
+    public List<DynamicFormFieldDto>? Fields { get; init; } = [];
+    public List<DynamicFormBlockDto>? Blocks { get; init; } = [];
+}
 
-public sealed record DynamicFormStatisticConfigUpdateResp(
-    DynamicFormDetail Template,
-    string StatisticRebuildJobId,
-    long QueuedReportCount,
-    DateTime? StatisticRebuildScheduledAtUtc,
-    bool StatisticRebuildRunsImmediately,
-    DateTime? StatisticConfigUpdatedAtUtc,
-    string? StatisticConfigUpdatedByUserId,
-    string? StatisticConfigUpdateMonthKey
+public sealed record DynamicFormSectionDto
+{
+    public string? Id { get; init; }
+    public string? Title { get; init; }
+    public string? Description { get; init; }
+    public string[]? TagCodes { get; init; }
+    public int? Order { get; init; }
+
+    [JsonExtensionData]
+    public Dictionary<string, JsonElement>? ExtensionData { get; init; }
+}
+
+public sealed record DynamicFormFieldDto
+{
+    public string? Id { get; init; }
+    public string? SectionId { get; init; }
+    public string? Key { get; init; }
+    public string? Name { get; init; }
+    public string? Type { get; init; }
+    public bool? Required { get; init; }
+    public int? ColSpan { get; init; }
+    public int? MinHeight { get; init; }
+    public int? CanvasX { get; init; }
+    public int? CanvasY { get; init; }
+    public int? CanvasW { get; init; }
+    public int? CanvasH { get; init; }
+    public int? Order { get; init; }
+    public List<DynamicFormOptionDto>? Options { get; init; }
+    public DynamicFormValueSourceDto? ValueSource { get; init; }
+    public string[]? StatisticLabelCodes { get; init; }
+    public bool? IsStatistic { get; init; }
+    public JsonElement? Statistic { get; init; }
+
+    [JsonExtensionData]
+    public Dictionary<string, JsonElement>? ExtensionData { get; init; }
+}
+
+public sealed record DynamicFormValueSourceDto
+{
+    public string? SourceType { get; init; }
+    public string? LabelCode { get; init; }
+    public string? LabelName { get; init; }
+    public string? CatalogId { get; init; }
+    public string? CatalogCode { get; init; }
+    public string? CatalogName { get; init; }
+    public List<DynamicFormOptionDto>? Options { get; init; }
+
+    [JsonExtensionData]
+    public Dictionary<string, JsonElement>? ExtensionData { get; init; }
+}
+
+public sealed record DynamicFormOptionDto
+{
+    public string? Code { get; init; }
+    public string? Label { get; init; }
+
+    [JsonExtensionData]
+    public Dictionary<string, JsonElement>? ExtensionData { get; init; }
+}
+
+public sealed record DynamicFormBlockDto
+{
+    public string? BlockId { get; init; }
+    public string? SectionId { get; init; }
+    public string? TableMode { get; init; }
+    public string? DynamicExcelTemplateId { get; init; }
+    public string? DynamicExcelCode { get; init; }
+    public string? DynamicExcelName { get; init; }
+    public string? ExcelSpecKind { get; init; }
+
+    [JsonExtensionData]
+    public Dictionary<string, JsonElement>? ExtensionData { get; init; }
+}
+
+public sealed record PublishDynamicFormReq(
+    int? ExpectedRevision = null
 );
 
 public sealed record DynamicFormSearchReq(
@@ -122,7 +235,8 @@ public sealed record WrapDynamicExcelAsFormReq(
 
 public sealed record ImportDynamicExcelBlockReq(
     string DynamicExcelTemplateId,
-    string? SectionId = null
+    string? SectionId = null,
+    int? ExpectedRevision = null
 );
 
 public sealed record DynamicFormExcelBlockSnapshot(

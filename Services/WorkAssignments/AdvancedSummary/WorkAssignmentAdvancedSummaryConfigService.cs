@@ -5,6 +5,7 @@ using System.Text.Json.Serialization;
 using Hangfire;
 using MongoDB.Bson;
 using MongoDB.Driver;
+using tdtd_be.Common.Auth;
 using tdtd_be.Common.Errors;
 using tdtd_be.Data;
 using tdtd_be.DTOs.WorkAssignments.AdvancedSummary;
@@ -12,13 +13,16 @@ using tdtd_be.Enum;
 using tdtd_be.Models;
 using tdtd_be.Models.Enums;
 using tdtd_be.Services.Notifications;
+using tdtd_be.Services.DynamicForms;
+using tdtd_be.Services.StatisticsConfiguration;
+using tdtd_be.Services.StatisticsRun;
 using tdtd_be.Services.WorkAssignmentReports.Payloads;
 using tdtd_be.Services.WorkAssignments.Internal;
 using tdtd_be.Services.WorkAssignments.SummaryTokens;
 
 namespace tdtd_be.Services.WorkAssignments.AdvancedSummary;
 
-public sealed class WorkAssignmentAdvancedSummaryConfigService : IWorkAssignmentAdvancedSummaryConfigService
+public sealed partial class WorkAssignmentAdvancedSummaryConfigService : IWorkAssignmentAdvancedSummaryConfigService
 {
     private const int PreviewPeriodLimit = 3;
     private const int PreviewSeedReportScanLimit = 3000;
@@ -44,19 +48,28 @@ public sealed class WorkAssignmentAdvancedSummaryConfigService : IWorkAssignment
     private readonly IWorkReportPayloadReader _payloadReader;
     private readonly INotificationService _notifications;
     private readonly IWorkSummaryTokenService _summaryTokens;
+    private readonly MeAccessor _me;
+    private readonly IStatConfigTransactionRunner _statConfigTransactions;
+    private readonly IStatRunCandidateActivation _candidateActivation;
 
     public WorkAssignmentAdvancedSummaryConfigService(
         MongoDbContext ctx,
         IBackgroundJobClient backgroundJobs,
         IWorkReportPayloadReader payloadReader,
         INotificationService notifications,
-        IWorkSummaryTokenService summaryTokens)
+        IWorkSummaryTokenService summaryTokens,
+        MeAccessor me,
+        IStatConfigTransactionRunner statConfigTransactions,
+        IStatRunCandidateActivation candidateActivation)
     {
         _ctx = ctx;
         _backgroundJobs = backgroundJobs;
         _payloadReader = payloadReader;
         _notifications = notifications;
         _summaryTokens = summaryTokens;
+        _me = me;
+        _statConfigTransactions = statConfigTransactions;
+        _candidateActivation = candidateActivation;
     }
 
     public async Task<List<WorkAssignmentAdvancedSummaryConfigDto>> ListConfigsAsync(
@@ -83,7 +96,7 @@ public sealed class WorkAssignmentAdvancedSummaryConfigService : IWorkAssignment
 
         var gatesByConfigId = new Dictionary<string, AdvancedSummaryFieldGateInfo>(StringComparer.Ordinal);
         foreach (var row in rows)
-            gatesByConfigId[row.Id] = await BuildFieldGateInfoAsync(context.Template, context.Section.Id, row.ConfigJson, ct);
+            gatesByConfigId[row.Id] = BuildFieldGateInfoForTemplate(context.Template, context.Section.Id, row.ConfigJson);
 
         return rows.Select(x => Map(x, lockedCount, gatesByConfigId[x.Id])).ToList();
     }
@@ -96,6 +109,7 @@ public sealed class WorkAssignmentAdvancedSummaryConfigService : IWorkAssignment
         string actorUserId,
         CancellationToken ct)
     {
+        throw BuildP805LegacyMutationBlocked();
         EnsureActor(actorUserId);
         var context = await LoadContextAsync(assignmentId, dynamicFormTemplateId, sectionId, actorUserId, ct);
         var configJson = NormalizeConfigJson(req?.ConfigJson);
@@ -107,7 +121,7 @@ public sealed class WorkAssignmentAdvancedSummaryConfigService : IWorkAssignment
             req?.SourceFlowBranchId,
             req?.SourceFlowEffectiveStatus);
         var configHash = BuildConfigHash(configJson, sourceScope);
-        var gate = await BuildFieldGateInfoAsync(context.Template, context.Section.Id, configJson, ct);
+        var gate = BuildFieldGateInfoForTemplate(context.Template, context.Section.Id, configJson);
         EnsureFieldGateAllowsAdvanced(gate);
         var now = DateTime.UtcNow;
         var lockedCount = await CountLockedAsync(context.Scope.Id, context.Template.Id, context.Section.Id, ct);
@@ -171,6 +185,7 @@ public sealed class WorkAssignmentAdvancedSummaryConfigService : IWorkAssignment
         string actorUserId,
         CancellationToken ct)
     {
+        throw BuildP805LegacyMutationBlocked();
         EnsureActor(actorUserId);
         configId = configId?.Trim() ?? string.Empty;
         if (string.IsNullOrWhiteSpace(configId))
@@ -189,7 +204,7 @@ public sealed class WorkAssignmentAdvancedSummaryConfigService : IWorkAssignment
             ct);
 
         var lockedCount = await CountLockedAsync(context.Scope.Id, context.Template.Id, context.Section.Id, ct);
-        var gate = await BuildFieldGateInfoAsync(context.Template, context.Section.Id, entity.ConfigJson, ct);
+        var gate = BuildFieldGateInfoForTemplate(context.Template, context.Section.Id, entity.ConfigJson);
         if (entity.Status == WorkAssignmentAdvancedSummaryConfigStatuses.Locked)
             return Map(entity, lockedCount, gate);
 
@@ -262,6 +277,9 @@ public sealed class WorkAssignmentAdvancedSummaryConfigService : IWorkAssignment
         string actorUserId,
         CancellationToken ct)
     {
+        _candidateActivation.RequireCapability(
+            StatRunCapabilities.AdvancedSummary,
+            StatRunRouteRegistry.AdvancedBuild);
         EnsureActor(actorUserId);
         var entity = await LoadConfigForActionAsync(configId, ct);
         var context = await LoadContextAsync(
@@ -278,7 +296,7 @@ public sealed class WorkAssignmentAdvancedSummaryConfigService : IWorkAssignment
                 new { configId = entity.Id, entity.Status, reason = "ADVANCED_SUMMARY_CONFIG_STATUS_NOT_PREVIEWABLE" });
         }
 
-        var gate = await BuildFieldGateInfoAsync(context.Template, context.Section.Id, entity.ConfigJson, ct);
+        var gate = BuildFieldGateInfoForTemplate(context.Template, context.Section.Id, entity.ConfigJson);
         EnsureFieldGateAllowsAdvanced(gate);
 
         var previewStatus = NormalizePreviewStatus(entity.PreviewStatus);
@@ -319,6 +337,9 @@ public sealed class WorkAssignmentAdvancedSummaryConfigService : IWorkAssignment
         string correlationId,
         CancellationToken ct)
     {
+        _candidateActivation.RequireCapability(
+            StatRunCapabilities.AdvancedSummary,
+            StatRunRouteRegistry.AdvancedBuild);
         EnsureActor(actorUserId);
         var entity = await LoadConfigForActionAsync(configId, ct);
         if (!IsCurrentPreviewJob(entity, expectedConfigHash, correlationId))
@@ -457,7 +478,7 @@ public sealed class WorkAssignmentAdvancedSummaryConfigService : IWorkAssignment
     {
         EnsurePreviewConfigSupported(config.ConfigJson);
 
-        var sectionFields = await LoadSectionFieldsAsync(context.Template, context.Section.Id, ct);
+        var sectionFields = LoadSectionFields(context.Template, context.Section.Id);
         var gate = BuildFieldGateInfo(config.ConfigJson, sectionFields);
         EnsureFieldGateAllowsAdvanced(gate);
         var configAnalysis = AnalyzePreviewConfigJson(config.ConfigJson, sectionFields);
@@ -558,7 +579,8 @@ public sealed class WorkAssignmentAdvancedSummaryConfigService : IWorkAssignment
 
             periodAccumulator.ReportCount++;
             string? fieldValuesJson;
-            if (sectionByReportId.TryGetValue(report.Id, out var sectionRow))
+            if (sectionByReportId.TryGetValue(report.Id, out var sectionRow) &&
+                IsCurrentSectionProjection(report, sectionRow))
             {
                 periodAccumulator.SectionReportCount++;
                 fieldValuesJson = sectionRow.FieldValuesJson;
@@ -567,6 +589,8 @@ public sealed class WorkAssignmentAdvancedSummaryConfigService : IWorkAssignment
             {
                 fallbackPayloadReadCount++;
                 var payload = await _payloadReader.LoadReportPayloadAsync(report, ct);
+                if (report.PayloadRevision > 0)
+                    WorkReportPayloadConsistency.EnsureSnapshotFreshForStatisticProjection(report, payload);
                 fieldValuesJson = payload.FieldValuesJson;
             }
 
@@ -590,7 +614,7 @@ public sealed class WorkAssignmentAdvancedSummaryConfigService : IWorkAssignment
         }
 
         if (fallbackPayloadReadCount > 0)
-            warnings.Add($"Preview had to read {fallbackPayloadReadCount} full payload(s) because section snapshots were missing.");
+            warnings.Add($"Preview had to read {fallbackPayloadReadCount} full payload(s) because section snapshots were missing or stale.");
         if (periodKeys.Count == 0)
             warnings.Add("No approved source reports were found for the latest-three-period preview.");
         if (targetFields.Count == 0)
@@ -671,31 +695,23 @@ public sealed class WorkAssignmentAdvancedSummaryConfigService : IWorkAssignment
                & fb.Ne(x => x.CumulativeContributionMode, WorkReportCumulativeContributionMode.Exclude);
     }
 
-    private async Task<List<AdvancedFieldDefinition>> LoadSectionFieldsAsync(
+    private static List<AdvancedFieldDefinition> LoadSectionFields(
         DynamicFormTemplate template,
-        string sectionId,
-        CancellationToken ct)
+        string sectionId)
     {
-        var section = await _ctx.DynamicFormSections
-            .Find(x =>
-                x.DynamicFormTemplateId == template.Id &&
-                x.SectionId == sectionId &&
-                !x.IsDeleted)
-            .FirstOrDefaultAsync(ct);
-
-        if (section is not null)
-            return ExtractFieldDefinitions(section.FieldsJson, sectionId, section.FieldIds.ToHashSet(StringComparer.Ordinal));
-
-        return ExtractFieldDefinitions(template.FieldsJson, sectionId, null);
+        var section = DynamicFormSectionSnapshotBuilder.GetRequiredSection(template, sectionId);
+        return ExtractFieldDefinitions(
+            section.FieldsJson,
+            section.SectionId,
+            section.FieldIds.ToHashSet(StringComparer.Ordinal));
     }
 
-    private async Task<AdvancedSummaryFieldGateInfo> BuildFieldGateInfoAsync(
+    private static AdvancedSummaryFieldGateInfo BuildFieldGateInfoForTemplate(
         DynamicFormTemplate template,
         string sectionId,
-        string configJson,
-        CancellationToken ct)
+        string configJson)
     {
-        var sectionFields = await LoadSectionFieldsAsync(template, sectionId, ct);
+        var sectionFields = LoadSectionFields(template, sectionId);
         return BuildFieldGateInfo(configJson, sectionFields);
     }
 
@@ -1551,27 +1567,8 @@ public sealed class WorkAssignmentAdvancedSummaryConfigService : IWorkAssignment
 
     private static DynamicFormSectionInfo ResolveSection(DynamicFormTemplate template, string sectionId)
     {
-        try
-        {
-            var sections = JsonSerializer.Deserialize<List<DynamicFormSectionInfo>>(template.SectionsJson, JsonOptions)
-                           ?? new List<DynamicFormSectionInfo>();
-            var section = sections.FirstOrDefault(x => string.Equals(x.Id, sectionId, StringComparison.Ordinal));
-            if (section is not null && !string.IsNullOrWhiteSpace(section.Id))
-                return section with { Id = section.Id.Trim(), Title = string.IsNullOrWhiteSpace(section.Title) ? null : section.Title.Trim() };
-        }
-        catch (JsonException)
-        {
-            // Re-throw a product-level error below.
-        }
-
-        throw AppExceptionFactory.BadRequest(
-            AppErrorCode.DYNAMIC_FORM_SECTION_CONFIG_INVALID,
-            new
-            {
-                dynamicFormTemplateId = template.Id,
-                sectionId,
-                reason = "ADVANCED_SUMMARY_SECTION_NOT_FOUND"
-            });
+        var section = DynamicFormSectionSnapshotBuilder.GetRequiredSection(template, sectionId);
+        return new DynamicFormSectionInfo(section.SectionId, section.Title);
     }
 
     private static string NormalizeConfigJson(string? configJson)
@@ -1833,6 +1830,17 @@ public sealed class WorkAssignmentAdvancedSummaryConfigService : IWorkAssignment
                 _samples.Add(value);
         }
     }
+
+    private static bool IsCurrentSectionProjection(
+        WorkAssignmentReport report,
+        WorkAssignmentReportSection section)
+        => section.SourcePayloadRevision == report.PayloadRevision &&
+           section.SourceLifecycleRevision == report.LifecycleRevision &&
+           section.Status == report.Status &&
+           string.Equals(
+               section.SourcePayloadHash?.Trim(),
+               report.PayloadHash?.Trim(),
+               StringComparison.Ordinal);
 
     private sealed class AdvancedSummaryPreviewResult
     {

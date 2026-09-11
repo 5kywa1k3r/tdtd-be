@@ -7,6 +7,7 @@ using System.Text.Json.Serialization;
 using Hangfire;
 using MongoDB.Bson;
 using MongoDB.Driver;
+using tdtd_be.Common.Auth;
 using tdtd_be.Common.Errors;
 using tdtd_be.Data;
 using tdtd_be.DTOs.WorkAssignments.BasicSummary;
@@ -15,12 +16,15 @@ using tdtd_be.Models;
 using tdtd_be.Models.Enums;
 using tdtd_be.Services;
 using tdtd_be.Services.Notifications;
+using tdtd_be.Services.StatisticsConfiguration;
+using tdtd_be.Services.StatisticsRun;
 using tdtd_be.Services.WorkAssignmentReports.Payloads;
 using tdtd_be.Services.WorkAssignments.Internal;
 
 namespace tdtd_be.Services.WorkAssignments.BasicSummary;
 
-public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSummaryService
+public sealed partial class WorkAssignmentBasicSummaryService :
+    IWorkAssignmentBasicSummaryService
 {
     private const int DefaultMaxTextChars = 12000;
     private const int MaxTextCharsLimit = 100000;
@@ -48,19 +52,28 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
     private readonly IUnitSelectionService _unitSelection;
     private readonly IBackgroundJobClient _backgroundJobs;
     private readonly INotificationService _notifications;
+    private readonly MeAccessor _me;
+    private readonly IStatConfigTransactionRunner _statConfigTransactions;
+    private readonly IStatRunCandidateActivation _candidateActivation;
 
     public WorkAssignmentBasicSummaryService(
         MongoDbContext ctx,
         IWorkReportPayloadReader payloadReader,
         IUnitSelectionService unitSelection,
         IBackgroundJobClient backgroundJobs,
-        INotificationService notifications)
+        INotificationService notifications,
+        MeAccessor me,
+        IStatConfigTransactionRunner statConfigTransactions,
+        IStatRunCandidateActivation candidateActivation)
     {
         _ctx = ctx;
         _payloadReader = payloadReader;
         _unitSelection = unitSelection;
         _backgroundJobs = backgroundJobs;
         _notifications = notifications;
+        _me = me;
+        _statConfigTransactions = statConfigTransactions;
+        _candidateActivation = candidateActivation;
     }
 
     public async Task<WorkAssignmentBasicSummaryConfigDto?> GetConfigAsync(
@@ -154,11 +167,13 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
         string actorUserId,
         CancellationToken ct)
     {
+        var candidate = _candidateActivation.RequireCapability(
+            StatRunCapabilities.BasicSummary,
+            StatRunRouteRegistry.BasicResult);
         EnsureActor(actorUserId);
 
         var normalized = await NormalizeRequestAsync(req, ct);
         var scope = await LoadScopeAssignmentAsync(normalized.ScopeAssignmentId, ct);
-        normalized = AttachSourceScope(scope, normalized);
 
         if (!CanReadAssignment(scope, actorUserId))
         {
@@ -166,8 +181,6 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
                 AppErrorCode.WORK_ASSIGNMENT_AGGREGATE_READ_FORBIDDEN,
                 new { normalized.ScopeAssignmentId, actorUserId });
         }
-
-        ValidateSummaryScope(scope, normalized);
 
         var dynamicFormTemplateId = normalized.DynamicFormTemplateId ?? scope.DynamicFormTemplateId;
         if (string.IsNullOrWhiteSpace(dynamicFormTemplateId))
@@ -180,6 +193,13 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
             ?? throw AppExceptionFactory.NotFound(
                 AppErrorCode.DYNAMIC_FORM_TEMPLATE_NOT_FOUND,
                 new { dynamicFormTemplateId });
+        normalized = await P9ApplyLockedRuntimeConfigAsync(
+            scope,
+            template,
+            normalized,
+            candidate,
+            ct);
+        ValidateSummaryScope(scope, normalized);
 
         var sourceAssignments = await LoadSourceAssignmentsAsync(
             scope,
@@ -198,6 +218,7 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
                 ct);
 
             ApplySourceView(rangeResponse, normalized.SourceView, normalized.IncludeSourceRows);
+            P9ApplyRuntimeMeta(rangeResponse, normalized.RuntimePin);
             return rangeResponse;
         }
 
@@ -217,6 +238,7 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
             ct);
 
         ApplySourceView(response, normalized.SourceView, normalized.IncludeSourceRows);
+        P9ApplyRuntimeMeta(response, normalized.RuntimePin);
 
         return response;
     }
@@ -227,6 +249,9 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
         string actorUserId,
         CancellationToken ct)
     {
+        var candidate = _candidateActivation.RequireCapability(
+            StatRunCapabilities.BasicSummary,
+            StatRunRouteRegistry.BasicResult);
         EnsureActor(actorUserId);
 
         if (string.IsNullOrWhiteSpace(snapshotId))
@@ -243,7 +268,6 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
 
             var normalized = await NormalizeRequestAsync(req, ct);
             var scope = await LoadScopeAssignmentAsync(normalized.ScopeAssignmentId, ct);
-            normalized = AttachSourceScope(scope, normalized);
             notifyScope = scope;
 
             if (!CanReadAssignment(scope, actorUserId))
@@ -252,11 +276,6 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
                     AppErrorCode.WORK_ASSIGNMENT_AGGREGATE_READ_FORBIDDEN,
                     new { normalized.ScopeAssignmentId, actorUserId });
             }
-
-            ValidateSummaryScope(scope, normalized);
-
-            if (IsPeriodicAssignment(scope) && normalized.PeriodScopeMode == "PERIOD_RANGE")
-                throw new InvalidOperationException("Basic summary refresh job must target one snapshot, not a period range.");
 
             var dynamicFormTemplateId = normalized.DynamicFormTemplateId ?? scope.DynamicFormTemplateId;
             if (string.IsNullOrWhiteSpace(dynamicFormTemplateId))
@@ -270,6 +289,16 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
                     AppErrorCode.DYNAMIC_FORM_TEMPLATE_NOT_FOUND,
                     new { dynamicFormTemplateId });
             notifyTemplate = template;
+            normalized = await P9ApplyLockedRuntimeConfigAsync(
+                scope,
+                template,
+                normalized,
+                candidate,
+                ct);
+            ValidateSummaryScope(scope, normalized);
+
+            if (IsPeriodicAssignment(scope) && normalized.PeriodScopeMode == "PERIOD_RANGE")
+                throw new InvalidOperationException("Basic summary refresh job must target one snapshot, not a period range.");
 
             var sourceAssignments = await LoadSourceAssignmentsAsync(
                 scope,
@@ -483,6 +512,7 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
             sourceReports,
             sourceSignatureHash,
             ct);
+        P9ApplyRuntimeMeta(response, normalized.RuntimePin);
 
         await SaveSnapshotAsync(
             snapshotId,
@@ -534,6 +564,18 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
             .Set(x => x.SourceAssignmentIds, sourceAssignments.Select(x => x.Id).ToList())
             .Set(x => x.SourceReportIds, sourceReports.Select(x => x.Id).ToList())
             .Set(x => x.SourceSignatureHash, sourceSignatureHash)
+            .Set(x => x.ConfigId, req.RuntimePin!.ConfigId)
+            .Set(x => x.ConfigVersionId, req.RuntimePin.VersionId)
+            .Set(x => x.ConfigVersionNo, req.RuntimePin.VersionNo)
+            .Set(x => x.ConfigRevision, req.RuntimePin.Revision)
+            .Set(x => x.ConfigHash, req.RuntimePin.ConfigHash)
+            .Set(x => x.ConfigDependencyPins, req.RuntimePin.DependencyPins)
+            .Set(x => x.CandidateChainId, req.RuntimePin.Candidate.ChainId)
+            .Set(x => x.CandidatePromptId, req.RuntimePin.Candidate.PromptId)
+            .Set(x => x.CandidateStage, req.RuntimePin.Candidate.Stage)
+            .Set(x => x.CandidateCatalogRawSha256, req.RuntimePin.Candidate.CatalogRawSha256)
+            .Set(x => x.CandidateCatalogSemanticSha256, req.RuntimePin.Candidate.CatalogSemanticSha256)
+            .Set(x => x.CandidateStageLockSha256, req.RuntimePin.Candidate.StageLockSha256)
             .Set(x => x.SnapshotDirty, true)
             .Set(x => x.SnapshotDirtyAtUtc, now)
             .Set(x => x.UpdatedAtUtc, now)
@@ -1247,7 +1289,8 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
             null,
             req.ForceRefresh,
             req.IncludeSourceRows,
-            Math.Clamp(req.MaxTextChars <= 0 ? DefaultMaxTextChars : req.MaxTextChars, 1000, MaxTextCharsLimit));
+            Math.Clamp(req.MaxTextChars <= 0 ? DefaultMaxTextChars : req.MaxTextChars, 1000, MaxTextCharsLimit),
+            null);
     }
 
     private static NormalizedRequest AttachSourceScope(WorkAssignment scope, NormalizedRequest req)
@@ -1708,6 +1751,18 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
             .Set(x => x.SourceAssignmentIds, sourceAssignments.Select(x => x.Id).ToList())
             .Set(x => x.SourceReportIds, sourceReports.Select(x => x.Id).ToList())
             .Set(x => x.SourceSignatureHash, sourceSignatureHash)
+            .Set(x => x.ConfigId, req.RuntimePin!.ConfigId)
+            .Set(x => x.ConfigVersionId, req.RuntimePin.VersionId)
+            .Set(x => x.ConfigVersionNo, req.RuntimePin.VersionNo)
+            .Set(x => x.ConfigRevision, req.RuntimePin.Revision)
+            .Set(x => x.ConfigHash, req.RuntimePin.ConfigHash)
+            .Set(x => x.ConfigDependencyPins, req.RuntimePin.DependencyPins)
+            .Set(x => x.CandidateChainId, req.RuntimePin.Candidate.ChainId)
+            .Set(x => x.CandidatePromptId, req.RuntimePin.Candidate.PromptId)
+            .Set(x => x.CandidateStage, req.RuntimePin.Candidate.Stage)
+            .Set(x => x.CandidateCatalogRawSha256, req.RuntimePin.Candidate.CatalogRawSha256)
+            .Set(x => x.CandidateCatalogSemanticSha256, req.RuntimePin.Candidate.CatalogSemanticSha256)
+            .Set(x => x.CandidateStageLockSha256, req.RuntimePin.Candidate.StageLockSha256)
             .Set(x => x.SnapshotJson, SerializeSnapshotJson(response))
             .Set(x => x.SnapshotDirty, false)
             .Set(x => x.SnapshotDirtyAtUtc, (DateTime?)null)
@@ -1747,6 +1802,17 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
             selectedUnitIds = req.SelectedUnitIds,
             defaultMethods = req.DefaultMethods,
             rules = req.Rules,
+            configId = req.RuntimePin?.ConfigId,
+            configVersionId = req.RuntimePin?.VersionId,
+            configVersionNo = req.RuntimePin?.VersionNo,
+            configRevision = req.RuntimePin?.Revision,
+            configHash = req.RuntimePin?.ConfigHash,
+            configDependencyPins = req.RuntimePin?.DependencyPins,
+            candidateChainId = req.RuntimePin?.Candidate.ChainId,
+            candidatePromptId = req.RuntimePin?.Candidate.PromptId,
+            candidateStage = req.RuntimePin?.Candidate.Stage,
+            candidateCatalogRawSha256 = req.RuntimePin?.Candidate.CatalogRawSha256,
+            candidateStageLockSha256 = req.RuntimePin?.Candidate.StageLockSha256,
             maxTextChars = req.MaxTextChars
         }, JsonOptions);
 
@@ -2569,6 +2635,9 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
             selectedUnitIds = req.SelectedUnitIds,
             defaultMethods = req.DefaultMethods,
             rules = req.Rules,
+            configHash = req.RuntimePin?.ConfigHash,
+            configRevision = req.RuntimePin?.Revision,
+            candidateStageLockSha256 = req.RuntimePin?.Candidate.StageLockSha256,
             maxTextChars = req.MaxTextChars
         }, JsonOptions);
 
@@ -2806,6 +2875,11 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
                 TargetKey = x.TargetKey,
                 Operation = x.Operation
             }).ToList(),
+            SourceScopeMode = req.SourceScope?.Mode,
+            SourceFlowInstanceId = req.SourceScope?.FlowInstanceId,
+            SourceFlowStepId = req.SourceScope?.FlowStepId,
+            SourceFlowBranchId = req.SourceScope?.FlowBranchId,
+            SourceFlowEffectiveStatus = req.SourceScope?.FlowEffectiveStatus,
             SourceView = new WorkAssignmentBasicSummarySourceViewRequestDto
             {
                 Q = req.SourceView.Q,
@@ -2891,11 +2965,29 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
                 continue;
             }
 
+            var operation = NormalizeBasicOperationOrDefault(rule.Operation, string.Empty);
+            if (string.IsNullOrWhiteSpace(operation) && rejectUnsupportedTargets)
+            {
+                throw AppExceptionFactory.BadRequest(
+                    AppErrorCode.WORK_ASSIGNMENT_AGGREGATE_MODE_INVALID,
+                    new
+                    {
+                        summaryType = SummaryType,
+                        contractVersion = ContractVersion,
+                        field = rule.TargetKey.Trim(),
+                        method = rule.Operation,
+                        reason = "BASIC_SUMMARY_METHOD_UNSUPPORTED_FOR_DATA_TYPE"
+                    },
+                    "Basic summary method is not supported.");
+            }
+
             normalizedRules.Add(new WorkAssignmentBasicSummaryRuleDto
             {
                 TargetKind = "FIELD",
                 TargetKey = rule.TargetKey.Trim(),
-                Operation = NormalizeOperation(rule.Operation)
+                Operation = string.IsNullOrWhiteSpace(operation)
+                    ? NormalizeOperation(rule.Operation)
+                    : operation
             });
         }
 
@@ -2975,7 +3067,25 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
             (string.Equals(x.TargetKey, targetKey, StringComparison.OrdinalIgnoreCase) ||
              string.Equals(x.TargetKey, alternateKey, StringComparison.OrdinalIgnoreCase)));
 
-        return rule is null ? fallback : NormalizeOperationForDataType(rule.Operation, dataType, fallback);
+        if (rule is null)
+            return fallback;
+
+        var operation = NormalizeBasicOperationOrDefault(rule.Operation, string.Empty);
+        if (!string.IsNullOrWhiteSpace(operation) && IsOperationAllowedForDataType(operation, dataType))
+            return operation;
+
+        throw AppExceptionFactory.BadRequest(
+            AppErrorCode.WORK_ASSIGNMENT_AGGREGATE_MODE_INVALID,
+            new
+            {
+                summaryType = SummaryType,
+                contractVersion = ContractVersion,
+                field = rule.TargetKey,
+                method = rule.Operation,
+                dataType,
+                reason = "BASIC_SUMMARY_METHOD_UNSUPPORTED_FOR_DATA_TYPE"
+            },
+            "Basic summary method is not supported for this data type.");
     }
 
     private static string NormalizeOperation(string? value)
@@ -3969,7 +4079,8 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
         NormalizedSummarySourceScope? SourceScope,
         bool ForceRefresh,
         bool IncludeSourceRows,
-        int MaxTextChars);
+        int MaxTextChars,
+        P9BasicRuntimePin? RuntimePin);
 
     private sealed record NormalizedDefaultMethods(
         string Number,
@@ -3985,6 +4096,15 @@ public sealed class WorkAssignmentBasicSummaryService : IWorkAssignmentBasicSumm
         string? AssigneeUserId,
         int Page,
         int PageSize);
+
+    private sealed record P9BasicRuntimePin(
+        string ConfigId,
+        string VersionId,
+        int VersionNo,
+        long Revision,
+        string ConfigHash,
+        List<string> DependencyPins,
+        StatRunCandidateBinding Candidate);
 
     private sealed class DynamicFormFieldDefinition
     {

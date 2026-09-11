@@ -1,4 +1,4 @@
-﻿namespace tdtd_be.Data.Infrastructure
+namespace tdtd_be.Data.Infrastructure
 {
     public sealed class MongoOptions
     {
@@ -16,6 +16,12 @@
         public string DynamicFormTemplateCollection { get; set; } = "dynamic_form_templates";
         public string DynamicFormSectionCollection { get; set; } = "dynamic_form_sections";
         public string LabelCollection { get; set; } = "labels";
+        public string StatConfigCommandReceiptCollection { get; set; } =
+            "stat_config_command_receipts";
+        public string StatConfigValidationJobCollection { get; set; } =
+            "stat_config_validation_jobs";
+        public string StatConfigAuditOutboxCollection { get; set; } =
+            "stat_config_audit_outbox";
         public string LabelEnumCatalogCollection { get; set; } = "label_enum_catalogs";
         public string LabelEnumOptionReadModelCollection { get; set; } = "label_enum_option_read_models";
         public string WorkCollection { get; set; } = "works";
@@ -32,7 +38,23 @@
         public string WorkSummaryTokenLedgerCollection { get; set; } = "work_summary_token_ledgers";
         public string DynamicFlowTemplateCollection { get; set; } = "dynamic_flow_templates";
         public string DynamicFlowTemplateVersionCollection { get; set; } = "dynamic_flow_template_versions";
+        public string DynamicFlowDefinitionCommandReceiptCollection { get; set; } = "dynamic_flow_definition_command_receipts";
         public string DynamicFlowEventCollection { get; set; } = "dynamic_flow_events";
+        public string DynamicFlowInstanceCollection { get; set; } = "dynamic_flow_instances";
+        public string DynamicFlowStepInstanceCollection { get; set; } = "dynamic_flow_step_instances";
+        public string DynamicFlowParticipantSnapshotCollection { get; set; } = "dynamic_flow_participant_snapshots";
+        public string DynamicFlowRuntimeCommandReceiptCollection { get; set; } = "dynamic_flow_runtime_command_receipts";
+        public string DynamicFlowRuntimeEventCollection { get; set; } = "dynamic_flow_runtime_events";
+        public string DynamicFlowRuntimeOutboxCollection { get; set; } = "dynamic_flow_runtime_outbox";
+        public string DynamicFlowMappingApplyReceiptCollection { get; set; } = "dynamic_flow_mapping_apply_receipts";
+        public string DynamicFlowMappingProvenanceCollection { get; set; } = "dynamic_flow_mapping_provenance";
+        public string DynamicFlowMappingEventCollection { get; set; } = "dynamic_flow_mapping_events";
+        public string DynamicFlowMappingOutboxCollection { get; set; } = "dynamic_flow_mapping_outbox";
+        public string DynamicFlowGatewayInstanceCollection { get; set; } = "dynamic_flow_gateway_instances";
+        public string DynamicFlowGatewayContributionCollection { get; set; } = "dynamic_flow_gateway_contributions";
+        public string DynamicFlowPeriodicScheduleCollection { get; set; } = "dynamic_flow_periodic_schedules";
+        public string DynamicFlowPeriodicOccurrenceCollection { get; set; } = "dynamic_flow_periodic_occurrences";
+        public string DynamicFlowExecutionEpochCollection { get; set; } = "dynamic_flow_execution_epochs";
         public string WorkTemplateAssigneeCollection { get; set; } = "work_template_assignees";
         public string DocRoleCollection { get; set; } = "doc_roles";
         public string WorkListDocRoleCollection { get; set; } = "work_list_doc_roles";
@@ -64,7 +86,15 @@
         public string WorkReportFieldStatValueCollection { get; set; } = "work_report_field_stat_values";
         public string WorkReportFieldStatAggregateCollection { get; set; } = "work_report_field_stat_aggregates";
         public string WorkReportStatisticRebuildJobCollection { get; set; } = "work_report_statistic_rebuild_jobs";
+        public string StatisticReconciliationRunCollection { get; set; } =
+            "work_report_statistic_reconciliations";
+        public string StatisticReconciliationObservationCollection { get; set; } =
+            "work_report_statistic_reconciliation_observations";
+        public string StatisticReconciliationReviewCollection { get; set; } =
+            "work_report_statistic_reconciliation_reviews";
         public string WorkReportStatisticDiffConfigCollection { get; set; } = "work_report_statistic_diff_configs";
+        public string WorkReportStatisticExportCollection { get; set; } = "work_report_statistic_exports";
+        public string WorkReportStatisticDiffExportCollection { get; set; } = "work_report_statistic_diff_exports";
         public string NotificationCollection { get; set; } = "notifications";
     }
 }

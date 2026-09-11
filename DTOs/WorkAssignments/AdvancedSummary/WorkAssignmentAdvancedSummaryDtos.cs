@@ -1,4 +1,129 @@
+using System.Text.Json.Serialization;
+using tdtd_be.DTOs.StatisticsConfiguration;
+
 namespace tdtd_be.DTOs.WorkAssignments.AdvancedSummary;
+
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record WorkAssignmentAdvancedSummaryConfigPayload(
+    WorkAssignmentAdvancedSummarySourceScopePayload? SourceScope,
+    IReadOnlyList<WorkAssignmentAdvancedSummarySectionPayload>? Sections,
+    IReadOnlyList<string>? HierarchyGrains,
+    IReadOnlyList<string>? Grouping,
+    IReadOnlyList<WorkAssignmentAdvancedSummaryOrderingPayload>? Ordering,
+    string? Description);
+
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record WorkAssignmentAdvancedSummarySourceScopePayload(
+    string? Mode,
+    string? FlowInstanceId,
+    string? FlowStepId,
+    string? FlowBranchId,
+    string? FlowEffectiveStatus);
+
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record WorkAssignmentAdvancedSummarySectionPayload(
+    string? SectionId,
+    bool? IsCumulative,
+    IReadOnlyList<WorkAssignmentAdvancedSummaryTargetPayload>? Targets);
+
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record WorkAssignmentAdvancedSummaryTargetPayload(
+    string? FieldId,
+    string? DataType,
+    string? Operation);
+
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record WorkAssignmentAdvancedSummaryOrderingPayload(
+    string? FieldId,
+    string? Direction);
+
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed class WorkAssignmentAdvancedSummaryEmptyCommandPayload
+{
+}
+
+public sealed record WorkAssignmentAdvancedSummaryValidationReceipt(
+    string ReceiptId,
+    string ContractVersion,
+    string ValidationMode,
+    string OwnerId,
+    string ConfigId,
+    string VersionId,
+    int VersionNo,
+    long Revision,
+    string ConfigHash,
+    IReadOnlyList<string> DependencyPins,
+    string SectionId,
+    string SourceScopeMode,
+    bool IsCumulative,
+    int TargetCount,
+    int TargetLimit,
+    IReadOnlyList<string> HierarchyGrains,
+    int HierarchyDepth,
+    int MaxHierarchyDepth,
+    int CanonicalPayloadBytes,
+    int MaxCanonicalPayloadBytes,
+    string RuntimeEligibility,
+    bool PreviewRead,
+    bool PreviewWrite,
+    bool HierarchyRead,
+    bool HierarchyWrite);
+
+public sealed record WorkAssignmentAdvancedSummaryConfigVersionDto(
+    StatConfigIdentity Identity,
+    WorkAssignmentAdvancedSummaryConfigPayload Payload,
+    string? PreviousVersionId,
+    WorkAssignmentAdvancedSummaryValidationReceipt? ValidationReceipt,
+    DateTime CreatedAtUtc,
+    DateTime UpdatedAtUtc,
+    DateTime? LockedAtUtc,
+    string? LockedByUserId,
+    DateTime? ArchivedAtUtc,
+    string? ArchivedByUserId);
+
+public sealed record WorkAssignmentAdvancedSummaryConfigReadback(
+    StatConfigIdentity Identity,
+    WorkAssignmentAdvancedSummaryConfigPayload Payload,
+    StatConfigPermissionSet Permissions,
+    string RuntimeEligibility,
+    bool IsVirtualEmpty,
+    string? PreviousVersionId,
+    IReadOnlyList<WorkAssignmentAdvancedSummaryConfigVersionDto> Versions,
+    WorkAssignmentAdvancedSummaryValidationReceipt? ValidationReceipt,
+    string? CommandReceiptId);
+
+public sealed record WorkAssignmentAdvancedSummaryConfigVersionsResult(
+    string OwnerKind,
+    string OwnerId,
+    string ConfigId,
+    IReadOnlyList<WorkAssignmentAdvancedSummaryConfigVersionDto> Versions);
+
+public static class WorkAssignmentAdvancedSummaryConfigContract
+{
+    public const string RuntimeBlockedUntilP9 = "BLOCKED_UNTIL_P9";
+    public const string ValidationContractVersion =
+        "P8_ADVANCED_CONFIG_VALIDATION_V1";
+    public const string ValidationMode = "CONFIG_ONLY_NO_DATASET";
+    public const int MaxCumulativeTargets = 249;
+    public const int MaxNonCumulativeTargets = 1000;
+    public const int MaxHierarchyDepth = 3;
+    public const int MaxCanonicalPayloadBytes = 1_048_576;
+
+    public static readonly IReadOnlyList<string> SourceScopeModes =
+        new[]
+        {
+            "DIRECT_CHILDREN_OR_SELF",
+            "DIRECT_CHILDREN",
+            "SELF",
+            "FLOW_BRANCH",
+            "FLOW_STEP",
+            "FLOW_EFFECTIVE_PATH",
+            "FLOW_FINAL"
+        };
+
+    public static readonly IReadOnlyList<string> HierarchyPrefix =
+        new[] { "DAY", "MONTH", "YEAR" };
+}
 
 public sealed class WorkAssignmentAdvancedSummaryConfigDto
 {
@@ -66,16 +191,25 @@ public sealed class PreviewWorkAssignmentAdvancedSummaryConfigRequest
 public sealed class BuildWorkAssignmentAdvancedSummaryDayNodeRequest
 {
     public bool ForceRefresh { get; set; }
+    public string? CommandId { get; set; }
+    public long? ExpectedConfigRevision { get; set; }
+    public string? ExpectedConfigHash { get; set; }
 }
 
 public sealed class BuildWorkAssignmentAdvancedSummaryMonthNodeRequest
 {
     public bool ForceRefresh { get; set; }
+    public string? CommandId { get; set; }
+    public long? ExpectedConfigRevision { get; set; }
+    public string? ExpectedConfigHash { get; set; }
 }
 
 public sealed class BuildWorkAssignmentAdvancedSummaryYearNodeRequest
 {
     public bool ForceRefresh { get; set; }
+    public string? CommandId { get; set; }
+    public long? ExpectedConfigRevision { get; set; }
+    public string? ExpectedConfigHash { get; set; }
 }
 
 public sealed class QueryWorkAssignmentAdvancedSummaryHierarchyRequest
@@ -83,6 +217,7 @@ public sealed class QueryWorkAssignmentAdvancedSummaryHierarchyRequest
     public string StartDayKey { get; set; } = string.Empty;
     public string EndDayKey { get; set; } = string.Empty;
     public bool EnqueueMissing { get; set; } = true;
+    public string? CommandId { get; set; }
 }
 
 public sealed class DiagnoseWorkAssignmentAdvancedSummaryDayNodeRequest

@@ -12,12 +12,16 @@ using tdtd_be.Enum;
 using tdtd_be.Models;
 using tdtd_be.Models.Enums;
 using tdtd_be.Services.Notifications;
+using tdtd_be.Services.DynamicForms;
+using tdtd_be.Services.StatisticsConfiguration;
+using tdtd_be.Services.StatisticsRun;
 using tdtd_be.Services.WorkAssignmentReports.Payloads;
 using tdtd_be.Services.WorkAssignments.Internal;
+using tdtd_be.Services.WorkAssignments.SummaryTokens;
 
 namespace tdtd_be.Services.WorkAssignments.AdvancedSummary;
 
-public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignmentAdvancedSummaryHierarchyService
+public sealed partial class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignmentAdvancedSummaryHierarchyService
 {
     private const int DayNodeSourceReportLimit = 3000;
     private const int DayNodeSampleTextLimit = 160;
@@ -26,6 +30,7 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
     private const string MonthNodeValueKind = "ADVANCED_SUMMARY_MONTH_NODE_V1";
     private const string YearNodeValueKind = "ADVANCED_SUMMARY_YEAR_NODE_V1";
     private const string QueryNodeValueKind = "ADVANCED_SUMMARY_QUERY_RESULT_V1";
+    private const int MaximumQueryDaySpan = 3660;
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
@@ -41,17 +46,23 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
     private readonly IBackgroundJobClient _backgroundJobs;
     private readonly IWorkReportPayloadReader _payloadReader;
     private readonly INotificationService _notifications;
+    private readonly IStatRunCandidateActivation _candidateActivation;
+    private readonly IWorkSummaryTokenService _summaryTokens;
 
     public WorkAssignmentAdvancedSummaryHierarchyService(
         MongoDbContext ctx,
         IBackgroundJobClient backgroundJobs,
         IWorkReportPayloadReader payloadReader,
-        INotificationService notifications)
+        INotificationService notifications,
+        IStatRunCandidateActivation candidateActivation,
+        IWorkSummaryTokenService summaryTokens)
     {
         _ctx = ctx;
         _backgroundJobs = backgroundJobs;
         _payloadReader = payloadReader;
         _notifications = notifications;
+        _candidateActivation = candidateActivation;
+        _summaryTokens = summaryTokens;
     }
 
     public async Task<WorkAssignmentAdvancedSummaryDayNodeDto> RequestDayNodeBuildAsync(
@@ -61,23 +72,33 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
         string actorUserId,
         CancellationToken ct)
     {
+        var candidate = RequireBuildCandidate();
         EnsureActor(actorUserId);
         var normalizedDayKey = NormalizeDayKey(dayKey);
         var config = await LoadLockedConfigAsync(configId, ct);
+        EnsureExpectedConfig(config, req?.ExpectedConfigRevision, req?.ExpectedConfigHash);
+        var commandId = NormalizeBuildCommandId(req?.CommandId);
+        var requestHash = BuildNodeRequestHash(
+            config,
+            WorkAssignmentAdvancedSummaryHierarchyGrains.Day,
+            normalizedDayKey,
+            req?.ForceRefresh == true,
+            commandId);
         var context = await LoadContextAsync(config, actorUserId, ct);
         var (startUtc, endExclusiveUtc) = AdvancedSummaryHierarchyKeyHelper.GetDayBoundsUtc(normalizedDayKey);
 
         var existing = await LoadDayNodeAsync(config, normalizedDayKey, ct);
-        if (existing is not null &&
-            req?.ForceRefresh != true &&
-            string.Equals(existing.Status, WorkAssignmentAdvancedSummaryHierarchyNodeStatuses.Building, StringComparison.Ordinal))
+        var exactReplay = IsReplayOrThrow(existing, commandId, requestHash);
+        if ((exactReplay && !string.IsNullOrWhiteSpace(existing!.BuildJobId)) ||
+            IsReusableCleanNode(existing, req?.ForceRefresh == true) ||
+            (!exactReplay && existing is not null &&
+             req?.ForceRefresh != true &&
+             string.Equals(existing.Status, WorkAssignmentAdvancedSummaryHierarchyNodeStatuses.Building, StringComparison.Ordinal)))
         {
-            return MapDayNode(existing);
+            return MapDayNode(existing!);
         }
 
         var correlationId = ObjectId.GenerateNewId().ToString();
-        var jobId = _backgroundJobs.Enqueue<IWorkAssignmentAdvancedSummaryHierarchyService>(
-            svc => svc.BuildDayNodeJobAsync(config.Id, normalizedDayKey, config.ConfigHash, actorUserId, correlationId, CancellationToken.None));
         var now = DateTime.UtcNow;
 
         var node = existing ?? new WorkAssignmentAdvancedSummaryDayNode
@@ -115,18 +136,28 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
         node.Status = WorkAssignmentAdvancedSummaryHierarchyNodeStatuses.Building;
         node.IsDirty = true;
         node.DirtyReason = req?.ForceRefresh == true ? "FORCE_REFRESH" : "BUILD_REQUESTED";
-        node.BuildJobId = jobId;
+        node.BuildJobId = null;
         node.BuildCorrelationId = correlationId;
         node.BuildError = null;
         node.UpdatedAtUtc = now;
         node.UpdatedByUserId = actorUserId;
         node.IsDeleted = false;
+        ApplyCandidateLineage(node, config, candidate);
+        ApplyBuildCommand(node, config, commandId, requestHash);
 
         await _ctx.WorkAssignmentAdvancedSummaryDayNodes.ReplaceOneAsync(
             DayNodeIdentityFilter(config, normalizedDayKey),
             node,
             new ReplaceOptions { IsUpsert = true },
             ct);
+
+        var jobId = _backgroundJobs.Enqueue<IWorkAssignmentAdvancedSummaryHierarchyService>(
+            svc => svc.BuildDayNodeJobAsync(config.Id, normalizedDayKey, config.ConfigHash, actorUserId, correlationId, CancellationToken.None));
+        await _ctx.WorkAssignmentAdvancedSummaryDayNodes.UpdateOneAsync(
+            CurrentDayNodeBuildFilter(config, normalizedDayKey, config.ConfigHash, correlationId),
+            Builders<WorkAssignmentAdvancedSummaryDayNode>.Update.Set(x => x.BuildJobId, jobId),
+            cancellationToken: ct);
+        node.BuildJobId = jobId;
 
         return MapDayNode(node);
     }
@@ -139,6 +170,7 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
         string correlationId,
         CancellationToken ct)
     {
+        var candidate = RequireBuildCandidate();
         EnsureActor(actorUserId);
         var normalizedDayKey = NormalizeDayKey(dayKey);
         var config = await LoadLockedConfigAsync(configId, ct);
@@ -147,18 +179,28 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
 
         WorkAssignment? notifyScope = null;
         DynamicFormTemplate? notifyTemplate = null;
+        var leaseOwner = $"p9-adv-worker:{ObjectId.GenerateNewId()}";
         try
         {
             var context = await LoadContextAsync(config, actorUserId, ct);
             notifyScope = context.Scope;
             notifyTemplate = context.Template;
 
-            await MarkDayNodeBuildingAsync(config, normalizedDayKey, expectedConfigHash, correlationId, actorUserId, ct);
+            if (!await MarkDayNodeBuildingAsync(
+                    config,
+                    normalizedDayKey,
+                    expectedConfigHash,
+                    correlationId,
+                    leaseOwner,
+                    actorUserId,
+                    ct))
+                return;
 
             var built = await BuildDayNodeAsync(config, context, normalizedDayKey, actorUserId, correlationId, ct);
+            ApplyCandidateLineage(built, config, candidate);
 
             await _ctx.WorkAssignmentAdvancedSummaryDayNodes.ReplaceOneAsync(
-                CurrentDayNodeBuildFilter(config, normalizedDayKey, expectedConfigHash, correlationId),
+                CurrentDayNodeLeaseFilter(config, normalizedDayKey, expectedConfigHash, correlationId, leaseOwner),
                 built,
                 new ReplaceOptions { IsUpsert = false },
                 ct);
@@ -179,7 +221,15 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
         catch (Exception ex)
         {
             var error = BuildErrorMessage(ex);
-            await MarkDayNodeFailedAsync(config, normalizedDayKey, expectedConfigHash, correlationId, actorUserId, error, ct);
+            await MarkDayNodeFailedAsync(
+                config,
+                normalizedDayKey,
+                expectedConfigHash,
+                correlationId,
+                leaseOwner,
+                actorUserId,
+                error,
+                ct);
             await NotifyDayNodeBuildAsync(
                 await LoadDayNodeAsync(config, normalizedDayKey, ct),
                 actorUserId,
@@ -203,24 +253,43 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
         string actorUserId,
         CancellationToken ct)
     {
+        var candidate = RequireBuildCandidate();
         EnsureActor(actorUserId);
         var normalizedMonthKey = NormalizeMonthKey(monthKey);
         var config = await LoadLockedConfigAsync(configId, ct);
-        await LoadContextAsync(config, actorUserId, ct);
+        EnsureExpectedConfig(config, req?.ExpectedConfigRevision, req?.ExpectedConfigHash);
+        var commandId = NormalizeBuildCommandId(req?.CommandId);
+        var requestHash = BuildNodeRequestHash(
+            config,
+            WorkAssignmentAdvancedSummaryHierarchyGrains.Month,
+            normalizedMonthKey,
+            req?.ForceRefresh == true,
+            commandId);
+        var context = await LoadContextAsync(config, actorUserId, ct);
         var (startUtc, endExclusiveUtc) = AdvancedSummaryHierarchyKeyHelper.GetMonthBoundsUtc(normalizedMonthKey);
         var yearKey = AdvancedSummaryHierarchyKeyHelper.ToYearKeyFromMonth(normalizedMonthKey);
 
         var existing = await LoadMonthNodeAsync(config, normalizedMonthKey, ct);
-        if (existing is not null &&
-            req?.ForceRefresh != true &&
-            string.Equals(existing.Status, WorkAssignmentAdvancedSummaryHierarchyNodeStatuses.Building, StringComparison.Ordinal))
+        var exactReplay = IsReplayOrThrow(existing, commandId, requestHash);
+        if ((exactReplay && !string.IsNullOrWhiteSpace(existing!.BuildJobId)) ||
+            IsReusableCleanNode(existing, req?.ForceRefresh == true) ||
+            (!exactReplay && existing is not null &&
+             req?.ForceRefresh != true &&
+             string.Equals(existing.Status, WorkAssignmentAdvancedSummaryHierarchyNodeStatuses.Building, StringComparison.Ordinal)))
         {
-            return MapMonthNode(existing);
+            return MapMonthNode(existing!);
         }
 
+        var quota = await _summaryTokens.ConsumeAdvancedBroadHistoricalBuildP9Async(
+            config,
+            RequireBroadBuildOwnerUnitId(context.Scope),
+            commandId,
+            WorkAssignmentAdvancedSummaryHierarchyGrains.Month,
+            normalizedMonthKey,
+            actorUserId,
+            ct);
+
         var correlationId = ObjectId.GenerateNewId().ToString();
-        var jobId = _backgroundJobs.Enqueue<IWorkAssignmentAdvancedSummaryHierarchyService>(
-            svc => svc.BuildMonthNodeJobAsync(config.Id, normalizedMonthKey, config.ConfigHash, actorUserId, correlationId, CancellationToken.None));
         var now = DateTime.UtcNow;
 
         var node = existing ?? new WorkAssignmentAdvancedSummaryMonthNode
@@ -247,18 +316,29 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
         node.Status = WorkAssignmentAdvancedSummaryHierarchyNodeStatuses.Building;
         node.IsDirty = true;
         node.DirtyReason = req?.ForceRefresh == true ? "FORCE_REFRESH" : "BUILD_REQUESTED";
-        node.BuildJobId = jobId;
+        node.BuildJobId = null;
         node.BuildCorrelationId = correlationId;
         node.BuildError = null;
         node.UpdatedAtUtc = now;
         node.UpdatedByUserId = actorUserId;
         node.IsDeleted = false;
+        ApplyCandidateLineage(node, config, candidate);
+        ApplyBuildCommand(node, config, commandId, requestHash);
+        node.QuotaLedgerId = quota.LedgerId;
 
         await _ctx.WorkAssignmentAdvancedSummaryMonthNodes.ReplaceOneAsync(
             MonthNodeIdentityFilter(config, normalizedMonthKey),
             node,
             new ReplaceOptions { IsUpsert = true },
             ct);
+
+        var jobId = _backgroundJobs.Enqueue<IWorkAssignmentAdvancedSummaryHierarchyService>(
+            svc => svc.BuildMonthNodeJobAsync(config.Id, normalizedMonthKey, config.ConfigHash, actorUserId, correlationId, CancellationToken.None));
+        await _ctx.WorkAssignmentAdvancedSummaryMonthNodes.UpdateOneAsync(
+            CurrentMonthNodeBuildFilter(config, normalizedMonthKey, config.ConfigHash, correlationId),
+            Builders<WorkAssignmentAdvancedSummaryMonthNode>.Update.Set(x => x.BuildJobId, jobId),
+            cancellationToken: ct);
+        node.BuildJobId = jobId;
 
         return MapMonthNode(node);
     }
@@ -271,6 +351,7 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
         string correlationId,
         CancellationToken ct)
     {
+        var candidate = RequireBuildCandidate();
         EnsureActor(actorUserId);
         var normalizedMonthKey = NormalizeMonthKey(monthKey);
         var config = await LoadLockedConfigAsync(configId, ct);
@@ -279,22 +360,26 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
 
         WorkAssignment? notifyScope = null;
         DynamicFormTemplate? notifyTemplate = null;
+        var leaseOwner = $"p9-adv-worker:{ObjectId.GenerateNewId()}";
         try
         {
             var context = await LoadContextAsync(config, actorUserId, ct);
             notifyScope = context.Scope;
             notifyTemplate = context.Template;
 
-            await MarkNodeBuildingAsync(
+            if (!await MarkNodeBuildingAsync(
                 _ctx.WorkAssignmentAdvancedSummaryMonthNodes,
                 CurrentMonthNodeBuildFilter(config, normalizedMonthKey, expectedConfigHash, correlationId),
+                leaseOwner,
                 actorUserId,
-                ct);
+                ct))
+                return;
 
             var built = await BuildMonthNodeAsync(config, normalizedMonthKey, actorUserId, correlationId, ct);
+            ApplyCandidateLineage(built, config, candidate);
 
             await _ctx.WorkAssignmentAdvancedSummaryMonthNodes.ReplaceOneAsync(
-                CurrentMonthNodeBuildFilter(config, normalizedMonthKey, expectedConfigHash, correlationId),
+                CurrentMonthNodeLeaseFilter(config, normalizedMonthKey, expectedConfigHash, correlationId, leaseOwner),
                 built,
                 new ReplaceOptions { IsUpsert = false },
                 ct);
@@ -317,7 +402,7 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
             var error = BuildErrorMessage(ex);
             await MarkNodeFailedAsync(
                 _ctx.WorkAssignmentAdvancedSummaryMonthNodes,
-                CurrentMonthNodeBuildFilter(config, normalizedMonthKey, expectedConfigHash, correlationId),
+                CurrentMonthNodeLeaseFilter(config, normalizedMonthKey, expectedConfigHash, correlationId, leaseOwner),
                 actorUserId,
                 error,
                 ct);
@@ -344,23 +429,42 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
         string actorUserId,
         CancellationToken ct)
     {
+        var candidate = RequireBuildCandidate();
         EnsureActor(actorUserId);
         var normalizedYearKey = NormalizeYearKey(yearKey);
         var config = await LoadLockedConfigAsync(configId, ct);
-        await LoadContextAsync(config, actorUserId, ct);
+        EnsureExpectedConfig(config, req?.ExpectedConfigRevision, req?.ExpectedConfigHash);
+        var commandId = NormalizeBuildCommandId(req?.CommandId);
+        var requestHash = BuildNodeRequestHash(
+            config,
+            WorkAssignmentAdvancedSummaryHierarchyGrains.Year,
+            normalizedYearKey,
+            req?.ForceRefresh == true,
+            commandId);
+        var context = await LoadContextAsync(config, actorUserId, ct);
         var (startUtc, endExclusiveUtc) = AdvancedSummaryHierarchyKeyHelper.GetYearBoundsUtc(normalizedYearKey);
 
         var existing = await LoadYearNodeAsync(config, normalizedYearKey, ct);
-        if (existing is not null &&
-            req?.ForceRefresh != true &&
-            string.Equals(existing.Status, WorkAssignmentAdvancedSummaryHierarchyNodeStatuses.Building, StringComparison.Ordinal))
+        var exactReplay = IsReplayOrThrow(existing, commandId, requestHash);
+        if ((exactReplay && !string.IsNullOrWhiteSpace(existing!.BuildJobId)) ||
+            IsReusableCleanNode(existing, req?.ForceRefresh == true) ||
+            (!exactReplay && existing is not null &&
+             req?.ForceRefresh != true &&
+             string.Equals(existing.Status, WorkAssignmentAdvancedSummaryHierarchyNodeStatuses.Building, StringComparison.Ordinal)))
         {
-            return MapYearNode(existing);
+            return MapYearNode(existing!);
         }
 
+        var quota = await _summaryTokens.ConsumeAdvancedBroadHistoricalBuildP9Async(
+            config,
+            RequireBroadBuildOwnerUnitId(context.Scope),
+            commandId,
+            WorkAssignmentAdvancedSummaryHierarchyGrains.Year,
+            normalizedYearKey,
+            actorUserId,
+            ct);
+
         var correlationId = ObjectId.GenerateNewId().ToString();
-        var jobId = _backgroundJobs.Enqueue<IWorkAssignmentAdvancedSummaryHierarchyService>(
-            svc => svc.BuildYearNodeJobAsync(config.Id, normalizedYearKey, config.ConfigHash, actorUserId, correlationId, CancellationToken.None));
         var now = DateTime.UtcNow;
 
         var node = existing ?? new WorkAssignmentAdvancedSummaryYearNode
@@ -386,18 +490,29 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
         node.Status = WorkAssignmentAdvancedSummaryHierarchyNodeStatuses.Building;
         node.IsDirty = true;
         node.DirtyReason = req?.ForceRefresh == true ? "FORCE_REFRESH" : "BUILD_REQUESTED";
-        node.BuildJobId = jobId;
+        node.BuildJobId = null;
         node.BuildCorrelationId = correlationId;
         node.BuildError = null;
         node.UpdatedAtUtc = now;
         node.UpdatedByUserId = actorUserId;
         node.IsDeleted = false;
+        ApplyCandidateLineage(node, config, candidate);
+        ApplyBuildCommand(node, config, commandId, requestHash);
+        node.QuotaLedgerId = quota.LedgerId;
 
         await _ctx.WorkAssignmentAdvancedSummaryYearNodes.ReplaceOneAsync(
             YearNodeIdentityFilter(config, normalizedYearKey),
             node,
             new ReplaceOptions { IsUpsert = true },
             ct);
+
+        var jobId = _backgroundJobs.Enqueue<IWorkAssignmentAdvancedSummaryHierarchyService>(
+            svc => svc.BuildYearNodeJobAsync(config.Id, normalizedYearKey, config.ConfigHash, actorUserId, correlationId, CancellationToken.None));
+        await _ctx.WorkAssignmentAdvancedSummaryYearNodes.UpdateOneAsync(
+            CurrentYearNodeBuildFilter(config, normalizedYearKey, config.ConfigHash, correlationId),
+            Builders<WorkAssignmentAdvancedSummaryYearNode>.Update.Set(x => x.BuildJobId, jobId),
+            cancellationToken: ct);
+        node.BuildJobId = jobId;
 
         return MapYearNode(node);
     }
@@ -410,6 +525,7 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
         string correlationId,
         CancellationToken ct)
     {
+        var candidate = RequireBuildCandidate();
         EnsureActor(actorUserId);
         var normalizedYearKey = NormalizeYearKey(yearKey);
         var config = await LoadLockedConfigAsync(configId, ct);
@@ -418,22 +534,26 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
 
         WorkAssignment? notifyScope = null;
         DynamicFormTemplate? notifyTemplate = null;
+        var leaseOwner = $"p9-adv-worker:{ObjectId.GenerateNewId()}";
         try
         {
             var context = await LoadContextAsync(config, actorUserId, ct);
             notifyScope = context.Scope;
             notifyTemplate = context.Template;
 
-            await MarkNodeBuildingAsync(
+            if (!await MarkNodeBuildingAsync(
                 _ctx.WorkAssignmentAdvancedSummaryYearNodes,
                 CurrentYearNodeBuildFilter(config, normalizedYearKey, expectedConfigHash, correlationId),
+                leaseOwner,
                 actorUserId,
-                ct);
+                ct))
+                return;
 
             var built = await BuildYearNodeAsync(config, normalizedYearKey, actorUserId, correlationId, ct);
+            ApplyCandidateLineage(built, config, candidate);
 
             await _ctx.WorkAssignmentAdvancedSummaryYearNodes.ReplaceOneAsync(
-                CurrentYearNodeBuildFilter(config, normalizedYearKey, expectedConfigHash, correlationId),
+                CurrentYearNodeLeaseFilter(config, normalizedYearKey, expectedConfigHash, correlationId, leaseOwner),
                 built,
                 new ReplaceOptions { IsUpsert = false },
                 ct);
@@ -456,7 +576,7 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
             var error = BuildErrorMessage(ex);
             await MarkNodeFailedAsync(
                 _ctx.WorkAssignmentAdvancedSummaryYearNodes,
-                CurrentYearNodeBuildFilter(config, normalizedYearKey, expectedConfigHash, correlationId),
+                CurrentYearNodeLeaseFilter(config, normalizedYearKey, expectedConfigHash, correlationId, leaseOwner),
                 actorUserId,
                 error,
                 ct);
@@ -482,6 +602,7 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
         string actorUserId,
         CancellationToken ct)
     {
+        _ = RequireResultCandidate();
         EnsureActor(actorUserId);
         var startDayKey = NormalizeQueryDayKey(req.StartDayKey, "startDayKey");
         var endDayKey = NormalizeQueryDayKey(string.IsNullOrWhiteSpace(req.EndDayKey) ? req.StartDayKey : req.EndDayKey, "endDayKey");
@@ -493,6 +614,22 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
                 AppErrorCode.COMMON_VALIDATION_FAILED,
                 new { startDayKey, endDayKey, reason = "ADVANCED_SUMMARY_QUERY_RANGE_INVALID" },
                 "Advanced summary query end day must be on or after start day.");
+        }
+
+        var queryDaySpan = checked((int)(endExclusiveUtc - startUtc).TotalDays);
+        if (queryDaySpan > MaximumQueryDaySpan)
+        {
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.COMMON_VALIDATION_FAILED,
+                new
+                {
+                    startDayKey,
+                    endDayKey,
+                    queryDaySpan,
+                    maximumQueryDaySpan = MaximumQueryDaySpan,
+                    reason = "ADVANCED_SUMMARY_QUERY_RANGE_TOO_BROAD"
+                },
+                "Advanced summary query range exceeds the bounded historical window.");
         }
 
         var config = await LoadLockedConfigAsync(configId, ct);
@@ -576,6 +713,7 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
         string actorUserId,
         CancellationToken ct)
     {
+        _ = RequireResultCandidate();
         EnsureActor(actorUserId);
         req ??= new DiagnoseWorkAssignmentAdvancedSummaryDayNodeRequest();
         var normalizedDayKey = NormalizeDayKey(string.IsNullOrWhiteSpace(dayKey) ? req.DayKey : dayKey);
@@ -615,6 +753,7 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
         string actorUserId,
         CancellationToken ct)
     {
+        _ = RequireResultCandidate();
         EnsureActor(actorUserId);
         req ??= new DiagnoseWorkAssignmentAdvancedSummaryMonthNodeRequest();
         var normalizedMonthKey = NormalizeMonthKey(string.IsNullOrWhiteSpace(monthKey) ? req.MonthKey : monthKey);
@@ -652,6 +791,7 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
         string actorUserId,
         CancellationToken ct)
     {
+        _ = RequireResultCandidate();
         EnsureActor(actorUserId);
         req ??= new DiagnoseWorkAssignmentAdvancedSummaryYearNodeRequest();
         var normalizedYearKey = NormalizeYearKey(string.IsNullOrWhiteSpace(yearKey) ? req.YearKey : yearKey);
@@ -692,7 +832,7 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
     {
         EnsureSimpleConfigSupported(config.ConfigJson);
         var (startUtc, endExclusiveUtc) = AdvancedSummaryHierarchyKeyHelper.GetDayBoundsUtc(dayKey);
-        var sectionFields = await LoadSectionFieldsAsync(context.Template, config.SectionId, ct);
+        var sectionFields = LoadSectionFields(context.Template, config.SectionId);
         var configAnalysis = AnalyzeSimpleConfig(config.ConfigJson, sectionFields);
         if (configAnalysis.UnsupportedFeatures.Count > 0)
             throw UnsupportedConfig(configAnalysis.UnsupportedFeatures);
@@ -738,7 +878,8 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
         {
             string? fieldValuesJson;
             string? sectionPayloadHash = null;
-            if (sectionByReportId.TryGetValue(report.Id, out var sectionRow))
+            if (sectionByReportId.TryGetValue(report.Id, out var sectionRow) &&
+                IsCurrentSectionProjection(report, sectionRow))
             {
                 fieldValuesJson = sectionRow.FieldValuesJson;
                 sectionPayloadHash = sectionRow.PayloadHash;
@@ -747,6 +888,8 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
             {
                 fallbackPayloadReadCount++;
                 var payload = await _payloadReader.LoadReportPayloadAsync(report, ct);
+                if (report.PayloadRevision > 0)
+                    WorkReportPayloadConsistency.EnsureSnapshotFreshForStatisticProjection(report, payload);
                 fieldValuesJson = payload.FieldValuesJson;
             }
 
@@ -765,7 +908,7 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
         }
 
         if (fallbackPayloadReadCount > 0)
-            warnings.Add($"Day node read {fallbackPayloadReadCount} full payload(s) because section snapshots were missing.");
+            warnings.Add($"Day node read {fallbackPayloadReadCount} full payload(s) because section snapshots were missing or stale.");
         if (sourceReports.Count == 0)
             warnings.Add("No approved source reports were found for this source day.");
         if (targetFields.Count == 0)
@@ -832,6 +975,12 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
             BuiltAtUtc = now,
             BuildJobId = existingNode?.BuildJobId,
             BuildCorrelationId = correlationId,
+            BuildCommandId = existingNode?.BuildCommandId,
+            BuildRequestHash = existingNode?.BuildRequestHash,
+            BuildReceiptId = existingNode?.BuildReceiptId,
+            QuotaLedgerId = existingNode?.QuotaLedgerId,
+            BuildAttemptNo = existingNode?.BuildAttemptNo ?? 0,
+            FenceToken = existingNode?.FenceToken ?? 0,
             BuildError = null,
             CreatedAtUtc = existingNode?.CreatedAtUtc ?? now,
             CreatedByUserId = existingNode?.CreatedByUserId ?? actorUserId,
@@ -902,6 +1051,12 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
             BuiltAtUtc = now,
             BuildJobId = existingNode?.BuildJobId,
             BuildCorrelationId = correlationId,
+            BuildCommandId = existingNode?.BuildCommandId,
+            BuildRequestHash = existingNode?.BuildRequestHash,
+            BuildReceiptId = existingNode?.BuildReceiptId,
+            QuotaLedgerId = existingNode?.QuotaLedgerId,
+            BuildAttemptNo = existingNode?.BuildAttemptNo ?? 0,
+            FenceToken = existingNode?.FenceToken ?? 0,
             BuildError = null,
             CreatedAtUtc = existingNode?.CreatedAtUtc ?? now,
             CreatedByUserId = existingNode?.CreatedByUserId ?? actorUserId,
@@ -973,6 +1128,12 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
             BuiltAtUtc = now,
             BuildJobId = existingNode?.BuildJobId,
             BuildCorrelationId = correlationId,
+            BuildCommandId = existingNode?.BuildCommandId,
+            BuildRequestHash = existingNode?.BuildRequestHash,
+            BuildReceiptId = existingNode?.BuildReceiptId,
+            QuotaLedgerId = existingNode?.QuotaLedgerId,
+            BuildAttemptNo = existingNode?.BuildAttemptNo ?? 0,
+            FenceToken = existingNode?.FenceToken ?? 0,
             BuildError = null,
             CreatedAtUtc = existingNode?.CreatedAtUtc ?? now,
             CreatedByUserId = existingNode?.CreatedByUserId ?? actorUserId,
@@ -992,7 +1153,10 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
         var filter = fb.Eq(x => x.AssignmentId, config.AssignmentId)
                      & fb.Eq(x => x.DynamicFormTemplateId, config.DynamicFormTemplateId)
                      & fb.Eq(x => x.SectionId, config.SectionId)
+                     & fb.Eq(x => x.ConfigId, config.ConfigId)
+                     & fb.Eq(x => x.ConfigVersionId, config.Id)
                      & fb.Eq(x => x.ConfigHash, config.ConfigHash)
+                     & fb.Eq(x => x.TimeAxis, P9TimeAxis)
                      & fb.Eq(x => x.IsDeleted, false)
                      & fb.In(x => x.DayKey, expectedDayKeys);
 
@@ -1012,7 +1176,10 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
         var filter = fb.Eq(x => x.AssignmentId, config.AssignmentId)
                      & fb.Eq(x => x.DynamicFormTemplateId, config.DynamicFormTemplateId)
                      & fb.Eq(x => x.SectionId, config.SectionId)
+                     & fb.Eq(x => x.ConfigId, config.ConfigId)
+                     & fb.Eq(x => x.ConfigVersionId, config.Id)
                      & fb.Eq(x => x.ConfigHash, config.ConfigHash)
+                     & fb.Eq(x => x.TimeAxis, P9TimeAxis)
                      & fb.Eq(x => x.YearKey, yearKey)
                      & fb.Eq(x => x.IsDeleted, false)
                      & fb.In(x => x.MonthKey, expectedMonthKeys);
@@ -1210,7 +1377,10 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
         var filter = fb.Eq(x => x.AssignmentId, config.AssignmentId)
                      & fb.Eq(x => x.DynamicFormTemplateId, config.DynamicFormTemplateId)
                      & fb.Eq(x => x.SectionId, config.SectionId)
+                     & fb.Eq(x => x.ConfigId, config.ConfigId)
+                     & fb.Eq(x => x.ConfigVersionId, config.Id)
                      & fb.Eq(x => x.ConfigHash, config.ConfigHash)
+                     & fb.Eq(x => x.TimeAxis, P9TimeAxis)
                      & fb.Eq(x => x.IsDeleted, false)
                      & fb.In(x => x.DayKey, dayKeys);
 
@@ -1233,7 +1403,10 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
         var filter = fb.Eq(x => x.AssignmentId, config.AssignmentId)
                      & fb.Eq(x => x.DynamicFormTemplateId, config.DynamicFormTemplateId)
                      & fb.Eq(x => x.SectionId, config.SectionId)
+                     & fb.Eq(x => x.ConfigId, config.ConfigId)
+                     & fb.Eq(x => x.ConfigVersionId, config.Id)
                      & fb.Eq(x => x.ConfigHash, config.ConfigHash)
+                     & fb.Eq(x => x.TimeAxis, P9TimeAxis)
                      & fb.Eq(x => x.IsDeleted, false)
                      & fb.In(x => x.MonthKey, monthKeys);
 
@@ -1256,7 +1429,10 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
         var filter = fb.Eq(x => x.AssignmentId, config.AssignmentId)
                      & fb.Eq(x => x.DynamicFormTemplateId, config.DynamicFormTemplateId)
                      & fb.Eq(x => x.SectionId, config.SectionId)
+                     & fb.Eq(x => x.ConfigId, config.ConfigId)
+                     & fb.Eq(x => x.ConfigVersionId, config.Id)
                      & fb.Eq(x => x.ConfigHash, config.ConfigHash)
+                     & fb.Eq(x => x.TimeAxis, P9TimeAxis)
                      & fb.Eq(x => x.IsDeleted, false)
                      & fb.In(x => x.YearKey, yearKeys);
 
@@ -1672,6 +1848,8 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
                 "Advanced summary hierarchy nodes can only be built from a locked config.");
         }
 
+        EnsureLockedConfigIntegrity(config);
+
         return config;
     }
 
@@ -1688,22 +1866,15 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
             sourceScope,
             ct);
 
-    private async Task<List<FieldDefinition>> LoadSectionFieldsAsync(
+    private static List<FieldDefinition> LoadSectionFields(
         DynamicFormTemplate template,
-        string sectionId,
-        CancellationToken ct)
+        string sectionId)
     {
-        var section = await _ctx.DynamicFormSections
-            .Find(x =>
-                x.DynamicFormTemplateId == template.Id &&
-                x.SectionId == sectionId &&
-                !x.IsDeleted)
-            .FirstOrDefaultAsync(ct);
-
-        if (section is not null)
-            return ExtractFieldDefinitions(section.FieldsJson, sectionId, section.FieldIds.ToHashSet(StringComparer.Ordinal));
-
-        return ExtractFieldDefinitions(template.FieldsJson, sectionId, null);
+        var section = DynamicFormSectionSnapshotBuilder.GetRequiredSection(template, sectionId);
+        return ExtractFieldDefinitions(
+            section.FieldsJson,
+            section.SectionId,
+            section.FieldIds.ToHashSet(StringComparer.Ordinal));
     }
 
     private async Task<WorkAssignmentAdvancedSummaryDayNode?> LoadDayNodeAsync(
@@ -1730,43 +1901,58 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
             .Find(YearNodeIdentityFilter(config, yearKey))
             .FirstOrDefaultAsync(ct);
 
-    private async Task MarkDayNodeBuildingAsync(
+    private async Task<bool> MarkDayNodeBuildingAsync(
         WorkAssignmentAdvancedSummaryConfig config,
         string dayKey,
         string expectedConfigHash,
         string correlationId,
+        string leaseOwner,
         string actorUserId,
         CancellationToken ct)
     {
         var now = DateTime.UtcNow;
-        await _ctx.WorkAssignmentAdvancedSummaryDayNodes.UpdateOneAsync(
-            CurrentDayNodeBuildFilter(config, dayKey, expectedConfigHash, correlationId),
+        var fb = Builders<WorkAssignmentAdvancedSummaryDayNode>.Filter;
+        var result = await _ctx.WorkAssignmentAdvancedSummaryDayNodes.UpdateOneAsync(
+            CurrentDayNodeBuildFilter(config, dayKey, expectedConfigHash, correlationId) &
+            fb.Or(
+                fb.Eq(x => x.LeaseOwner, null),
+                fb.Lte(x => x.LeaseExpiresAtUtc, now)),
             Builders<WorkAssignmentAdvancedSummaryDayNode>.Update
                 .Set(x => x.Status, WorkAssignmentAdvancedSummaryHierarchyNodeStatuses.Building)
                 .Set(x => x.IsDirty, true)
                 .Set(x => x.BuildError, (string?)null)
+                .Set(x => x.LeaseOwner, leaseOwner)
+                .Set(x => x.LeaseExpiresAtUtc, now.AddMinutes(10))
                 .Set(x => x.UpdatedAtUtc, now)
                 .Set(x => x.UpdatedByUserId, actorUserId),
             cancellationToken: ct);
+        return result.ModifiedCount == 1;
     }
 
-    private static async Task MarkNodeBuildingAsync<T>(
+    private static async Task<bool> MarkNodeBuildingAsync<T>(
         IMongoCollection<T> collection,
         FilterDefinition<T> filter,
+        string leaseOwner,
         string actorUserId,
         CancellationToken ct)
         where T : WorkAssignmentAdvancedSummaryHierarchyNodeBase
     {
         var now = DateTime.UtcNow;
-        await collection.UpdateOneAsync(
-            filter,
+        var fb = Builders<T>.Filter;
+        var result = await collection.UpdateOneAsync(
+            filter & fb.Or(
+                fb.Eq(x => x.LeaseOwner, null),
+                fb.Lte(x => x.LeaseExpiresAtUtc, now)),
             Builders<T>.Update
                 .Set(x => x.Status, WorkAssignmentAdvancedSummaryHierarchyNodeStatuses.Building)
                 .Set(x => x.IsDirty, true)
                 .Set(x => x.BuildError, (string?)null)
+                .Set(x => x.LeaseOwner, leaseOwner)
+                .Set(x => x.LeaseExpiresAtUtc, now.AddMinutes(10))
                 .Set(x => x.UpdatedAtUtc, now)
                 .Set(x => x.UpdatedByUserId, actorUserId),
             cancellationToken: ct);
+        return result.ModifiedCount == 1;
     }
 
     private static async Task MarkNodeFailedAsync<T>(
@@ -1784,6 +1970,8 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
                 .Set(x => x.Status, WorkAssignmentAdvancedSummaryHierarchyNodeStatuses.Failed)
                 .Set(x => x.IsDirty, true)
                 .Set(x => x.BuildError, error)
+                .Set(x => x.LeaseOwner, (string?)null)
+                .Set(x => x.LeaseExpiresAtUtc, (DateTime?)null)
                 .Set(x => x.UpdatedAtUtc, now)
                 .Set(x => x.UpdatedByUserId, actorUserId),
             cancellationToken: ct);
@@ -1794,17 +1982,25 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
         string dayKey,
         string expectedConfigHash,
         string correlationId,
+        string leaseOwner,
         string actorUserId,
         string error,
         CancellationToken ct)
     {
         var now = DateTime.UtcNow;
         await _ctx.WorkAssignmentAdvancedSummaryDayNodes.UpdateOneAsync(
-            CurrentDayNodeBuildFilter(config, dayKey, expectedConfigHash, correlationId),
+            CurrentDayNodeLeaseFilter(
+                config,
+                dayKey,
+                expectedConfigHash,
+                correlationId,
+                leaseOwner),
             Builders<WorkAssignmentAdvancedSummaryDayNode>.Update
                 .Set(x => x.Status, WorkAssignmentAdvancedSummaryHierarchyNodeStatuses.Failed)
                 .Set(x => x.IsDirty, true)
                 .Set(x => x.BuildError, error)
+                .Set(x => x.LeaseOwner, (string?)null)
+                .Set(x => x.LeaseExpiresAtUtc, (DateTime?)null)
                 .Set(x => x.UpdatedAtUtc, now)
                 .Set(x => x.UpdatedByUserId, actorUserId),
             cancellationToken: ct);
@@ -1818,7 +2014,10 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
         return fb.Eq(x => x.AssignmentId, config.AssignmentId)
                & fb.Eq(x => x.DynamicFormTemplateId, config.DynamicFormTemplateId)
                & fb.Eq(x => x.SectionId, config.SectionId)
+               & fb.Eq(x => x.ConfigId, config.ConfigId)
+               & fb.Eq(x => x.ConfigVersionId, config.Id)
                & fb.Eq(x => x.ConfigHash, config.ConfigHash)
+               & fb.Eq(x => x.TimeAxis, P9TimeAxis)
                & fb.Eq(x => x.DayKey, dayKey)
                & fb.Eq(x => x.IsDeleted, false);
     }
@@ -1831,7 +2030,10 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
         return fb.Eq(x => x.AssignmentId, config.AssignmentId)
                & fb.Eq(x => x.DynamicFormTemplateId, config.DynamicFormTemplateId)
                & fb.Eq(x => x.SectionId, config.SectionId)
+               & fb.Eq(x => x.ConfigId, config.ConfigId)
+               & fb.Eq(x => x.ConfigVersionId, config.Id)
                & fb.Eq(x => x.ConfigHash, config.ConfigHash)
+               & fb.Eq(x => x.TimeAxis, P9TimeAxis)
                & fb.Eq(x => x.MonthKey, monthKey)
                & fb.Eq(x => x.IsDeleted, false);
     }
@@ -1844,7 +2046,10 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
         return fb.Eq(x => x.AssignmentId, config.AssignmentId)
                & fb.Eq(x => x.DynamicFormTemplateId, config.DynamicFormTemplateId)
                & fb.Eq(x => x.SectionId, config.SectionId)
+               & fb.Eq(x => x.ConfigId, config.ConfigId)
+               & fb.Eq(x => x.ConfigVersionId, config.Id)
                & fb.Eq(x => x.ConfigHash, config.ConfigHash)
+               & fb.Eq(x => x.TimeAxis, P9TimeAxis)
                & fb.Eq(x => x.YearKey, yearKey)
                & fb.Eq(x => x.IsDeleted, false);
     }
@@ -1873,6 +2078,30 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
                & fb.Eq(x => x.BuildCorrelationId, correlationId);
     }
 
+    private static FilterDefinition<WorkAssignmentAdvancedSummaryDayNode> CurrentDayNodeLeaseFilter(
+        WorkAssignmentAdvancedSummaryConfig config,
+        string dayKey,
+        string expectedConfigHash,
+        string correlationId,
+        string leaseOwner)
+    {
+        var fb = Builders<WorkAssignmentAdvancedSummaryDayNode>.Filter;
+        return CurrentDayNodeBuildFilter(config, dayKey, expectedConfigHash, correlationId)
+               & fb.Eq(x => x.LeaseOwner, leaseOwner);
+    }
+
+    private static FilterDefinition<WorkAssignmentAdvancedSummaryMonthNode> CurrentMonthNodeLeaseFilter(
+        WorkAssignmentAdvancedSummaryConfig config,
+        string monthKey,
+        string expectedConfigHash,
+        string correlationId,
+        string leaseOwner)
+    {
+        var fb = Builders<WorkAssignmentAdvancedSummaryMonthNode>.Filter;
+        return CurrentMonthNodeBuildFilter(config, monthKey, expectedConfigHash, correlationId)
+               & fb.Eq(x => x.LeaseOwner, leaseOwner);
+    }
+
     private static FilterDefinition<WorkAssignmentAdvancedSummaryYearNode> CurrentYearNodeBuildFilter(
         WorkAssignmentAdvancedSummaryConfig config,
         string yearKey,
@@ -1883,6 +2112,18 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
         return YearNodeIdentityFilter(config, yearKey)
                & fb.Eq(x => x.ConfigHash, expectedConfigHash)
                & fb.Eq(x => x.BuildCorrelationId, correlationId);
+    }
+
+    private static FilterDefinition<WorkAssignmentAdvancedSummaryYearNode> CurrentYearNodeLeaseFilter(
+        WorkAssignmentAdvancedSummaryConfig config,
+        string yearKey,
+        string expectedConfigHash,
+        string correlationId,
+        string leaseOwner)
+    {
+        var fb = Builders<WorkAssignmentAdvancedSummaryYearNode>.Filter;
+        return CurrentYearNodeBuildFilter(config, yearKey, expectedConfigHash, correlationId)
+               & fb.Eq(x => x.LeaseOwner, leaseOwner);
     }
 
     private static WorkAssignmentAdvancedSummaryDayNodeDto MapDayNode(WorkAssignmentAdvancedSummaryDayNode x)
@@ -2915,6 +3156,14 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
         if (string.IsNullOrWhiteSpace(message))
             message = ex.GetType().Name;
 
+        if (ex is AppException appException)
+        {
+            var details = appException.Details is null
+                ? "null"
+                : JsonSerializer.Serialize(appException.Details);
+            message = $"{appException.Code}: {message}; details={details}";
+        }
+
         message = message.Trim();
         return message.Length <= 2000 ? message : message[..2000];
     }
@@ -3296,6 +3545,17 @@ public sealed class WorkAssignmentAdvancedSummaryHierarchyService : IWorkAssignm
                 _samples.Add(value);
         }
     }
+
+    private static bool IsCurrentSectionProjection(
+        WorkAssignmentReport report,
+        WorkAssignmentReportSection section)
+        => section.SourcePayloadRevision == report.PayloadRevision &&
+           section.SourceLifecycleRevision == report.LifecycleRevision &&
+           section.Status == report.Status &&
+           string.Equals(
+               section.SourcePayloadHash?.Trim(),
+               report.PayloadHash?.Trim(),
+               StringComparison.Ordinal);
 
     private sealed class AdvancedSummaryHierarchyNodeValue
     {

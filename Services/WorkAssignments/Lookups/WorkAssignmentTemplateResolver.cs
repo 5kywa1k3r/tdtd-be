@@ -2,6 +2,8 @@ using System.Text.Json;
 using MongoDB.Driver;
 using tdtd_be.Common.Errors;
 using tdtd_be.Data;
+using tdtd_be.Models;
+using tdtd_be.Services.DynamicForms;
 
 namespace tdtd_be.Services.WorkAssignments.Lookups;
 
@@ -16,28 +18,39 @@ public sealed class WorkAssignmentTemplateResolver : IWorkAssignmentTemplateReso
 
     public async Task<WorkAssignmentTemplateResolution> ResolveAsync(
         string? dynamicFormTemplateId,
+        string actorUserId,
         CancellationToken ct = default)
     {
+        if (string.IsNullOrWhiteSpace(actorUserId))
+            throw AppExceptionFactory.Unauthorized();
+
         if (string.IsNullOrWhiteSpace(dynamicFormTemplateId))
             throw AppExceptionFactory.BadRequest(AppErrorCode.DYNAMIC_FORM_TEMPLATE_REQUIRED);
 
-        return await ResolveDynamicFormAsync(dynamicFormTemplateId.Trim(), ct);
+        var actor = await _ctx.Users
+            .Find(x => x.Id == actorUserId.Trim() && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct)
+            ?? throw AppExceptionFactory.Unauthorized();
+
+        return await ResolveDynamicFormAsync(dynamicFormTemplateId.Trim(), actor, ct);
     }
 
     private async Task<WorkAssignmentTemplateResolution> ResolveDynamicFormAsync(
         string dynamicFormTemplateId,
+        AppUser actor,
         CancellationToken ct)
     {
         var form = await _ctx.DynamicFormTemplates
-            .Find(x =>
-                x.Id == dynamicFormTemplateId &&
-                x.IsActive &&
-                x.IsPublished &&
-                !x.IsDeleted)
+            .Find(DynamicFormBindingAccessPolicy.BuildMayBindFilter(
+                actor,
+                new[] { dynamicFormTemplateId },
+                requirePublished: true))
             .FirstOrDefaultAsync(ct)
-            ?? throw AppExceptionFactory.NotFound(
-                AppErrorCode.DYNAMIC_FORM_TEMPLATE_NOT_FOUND_OR_UNPUBLISHED,
-                new { dynamicFormTemplateId });
+            ?? throw DynamicFormBindingAccessPolicy.Forbidden();
+
+        // Integrity is evaluated only after the Mongo ACL projection has
+        // established that this actor may bind the exact Form.
+        DynamicFormBindingAccessPolicy.EnsureMayBind(actor, new[] { form });
 
         var excelId = NormalizeId(form.ExcelBlockDynamicExcelTemplateId)
             ?? ExtractExcelTemplateId(form.ExcelBlockJson)

@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>tdtd-be.P10T09Tests</AssemblyName>
+    <RootNamespace>tdtd_be.P10T09Tests</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="..\..\Services\StatisticsReconciliation\ExpectedLedger\ExpectedLedgerAssemblyInfo.cs" Link="ExpectedLedger\ExpectedLedgerAssemblyInfo.cs" />
+    <Compile Include="..\..\Services\StatisticsReconciliation\ExpectedLedger\IStatisticReconciliationExpectedLedgerCompiler.cs" Link="ExpectedLedger\IStatisticReconciliationExpectedLedgerCompiler.cs" />
+    <Compile Include="..\..\Services\StatisticsReconciliation\ExpectedLedger\IStatisticReconciliationExpectedLedgerAuthoritativeInputProvider.cs" Link="ExpectedLedger\IStatisticReconciliationExpectedLedgerAuthoritativeInputProvider.cs" />
+    <Compile Include="..\..\Services\StatisticsReconciliation\ExpectedLedger\StatisticReconciliationExpectedLedgerCanonicalizer.cs" Link="ExpectedLedger\StatisticReconciliationExpectedLedgerCanonicalizer.cs" />
+    <Compile Include="..\..\Services\StatisticsReconciliation\ExpectedLedger\StatisticReconciliationExpectedLedgerCompiler.cs" Link="ExpectedLedger\StatisticReconciliationExpectedLedgerCompiler.cs" />
+    <Compile Include="..\..\Services\StatisticsReconciliation\ExpectedLedger\StatisticReconciliationExpectedLedgerContracts.cs" Link="ExpectedLedger\StatisticReconciliationExpectedLedgerContracts.cs" />
+  </ItemGroup>
+
+</Project>

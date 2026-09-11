@@ -1,12 +1,16 @@
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using tdtd_be.DashboardModel.DTOs;
 using tdtd_be.DashboardModel.DTOs.MindMap;
 using tdtd_be.DashboardModel.Services;
 using tdtd_be.DTOs.Common;
+using tdtd_be.DTOs.StatisticsConfiguration;
+using tdtd_be.Services.StatisticsConfiguration;
 
 namespace tdtd_be.Controllers;
 
 [ApiController]
+[Authorize]
 [Route("api/dashboard-mindmap")]
 public sealed class DashboardMindMapController : ControllerBase
 {
@@ -115,6 +119,7 @@ public sealed class DashboardMindMapController : ControllerBase
         [FromQuery] List<string>? unitIds,
         CancellationToken ct = default)
     {
+        StatConfigPhaseBarrier.Reject(StatConfigPhaseBarrierEntries.P9Result);
         var result = await _service.GetNodeSummaryAsync(
             assignmentId,
             BuildScopeRequest(fromUtc, toUtc, unitIds),
@@ -148,6 +153,7 @@ public sealed class DashboardMindMapController : ControllerBase
         [FromBody] DashboardMindMapTableMetricReportsSearchRequest? req,
         CancellationToken ct = default)
     {
+        StatConfigPhaseBarrier.Reject(StatConfigPhaseBarrierEntries.P9Result);
         var result = await _service.SearchNodeTableMetricReportsAsync(assignmentId, req, ct);
         return Ok(result);
     }
@@ -158,6 +164,7 @@ public sealed class DashboardMindMapController : ControllerBase
         [FromBody] DashboardMindMapFieldMetricReportsSearchRequest? req,
         CancellationToken ct = default)
     {
+        StatConfigPhaseBarrier.Reject(StatConfigPhaseBarrierEntries.P9Result);
         var result = await _service.SearchNodeFieldMetricReportsAsync(assignmentId, req, ct);
         return Ok(result);
     }
@@ -168,6 +175,7 @@ public sealed class DashboardMindMapController : ControllerBase
         [FromBody] DashboardMindMapLabelReportsSearchRequest? req,
         CancellationToken ct = default)
     {
+        StatConfigPhaseBarrier.Reject(StatConfigPhaseBarrierEntries.P9Result);
         var result = await _service.SearchNodeLabelReportsAsync(assignmentId, req, ct);
         return Ok(result);
     }

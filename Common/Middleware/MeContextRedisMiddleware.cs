@@ -20,7 +20,7 @@ namespace tdtd_be.Common.Middleware
     {
         public const string MeItemKey = "me";
 
-        private readonly RedisUserCache? _cache;
+        private readonly IUserSessionCache _cache;
 
         private readonly IMongoCollection<AppUser> _users;
         private readonly IMongoCollection<Unit> _units;
@@ -28,7 +28,7 @@ namespace tdtd_be.Common.Middleware
         private readonly UserContext? _userContext;
 
         public MeContextRedisMiddleware(
-            RedisUserCache? cache,
+            IUserSessionCache cache,
             MongoDbContext ctx,
             UserContext? userContext = null)
         {
@@ -62,30 +62,23 @@ namespace tdtd_be.Common.Middleware
             var tokenTvStr = context.User.FindFirstValue("tv") ?? "0";
             _ = long.TryParse(tokenTvStr, out var tokenTv);
 
-            // Chỉ check tokenVersion nếu Redis bật (có cache)
-            if (_cache is not null)
-            {
-                await _cache.EnsureTokenVersionAsync(userId);
-                var currentTv = await _cache.GetTokenVersionAsync(userId);
+            await _cache.EnsureTokenVersionAsync(userId);
+            var currentTv = await _cache.GetTokenVersionAsync(userId);
 
-                if (tokenTv < currentTv)
+            if (tokenTv < currentTv)
+            {
+                context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+                await context.Response.WriteAsJsonAsync(new
                 {
-                    context.Response.StatusCode = StatusCodes.Status401Unauthorized;
-                    await context.Response.WriteAsJsonAsync(new
-                    {
-                        error = "TOKEN_REVOKED",
-                        message = "Token đã bị thu hồi."
-                    });
-                    return;
-                }
+                    error = "TOKEN_REVOKED",
+                    message = "Token đã bị thu hồi."
+                });
+                return;
             }
 
             // ===== Redis-first: Me =====
             MeResponse? me = null;
-            if (_cache is not null)
-            {
-                me = await _cache.GetMeAsync(userId);
-            }
+            me = await _cache.GetMeAsync(userId);
 
             // ===== Mongo fallback =====
             if (me is null)
@@ -94,8 +87,7 @@ namespace tdtd_be.Common.Middleware
                 if (me is not null)
                 {
                     // ✅ chỉ cache khi đã dựng được me chuẩn
-                    if (_cache is not null)
-                        await _cache.SetMeAsync(me);
+                    await _cache.SetMeAsync(me);
                 }
             }
 
@@ -106,8 +98,7 @@ namespace tdtd_be.Common.Middleware
 
                 // claims fallback chỉ nên cache nếu muốn tối ưu,
                 // nhưng đây là "last resort" nên vẫn cache để giảm hit.
-                if (_cache is not null)
-                    await _cache.SetMeAsync(me);
+                await _cache.SetMeAsync(me);
             }
 
             // ===== Active check =====

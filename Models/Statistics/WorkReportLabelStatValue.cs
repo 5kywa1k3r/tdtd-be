@@ -12,6 +12,10 @@ public sealed class WorkReportLabelStatValue : BaseEntity
     [BsonRepresentation(BsonType.ObjectId)]
     public string Id { get; set; } = default!;
 
+    [BsonElement("directProjection")]
+    [BsonIgnoreIfNull]
+    public WorkReportDirectProjectionPin? DirectProjection { get; set; }
+
     [BsonElement("workId")]
     [BsonRepresentation(BsonType.ObjectId)]
     public string WorkId { get; set; } = default!;
@@ -41,6 +45,50 @@ public sealed class WorkReportLabelStatValue : BaseEntity
     [BsonElement("ancestorAssignmentIds")]
     [BsonRepresentation(BsonType.ObjectId)]
     public List<string> AncestorAssignmentIds { get; set; } = new();
+
+    [BsonElement("flowTemplateId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? FlowTemplateId { get; set; }
+
+    [BsonElement("flowTemplateVersionNo")]
+    public int? FlowTemplateVersionNo { get; set; }
+
+    [BsonElement("flowInstanceId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? FlowInstanceId { get; set; }
+
+    [BsonElement("flowStepId")]
+    public string? FlowStepId { get; set; }
+
+    [BsonElement("flowStepCode")]
+    public string? FlowStepCode { get; set; }
+
+    [BsonElement("flowStepOrder")]
+    public int? FlowStepOrder { get; set; }
+
+    [BsonElement("flowBranchId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? FlowBranchId { get; set; }
+
+    [BsonElement("parentFlowBranchId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? ParentFlowBranchId { get; set; }
+
+    [BsonElement("flowAttemptNo")]
+    public int? FlowAttemptNo { get; set; }
+
+    [BsonElement("flowRole")]
+    public string? FlowRole { get; set; }
+
+    [BsonElement("isFlowFinalNode")]
+    public bool IsFlowFinalNode { get; set; }
+
+    [BsonElement("flowEffectiveStatus")]
+    public string? FlowEffectiveStatus { get; set; }
+
+    [BsonElement("invalidatedByFlowEventId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? InvalidatedByFlowEventId { get; set; }
 
     [BsonElement("workReportPeriodId")]
     [BsonRepresentation(BsonType.ObjectId)]

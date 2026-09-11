@@ -4,6 +4,7 @@ public interface IWorkAssignmentTemplateResolver
 {
     Task<WorkAssignmentTemplateResolution> ResolveAsync(
         string? dynamicFormTemplateId,
+        string actorUserId,
         CancellationToken ct = default);
 }
 

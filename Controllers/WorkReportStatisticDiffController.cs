@@ -1,60 +1,155 @@
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
-using tdtd_be.Common.Auth;
+using System.Text.Json;
+using tdtd_be.Common.Errors;
 using tdtd_be.DTOs.Statistics;
+using tdtd_be.Services.StatisticsConfiguration;
 using tdtd_be.Services.WorkAssignmentReports.Statistics;
 
 namespace tdtd_be.Controllers;
 
 [ApiController]
+[Authorize]
 [Route("api/work-report-statistic-diffs")]
 public sealed class WorkReportStatisticDiffController : ControllerBase
 {
     private readonly IWorkReportStatisticDiffService _service;
-    private readonly MeAccessor _me;
 
     public WorkReportStatisticDiffController(
-        IWorkReportStatisticDiffService service,
-        MeAccessor me)
+        IWorkReportStatisticDiffService service)
     {
         _service = service;
-        _me = me;
     }
+
+    [HttpGet("assignments/{assignmentId}/templates/{dynamicFormTemplateId}/config")]
+    public async Task<IActionResult> GetP8Config(
+        [FromRoute] string assignmentId,
+        [FromRoute] string dynamicFormTemplateId,
+        CancellationToken ct)
+        => Ok(await _service.GetP8ConfigAsync(
+            assignmentId,
+            dynamicFormTemplateId,
+            ct));
+
+    [HttpGet("assignments/{assignmentId}/templates/{dynamicFormTemplateId}/config/versions")]
+    public async Task<IActionResult> ListP8ConfigVersions(
+        [FromRoute] string assignmentId,
+        [FromRoute] string dynamicFormTemplateId,
+        CancellationToken ct)
+        => Ok(await _service.ListP8ConfigVersionsAsync(
+            assignmentId,
+            dynamicFormTemplateId,
+            ct));
+
+    [HttpGet("assignments/{assignmentId}/templates/{dynamicFormTemplateId}/config/versions/{versionNo:int}")]
+    public async Task<IActionResult> GetP8ConfigVersion(
+        [FromRoute] string assignmentId,
+        [FromRoute] string dynamicFormTemplateId,
+        [FromRoute] int versionNo,
+        CancellationToken ct)
+        => Ok(await _service.GetP8ConfigVersionAsync(
+            assignmentId,
+            dynamicFormTemplateId,
+            versionNo,
+            ct));
+
+    [HttpPut("assignments/{assignmentId}/templates/{dynamicFormTemplateId}/config")]
+    public async Task<IActionResult> PutP8Config(
+        [FromRoute] string assignmentId,
+        [FromRoute] string dynamicFormTemplateId,
+        [FromBody] JsonElement body,
+        CancellationToken ct)
+        => Ok(await _service.PutP8ConfigAsync(
+            assignmentId,
+            dynamicFormTemplateId,
+            body,
+            ct));
+
+    [HttpPost("assignments/{assignmentId}/templates/{dynamicFormTemplateId}/config/lock")]
+    public async Task<IActionResult> LockP8Config(
+        [FromRoute] string assignmentId,
+        [FromRoute] string dynamicFormTemplateId,
+        [FromBody] JsonElement body,
+        CancellationToken ct)
+        => Ok(await _service.LockP8ConfigAsync(
+            assignmentId,
+            dynamicFormTemplateId,
+            body,
+            ct));
+
+    [HttpPost("assignments/{assignmentId}/templates/{dynamicFormTemplateId}/config/next-draft")]
+    public async Task<IActionResult> CreateNextP8Draft(
+        [FromRoute] string assignmentId,
+        [FromRoute] string dynamicFormTemplateId,
+        [FromBody] JsonElement body,
+        CancellationToken ct)
+        => Ok(await _service.CreateNextP8DraftAsync(
+            assignmentId,
+            dynamicFormTemplateId,
+            body,
+            ct));
 
     [HttpGet("configs")]
-    public async Task<ActionResult<List<WorkReportStatisticDiffConfigDto>>> ListConfigs(
+    public IActionResult ListConfigs(
         [FromQuery] string? workId,
         [FromQuery] string? assignmentId,
-        [FromQuery] string? dynamicFormTemplateId,
-        CancellationToken ct)
-    {
-        var result = await _service.ListConfigsAsync(workId, assignmentId, dynamicFormTemplateId, ct);
-        return Ok(result);
-    }
+        [FromQuery] string? dynamicFormTemplateId)
+        => throw LegacyRouteBlocked(
+            "DIFF_LEGACY_CONFIG_ROUTE_BLOCKED");
 
     [HttpPost("configs")]
-    public async Task<ActionResult<WorkReportStatisticDiffConfigDto>> SaveConfig(
-        [FromBody] WorkReportStatisticDiffSaveRequest req,
-        CancellationToken ct)
-    {
-        var me = _me.RequireMe();
-        var result = await _service.SaveConfigAsync(req, me.Id, ct);
-        return Ok(result);
-    }
+    public IActionResult SaveConfig(
+        [FromBody] JsonElement body)
+        => throw LegacyRouteBlocked(
+            "DIFF_LEGACY_MUTATION_BLOCKED_USE_CAS_CONFIG_ROUTE");
 
     [HttpDelete("configs/{configId}")]
-    public async Task<IActionResult> DeleteConfig(string configId, CancellationToken ct)
+    public IActionResult DeleteConfig(string configId)
+        => throw LegacyRouteBlocked(
+            "DIFF_LEGACY_DELETE_BLOCKED_USE_CAS_CONFIG_ROUTE");
+
+    [HttpPost("run")]
+    public IActionResult Run([FromBody] JsonElement body)
     {
-        var me = _me.RequireMe();
-        await _service.DeleteConfigAsync(configId, me.Id, ct);
+        StatConfigPhaseBarrier.Reject(
+            StatConfigPhaseBarrierEntries.P9Run,
+            "WORK_REPORT_STATISTIC_DIFF_RUN");
+        StatConfigIsolationGuard.RejectResultMaterializer(
+            "WORK_REPORT_STATISTIC_DIFF_RUN");
         return NoContent();
     }
 
-    [HttpPost("run")]
-    public async Task<ActionResult<WorkReportStatisticDiffRunResponse>> Run(
-        [FromBody] WorkReportStatisticDiffRunRequest req,
+    [HttpPost("assignments/{assignmentId}/templates/{dynamicFormTemplateId}/runs")]
+    public async Task<IActionResult> RunP9(
+        [FromRoute] string assignmentId,
+        [FromRoute] string dynamicFormTemplateId,
+        [FromBody] P9StatisticDiffRunRequest request,
         CancellationToken ct)
-    {
-        var result = await _service.RunAsync(req, ct);
-        return Ok(result);
-    }
+        => StatusCode(StatusCodes.Status201Created,
+            await _service.RunP9Async(
+                assignmentId,
+                dynamicFormTemplateId,
+                request,
+                ct));
+
+    [HttpGet("assignments/{assignmentId}/templates/{dynamicFormTemplateId}/results/{resultId}")]
+    public async Task<IActionResult> GetP9Result(
+        [FromRoute] string assignmentId,
+        [FromRoute] string dynamicFormTemplateId,
+        [FromRoute] string resultId,
+        [FromQuery] int page = 0,
+        [FromQuery] int pageSize = 100,
+        CancellationToken ct = default)
+        => Ok(await _service.GetP9ResultAsync(
+            assignmentId,
+            dynamicFormTemplateId,
+            resultId,
+            page,
+            pageSize,
+            ct));
+
+    private static AppException LegacyRouteBlocked(string reason)
+        => AppExceptionFactory.Create(
+            AppErrorCode.STAT_CONFIG_CAS_CONFLICT,
+            new { reason });
 }

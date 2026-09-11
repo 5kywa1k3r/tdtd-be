@@ -1,4 +1,4 @@
-﻿using Hangfire;
+using Hangfire;
 using Hangfire.Dashboard;
 using Hangfire.Mongo;
 using Hangfire.Mongo.Migration.Strategies;
@@ -26,13 +26,16 @@ using tdtd_be.Hubs;
 using tdtd_be.Jobs;
 using tdtd_be.Models;
 using tdtd_be.Options;
+using tdtd_be.OpenApi;
 using tdtd_be.Services;
+using tdtd_be.Services.DynamicForms;
 using tdtd_be.Services.Common;
 using tdtd_be.Services.DynamicFlows;
 using tdtd_be.Services.EvaluationTemplates;
 using tdtd_be.Services.WorkAssignmentReports;
 using tdtd_be.Services.WorkAssignmentReports.Statistics;
 using tdtd_be.Services.WorkAssignmentReports.Payloads;
+using tdtd_be.Services.WorkAssignmentReports.Runtime;
 using tdtd_be.Services.WorkAssignments;
 using tdtd_be.Services.WorkAssignments.AdvancedSummary;
 using tdtd_be.Services.WorkAssignments.Aggregate;
@@ -47,6 +50,19 @@ using tdtd_be.Services.WorkAssignments.Review;
 using tdtd_be.Services.WorkAssignments.Runtime;
 using tdtd_be.Services.WorkAssignments.SummaryTokens;
 using tdtd_be.Services.Notifications;
+using tdtd_be.Services.Nq57;
+using tdtd_be.Services.StatisticsConfiguration;
+using tdtd_be.Services.StatisticsReconciliation;
+using tdtd_be.Services.StatisticsReconciliation.ActualObservation;
+using tdtd_be.Services.StatisticsReconciliation.Production;
+using tdtd_be.Services.StatisticsReconciliation.IndependentReview;
+using tdtd_be.Services.StatisticsReconciliation.Recheck;
+using tdtd_be.Services.StatisticsReconciliation.LifecycleReconciliation;
+using tdtd_be.Services.StatisticsReconciliation.ExpectedLedger;
+using tdtd_be.Services.StatisticsReconciliation.EvidenceExport;
+using tdtd_be.Services.StatisticsReconciliation.SummaryReconciliation;
+using tdtd_be.Services.StatisticsReconciliation.TypedDelta;
+using tdtd_be.Services.StatisticsRun;
 using tdtd_be.Services.WorkDocuments;
 using tdtd_be.Services.Works;
 using tdtd_be.Uploads;
@@ -83,7 +99,22 @@ builder.Services.Configure<ForwardedHeadersOptions>(opt =>
 
 // ================== mongo ==================
 builder.Services.AddSingleton<MongoDbContext>();
-builder.Services.AddSingleton<IAppTimeService, AppTimeService>();
+var fixedUtcRaw = builder.Configuration[FixedAppTimeService.ConfigurationKey];
+if (fixedUtcRaw is null)
+{
+    builder.Services.AddSingleton<IAppTimeService, AppTimeService>();
+}
+else
+{
+    if (!builder.Environment.IsEnvironment("Testing") ||
+        !DateTime.TryParseExact(fixedUtcRaw, "O",
+            System.Globalization.CultureInfo.InvariantCulture,
+            System.Globalization.DateTimeStyles.RoundtripKind,
+            out var fixedUtc) || fixedUtc.Kind != DateTimeKind.Utc)
+        throw new InvalidOperationException("APP_TIME_TESTING_FIXED_UTC_INVALID");
+    builder.Services.AddSingleton<IAppTimeService>(
+        new FixedAppTimeService(fixedUtc));
+}
 
 // ================== Hangfire ==================
 var mongoConnectionString = builder.Configuration["Mongo:ConnectionString"]
@@ -92,6 +123,10 @@ var mongoDatabaseName = builder.Configuration["Mongo:Database"]
     ?? throw new Exception("Mongo:Database is missing");
 
 var hangfirePrefix = builder.Configuration["Hangfire:Prefix"] ?? "hangfire";
+var hangfireServerEnabled = builder.Configuration.GetValue<bool?>("Hangfire:ServerEnabled") ?? true;
+var hangfireDashboardEnabled = builder.Configuration.GetValue<bool?>("Hangfire:DashboardEnabled") ?? true;
+var hangfireRecurringRegistrationEnabled =
+    builder.Configuration.GetValue<bool?>("Hangfire:RecurringRegistrationEnabled") ?? true;
 var schedulePollingSeconds = Math.Clamp(
     builder.Configuration.GetValue<int?>("Hangfire:SchedulePollingSeconds") ?? 15,
     5,
@@ -135,13 +170,16 @@ builder.Services.AddHangfire(cfg => cfg
     .UseRecommendedSerializerSettings()
     .UseMongoStorage(hangfireMongoClient, mongoDatabaseName, storageOptions));
 
-builder.Services.AddHangfireServer(options =>
+if (hangfireServerEnabled)
 {
-    options.ServerName = $"tdtd-be:{Environment.MachineName}";
-    options.WorkerCount = Math.Max(1, Environment.ProcessorCount);
-    options.Queues = new[] { "default" };
-    options.SchedulePollingInterval = TimeSpan.FromSeconds(schedulePollingSeconds);
-});
+    builder.Services.AddHangfireServer(options =>
+    {
+        options.ServerName = $"tdtd-be:{Environment.MachineName}";
+        options.WorkerCount = Math.Max(1, Environment.ProcessorCount);
+        options.Queues = new[] { "default" };
+        options.SchedulePollingInterval = TimeSpan.FromSeconds(schedulePollingSeconds);
+    });
+}
 
 // ================== MinIO client + TUS ==================
 builder.Services.AddScoped<UploadFinalizeService>();
@@ -197,12 +235,136 @@ builder.Services.AddScoped<IUnitService, UnitService>();
 builder.Services.AddScoped<IUserAdminService, UserAdminService>();
 builder.Services.AddScoped<IAdminImportService, AdminImportService>();
 builder.Services.AddScoped<IDynamicExcelService, DynamicExcelService>();
+builder.Services.AddScoped<
+    IDynamicFormStatisticConfigCommandService,
+    DynamicFormStatisticConfigCommandService>();
 builder.Services.AddScoped<IDynamicFormService, DynamicFormService>();
 builder.Services.AddScoped<IDynamicFormCloneRequestService, DynamicFormCloneRequestService>();
 builder.Services.AddScoped<IDynamicFlowTemplateService, DynamicFlowTemplateService>();
+builder.Services.AddScoped<IDynamicFlowDefinitionTransactionRunner, DynamicFlowDefinitionTransactionRunner>();
+builder.Services.AddSingleton<IDynamicFlowDefinitionFaultInjector, DynamicFlowDefinitionFaultInjector>();
+builder.Services.AddHealthChecks().AddCheck<DynamicFlowDefinitionTransactionHealthCheck>(
+    "dynamic-flow-definition-transactions",
+    tags: new[] { "ready", "dynamic-flow" });
 builder.Services.AddScoped<IDynamicFlowRuntimeService, DynamicFlowRuntimeService>();
+builder.Services.AddScoped<IDynamicFlowRuntimeReadService, DynamicFlowRuntimeReadService>();
+builder.Services.AddScoped<IDynamicFlowPeriodicService, DynamicFlowPeriodicService>();
+builder.Services.AddScoped<IDynamicFlowRuntimePersistence, DynamicFlowRuntimePersistence>();
+builder.Services.AddSingleton<IDynamicFlowRuntimeActivationPolicy, DynamicFlowRuntimeActivationPolicy>();
+builder.Services.AddSingleton<IDynamicFlowRuntimeFaultInjector, DynamicFlowRuntimeFaultInjector>();
+builder.Services.AddScoped<IDynamicFlowRuntimeMaterializer, DynamicFlowRuntimeMaterializer>();
+builder.Services.AddSingleton<
+    IDynamicFlowRuntimeStateProjectionFaultInjector,
+    DynamicFlowRuntimeStateProjectionFaultInjector>();
+builder.Services.AddScoped<IDynamicFlowRuntimeStateProjector, DynamicFlowRuntimeStateProjector>();
 builder.Services.AddSingleton<IDynamicFlowPolicyEvaluator, DynamicFlowPolicyEvaluator>();
 builder.Services.AddScoped<ILabelService, LabelService>();
+builder.Services.AddScoped<
+    ILabelConfigCommandService,
+    LabelConfigCommandService>();
+builder.Services.AddScoped<IStatConfigTransactionRunner, StatConfigTransactionRunner>();
+builder.Services.AddScoped<IStatConfigOperationsService, StatConfigOperationsService>();
+builder.Services.AddScoped<IStatConfigBundleService, StatConfigBundleService>();
+builder.Services.AddSingleton<
+    IStatConfigOperationsFaultInjector,
+    StatConfigOperationsFaultInjector>();
+builder.Services.AddSingleton<IStatRunCandidateActivation, StatRunCapabilityActivation>();
+builder.Services.AddSingleton<
+    IStatisticReconciliationCandidateActivation,
+    StatisticReconciliationCapabilityActivation>();
+builder.Services.AddMemoryCache();
+builder.Services.AddScoped<P9DirectResultService>();
+builder.Services.AddScoped<IP9DirectResultService>(services =>
+    services.GetRequiredService<P9DirectResultService>());
+builder.Services.AddScoped<IStatisticReconciliationActualPinnedDirectResultService>(services =>
+    services.GetRequiredService<P9DirectResultService>());
+builder.Services.AddScoped<StatRunService>();
+builder.Services.AddScoped<IStatRunService>(services =>
+    services.GetRequiredService<StatRunService>());
+builder.Services.AddScoped<IStatRunFoundationWorkerStateOwner>(services =>
+    services.GetRequiredService<StatRunService>());
+builder.Services.AddScoped<IStatRunFoundationDirectProjectionOwner,
+    StatRunFoundationDirectProjectionOwner>();
+builder.Services.AddScoped<IStatRunFoundationWorker, StatRunFoundationWorker>();
+builder.Services.AddScoped<StatRunExportService>();
+builder.Services.AddScoped<IStatRunExportService>(sp =>
+    sp.GetRequiredService<StatRunExportService>());
+builder.Services.AddScoped<
+    IStatisticReconciliationRunService,
+    StatisticReconciliationRunService>();
+builder.Services.AddSingleton<
+    IStatisticReconciliationExpectedLedgerCompiler,
+    StatisticReconciliationExpectedLedgerCompiler>();
+builder.Services.AddSingleton<
+    IStatisticReconciliationExpectedMetricIdentityCompiler,
+    StatisticReconciliationExpectedMetricIdentityCompiler>();
+builder.Services.AddSingleton<
+    IStatisticReconciliationExpectedSourcePlanner,
+    StatisticReconciliationExpectedSourcePlanner>();
+builder.Services.AddSingleton<
+    IStatisticReconciliationExpectedTypedCompiler,
+    StatisticReconciliationExpectedTypedCompiler>();
+builder.Services.AddScoped<
+    IStatisticReconciliationExpectedObservationBackend,
+    StatisticReconciliationExpectedObservationMongoBackend>();
+builder.Services.AddScoped<
+    IStatisticReconciliationExpectedObservationStore,
+    StatisticReconciliationExpectedObservationStore>();
+builder.Services.AddScoped<
+    IStatisticReconciliationExpectedAuthoritativeSnapshotReader,
+    StatisticReconciliationExpectedMongoSnapshotReader>();
+builder.Services.AddScoped<
+    IStatisticReconciliationExpectedProjectionInputReader,
+    StatisticReconciliationExpectedMongoProjectionInputReader>();
+builder.Services.AddScoped<
+    IStatisticReconciliationExpectedGenerationBindingReader,
+    StatisticReconciliationExpectedMongoGenerationBindingReader>();
+builder.Services.AddScoped<
+    IStatisticReconciliationExpectedAuthoritativeLifecycleProjectionReader,
+    StatisticReconciliationExpectedMongoAuthoritativeLifecycleProjectionReader>();
+builder.Services.AddScoped<
+    IStatisticReconciliationExpectedGenerationOwner,
+    StatisticReconciliationExpectedGenerationOwner>();
+builder.Services.AddScoped<
+    IStatisticReconciliationExpectedAuthoritativeCurrentValidator,
+    StatisticReconciliationExpectedAuthoritativeCurrentValidator>();
+builder.Services.AddSingleton<StatisticReconciliationFinalVerdictEvaluator>();
+builder.Services.AddScoped<
+    IStatisticReconciliationReviewBackend,
+    StatisticReconciliationReviewMongoBackend>();
+builder.Services.AddScoped<StatisticReconciliationFinalVerdictPublisher>();
+builder.Services.AddScoped<IStatisticReconciliationTrustedFinalizer,
+    StatisticReconciliationTrustedFinalizer>();
+builder.Services.AddScoped<
+    IStatisticReconciliationRecheckReviewSupersessionAppender,
+    StatisticReconciliationRecheckReviewSupersessionAppender>();
+builder.Services.AddScoped<
+    IStatisticReconciliationTrustedRecheckFinalizer,
+    StatisticReconciliationTrustedRecheckFinalizer>();
+builder.Services.AddSingleton<StatisticReconciliationSummaryReconciler>();
+builder.Services.AddSingleton<StatisticReconciliationLifecycleEvaluator>();
+builder.Services.AddScoped<
+    IStatisticReconciliationLifecycleObservationStore,
+    StatisticReconciliationLifecycleMongoObservationStore>();
+builder.Services.AddScoped<
+    IStatisticReconciliationIndependentReviewBackend,
+    StatisticReconciliationIndependentReviewMongoBackend>();
+builder.Services.AddScoped<StatisticReconciliationIndependentReviewService>();
+builder.Services.AddScoped<
+    IStatisticReconciliationIndependentReviewCandidateGate,
+    StatisticReconciliationIndependentReviewCandidateGate>();
+builder.Services.AddScoped<
+    IStatisticReconciliationCurrentReviewValidator,
+    StatisticReconciliationCurrentReviewValidator>();
+builder.Services.AddScoped<
+    IStatisticReconciliationIndependentReviewOwner,
+    StatisticReconciliationIndependentReviewOwner>();
+builder.Services.AddScoped<IStatisticReconciliationEvidenceStore,
+    StatisticReconciliationEvidenceMongoStore>();
+builder.Services.AddScoped<IStatisticReconciliationEvidenceCandidateGate,
+    StatisticReconciliationEvidenceCandidateGate>();
+builder.Services.AddScoped<IStatisticReconciliationEvidenceOwner,
+    StatisticReconciliationEvidenceOwner>();
 builder.Services.AddScoped<ILabelEnumCatalogService, LabelEnumCatalogService>();
 builder.Services.AddSingleton<WorkAssignmentTargetScopePolicy>();
 
@@ -244,6 +406,26 @@ builder.Services.AddScoped<IWorkReportTableStatisticsService, WorkReportTableSta
 builder.Services.AddScoped<IWorkReportFieldStatisticsService, WorkReportFieldStatisticsService>();
 builder.Services.AddScoped<IWorkReportStatisticRebuildJobService, WorkReportStatisticRebuildJobService>();
 builder.Services.AddScoped<IWorkReportStatisticDiffService, WorkReportStatisticDiffService>();
+builder.Services.AddScoped<StatRunDirectProjectionService>();
+builder.Services.AddScoped<IStatRunDirectProjectionService>(sp =>
+    sp.GetRequiredService<StatRunDirectProjectionService>());
+builder.Services.AddStatisticReconciliationActualCapture(builder.Configuration);
+builder.Services.AddStatisticReconciliationProductionWorker(builder.Configuration);
+builder.Services.AddScoped<IWorkReportAggregateDependentRecoveryService, WorkReportAggregateDependentRecoveryService>();
+builder.Services.AddScoped<IWorkAssignmentReportSectionProjectionService, WorkAssignmentReportSectionProjectionService>();
+builder.Services.AddScoped<IWorkReportLifecycleProjectionReconciler, WorkReportLifecycleProjectionReconciler>();
+builder.Services.AddScoped<
+    IDynamicFlowMappingOutboxReconciler,
+    DynamicFlowMappingOutboxReconciler>();
+builder.Services.AddScoped<IWorkReportLifecycleBusinessLogProjector, WorkReportLifecycleBusinessLogProjector>();
+builder.Services.AddSingleton<IWorkReportLifecycleProjectionFaultInjector, WorkReportLifecycleProjectionFaultInjector>();
+builder.Services.AddSingleton<
+    IDynamicFlowMappingReconcileFaultInjector,
+    DynamicFlowMappingReconcileFaultInjector>();
+builder.Services.AddSingleton<
+    IDynamicFlowMappingApplyFaultInjector,
+    DynamicFlowMappingApplyFaultInjector>();
+builder.Services.AddScoped<IWorkReportLifecycleSeriesLockService, WorkReportLifecycleSeriesLockService>();
 
 builder.Services.AddScoped<IWorkAssignmentProgressService, WorkAssignmentProgressService>();
 builder.Services.AddScoped<IWorkAssignmentReviewService, WorkAssignmentReviewService>();
@@ -265,6 +447,7 @@ builder.Services.AddScoped<IEvaluationTemplateService, EvaluationTemplateService
 builder.Services.AddScoped<IDashboardQueryService, DashboardQueryService>();
 builder.Services.AddScoped<IDashboardOverviewService, DashboardOverviewService>();
 builder.Services.AddScoped<IDashboardMindMapQueryService, DashboardMindMapQueryService>();
+builder.Services.AddHttpClient<INq57IntegrationService, Nq57IntegrationService>();
 
 // ================== redis (cache) ==================
 var redisEnabled = builder.Configuration.GetValue<bool>("Redis:Enabled");
@@ -279,9 +462,16 @@ if (redisEnabled)
         ConnectionMultiplexer.Connect($"{cs},abortConnect=false")
     );
 
-    builder.Services.AddSingleton<RedisUserCache>();
-    builder.Services.AddSingleton<RedisDashboardCache>();
+    builder.Services.AddSingleton<IUserSessionCache, RedisUserCache>();
 }
+else
+{
+    builder.Services.AddSingleton<IUserSessionCache, InMemoryUserSessionCache>();
+}
+builder.Services.AddSingleton<RedisDashboardCache>(sp =>
+    new RedisDashboardCache(
+        sp.GetService<IConnectionMultiplexer>(),
+        sp.GetRequiredService<IConfiguration>()));
 builder.Services.AddTransient<MeContextRedisMiddleware>();
 
 // ================== ApiExceptionMiddleware ==================
@@ -376,6 +566,7 @@ builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen(c =>
 {
     c.SwaggerDoc("v1", new OpenApiInfo { Title = "TDTD API", Version = "v1" });
+    c.SchemaFilter<DeprecatedSchemaPropertyFilter>();
     c.AddSecurityDefinition("Bearer", new OpenApiSecurityScheme
     {
         In = ParameterLocation.Header,
@@ -455,14 +646,18 @@ app.UseMiddleware<MeContextRedisMiddleware>();
 app.UseMiddleware<ApiExceptionMiddleware>();
 app.UseAuthorization();
 
-app.UseHangfireDashboard("/hangfire", new DashboardOptions
+if (hangfireDashboardEnabled)
 {
-    Authorization = new[] { new LocalRequestsOnlyAuthorizationFilter() },
-    DisplayStorageConnectionString = false,
-    DashboardTitle = "TDTD Hangfire"
-});
+    app.UseHangfireDashboard("/hangfire", new DashboardOptions
+    {
+        Authorization = new[] { new LocalRequestsOnlyAuthorizationFilter() },
+        DisplayStorageConnectionString = false,
+        DashboardTitle = "TDTD Hangfire"
+    });
+}
 
 app.MapControllers();
+app.MapHealthChecks("/health/ready");
 app.MapHub<NotificationsHub>("/hubs/notifications");
 app.MapTusUploads();
 if (frontendStaticFilesEnabled)
@@ -486,14 +681,39 @@ if (frontendStaticFilesEnabled)
 
 using (var scope = app.Services.CreateScope())
 {
-    var ctx = scope.ServiceProvider.GetRequiredService<MongoDbContext>();
-    var mongoOpt = scope.ServiceProvider
-        .GetRequiredService<Microsoft.Extensions.Options.IOptions<MongoOptions>>().Value;
-    await MongoIndexInitializer.EnsureAsync(ctx.Db, mongoOpt);
+    var skipMongoIndexInitializationForTesting =
+        string.Equals(
+            app.Environment.EnvironmentName,
+            "Testing",
+            StringComparison.Ordinal) &&
+        app.Configuration.GetValue<bool>(
+            "Mongo:TestingSkipIndexInitialization");
+    if (skipMongoIndexInitializationForTesting)
+    {
+        app.Logger.LogWarning(
+            "Skipping Mongo index initialization for the Testing environment.");
+    }
+    else
+    {
+        var ctx = scope.ServiceProvider
+            .GetRequiredService<MongoDbContext>();
+        var mongoOpt = scope.ServiceProvider
+            .GetRequiredService<
+                Microsoft.Extensions.Options.IOptions<MongoOptions>>()
+            .Value;
+        await MongoIndexInitializer.EnsureAsync(
+            ctx.Db,
+            mongoOpt);
+    }
 
-    HangfireRecurringJobRegistrar.Register(
-        scope.ServiceProvider.GetRequiredService<IConfiguration>(),
-        scope.ServiceProvider.GetRequiredService<IAppTimeService>());
+    if (hangfireRecurringRegistrationEnabled)
+    {
+        JobStorage.Current =
+            scope.ServiceProvider.GetRequiredService<JobStorage>();
+        HangfireRecurringJobRegistrar.Register(
+            scope.ServiceProvider.GetRequiredService<IConfiguration>(),
+            scope.ServiceProvider.GetRequiredService<IAppTimeService>());
+    }
 }
 
 app.Run();

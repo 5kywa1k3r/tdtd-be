@@ -9,7 +9,9 @@ using tdtd_be.DTOs.WorkAssignments.AdvancedSummary;
 using tdtd_be.Models;
 using tdtd_be.Models.Statistics;
 using tdtd_be.Services.Notifications;
+using tdtd_be.Services.StatisticsConfiguration;
 using tdtd_be.Services.WorkAssignmentReports.Statistics;
+using tdtd_be.Services.WorkAssignmentReports.Runtime;
 using tdtd_be.Services.WorkAssignments.AdvancedSummary;
 using tdtd_be.Services.WorkAssignments.BasicSummary;
 using tdtd_be.Services.WorkAssignments.Queue;
@@ -77,6 +79,12 @@ public interface IJobRunManagementService
     Task ProcessNotificationDueScanAsync(CancellationToken ct = default);
     Task<int> ProcessProjectionRetryJobsAsync(int maxJobs, CancellationToken ct = default);
     Task<int> ProcessUserActionLogRetriesAsync(int maxJobs, CancellationToken ct = default);
+    Task<int> ProcessWorkReportLifecycleProjectionOutboxAsync(
+        int maxReports,
+        CancellationToken ct = default);
+    Task<int> ProcessDynamicFlowMappingOutboxAsync(
+        int maxItems,
+        CancellationToken ct = default);
     Task<int> ProcessStatisticRebuildJobsAsync(int maxJobs, int batchSize, CancellationToken ct = default);
 }
 
@@ -88,6 +96,9 @@ public sealed class JobRunManagementService : IJobRunManagementService
     private readonly INotificationDueScanJobService _notificationDueScan;
     private readonly IDocRoleReadModelProjectionRetryJobService _projectionRetry;
     private readonly IUserActionLogService _userActionLog;
+    private readonly IWorkReportLifecycleProjectionReconciler _lifecycleProjectionReconciler;
+    private readonly IDynamicFlowMappingOutboxReconciler
+        _dynamicFlowMappingOutboxReconciler;
     private readonly IWorkReportStatisticRebuildJobService _statisticRebuildJobs;
     private readonly IWorkAssignmentBasicSummaryService _basicSummary;
     private readonly IWorkAssignmentAdvancedSummaryHierarchyService _advancedSummary;
@@ -99,6 +110,9 @@ public sealed class JobRunManagementService : IJobRunManagementService
         INotificationDueScanJobService notificationDueScan,
         IDocRoleReadModelProjectionRetryJobService projectionRetry,
         IUserActionLogService userActionLog,
+        IWorkReportLifecycleProjectionReconciler lifecycleProjectionReconciler,
+        IDynamicFlowMappingOutboxReconciler
+            dynamicFlowMappingOutboxReconciler,
         IWorkReportStatisticRebuildJobService statisticRebuildJobs,
         IWorkAssignmentBasicSummaryService basicSummary,
         IWorkAssignmentAdvancedSummaryHierarchyService advancedSummary)
@@ -109,6 +123,9 @@ public sealed class JobRunManagementService : IJobRunManagementService
         _notificationDueScan = notificationDueScan;
         _projectionRetry = projectionRetry;
         _userActionLog = userActionLog;
+        _lifecycleProjectionReconciler = lifecycleProjectionReconciler;
+        _dynamicFlowMappingOutboxReconciler =
+            dynamicFlowMappingOutboxReconciler;
         _statisticRebuildJobs = statisticRebuildJobs;
         _basicSummary = basicSummary;
         _advancedSummary = advancedSummary;
@@ -227,10 +244,25 @@ public sealed class JobRunManagementService : IJobRunManagementService
     public Task<int> ProcessUserActionLogRetriesAsync(int maxJobs, CancellationToken ct = default)
         => _userActionLog.ProcessPendingRetriesAsync(Math.Clamp(maxJobs, 1, 200), ct);
 
+    public Task<int> ProcessWorkReportLifecycleProjectionOutboxAsync(
+        int maxReports,
+        CancellationToken ct = default)
+        => _lifecycleProjectionReconciler.ProcessPendingAsync(
+            Math.Clamp(maxReports, 1, 200),
+            ct);
+
+    public Task<int> ProcessDynamicFlowMappingOutboxAsync(
+        int maxItems,
+        CancellationToken ct = default)
+        => _dynamicFlowMappingOutboxReconciler.ProcessPendingAsync(
+            Math.Clamp(maxItems, 1, 200),
+            ct);
+
     public async Task<PagedResult<StatisticRebuildJobRow>> SearchStatisticRebuildJobsAsync(
         JobRunSearchRequest request,
         CancellationToken ct = default)
     {
+        StatConfigPhaseBarrier.Reject(StatConfigPhaseBarrierEntries.P9Projection);
         request ??= new JobRunSearchRequest();
 
         var page = Math.Max(0, request.Page);
@@ -294,6 +326,7 @@ public sealed class JobRunManagementService : IJobRunManagementService
         string actorUserId,
         CancellationToken ct = default)
     {
+        StatConfigPhaseBarrier.Reject(StatConfigPhaseBarrierEntries.P9Projection);
         jobId = NullIfWhiteSpace(jobId)
             ?? throw AppExceptionFactory.BadRequest(AppErrorCode.COMMON_ARGUMENT_REQUIRED, new { field = "jobId" });
         actorUserId = NullIfWhiteSpace(actorUserId)
@@ -336,6 +369,7 @@ public sealed class JobRunManagementService : IJobRunManagementService
         FlowStatisticProjectionDiagnosticsRequest request,
         CancellationToken ct = default)
     {
+        StatConfigPhaseBarrier.Reject(StatConfigPhaseBarrierEntries.P9Projection);
         request ??= new FlowStatisticProjectionDiagnosticsRequest();
         var workId = NullIfWhiteSpace(request.WorkId)
             ?? throw AppExceptionFactory.BadRequest(AppErrorCode.COMMON_ARGUMENT_REQUIRED, new { field = "workId" });
@@ -383,13 +417,22 @@ public sealed class JobRunManagementService : IJobRunManagementService
             ? new List<WorkReportFieldStatValue>()
             : await _ctx.WorkReportFieldStatValues
                 .Find(Builders<WorkReportFieldStatValue>.Filter.In(x => x.WorkAssignmentReportId, reportIds) &
-                      Builders<WorkReportFieldStatValue>.Filter.Eq(x => x.IsDeleted, false))
+                      Builders<WorkReportFieldStatValue>.Filter.Eq(x => x.IsDeleted, false) &
+                      Builders<WorkReportFieldStatValue>.Filter.Eq(x => x.DirectProjection, null))
                 .ToListAsync(ct);
         var tableValues = reportIds.Count == 0
             ? new List<WorkReportTableStatValue>()
             : await _ctx.WorkReportTableStatValues
                 .Find(Builders<WorkReportTableStatValue>.Filter.In(x => x.WorkAssignmentReportId, reportIds) &
-                      Builders<WorkReportTableStatValue>.Filter.Eq(x => x.IsDeleted, false))
+                      Builders<WorkReportTableStatValue>.Filter.Eq(x => x.IsDeleted, false) &
+                      Builders<WorkReportTableStatValue>.Filter.Eq(x => x.DirectProjection, null))
+                .ToListAsync(ct);
+        var labelValues = reportIds.Count == 0
+            ? new List<WorkReportLabelStatValue>()
+            : await _ctx.WorkReportLabelStatValues
+                .Find(Builders<WorkReportLabelStatValue>.Filter.In(x => x.WorkAssignmentReportId, reportIds) &
+                      Builders<WorkReportLabelStatValue>.Filter.Eq(x => x.IsDeleted, false) &
+                      Builders<WorkReportLabelStatValue>.Filter.Eq(x => x.DirectProjection, null))
                 .ToListAsync(ct);
 
         var fieldByReport = fieldValues
@@ -398,18 +441,24 @@ public sealed class JobRunManagementService : IJobRunManagementService
         var tableByReport = tableValues
             .GroupBy(x => x.WorkAssignmentReportId, StringComparer.Ordinal)
             .ToDictionary(x => x.Key, x => x.ToList(), StringComparer.Ordinal);
+        var labelByReport = labelValues
+            .GroupBy(x => x.WorkAssignmentReportId, StringComparer.Ordinal)
+            .ToDictionary(x => x.Key, x => x.ToList(), StringComparer.Ordinal);
 
         var rows = reports.Select(report =>
         {
             fieldByReport.TryGetValue(report.Id, out var fields);
             tableByReport.TryGetValue(report.Id, out var tables);
+            labelByReport.TryGetValue(report.Id, out var labels);
             fields ??= new List<WorkReportFieldStatValue>();
             tables ??= new List<WorkReportTableStatValue>();
+            labels ??= new List<WorkReportLabelStatValue>();
 
             return BuildFlowStatisticProjectionDiagnosticRow(
                 report,
                 fields,
                 tables,
+                labels,
                 flowInstanceId,
                 flowEffectiveStatus);
         }).ToList();
@@ -427,6 +476,7 @@ public sealed class JobRunManagementService : IJobRunManagementService
             ScannedReportCount = reports.Count,
             FieldProjectionRowCount = fieldValues.Count,
             TableProjectionRowCount = tableValues.Count,
+            LabelProjectionRowCount = labelValues.Count,
             NoProjectionReportCount = rows.Count(x => x.IssueTypes.Contains("NO_STAT_PROJECTION", StringComparer.Ordinal)),
             StaleProjectionReportCount = rows.Count(x => x.IssueTypes.Contains("STALE_STAT_PROJECTION", StringComparer.Ordinal)),
             FlowMetadataMismatchReportCount = rows.Count(x => x.IssueTypes.Contains("FLOW_METADATA_MISMATCH", StringComparer.Ordinal)),
@@ -439,6 +489,7 @@ public sealed class JobRunManagementService : IJobRunManagementService
         JobRunSearchRequest request,
         CancellationToken ct = default)
     {
+        StatConfigPhaseBarrier.Reject(StatConfigPhaseBarrierEntries.P9Result);
         request ??= new JobRunSearchRequest();
 
         var page = Math.Max(0, request.Page);
@@ -498,6 +549,7 @@ public sealed class JobRunManagementService : IJobRunManagementService
         string actorUserId,
         CancellationToken ct = default)
     {
+        StatConfigPhaseBarrier.Reject(StatConfigPhaseBarrierEntries.P9Result);
         var reset = await _basicSummary.ResetSnapshotJobAsync(snapshotId, actorUserId, ct);
         var snapshot = await _ctx.WorkAssignmentBasicSummarySnapshots
             .Find(x => x.Id == reset.SnapshotId)
@@ -518,6 +570,7 @@ public sealed class JobRunManagementService : IJobRunManagementService
         JobRunSearchRequest request,
         CancellationToken ct = default)
     {
+        StatConfigPhaseBarrier.Reject(StatConfigPhaseBarrierEntries.P9Result);
         request ??= new JobRunSearchRequest();
 
         var page = Math.Max(0, request.Page);
@@ -573,6 +626,7 @@ public sealed class JobRunManagementService : IJobRunManagementService
         string actorUserId,
         CancellationToken ct = default)
     {
+        StatConfigPhaseBarrier.Reject(StatConfigPhaseBarrierEntries.P9Result);
         grain = NormalizeAdvancedSummaryGrain(grain);
         nodeId = NullIfWhiteSpace(nodeId)
             ?? throw AppExceptionFactory.BadRequest(AppErrorCode.COMMON_ARGUMENT_REQUIRED, new { field = "nodeId" });
@@ -594,6 +648,7 @@ public sealed class JobRunManagementService : IJobRunManagementService
         string actorUserId,
         CancellationToken ct = default)
     {
+        StatConfigPhaseBarrier.Reject(StatConfigPhaseBarrierEntries.P9Result);
         request ??= new AdvancedSummaryNodeCleanupRequest();
         actorUserId = NullIfWhiteSpace(actorUserId)
             ?? throw AppExceptionFactory.BadRequest(AppErrorCode.COMMON_ARGUMENT_REQUIRED, new { field = "actorUserId" });
@@ -1031,19 +1086,22 @@ public sealed class JobRunManagementService : IJobRunManagementService
         WorkAssignmentReport report,
         IReadOnlyCollection<WorkReportFieldStatValue> fieldValues,
         IReadOnlyCollection<WorkReportTableStatValue> tableValues,
+        IReadOnlyCollection<WorkReportLabelStatValue> labelValues,
         string flowInstanceId,
         string? flowEffectiveStatus)
     {
-        var hasProjection = fieldValues.Count > 0 || tableValues.Count > 0;
+        var hasProjection = fieldValues.Count > 0 || tableValues.Count > 0 || labelValues.Count > 0;
         var fieldFresh = ProjectionRowsFresh(fieldValues, report.PayloadRevision, report.PayloadHash);
         var tableFresh = ProjectionRowsFresh(tableValues, report.PayloadRevision, report.PayloadHash);
+        var labelFresh = ProjectionRowsFresh(labelValues, report.PayloadRevision, report.PayloadHash);
         var flowMatches = ProjectionRowsMatchFlow(fieldValues, flowInstanceId, flowEffectiveStatus) &&
-                          ProjectionRowsMatchFlow(tableValues, flowInstanceId, flowEffectiveStatus);
+                          ProjectionRowsMatchFlow(tableValues, flowInstanceId, flowEffectiveStatus) &&
+                          ProjectionRowsMatchFlow(labelValues, flowInstanceId, flowEffectiveStatus);
         var issues = new List<string>();
 
         if (!hasProjection)
             issues.Add("NO_STAT_PROJECTION");
-        if (!fieldFresh || !tableFresh)
+        if (!fieldFresh || !tableFresh || !labelFresh)
             issues.Add("STALE_STAT_PROJECTION");
         if (!flowMatches)
             issues.Add("FLOW_METADATA_MISMATCH");
@@ -1059,8 +1117,10 @@ public sealed class JobRunManagementService : IJobRunManagementService
             PayloadHash = report.PayloadHash,
             FieldProjectionRows = fieldValues.Count,
             TableProjectionRows = tableValues.Count,
+            LabelProjectionRows = labelValues.Count,
             FieldProjectionFresh = fieldFresh,
             TableProjectionFresh = tableFresh,
+            LabelProjectionFresh = labelFresh,
             FlowMetadataMatches = flowMatches,
             IssueTypes = issues
         };
@@ -1080,12 +1140,14 @@ public sealed class JobRunManagementService : IJobRunManagementService
             {
                 WorkReportFieldStatValue field => field.SourcePayloadRevision,
                 WorkReportTableStatValue table => table.SourcePayloadRevision,
+                WorkReportLabelStatValue label => label.SourcePayloadRevision,
                 _ => payloadRevision
             };
             var hash = value switch
             {
                 WorkReportFieldStatValue field => field.SourcePayloadHash,
                 WorkReportTableStatValue table => table.SourcePayloadHash,
+                WorkReportLabelStatValue label => label.SourcePayloadHash,
                 _ => payloadHash
             };
 
@@ -1108,12 +1170,14 @@ public sealed class JobRunManagementService : IJobRunManagementService
             {
                 WorkReportFieldStatValue field => field.FlowInstanceId,
                 WorkReportTableStatValue table => table.FlowInstanceId,
+                WorkReportLabelStatValue label => label.FlowInstanceId,
                 _ => null
             };
             var rowFlowEffectiveStatus = value switch
             {
                 WorkReportFieldStatValue field => field.FlowEffectiveStatus,
                 WorkReportTableStatValue table => table.FlowEffectiveStatus,
+                WorkReportLabelStatValue label => label.FlowEffectiveStatus,
                 _ => null
             };
 

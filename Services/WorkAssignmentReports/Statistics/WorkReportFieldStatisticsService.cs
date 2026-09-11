@@ -7,9 +7,11 @@ using MongoDB.Driver;
 using tdtd_be.Common.Auth;
 using tdtd_be.Data;
 using tdtd_be.DTOs.Statistics;
+using tdtd_be.DTOs.StatisticsConfiguration;
 using tdtd_be.Models;
 using tdtd_be.Models.Enums;
 using tdtd_be.Models.Statistics;
+using tdtd_be.Services.StatisticsConfiguration;
 using tdtd_be.Services.WorkAssignmentReports;
 using tdtd_be.Services.WorkAssignmentReports.Payloads;
 
@@ -46,6 +48,7 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
         string? actorUserId,
         CancellationToken ct = default)
     {
+        StatConfigPhaseBarrier.Reject(StatConfigPhaseBarrierEntries.P9Projection);
         var aggregateKey = await RebuildValuesForReportAsync(reportId, actorUserId, ct);
         if (aggregateKey is null)
             return;
@@ -63,6 +66,75 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
         string? actorUserId,
         CancellationToken ct = default)
     {
+        StatConfigPhaseBarrier.Reject(StatConfigPhaseBarrierEntries.P9Projection);
+        return await RebuildValuesForReportCoreAsync(
+            reportId,
+            actorUserId,
+            generationContext: null,
+            generationRows: null,
+            ct);
+    }
+
+    public Task<ReportStatisticAggregateKey?> StageGenerationValuesForReportAsync(
+        string reportId,
+        WorkReportDirectGenerationContext context,
+        string? actorUserId,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(context);
+        return RebuildValuesForReportCoreAsync(
+            reportId,
+            actorUserId,
+            context,
+            generationRows: null,
+            ct);
+    }
+
+    public async Task StageGenerationValuesForReportsAsync(
+        IReadOnlyCollection<string> reportIds,
+        WorkReportDirectGenerationContext context,
+        string? actorUserId,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(reportIds);
+        ArgumentNullException.ThrowIfNull(context);
+        var normalizedReportIds = new List<string>(reportIds.Count);
+        foreach (var reportId in reportIds)
+        {
+            if (string.IsNullOrWhiteSpace(reportId))
+                throw new ArgumentException("P9 Direct FIELD report ids must be non-empty.", nameof(reportIds));
+            normalizedReportIds.Add(reportId.Trim());
+        }
+
+        var generationRows = new List<WorkReportFieldStatValue>();
+        foreach (var reportId in normalizedReportIds
+                     .Distinct(StringComparer.Ordinal)
+                     .OrderBy(value => value, StringComparer.Ordinal))
+        {
+            ct.ThrowIfCancellationRequested();
+            await RebuildValuesForReportCoreAsync(
+                reportId,
+                actorUserId,
+                context,
+                generationRows,
+                ct);
+        }
+
+        await WorkReportDirectGenerationInsertOnly.InsertOrValidateAsync(
+            _ctx.WorkReportFieldStatValues,
+            generationRows,
+            "work_report_field_stat_values",
+            context.GenerationId,
+            ct);
+    }
+
+    private async Task<ReportStatisticAggregateKey?> RebuildValuesForReportCoreAsync(
+        string reportId,
+        string? actorUserId,
+        WorkReportDirectGenerationContext? generationContext,
+        List<WorkReportFieldStatValue>? generationRows,
+        CancellationToken ct)
+    {
         if (string.IsNullOrWhiteSpace(reportId))
             return null;
 
@@ -72,8 +144,15 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
 
         if (report is null)
         {
-            await _ctx.WorkReportFieldStatValues
-                .DeleteManyAsync(x => x.WorkAssignmentReportId == reportId, ct);
+            if (generationContext is null)
+            {
+                await _ctx.WorkReportFieldStatValues
+                    .DeleteManyAsync(
+                        x => x.WorkAssignmentReportId == reportId &&
+                             x.DirectProjection == null,
+                        ct);
+            }
+
             return null;
         }
 
@@ -85,11 +164,19 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
             .FirstOrDefaultAsync(ct);
         var dynamicFormTemplateId = NormalizeObjectIdOrNull(report.DynamicFormTemplateId ?? assignment?.DynamicFormTemplateId);
 
-        await _ctx.WorkReportFieldStatValues.DeleteManyAsync(
-            x => x.WorkAssignmentReportId == report.Id,
-            ct);
+        if (generationContext is null)
+        {
+            await _ctx.WorkReportFieldStatValues.DeleteManyAsync(
+                x => x.WorkAssignmentReportId == report.Id &&
+                     x.DirectProjection == null,
+                ct);
+        }
 
-        if (report.IsActive == false || report.Status != WorkAssignmentReportStatus.Approved)
+        var isEligible = generationContext is null
+            ? report.IsActive != false && report.Status == WorkAssignmentReportStatus.Approved
+            : IsEligibleForDirectGeneration(report, assignment);
+
+        if (!isEligible)
         {
             return new ReportStatisticAggregateKey(
                 report.WorkId,
@@ -97,7 +184,8 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
                 dynamicFormTemplateId);
         }
 
-        var contributionPolicy = WorkReportCumulativeContributionPolicy.FromReport(report);
+        var contributionPolicy = generationContext?.ResolveContributionPolicy(report)
+                                 ?? WorkReportCumulativeContributionPolicy.FromReport(report);
         if (!contributionPolicy.IncludesReport)
         {
             return new ReportStatisticAggregateKey(
@@ -119,7 +207,7 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
 
         if (values.Count > 0)
         {
-            var now = DateTime.UtcNow;
+            var now = generationContext?.ComputedAtUtc ?? DateTime.UtcNow;
             var actorId = NormalizeObjectIdOrNull(actorUserId);
             var ancestorAssignmentIds = ExtractAncestorAssignmentIds(assignment, report.WorkAssignmentId);
             var sourceWindow = WorkAssignmentReportTemporalPolicy.ResolveSourceWindow(report);
@@ -128,7 +216,16 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
 
             var rows = values.Select(value => new WorkReportFieldStatValue
             {
-                Id = ObjectId.GenerateNewId().ToString(),
+                Id = generationContext?.StableObjectId(
+                         "FIELD_VALUE",
+                         report.Id,
+                         report.PeriodInstanceKey,
+                         dynamicFormTemplateId,
+                         value.Field.FieldId,
+                         value.SourceKey,
+                         value.BucketKey,
+                         value.ValueKind)
+                     ?? ObjectId.GenerateNewId().ToString(),
                 WorkId = report.WorkId,
                 WorkAssignmentId = report.WorkAssignmentId,
                 AssigneeUserId = projectionContext.AssigneeUserId,
@@ -147,6 +244,7 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
                 ParentFlowBranchId = projectionContext.ParentFlowBranchId,
                 FlowAttemptNo = projectionContext.FlowAttemptNo,
                 FlowRole = projectionContext.FlowRole,
+                IsFlowFinalNode = projectionContext.IsFlowFinalNode,
                 FlowEffectiveStatus = projectionContext.FlowEffectiveStatus,
                 InvalidatedByFlowEventId = projectionContext.InvalidatedByFlowEventId,
                 WorkReportPeriodId = report.WorkReportPeriodId,
@@ -159,6 +257,7 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
                 FieldLabel = value.Field.FieldLabel,
                 FieldType = value.Field.FieldType,
                 ConceptCode = value.Field.ConceptCode ?? conceptMap.ResolveField(value.Field.FieldId, value.Field.FieldKey),
+                StatisticLabelCodes = value.Field.StatisticLabelCodes.ToList(),
                 ShowInTree = value.Field.ShowInTree,
                 ShowInDetail = value.Field.ShowInDetail,
                 BucketKey = value.BucketKey,
@@ -168,6 +267,7 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
                 NumericValue = value.NumericValue,
                 BooleanValue = value.BooleanValue,
                 DateValueUtc = value.DateValueUtc,
+                TextValue = value.TextValue,
                 PeriodKey = report.PeriodKey,
                 PeriodInstanceKey = report.PeriodInstanceKey,
                 PeriodKind = report.PeriodKind,
@@ -179,6 +279,7 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
                 ReportStatus = (int)report.Status,
                 SourcePayloadRevision = projectionContext.SourcePayloadRevision,
                 SourcePayloadHash = projectionContext.SourcePayloadHash,
+                DirectProjection = generationContext?.CreatePin(report),
                 CreatedAtUtc = now,
                 UpdatedAtUtc = now,
                 CreatedByUserId = actorId,
@@ -187,7 +288,28 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
             }).ToList();
 
             if (rows.Count > 0)
-                await _ctx.WorkReportFieldStatValues.InsertManyAsync(rows, cancellationToken: ct);
+            {
+                if (generationContext is null)
+                {
+                    await _ctx.WorkReportFieldStatValues.InsertManyAsync(rows, cancellationToken: ct);
+                }
+                else
+                {
+                    if (generationRows is not null)
+                    {
+                        generationRows.AddRange(rows);
+                    }
+                    else
+                    {
+                        await WorkReportDirectGenerationInsertOnly.InsertOrValidateAsync(
+                            _ctx.WorkReportFieldStatValues,
+                            rows,
+                            "work_report_field_stat_values",
+                            generationContext.GenerationId,
+                            ct);
+                    }
+                }
+            }
         }
 
         return new ReportStatisticAggregateKey(
@@ -203,22 +325,127 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
         string? actorUserId,
         CancellationToken ct = default)
     {
+        StatConfigPhaseBarrier.Reject(StatConfigPhaseBarrierEntries.P9Projection);
+        await RebuildAggregatesForWorkPeriodCoreAsync(
+            workId,
+            periodInstanceKey,
+            dynamicFormTemplateId,
+            actorUserId,
+            generationContext: null,
+            ct);
+    }
+
+    public Task StageGenerationAggregatesForWorkPeriodAsync(
+        string workId,
+        string? periodInstanceKey,
+        string? dynamicFormTemplateId,
+        WorkReportDirectGenerationContext context,
+        string? actorUserId,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(context);
+        return RebuildAggregatesForWorkPeriodCoreAsync(
+            workId,
+            periodInstanceKey,
+            dynamicFormTemplateId,
+            actorUserId,
+            context,
+            ct);
+    }
+
+    private async Task RebuildAggregatesForWorkPeriodCoreAsync(
+        string workId,
+        string? periodInstanceKey,
+        string? dynamicFormTemplateId,
+        string? actorUserId,
+        WorkReportDirectGenerationContext? generationContext,
+        CancellationToken ct)
+    {
         if (string.IsNullOrWhiteSpace(workId))
             return;
 
-        var valueFilter = BuildValueFilter(workId, periodInstanceKey, dynamicFormTemplateId);
-        var aggregateFilter = BuildAggregateFilter(workId, periodInstanceKey, dynamicFormTemplateId);
+        var valueFilter = BuildValueFilter(
+            workId,
+            periodInstanceKey,
+            dynamicFormTemplateId,
+            generationContext?.GenerationId);
+        if (generationContext is not null)
+        {
+            var fb = Builders<WorkReportFieldStatValue>.Filter;
+            valueFilter &= fb.Eq(x => x.AssignmentIsActive, true)
+                           & fb.Eq(x => x.ReportIsActive, true)
+                           & fb.Eq(x => x.ReportStatus, (int)WorkAssignmentReportStatus.Approved)
+                           & fb.Eq(x => x.InvalidatedByFlowEventId, null);
+        }
 
         var values = await _ctx.WorkReportFieldStatValues
             .Find(valueFilter)
             .ToListAsync(ct);
 
-        await _ctx.WorkReportFieldStatAggregates.DeleteManyAsync(aggregateFilter, ct);
+        var sourceReportsById = new Dictionary<string, WorkAssignmentReport>(StringComparer.Ordinal);
+        if (generationContext is not null && values.Count > 0)
+        {
+            var reportIds = values
+                .Select(x => x.WorkAssignmentReportId)
+                .Distinct(StringComparer.Ordinal)
+                .ToList();
+            var reportFb = Builders<WorkAssignmentReport>.Filter;
+            var authoritativeReports = await _ctx.WorkAssignmentReports
+                .Find(
+                    reportFb.In(x => x.Id, reportIds)
+                    & reportFb.Eq(x => x.IsDeleted, false)
+                    & reportFb.Eq(x => x.IsCurrent, true)
+                    & reportFb.Ne(x => x.IsActive, false)
+                    & reportFb.Eq(x => x.Status, WorkAssignmentReportStatus.Approved)
+                    & reportFb.Eq(x => x.InvalidatedByFlowEventId, null))
+                .ToListAsync(ct);
+
+            var assignmentIds = authoritativeReports
+                .Select(x => x.WorkAssignmentId)
+                .Distinct(StringComparer.Ordinal)
+                .ToList();
+            var assignmentFb = Builders<WorkAssignment>.Filter;
+            var activeAssignmentIds = (await _ctx.WorkAssignments
+                    .Find(
+                        assignmentFb.In(x => x.Id, assignmentIds)
+                        & assignmentFb.Eq(x => x.IsDeleted, false)
+                        & assignmentFb.Eq(x => x.IsActive, true)
+                        & assignmentFb.Eq(x => x.InvalidatedByFlowEventId, null))
+                    .Project(x => x.Id)
+                    .ToListAsync(ct))
+                .ToHashSet(StringComparer.Ordinal);
+
+            sourceReportsById = authoritativeReports
+                .Where(x => activeAssignmentIds.Contains(x.WorkAssignmentId))
+                .ToDictionary(x => x.Id, StringComparer.Ordinal);
+            values = values
+                .Where(value =>
+                    sourceReportsById.TryGetValue(value.WorkAssignmentReportId, out var report)
+                    && string.Equals(report.WorkAssignmentId, value.WorkAssignmentId, StringComparison.Ordinal))
+                .ToList();
+        }
+
+        if (generationContext is null)
+        {
+            var aggregateFilter = BuildAggregateFilter(workId, periodInstanceKey, dynamicFormTemplateId);
+            await _ctx.WorkReportFieldStatAggregates.DeleteManyAsync(aggregateFilter, ct);
+        }
 
         if (values.Count == 0)
+        {
+            if (generationContext is not null)
+            {
+                await WorkReportDirectGenerationInsertOnly.InsertOrValidateAsync(
+                    _ctx.WorkReportFieldStatAggregates,
+                    Array.Empty<WorkReportFieldStatAggregate>(),
+                    "work_report_field_stat_aggregates",
+                    generationContext.GenerationId,
+                    ct);
+            }
             return;
+        }
 
-        var now = DateTime.UtcNow;
+        var now = generationContext?.ComputedAtUtc ?? DateTime.UtcNow;
         var actorId = NormalizeObjectIdOrNull(actorUserId);
         var buckets = new Dictionary<AggregateKey, AggregateBucket>();
 
@@ -245,7 +472,17 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
                     {
                         Row = new WorkReportFieldStatAggregate
                         {
-                            Id = ObjectId.GenerateNewId().ToString(),
+                            Id = generationContext?.StableObjectId(
+                                     "FIELD_AGGREGATE",
+                                     key.WorkId,
+                                     key.ScopeType,
+                                     key.ScopeId,
+                                     key.DynamicFormTemplateId,
+                                     key.FieldId,
+                                     key.BucketKey,
+                                     key.PeriodInstanceKey,
+                                     key.ReportStatus.ToString(CultureInfo.InvariantCulture))
+                                 ?? ObjectId.GenerateNewId().ToString(),
                             WorkId = value.WorkId,
                             ScopeType = scope.ScopeType,
                             ScopeId = scope.ScopeId,
@@ -257,6 +494,7 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
                             FieldKey = value.FieldKey,
                             FieldLabel = value.FieldLabel,
                             FieldType = value.FieldType,
+                            StatisticLabelCodes = value.StatisticLabelCodes.ToList(),
                             ShowInTree = value.ShowInTree,
                             ShowInDetail = value.ShowInDetail,
                             BucketKey = value.BucketKey,
@@ -287,11 +525,35 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
         var aggregates = buckets.Values.Select(x =>
         {
             x.Row.ReportCount = x.ReportIds.Count;
+            if (generationContext is not null)
+            {
+                if (x.SourceReportId is null
+                    || !sourceReportsById.TryGetValue(x.SourceReportId, out var sourceReport))
+                {
+                    throw WorkReportDirectGenerationValidationException
+                        .SourceDrift();
+                }
+
+                x.Row.DirectProjection = generationContext.CreatePin(sourceReport);
+            }
+
             return x.Row;
         }).ToList();
 
-        if (aggregates.Count > 0)
-            await _ctx.WorkReportFieldStatAggregates.InsertManyAsync(aggregates, cancellationToken: ct);
+        if (generationContext is null)
+        {
+            if (aggregates.Count > 0)
+                await _ctx.WorkReportFieldStatAggregates.InsertManyAsync(aggregates, cancellationToken: ct);
+        }
+        else
+        {
+            await WorkReportDirectGenerationInsertOnly.InsertOrValidateAsync(
+                _ctx.WorkReportFieldStatAggregates,
+                aggregates,
+                "work_report_field_stat_aggregates",
+                generationContext.GenerationId,
+                ct);
+        }
     }
 
     public async Task<RebuildFieldStatisticResponse> RebuildForWorkPeriodAsync(
@@ -299,6 +561,7 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
         string? actorUserId,
         CancellationToken ct = default)
     {
+        StatConfigPhaseBarrier.Reject(StatConfigPhaseBarrierEntries.P9Projection);
         var actorId = string.IsNullOrWhiteSpace(actorUserId)
             ? _me.RequireMe().Id
             : actorUserId.Trim();
@@ -349,6 +612,7 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
         FieldStatisticSummaryRequest req,
         CancellationToken ct = default)
     {
+        StatConfigPhaseBarrier.Reject(StatConfigPhaseBarrierEntries.P9Result);
         var me = _me.RequireMe();
         var normalized = NormalizeRequest(req);
         await EnsureCanReadScopeAsync(normalized, me.Id, ct);
@@ -358,6 +622,18 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
         var pageSize = Math.Clamp(normalized.PageSize <= 0 ? 50 : normalized.PageSize, 1, 200);
 
         var total = await _ctx.WorkReportFieldStatAggregates.CountDocumentsAsync(filter, cancellationToken: ct);
+        var totals = await _ctx.WorkReportFieldStatAggregates
+            .Aggregate()
+            .Match(filter)
+            .Group(
+                _ => 1,
+                group => new FieldStatisticSummaryTotals
+                {
+                    TotalValueCount = group.Sum(x => x.ValueCount),
+                    TotalSum = group.Sum(x => x.Sum),
+                    TotalReportCount = group.Sum(x => x.ReportCount)
+                })
+            .FirstOrDefaultAsync(ct);
         var rows = await _ctx.WorkReportFieldStatAggregates
             .Find(filter)
             .SortByDescending(x => x.ValueCount)
@@ -381,6 +657,7 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
             FieldKey = x.FieldKey,
             FieldLabel = x.FieldLabel,
             FieldType = x.FieldType,
+            StatisticLabelCodes = x.StatisticLabelCodes.ToList(),
             ShowInTree = x.ShowInTree,
             ShowInDetail = x.ShowInDetail,
             BucketKey = x.BucketKey,
@@ -407,9 +684,9 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
         {
             Rows = resultRows,
             TotalRows = total,
-            TotalValueCount = resultRows.Sum(x => x.ValueCount),
-            TotalSum = resultRows.Sum(x => x.Sum ?? 0m),
-            TotalReportCount = resultRows.Sum(x => x.ReportCount)
+            TotalValueCount = totals?.TotalValueCount ?? 0,
+            TotalSum = totals?.TotalSum ?? 0m,
+            TotalReportCount = totals?.TotalReportCount ?? 0
         };
     }
 
@@ -417,6 +694,7 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
         FieldTextConcatRequest req,
         CancellationToken ct = default)
     {
+        StatConfigPhaseBarrier.Reject(StatConfigPhaseBarrierEntries.P9Result);
         var me = _me.RequireMe();
         var normalized = NormalizeTextConcatRequest(req);
         var data = await LoadTextConcatRowsAsync(normalized, me.Id, ct);
@@ -458,6 +736,7 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
         FieldTextConcatRequest req,
         CancellationToken ct = default)
     {
+        StatConfigPhaseBarrier.Reject(StatConfigPhaseBarrierEntries.P9Export);
         var me = _me.RequireMe();
         var normalized = NormalizeTextConcatRequest(req, forExport: true);
         var data = await LoadTextConcatRowsAsync(normalized, me.Id, ct);
@@ -587,10 +866,21 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
         return null;
     }
 
+    private static bool IsEligibleForDirectGeneration(
+        WorkAssignmentReport report,
+        WorkAssignment? assignment)
+        => report.Status == WorkAssignmentReportStatus.Approved
+           && report.IsCurrent
+           && report.IsActive != false
+           && string.IsNullOrWhiteSpace(report.InvalidatedByFlowEventId)
+           && assignment is { IsActive: true }
+           && string.IsNullOrWhiteSpace(assignment.InvalidatedByFlowEventId);
+
     private static FilterDefinition<WorkReportFieldStatValue> BuildValueFilter(
         string workId,
         string? periodInstanceKey,
-        string? dynamicFormTemplateId)
+        string? dynamicFormTemplateId,
+        string? generationId)
     {
         var fb = Builders<WorkReportFieldStatValue>.Filter;
         var filter = fb.Eq(x => x.WorkId, workId.Trim()) & fb.Eq(x => x.IsDeleted, false);
@@ -601,6 +891,10 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
         if (!string.IsNullOrWhiteSpace(dynamicFormTemplateId))
             filter &= fb.Eq(x => x.DynamicFormTemplateId, dynamicFormTemplateId.Trim());
 
+        filter &= generationId is null
+            ? fb.Eq(x => x.DirectProjection, null)
+            : fb.Eq("directProjection.generationId", generationId);
+
         return filter;
     }
 
@@ -610,7 +904,9 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
         string? dynamicFormTemplateId)
     {
         var fb = Builders<WorkReportFieldStatAggregate>.Filter;
-        var filter = fb.Eq(x => x.WorkId, workId.Trim()) & fb.Eq(x => x.IsDeleted, false);
+        var filter = fb.Eq(x => x.WorkId, workId.Trim())
+                     & fb.Eq(x => x.IsDeleted, false)
+                     & fb.Eq(x => x.DirectProjection, null);
 
         if (!string.IsNullOrWhiteSpace(periodInstanceKey))
             filter &= fb.Eq(x => x.PeriodInstanceKey, periodInstanceKey.Trim());
@@ -625,7 +921,9 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
         FieldStatisticSummaryRequest req)
     {
         var fb = Builders<WorkReportFieldStatAggregate>.Filter;
-        var filter = fb.Eq(x => x.WorkId, req.WorkId!.Trim()) & fb.Eq(x => x.IsDeleted, false);
+        var filter = fb.Eq(x => x.WorkId, req.WorkId!.Trim())
+                     & fb.Eq(x => x.IsDeleted, false)
+                     & fb.Eq(x => x.DirectProjection, null);
 
         if (!string.IsNullOrWhiteSpace(req.ScopeType))
             filter &= fb.Eq(x => x.ScopeType, req.ScopeType!.Trim().ToUpperInvariant());
@@ -641,6 +939,9 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
 
         if (!string.IsNullOrWhiteSpace(req.FieldKey))
             filter &= fb.Eq(x => x.FieldKey, req.FieldKey!.Trim());
+
+        if (!string.IsNullOrWhiteSpace(req.StatisticLabelCode))
+            filter &= fb.AnyEq(x => x.StatisticLabelCodes, req.StatisticLabelCode!.Trim().ToLowerInvariant());
 
         if (!string.IsNullOrWhiteSpace(req.FieldType))
             filter &= fb.Eq(x => x.FieldType, NormalizeFieldType(req.FieldType));
@@ -1249,6 +1550,9 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
             DynamicFormTemplateId = NormalizeOptionalId(req.DynamicFormTemplateId),
             FieldId = string.IsNullOrWhiteSpace(req.FieldId) ? null : req.FieldId.Trim(),
             FieldKey = string.IsNullOrWhiteSpace(req.FieldKey) ? null : req.FieldKey.Trim(),
+            StatisticLabelCode = string.IsNullOrWhiteSpace(req.StatisticLabelCode)
+                ? null
+                : req.StatisticLabelCode.Trim().ToLowerInvariant(),
             FieldType = string.IsNullOrWhiteSpace(req.FieldType) ? null : NormalizeFieldType(req.FieldType),
             BucketKey = string.IsNullOrWhiteSpace(req.BucketKey) ? null : req.BucketKey.Trim(),
             ShowInTree = req.ShowInTree,
@@ -1314,6 +1618,11 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
         var label = ResolveFieldDisplayName(field) ?? fieldKey;
         var conceptCode = WorkReportStatisticConceptMap.NormalizeConceptCode(
             PickNonBlank(field.ConceptCode, field.Statistic?.ConceptCode));
+        var statisticLabelCodes = (field.StatisticLabelCodes ?? new List<string>())
+            .Select(NormalizeStatisticLabelCode)
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
 
         var options = (field.Options ?? new List<DynamicFormFieldOption>())
             .Select(x => new FieldOption(
@@ -1330,6 +1639,7 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
             label,
             fieldType,
             conceptCode,
+            statisticLabelCodes,
             field.Statistic?.ShowInTree ?? false,
             field.Statistic?.ShowInDetail ?? true,
             options);
@@ -1366,7 +1676,18 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
             foreach (var field in fields)
             {
                 if (!TryGetFieldValue(valuesObject, field, out var value))
+                {
+                    rows.Add(new ParsedFieldValue(
+                        field,
+                        null,
+                        null,
+                        field.FieldId,
+                        "MISSING",
+                        null,
+                        null,
+                        null));
                     continue;
+                }
 
                 rows.AddRange(ExtractFieldValue(field, value));
             }
@@ -1384,13 +1705,28 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
         JsonElement value)
     {
         if (value.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined)
+        {
+            yield return new ParsedFieldValue(
+                field,
+                null,
+                null,
+                field.FieldId,
+                "NULL",
+                null,
+                null,
+                null);
             yield break;
+        }
 
         if (field.FieldType == "number")
         {
             var number = ToNullableDecimal(value);
             if (!number.HasValue)
+            {
+                yield return new ParsedFieldValue(
+                    field, null, null, field.FieldId, "EMPTY", null, null, null);
                 yield break;
+            }
 
             yield return new ParsedFieldValue(
                 field,
@@ -1408,7 +1744,11 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
         {
             var boolean = ToNullableBoolean(value);
             if (!boolean.HasValue)
+            {
+                yield return new ParsedFieldValue(
+                    field, null, null, field.FieldId, "EMPTY", null, null, null);
                 yield break;
+            }
 
             yield return new ParsedFieldValue(
                 field,
@@ -1426,7 +1766,11 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
         {
             var date = ToNullableDateUtc(value);
             if (!date.HasValue)
+            {
+                yield return new ParsedFieldValue(
+                    field, null, null, field.FieldId, "EMPTY", null, null, null);
                 yield break;
+            }
 
             yield return new ParsedFieldValue(
                 field,
@@ -1444,7 +1788,11 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
         {
             var code = ToNullableString(value);
             if (string.IsNullOrWhiteSpace(code))
+            {
+                yield return new ParsedFieldValue(
+                    field, null, null, field.FieldId, "EMPTY", null, null, null);
                 yield break;
+            }
 
             code = code.Trim();
             yield return new ParsedFieldValue(
@@ -1461,7 +1809,14 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
 
         if (field.FieldType == "multiSelect")
         {
-            foreach (var code in ToStringArray(value).Distinct(StringComparer.Ordinal))
+            var codes = ToStringArray(value).Distinct(StringComparer.Ordinal).ToList();
+            if (codes.Count == 0)
+            {
+                yield return new ParsedFieldValue(
+                    field, null, null, field.FieldId, "EMPTY", null, null, null);
+                yield break;
+            }
+            foreach (var code in codes)
             {
                 yield return new ParsedFieldValue(
                     field,
@@ -1481,7 +1836,11 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
         {
             var code = NormalizeShortTextBucket(ToNullableString(value));
             if (string.IsNullOrWhiteSpace(code))
+            {
+                yield return new ParsedFieldValue(
+                    field, null, null, field.FieldId, "EMPTY", null, null, null);
                 yield break;
+            }
 
             var label = ResolveOptionLabel(field, code);
             yield return new ParsedFieldValue(
@@ -1492,14 +1851,20 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
                 "TEXT_BUCKET",
                 null,
                 null,
-                null);
+                null,
+                ToNullableString(value));
             yield break;
         }
 
         if (field.FieldType is "stringList" or "longText")
         {
-            if (ToStringArray(value).Count == 0)
+            var textItems = ToStringArray(value);
+            if (textItems.Count == 0)
+            {
+                yield return new ParsedFieldValue(
+                    field, null, null, field.FieldId, "EMPTY", null, null, null);
                 yield break;
+            }
 
             yield return new ParsedFieldValue(
                 field,
@@ -1509,13 +1874,18 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
                 "PRESENT",
                 null,
                 null,
-                null);
+                null,
+                string.Join("\n", textItems));
             yield break;
         }
 
         var text = ToNullableString(value);
         if (string.IsNullOrWhiteSpace(text))
+        {
+            yield return new ParsedFieldValue(
+                field, null, null, field.FieldId, "EMPTY", null, null, null);
             yield break;
+        }
 
         yield return new ParsedFieldValue(
             field,
@@ -1525,7 +1895,8 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
             "PRESENT",
             null,
             null,
-            null);
+            null,
+            text);
     }
 
     private static bool TryGetValuesObject(JsonElement root, out JsonElement valuesObject)
@@ -1763,6 +2134,9 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
     private static string? NormalizeObjectIdOrNull(string? value)
         => ObjectId.TryParse(value, out _) ? value : null;
 
+    private static string NormalizeStatisticLabelCode(string? value)
+        => string.IsNullOrWhiteSpace(value) ? string.Empty : value.Trim().ToLowerInvariant();
+
     private sealed class DynamicFormFieldDefinition
     {
         public string? Id { get; set; }
@@ -1772,6 +2146,7 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
         public string? Label { get; set; }
         public string? Type { get; set; }
         public string? ConceptCode { get; set; }
+        public List<string>? StatisticLabelCodes { get; set; }
         public bool IsStatistic { get; set; }
         public DynamicFormStatisticDefinition? Statistic { get; set; }
         public List<DynamicFormFieldOption>? Options { get; set; }
@@ -1798,6 +2173,7 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
         string FieldLabel,
         string FieldType,
         string? ConceptCode,
+        List<string> StatisticLabelCodes,
         bool ShowInTree,
         bool ShowInDetail,
         List<FieldOption> Options);
@@ -1810,7 +2186,8 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
         string ValueKind,
         decimal? NumericValue,
         bool? BooleanValue,
-        DateTime? DateValueUtc);
+        DateTime? DateValueUtc,
+        string? TextValue = null);
 
     private sealed record FieldConcatValue(
         string Text,
@@ -1840,6 +2217,7 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
     {
         public WorkReportFieldStatAggregate Row { get; set; } = default!;
         public HashSet<string> ReportIds { get; } = new(StringComparer.Ordinal);
+        public string? SourceReportId { get; private set; }
 
         public void Add(WorkReportFieldStatValue value)
         {
@@ -1873,6 +2251,18 @@ public sealed class WorkReportFieldStatisticsService : IWorkReportFieldStatistic
             }
 
             ReportIds.Add(value.WorkAssignmentReportId);
+            if (SourceReportId is null
+                || string.CompareOrdinal(value.WorkAssignmentReportId, SourceReportId) < 0)
+            {
+                SourceReportId = value.WorkAssignmentReportId;
+            }
         }
+    }
+
+    private sealed class FieldStatisticSummaryTotals
+    {
+        public long TotalValueCount { get; set; }
+        public decimal TotalSum { get; set; }
+        public long TotalReportCount { get; set; }
     }
 }

@@ -152,7 +152,7 @@ public sealed class UserAdminService : IUserAdminService
             throw UserAdminManageForbidden("targetIsAdmin", me.Id, target.Id);
 
         // ADMIN: chỉ quản SYSTEM_ADMIN
-        if (meIsAdmin)
+        if (meIsAdmin && !meIsSys)
         {
             if (!IsSystemAdminUser(target))
                 throw UserAdminManageForbidden("adminCanOnlyManageSystemAdmin", me.Id, target.Id);

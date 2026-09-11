@@ -1,5 +1,7 @@
+using System.Text.Json;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Mvc.ModelBinding;
 using tdtd_be.DTOs.Common;
 using tdtd_be.DTOs.DynamicExcel;
 using tdtd_be.DTOs.DynamicForms;
@@ -31,9 +33,22 @@ public sealed class DynamicFormController : ControllerBase
     public Task<DynamicFormDetail> GetById([FromRoute] string id, CancellationToken ct)
         => _svc.GetByIdAsync(id, ct);
 
+    [HttpGet("{id}/versions")]
+    public Task<DynamicFormVersionHistoryResp> GetVersionHistory(
+        [FromRoute] string id,
+        CancellationToken ct)
+        => _svc.GetVersionHistoryAsync(id, ct);
+
     [HttpPost]
     public Task<DynamicFormDetail> Create([FromBody] CreateDynamicFormReq req, CancellationToken ct)
         => _svc.CreateAsync(req, ct);
+
+    [HttpPost("{id}/versions")]
+    public Task<DynamicFormDetail> CreateNextVersion(
+        [FromRoute] string id,
+        [FromBody] CreateDynamicFormVersionReq req,
+        CancellationToken ct)
+        => _svc.CreateNextVersionAsync(id, req, ct);
 
     [HttpPut("{id}")]
     public Task<DynamicFormDetail> Update(
@@ -42,16 +57,25 @@ public sealed class DynamicFormController : ControllerBase
         CancellationToken ct)
         => _svc.UpdateAsync(id, req, ct);
 
-    [HttpPatch("{id}/statistics")]
-    public Task<DynamicFormStatisticConfigUpdateResp> UpdateStatisticConfig(
+    [HttpGet("{id}/statistics")]
+    public Task<DynamicFormStatisticConfigResult> GetStatistics(
         [FromRoute] string id,
-        [FromBody] UpdateDynamicFormStatisticConfigReq req,
         CancellationToken ct)
-        => _svc.UpdateStatisticConfigAsync(id, req, ct);
+        => _svc.GetStatisticsAsync(id, ct);
+
+    [HttpPatch("{id}/statistics")]
+    public Task<DynamicFormStatisticConfigResult> UpdateStatisticConfig(
+        [FromRoute] string id,
+        [FromBody] JsonElement body,
+        CancellationToken ct)
+        => _svc.UpdateStatisticConfigAsync(id, body, ct);
 
     [HttpPost("{id}/publish")]
-    public Task<DynamicFormDetail> Publish([FromRoute] string id, CancellationToken ct)
-        => _svc.PublishAsync(id, ct);
+    public Task<DynamicFormDetail> Publish(
+        [FromRoute] string id,
+        [FromBody(EmptyBodyBehavior = EmptyBodyBehavior.Allow)] PublishDynamicFormReq? req,
+        CancellationToken ct)
+        => _svc.PublishAsync(id, req, ct);
 
     [HttpPost("{id}/clone")]
     public Task<DynamicFormDetail> Clone(
@@ -74,6 +98,9 @@ public sealed class DynamicFormController : ControllerBase
         => _svc.ImportDynamicExcelBlockAsync(id, req, ct);
 
     [HttpDelete("{id}")]
-    public Task Delete([FromRoute] string id, CancellationToken ct)
-        => _svc.DeleteAsync(id, ct);
+    public Task Delete(
+        [FromRoute] string id,
+        [FromQuery] int? expectedRevision,
+        CancellationToken ct)
+        => _svc.DeleteAsync(id, expectedRevision, ct);
 }

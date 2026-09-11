@@ -1,7 +1,11 @@
 using Hangfire;
 using tdtd_be.Services.Common;
+using tdtd_be.Services.DynamicFlows;
 using tdtd_be.Services.Notifications;
+using tdtd_be.Services.StatisticsReconciliation.Production;
+using tdtd_be.Services.StatisticsRun;
 using tdtd_be.Services.WorkAssignmentReports.Statistics;
+using tdtd_be.Services.WorkAssignmentReports.Runtime;
 using tdtd_be.Services.WorkAssignments.Queue;
 using tdtd_be.Services.WorkAssignments.Runtime;
 using tdtd_be.Uploads;
@@ -22,6 +26,12 @@ public sealed class NonOverlappingRecurringJobRunner
     private readonly IDocRoleReadModelProjectionRetryJobService _projectionRetry;
     private readonly IUserActionLogService _userActionLog;
     private readonly IWorkReportStatisticRebuildJobService _statisticRebuild;
+    private readonly IStatRunFoundationWorker _statRunFoundation;
+    private readonly IStatisticReconciliationProductionWorker _reconciliation;
+    private readonly IWorkReportLifecycleProjectionReconciler _lifecycleProjectionReconciler;
+    private readonly IDynamicFlowMappingOutboxReconciler
+        _dynamicFlowMappingOutboxReconciler;
+    private readonly IDynamicFlowRuntimeMaterializer _dynamicFlowRuntimeMaterializer;
 
     public NonOverlappingRecurringJobRunner(
         IMinioFileDocCleanupJob minioCleanup,
@@ -32,7 +42,13 @@ public sealed class NonOverlappingRecurringJobRunner
         INotificationDueScanJobService notificationDueScan,
         IDocRoleReadModelProjectionRetryJobService projectionRetry,
         IUserActionLogService userActionLog,
-        IWorkReportStatisticRebuildJobService statisticRebuild)
+        IWorkReportStatisticRebuildJobService statisticRebuild,
+        IStatRunFoundationWorker statRunFoundation,
+        IStatisticReconciliationProductionWorker reconciliation,
+        IWorkReportLifecycleProjectionReconciler lifecycleProjectionReconciler,
+        IDynamicFlowMappingOutboxReconciler
+            dynamicFlowMappingOutboxReconciler,
+        IDynamicFlowRuntimeMaterializer dynamicFlowRuntimeMaterializer)
     {
         _minioCleanup = minioCleanup;
         _tusTempCleanup = tusTempCleanup;
@@ -43,6 +59,12 @@ public sealed class NonOverlappingRecurringJobRunner
         _projectionRetry = projectionRetry;
         _userActionLog = userActionLog;
         _statisticRebuild = statisticRebuild;
+        _statRunFoundation = statRunFoundation;
+        _reconciliation = reconciliation;
+        _lifecycleProjectionReconciler = lifecycleProjectionReconciler;
+        _dynamicFlowMappingOutboxReconciler =
+            dynamicFlowMappingOutboxReconciler;
+        _dynamicFlowRuntimeMaterializer = dynamicFlowRuntimeMaterializer;
     }
 
     [DisableConcurrentExecution(LongJobLockSeconds)]
@@ -90,4 +112,36 @@ public sealed class NonOverlappingRecurringJobRunner
         int batchSize,
         CancellationToken ct = default)
         => _statisticRebuild.ProcessPendingJobsAsync(maxJobs, batchSize, ct);
+
+    [DisableConcurrentExecution(ShortJobLockSeconds)]
+    public Task<int> ProcessStatRunFoundationDirectJobsAsync(
+        int maxJobs,
+        CancellationToken ct = default)
+        => _statRunFoundation.ProcessPendingAsync(maxJobs, ct);
+
+    [DisableConcurrentExecution(ShortJobLockSeconds)]
+    public Task<int> ProcessStatisticReconciliationAsync(
+        int maxJobs,
+        CancellationToken ct = default)
+        => _reconciliation.ProcessPendingAsync(maxJobs, ct);
+
+    [DisableConcurrentExecution(ShortJobLockSeconds)]
+    public Task<int> ProcessWorkReportLifecycleProjectionOutboxAsync(
+        int maxReports,
+        CancellationToken ct = default)
+        => _lifecycleProjectionReconciler.ProcessPendingAsync(maxReports, ct);
+
+    [DisableConcurrentExecution(ShortJobLockSeconds)]
+    public Task<int> ProcessDynamicFlowMappingOutboxAsync(
+        int maxItems,
+        CancellationToken ct = default)
+        => _dynamicFlowMappingOutboxReconciler.ProcessPendingAsync(
+            maxItems,
+            ct);
+
+    [DisableConcurrentExecution(ShortJobLockSeconds)]
+    public Task<int> ProcessDynamicFlowRuntimeOutboxAsync(
+        int maxItems,
+        CancellationToken ct = default)
+        => _dynamicFlowRuntimeMaterializer.ProcessPendingAsync(maxItems, ct);
 }

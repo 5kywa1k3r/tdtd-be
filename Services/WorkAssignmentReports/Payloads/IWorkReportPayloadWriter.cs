@@ -1,3 +1,4 @@
+using MongoDB.Driver;
 using tdtd_be.Models;
 
 namespace tdtd_be.Services.WorkAssignmentReports.Payloads;
@@ -12,5 +13,6 @@ public interface IWorkReportPayloadWriter
         string? summarySourceJson,
         string? actorUserId,
         DateTime now,
-        CancellationToken ct = default);
+        CancellationToken ct = default,
+        IClientSessionHandle? session = null);
 }

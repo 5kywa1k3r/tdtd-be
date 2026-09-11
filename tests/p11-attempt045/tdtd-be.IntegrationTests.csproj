@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>tdtd-be.IntegrationTests</AssemblyName>
+    <RootNamespace>tdtd_be.IntegrationTests</RootNamespace>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\tdtd-be.csproj" />
+    <Compile Include="..\tdtd-be.IntegrationTests\**\*.cs"
+             Exclude="..\tdtd-be.IntegrationTests\P11IndependentDiagnosticFixture.cs;..\tdtd-be.IntegrationTests\obj\**;..\tdtd-be.IntegrationTests\bin\**;..\tdtd-be.IntegrationTests\**\obj\**;..\tdtd-be.IntegrationTests\**\bin\**;..\tdtd-be.IntegrationTests\.build\**"
+             Link="OriginalIntegrationTests\%(RecursiveDir)%(Filename)%(Extension)" />
+    <Compile Include="P11IndependentDiagnosticFixture045.cs" />
+    <Compile Include="..\tdtd-be.P10T26Integration\PublicationV7Fixture.cs"
+             Link="PublicationV7Fixture.cs" />
+  </ItemGroup>
+</Project>

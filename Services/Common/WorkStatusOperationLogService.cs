@@ -13,6 +13,10 @@ namespace tdtd_be.Services.Common;
 public interface IWorkStatusOperationLogService
 {
     Task WriteAsync(WorkStatusOperationLog log, CancellationToken ct = default);
+    Task WriteIdempotentAsync(
+        string lifecycleEventKey,
+        WorkStatusOperationLog log,
+        CancellationToken ct = default);
     Task<PagedResult<WorkStatusOperationLogRow>> SearchAsync(
         WorkStatusOperationLogSearchRequest request,
         CancellationToken ct = default);
@@ -45,7 +49,7 @@ public sealed class WorkStatusOperationLogService : IWorkStatusOperationLogServi
             log.UpdatedAtUtc = now;
             log.IsDeleted = false;
 
-            await _ctx.WorkStatusOperationLogs.InsertOneAsync(log, cancellationToken: ct);
+            await InsertAsync(log, log.LifecycleEventKey, ct);
         }
         catch (Exception ex)
         {
@@ -59,6 +63,53 @@ public sealed class WorkStatusOperationLogService : IWorkStatusOperationLogServi
                 log.WorkAssignmentId,
                 log.WorkReportPeriodId,
                 log.WorkAssignmentReportId);
+        }
+    }
+
+    public async Task WriteIdempotentAsync(
+        string lifecycleEventKey,
+        WorkStatusOperationLog log,
+        CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(lifecycleEventKey))
+            throw new ArgumentException("A lifecycle event key is required.", nameof(lifecycleEventKey));
+        ArgumentNullException.ThrowIfNull(log);
+
+        var now = DateTime.UtcNow;
+        log.CreatedAtUtc = log.CreatedAtUtc == default ? now : log.CreatedAtUtc;
+        log.UpdatedAtUtc = now;
+        log.IsDeleted = false;
+        await InsertAsync(log, lifecycleEventKey.Trim(), ct);
+    }
+
+    private async Task InsertAsync(
+        WorkStatusOperationLog log,
+        string? lifecycleEventKey,
+        CancellationToken ct)
+    {
+        lifecycleEventKey = string.IsNullOrWhiteSpace(lifecycleEventKey)
+            ? null
+            : lifecycleEventKey.Trim();
+        if (lifecycleEventKey is not null)
+        {
+            log.LifecycleEventKey = lifecycleEventKey;
+            log.Id = tdtd_be.Services.WorkAssignmentReports.Runtime.WorkReportLifecycleOutboxContract
+                .ComputeStableObjectId(lifecycleEventKey);
+        }
+
+        try
+        {
+            await _ctx.WorkStatusOperationLogs.InsertOneAsync(log, cancellationToken: ct);
+        }
+        catch (MongoWriteException ex) when (
+            lifecycleEventKey is not null &&
+            ex.WriteError?.Category == ServerErrorCategory.DuplicateKey)
+        {
+            var exists = await _ctx.WorkStatusOperationLogs
+                .Find(x => x.LifecycleEventKey == lifecycleEventKey && !x.IsDeleted)
+                .AnyAsync(ct);
+            if (!exists)
+                throw;
         }
     }
 

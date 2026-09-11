@@ -6,14 +6,14 @@ namespace tdtd_be.Common.Cache
 {
     public sealed class RedisDashboardCache
     {
-        private readonly IDatabase _db;
+        private readonly IDatabase? _db;
         private readonly IConfiguration _cfg;
 
         private static readonly JsonSerializerOptions JsonOpts = new(JsonSerializerDefaults.Web);
 
-        public RedisDashboardCache(IConnectionMultiplexer mux, IConfiguration cfg)
+        public RedisDashboardCache(IConnectionMultiplexer? mux, IConfiguration cfg)
         {
-            _db = mux.GetDatabase();
+            _db = mux?.GetDatabase();
             _cfg = cfg;
         }
 
@@ -34,6 +34,7 @@ namespace tdtd_be.Common.Cache
         public async Task<T?> GetAsync<T>(string cacheKey, CancellationToken ct = default)
         {
             ct.ThrowIfCancellationRequested();
+            if (_db is null) return default;
 
             var val = await _db.StringGetAsync(cacheKey);
             if (val.IsNullOrEmpty) return default;
@@ -44,6 +45,7 @@ namespace tdtd_be.Common.Cache
         public Task SetAsync<T>(string cacheKey, T value, TimeSpan? ttl = null, CancellationToken ct = default)
         {
             ct.ThrowIfCancellationRequested();
+            if (_db is null) return Task.CompletedTask;
 
             return _db.StringSetAsync(
                 cacheKey,
@@ -52,10 +54,14 @@ namespace tdtd_be.Common.Cache
         }
 
         public Task<bool> TryAcquireLockAsync(string cacheKey, string token)
-            => _db.StringSetAsync(LockKey(cacheKey), token, LockTtl, When.NotExists);
+            => _db is null
+                ? Task.FromResult(true)
+                : _db.StringSetAsync(LockKey(cacheKey), token, LockTtl, When.NotExists);
 
         public async Task ReleaseLockAsync(string cacheKey, string token)
         {
+            if (_db is null) return;
+
             const string script = @"
 if redis.call('get', KEYS[1]) == ARGV[1]
 then
@@ -82,6 +88,9 @@ end";
 
             if (factory is null)
                 throw AppExceptionFactory.BadRequest(AppErrorCode.COMMON_VALIDATION_FAILED, new { field = "factory" });
+
+            if (_db is null)
+                return await factory(ct);
 
             if (!forceRefresh)
             {

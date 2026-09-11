@@ -77,6 +77,33 @@ public sealed class AppTimeService : IAppTimeService
     }
 }
 
+public sealed class FixedAppTimeService : IAppTimeService
+{
+    public const string ConfigurationKey = "AppTime:TestingFixedUtcNow";
+    private readonly AppTimeService _inner = new();
+
+    public FixedAppTimeService(DateTime utcNow)
+    {
+        if (utcNow.Kind != DateTimeKind.Utc)
+            throw new ArgumentException("Fixed time must be UTC.", nameof(utcNow));
+        UtcNow = utcNow;
+    }
+
+    public DateTime UtcNow { get; }
+    public TimeZoneInfo ApplicationTimeZone => _inner.ApplicationTimeZone;
+    public DateTime ToUtc(DateTime value) => _inner.ToUtc(value);
+    public DateTime? ToUtc(DateTime? value) => _inner.ToUtc(value);
+    public DateTime NormalizeUtcDate(DateTime value) =>
+        _inner.NormalizeUtcDate(value);
+    public DateTime EndOfUtcDate(DateTime value) => _inner.EndOfUtcDate(value);
+    public DateTime NextLocalMidnightUtc(DateTime utcNow) =>
+        _inner.NextLocalMidnightUtc(utcNow);
+    public bool IsLastSundayOfMonth(DateTime utcNow) =>
+        _inner.IsLastSundayOfMonth(utcNow);
+    public AppUtcDateRange NormalizeMonthRange(DateTime? fromUtc, DateTime? toUtc)
+        => AppTimeRangeHelper.NormalizeMonthRange(fromUtc, toUtc, UtcNow);
+}
+
 public static class AppTimeRangeHelper
 {
     public static AppUtcDateRange NormalizeMonthRange(

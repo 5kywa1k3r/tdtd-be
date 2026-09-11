@@ -41,6 +41,27 @@ public sealed class DynamicFlowEvent : BaseEntity
     [BsonRepresentation(BsonType.ObjectId)]
     public string? FlowBranchId { get; set; }
 
+    [BsonElement("executionEpoch")]
+    public int? ExecutionEpoch { get; set; }
+
+    [BsonElement("stepInstanceId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? StepInstanceId { get; set; }
+
+    [BsonElement("attemptNo")]
+    public int? AttemptNo { get; set; }
+
+    [BsonElement("gatewayInstanceId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? GatewayInstanceId { get; set; }
+
+    [BsonElement("gatewayVersion")]
+    public int? GatewayVersion { get; set; }
+
+    [BsonElement("contributionId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? ContributionId { get; set; }
+
     [BsonElement("parentFlowBranchId")]
     [BsonRepresentation(BsonType.ObjectId)]
     public string? ParentFlowBranchId { get; set; }

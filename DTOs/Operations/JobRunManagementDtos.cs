@@ -135,6 +135,7 @@ public sealed class FlowStatisticProjectionDiagnosticsResponse
     public int ScannedReportCount { get; init; }
     public long FieldProjectionRowCount { get; init; }
     public long TableProjectionRowCount { get; init; }
+    public long LabelProjectionRowCount { get; init; }
     public int NoProjectionReportCount { get; init; }
     public int StaleProjectionReportCount { get; init; }
     public int FlowMetadataMismatchReportCount { get; init; }
@@ -158,8 +159,10 @@ public sealed class FlowStatisticProjectionDiagnosticRow
     public string? PayloadHash { get; init; }
     public int FieldProjectionRows { get; init; }
     public int TableProjectionRows { get; init; }
+    public int LabelProjectionRows { get; init; }
     public bool FieldProjectionFresh { get; init; }
     public bool TableProjectionFresh { get; init; }
+    public bool LabelProjectionFresh { get; init; }
     public bool FlowMetadataMatches { get; init; }
     public List<string> IssueTypes { get; init; } = new();
 }

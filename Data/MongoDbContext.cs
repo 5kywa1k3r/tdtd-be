@@ -1,14 +1,17 @@
-﻿using Microsoft.Extensions.Options;
+using Microsoft.Extensions.Options;
 using MongoDB.Driver;
 using tdtd_be.Data.Infrastructure;
 using tdtd_be.Models;
 using tdtd_be.Models.Statistics;
+using tdtd_be.Models.StatisticsConfiguration;
+using tdtd_be.Models.StatisticsReconciliation;
 
 namespace tdtd_be.Data
 {
     public sealed class MongoDbContext
     {
         public IMongoDatabase Db { get; }
+        public MongoOptions Options { get; }
 
         public IMongoCollection<AppUser> Users { get; }
         public IMongoCollection<RefreshTokenDoc> RefreshTokens { get; }
@@ -21,6 +24,9 @@ namespace tdtd_be.Data
         public IMongoCollection<DynamicFormTemplate> DynamicFormTemplates { get; }
         public IMongoCollection<DynamicFormSectionDocument> DynamicFormSections { get; }
         public IMongoCollection<LabelCatalogItem> Labels { get; }
+        public IMongoCollection<StatConfigCommandReceipt> StatConfigCommandReceipts { get; }
+        public IMongoCollection<StatConfigValidationJob> StatConfigValidationJobs { get; }
+        public IMongoCollection<StatConfigAuditOutboxItem> StatConfigAuditOutbox { get; }
         public IMongoCollection<LabelEnumCatalog> LabelEnumCatalogs { get; }
         public IMongoCollection<LabelEnumOptionReadModel> LabelEnumOptionReadModels { get; }
         public IMongoCollection<Work> Works { get; }
@@ -37,7 +43,23 @@ namespace tdtd_be.Data
         public IMongoCollection<WorkSummaryTokenLedger> WorkSummaryTokenLedgers { get; }
         public IMongoCollection<DynamicFlowTemplate> DynamicFlowTemplates { get; }
         public IMongoCollection<DynamicFlowTemplateVersion> DynamicFlowTemplateVersions { get; }
+        public IMongoCollection<DynamicFlowDefinitionCommandReceipt> DynamicFlowDefinitionCommandReceipts { get; }
         public IMongoCollection<DynamicFlowEvent> DynamicFlowEvents { get; }
+        public IMongoCollection<DynamicFlowInstance> DynamicFlowInstances { get; }
+        public IMongoCollection<DynamicFlowStepInstance> DynamicFlowStepInstances { get; }
+        public IMongoCollection<DynamicFlowParticipantSnapshot> DynamicFlowParticipantSnapshots { get; }
+        public IMongoCollection<DynamicFlowRuntimeCommandReceipt> DynamicFlowRuntimeCommandReceipts { get; }
+        public IMongoCollection<DynamicFlowRuntimeEvent> DynamicFlowRuntimeEvents { get; }
+        public IMongoCollection<DynamicFlowRuntimeOutboxItem> DynamicFlowRuntimeOutbox { get; }
+        public IMongoCollection<DynamicFlowMappingApplyReceipt> DynamicFlowMappingApplyReceipts { get; }
+        public IMongoCollection<DynamicFlowMappingProvenanceRecord> DynamicFlowMappingProvenanceRecords { get; }
+        public IMongoCollection<DynamicFlowMappingEvent> DynamicFlowMappingEvents { get; }
+        public IMongoCollection<DynamicFlowMappingOutboxItem> DynamicFlowMappingOutbox { get; }
+        public IMongoCollection<DynamicFlowGatewayInstance> DynamicFlowGatewayInstances { get; }
+        public IMongoCollection<DynamicFlowGatewayContribution> DynamicFlowGatewayContributions { get; }
+        public IMongoCollection<DynamicFlowPeriodicSchedule> DynamicFlowPeriodicSchedules { get; }
+        public IMongoCollection<DynamicFlowPeriodicOccurrence> DynamicFlowPeriodicOccurrences { get; }
+        public IMongoCollection<DynamicFlowExecutionEpoch> DynamicFlowExecutionEpochs { get; }
         public IMongoCollection<WorkTemplateAssignee> WorkTemplateAssignees { get; }
         public IMongoCollection<DocRole> DocRoles { get; }
         public IMongoCollection<WorkListDocRole> WorkListDocRoles { get; }
@@ -69,11 +91,17 @@ namespace tdtd_be.Data
         public IMongoCollection<WorkReportFieldStatValue> WorkReportFieldStatValues { get; }
         public IMongoCollection<WorkReportFieldStatAggregate> WorkReportFieldStatAggregates { get; }
         public IMongoCollection<WorkReportStatisticRebuildJob> WorkReportStatisticRebuildJobs { get; }
+        public IMongoCollection<StatisticReconciliationRun> StatisticReconciliationRuns { get; }
+        public IMongoCollection<StatisticReconciliationObservation> StatisticReconciliationObservations { get; }
+        public IMongoCollection<StatisticReconciliationReview> StatisticReconciliationReviews { get; }
         public IMongoCollection<WorkReportStatisticDiffConfig> WorkReportStatisticDiffConfigs { get; }
+        public IMongoCollection<StatRunExportArtifact> WorkReportStatisticExports { get; }
+        public IMongoCollection<StatRunExportArtifact> WorkReportStatisticDiffExports { get; }
         public IMongoCollection<UserNotification> Notifications { get; }
         public MongoDbContext(IOptions<MongoOptions> opt)
         {
             var o = opt.Value;
+            Options = o;
             var client = new MongoClient(o.ConnectionString);
             Db = client.GetDatabase(o.Database);
 
@@ -88,6 +116,12 @@ namespace tdtd_be.Data
             DynamicFormTemplates = Db.GetCollection<DynamicFormTemplate>(o.DynamicFormTemplateCollection);
             DynamicFormSections = Db.GetCollection<DynamicFormSectionDocument>(o.DynamicFormSectionCollection);
             Labels = Db.GetCollection<LabelCatalogItem>(o.LabelCollection);
+            StatConfigCommandReceipts = Db.GetCollection<StatConfigCommandReceipt>(
+                o.StatConfigCommandReceiptCollection);
+            StatConfigValidationJobs = Db.GetCollection<StatConfigValidationJob>(
+                o.StatConfigValidationJobCollection);
+            StatConfigAuditOutbox = Db.GetCollection<StatConfigAuditOutboxItem>(
+                o.StatConfigAuditOutboxCollection);
             LabelEnumCatalogs = Db.GetCollection<LabelEnumCatalog>(o.LabelEnumCatalogCollection);
             LabelEnumOptionReadModels = Db.GetCollection<LabelEnumOptionReadModel>(o.LabelEnumOptionReadModelCollection);
             Works = Db.GetCollection<Work>(o.WorkCollection);
@@ -104,7 +138,23 @@ namespace tdtd_be.Data
             WorkSummaryTokenLedgers = Db.GetCollection<WorkSummaryTokenLedger>(o.WorkSummaryTokenLedgerCollection);
             DynamicFlowTemplates = Db.GetCollection<DynamicFlowTemplate>(o.DynamicFlowTemplateCollection);
             DynamicFlowTemplateVersions = Db.GetCollection<DynamicFlowTemplateVersion>(o.DynamicFlowTemplateVersionCollection);
+            DynamicFlowDefinitionCommandReceipts = Db.GetCollection<DynamicFlowDefinitionCommandReceipt>(o.DynamicFlowDefinitionCommandReceiptCollection);
             DynamicFlowEvents = Db.GetCollection<DynamicFlowEvent>(o.DynamicFlowEventCollection);
+            DynamicFlowInstances = Db.GetCollection<DynamicFlowInstance>(o.DynamicFlowInstanceCollection);
+            DynamicFlowStepInstances = Db.GetCollection<DynamicFlowStepInstance>(o.DynamicFlowStepInstanceCollection);
+            DynamicFlowParticipantSnapshots = Db.GetCollection<DynamicFlowParticipantSnapshot>(o.DynamicFlowParticipantSnapshotCollection);
+            DynamicFlowRuntimeCommandReceipts = Db.GetCollection<DynamicFlowRuntimeCommandReceipt>(o.DynamicFlowRuntimeCommandReceiptCollection);
+            DynamicFlowRuntimeEvents = Db.GetCollection<DynamicFlowRuntimeEvent>(o.DynamicFlowRuntimeEventCollection);
+            DynamicFlowRuntimeOutbox = Db.GetCollection<DynamicFlowRuntimeOutboxItem>(o.DynamicFlowRuntimeOutboxCollection);
+            DynamicFlowMappingApplyReceipts = Db.GetCollection<DynamicFlowMappingApplyReceipt>(o.DynamicFlowMappingApplyReceiptCollection);
+            DynamicFlowMappingProvenanceRecords = Db.GetCollection<DynamicFlowMappingProvenanceRecord>(o.DynamicFlowMappingProvenanceCollection);
+            DynamicFlowMappingEvents = Db.GetCollection<DynamicFlowMappingEvent>(o.DynamicFlowMappingEventCollection);
+            DynamicFlowMappingOutbox = Db.GetCollection<DynamicFlowMappingOutboxItem>(o.DynamicFlowMappingOutboxCollection);
+            DynamicFlowGatewayInstances = Db.GetCollection<DynamicFlowGatewayInstance>(o.DynamicFlowGatewayInstanceCollection);
+            DynamicFlowGatewayContributions = Db.GetCollection<DynamicFlowGatewayContribution>(o.DynamicFlowGatewayContributionCollection);
+            DynamicFlowPeriodicSchedules = Db.GetCollection<DynamicFlowPeriodicSchedule>(o.DynamicFlowPeriodicScheduleCollection);
+            DynamicFlowPeriodicOccurrences = Db.GetCollection<DynamicFlowPeriodicOccurrence>(o.DynamicFlowPeriodicOccurrenceCollection);
+            DynamicFlowExecutionEpochs = Db.GetCollection<DynamicFlowExecutionEpoch>(o.DynamicFlowExecutionEpochCollection);
             WorkTemplateAssignees = Db.GetCollection<WorkTemplateAssignee>(o.WorkTemplateAssigneeCollection);
             DocRoles = Db.GetCollection<DocRole>(o.DocRoleCollection);
             WorkListDocRoles = Db.GetCollection<WorkListDocRole>(o.WorkListDocRoleCollection);
@@ -136,7 +186,15 @@ namespace tdtd_be.Data
             WorkReportFieldStatValues = Db.GetCollection<WorkReportFieldStatValue>(o.WorkReportFieldStatValueCollection);
             WorkReportFieldStatAggregates = Db.GetCollection<WorkReportFieldStatAggregate>(o.WorkReportFieldStatAggregateCollection);
             WorkReportStatisticRebuildJobs = Db.GetCollection<WorkReportStatisticRebuildJob>(o.WorkReportStatisticRebuildJobCollection);
+            StatisticReconciliationRuns = Db.GetCollection<StatisticReconciliationRun>(
+                o.StatisticReconciliationRunCollection);
+            StatisticReconciliationObservations = Db.GetCollection<StatisticReconciliationObservation>(
+                o.StatisticReconciliationObservationCollection);
+            StatisticReconciliationReviews = Db.GetCollection<StatisticReconciliationReview>(
+                o.StatisticReconciliationReviewCollection);
             WorkReportStatisticDiffConfigs = Db.GetCollection<WorkReportStatisticDiffConfig>(o.WorkReportStatisticDiffConfigCollection);
+            WorkReportStatisticExports = Db.GetCollection<StatRunExportArtifact>(o.WorkReportStatisticExportCollection);
+            WorkReportStatisticDiffExports = Db.GetCollection<StatRunExportArtifact>(o.WorkReportStatisticDiffExportCollection);
             Notifications = Db.GetCollection<UserNotification>(o.NotificationCollection);
         }
     }
