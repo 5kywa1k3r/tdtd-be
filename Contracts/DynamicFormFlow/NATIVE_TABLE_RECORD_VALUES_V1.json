@@ -1,0 +1,38 @@
+{
+  "contractId": "dynamic-form-native-table-record-values",
+  "version": 1,
+  "status": "SOURCE_ONLY_L4_MANUAL_HOST_WIRED_NOT_RUNTIME_VERIFIED",
+  "container": "WorkAssignmentReport.TableValuesJson.nativeTables",
+  "envelope": ["version", "schemaHash", "tables"],
+  "schemaPin": "Exact report.DynamicFormSchemaHash equals form.PublishedSchemaHash, after existing family/version/snapshot validation.",
+  "table": {"properties": ["tableId", "records"], "supportedLayouts": ["horizontal", "vertical"], "identity": "Exactly one table entry per definition tableId in a report. Identical names/configuration do not merge tables."},
+  "record": {"properties": ["recordId", "cells"], "cellsKey": "definition fieldId", "order": "records array order", "identity": "Stable opaque nonblank recordId; never row position or a display label."},
+  "cell": {
+    "valueState": ["type", "state=value", "value"],
+    "errorState": ["type", "state=error", "raw", "code"],
+    "rawKinds": ["string", "string[]"],
+    "missingCell": "Not entered; distinct from an explicit null cell.",
+    "number": "Finite JSON number with <=17 significant decimal digits (excluding trailing zeroes), decimal scale <=28, integer magnitude <=9007199254740991. The decimal literal must equal the shortest round-trip Number/double representation; reject rounding and underflow instead of rewriting. UI accepts decimal or exponent notation and retains invalid raw input in error state.",
+    "date": "dd/MM/yyyy, MM/yyyy or yyyy; fullDate requires dd/MM/yyyy.",
+    "maxLengthUnit": "UTF-16 code units, matching .NET string.Length and JavaScript string.length.",
+    "choice": "Exact stored option code, never label or silently converted code.",
+    "submit": "Reject every error state and missing/blank required cell; preserve 0 and false as actual values."
+  },
+  "write": "Existing report full-draft payload revision/commandId; preserve legacy blocks and root metadata. Missing native envelope/table is not a delete command; records=[] explicitly clears a list table. A matrix keeps all defined rows with cells={} when unentered; required cells are enforced on submit.",
+  "read": "Preserve raw on invalid JSON, unsupported version, pin mismatch or changed type; never initialize sample/default data during readback.",
+  "host": "Manual WorkReportEditorPage mounts native tables by section; explicit full save/submit preserves legacy root blocks and native sidecar. Persist exact request/commandId before dispatch; acknowledged response is read back without another write. Aggregate/Flow and publish activation remain outside L4.",
+  "sectionProjection": "Use pinned section.nativeTableIds to subset the native envelope. Native-only sections retain values, HasData/last-update/hash includes typed cell values/errors, and nativeTableCount is separate from legacy blockCount. Section detail adds nativeTablesVersion/nativeTablesJson only for native definitions. Never copy another section's native tables; Flow-restricted section detail is blocked until its native permission contract exists.",
+  "limits": {"recordsPerTable": 200, "cellsPerReport": 40000, "tableValuesJsonUtf8Bytes": 1048576, "visibleRecords": 10, "visibleFields": 10, "activeCellEditors": 1},
+  "matrix": {
+    "decision": "D1 confirmed by Yud on 2026-09-16: one matrix value set per tableId per report; a Form may contain multiple independent Tables.",
+    "properties": ["tableId", "rows"],
+    "row": {"properties": ["rowId", "cells"], "cellsKey": "definition fieldId"},
+    "identity": "reportId + tableId + rowId + fieldId, under the pinned schema. No instanceId or synthetic recordId.",
+    "rows": "Exact set of the pinned table's row IDs, each once. Display order comes from definition rows; payload order does not change identity.",
+    "shape": "Reject records, instanceId, unknown/duplicate/missing rows, foreign fields, and mixed record/matrix shapes. Never migrate a sample record during readback.",
+    "type": "Resolve the highest-order column/row/cell rule for each addressed cell.",
+    "copy": "A copied Table receives fresh table/row/field/statistic-target IDs; option codes and rule order stay unchanged. No join or statistic aggregation is inferred from matching labels or structure."
+  },
+  "job": "BLOCKED_UNTIL_L5_AND_D2",
+  "sourceValidators": ["DynamicFormNativeTableValues.Validate", "decodeNativeTableValues"]
+}

@@ -683,7 +683,7 @@ public sealed class DocRoleReadModelDriftService : IDocRoleReadModelDriftService
     }
 
     private static List<string> BuildReviewerIds(WorkAssignment? assignment, WorkTemplateAssignee? binding)
-        => new[] { assignment?.CreatedByUserId }
+        => new[] { tdtd_be.Services.WorkAssignments.Internal.WorkAssignmentCurrentAuthority.ReviewerId(assignment) }
             .Where(NotBlank)
             .Select(x => x!)
             .Distinct(StringComparer.Ordinal)

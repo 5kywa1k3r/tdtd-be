@@ -15,8 +15,13 @@ public sealed partial class WorkAssignmentBasicSummaryService
         DynamicFormTemplate template,
         NormalizedRequest request,
         StatRunCandidateBinding candidate,
-        CancellationToken ct)
+        CancellationToken ct,
+        bool nativeConsumer = false)
     {
+        // This scalar/Excel consumer cannot read native results yet. Keep both
+        // request and background-refresh paths closed before loading any cache.
+        if (!nativeConsumer && template.NativeTablesVersion is not null)
+            throw P804Schema("$.template", "BASIC_SUMMARY_NATIVE_RESULT_CONSUMER_REQUIRED");
         var state = await P804LoadStateAsync(null, scope, template, ct);
         if (state.IsVirtual ||
             !string.Equals(state.Status, StatConfigStatuses.Locked, StringComparison.Ordinal))
@@ -33,6 +38,8 @@ public sealed partial class WorkAssignmentBasicSummaryService
         }
 
         var payload = state.Payload;
+        if (!nativeConsumer && payload.NativeTargets is { Count: > 0 })
+            throw P804Schema("$.payload.nativeTargets", "BASIC_SUMMARY_NATIVE_RESULT_CONSUMER_REQUIRED");
         var configuredScope = payload.SourceScope
             ?? throw new InvalidOperationException("Locked Basic config has no source scope.");
         P9RejectSpoofedValue(request.SourceScopeMode, configuredScope.Mode, "sourceScopeMode");
@@ -43,6 +50,8 @@ public sealed partial class WorkAssignmentBasicSummaryService
 
         if (WorkAssignmentSummarySourceScope.IsFlowMode(configuredScope.Mode))
         {
+            if (nativeConsumer)
+                throw P804Schema("$.payload.sourceScope", "BASIC_NATIVE_FLOW_CONSUMER_REQUIRED");
             _candidateActivation.RequireCapability(
                 StatRunCapabilities.FlowScopes,
                 StatRunRouteRegistry.CoreJob(StatRunCapabilities.FlowScopes));

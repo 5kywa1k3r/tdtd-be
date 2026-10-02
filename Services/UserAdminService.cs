@@ -194,8 +194,7 @@ public sealed class UserAdminService : IUserAdminService
 
         if (RoleGuard.TryGetManagerUnit(me, out var managedUnitId))
         {
-            if (!string.Equals(targetUser.UnitId, managedUnitId, StringComparison.Ordinal))
-                throw UserAdminScopeForbidden("managerUnitScope", new { actorUserId = me.Id, targetUserId = targetUser.Id, targetUser.UnitId, managedUnitId });
+            await EnsureManagerUnitTargetAsync(me, targetUser.UnitId, ct);
             return;
         }
 
@@ -267,6 +266,13 @@ public sealed class UserAdminService : IUserAdminService
         if (u is null)
             throw UserAdminUnitNotFound(unitId);
         return u;
+    }
+
+    private async Task EnsureManagerUnitTargetAsync(MeResponse me, string? unitId, CancellationToken ct)
+    {
+        var scope = await UnitManagementScope.ResolveAsync(_ctx, me, ct);
+        var target = await RequireUnitAsync(unitId, ct);
+        UnitManagementScope.Require(scope, target.Code);
     }
 
     private static void EnsureUserBearingUnit(Unit unit)
@@ -353,8 +359,7 @@ public sealed class UserAdminService : IUserAdminService
 
         if (RoleGuard.TryGetManagerUnit(me, out var managedUnitId))
         {
-            if (!string.Equals(u.UnitId, managedUnitId, StringComparison.Ordinal))
-                throw UserAdminScopeForbidden("managerUnitScope", new { me.Id, userId, u.UnitId, managedUnitId });
+            await EnsureManagerUnitTargetAsync(me, u.UnitId, ct);
             if (targetUnit is null)
                 throw UserAdminScopeForbidden("targetUnitMissing", new { userId, u.UnitId });
             return ToResp(u, targetUnit.Symbol, targetUnit.ShortName, targetUnit.Code, positionName);
@@ -407,8 +412,7 @@ public sealed class UserAdminService : IUserAdminService
         }
         else if (RoleGuard.TryGetManagerUnit(me, out var managedUnitId))
         {
-            if (!string.Equals(req.UnitId, managedUnitId, StringComparison.Ordinal))
-                throw UserAdminScopeForbidden("managerUnitCreateScope", new { me.Id, req.UnitId, managedUnitId });
+            await EnsureManagerUnitTargetAsync(me, req.UnitId, ct);
         }
         else if (RoleGuard.IsManagerLevel(me))
         {
@@ -552,8 +556,7 @@ public sealed class UserAdminService : IUserAdminService
         }
         else if (RoleGuard.TryGetManagerUnit(me, out var managedUnitId))
         {
-            if (!string.Equals(user.UnitId, managedUnitId, StringComparison.Ordinal))
-                throw UserAdminScopeForbidden("managerUnitScope", new { me.Id, userId, user.UnitId, managedUnitId });
+            await EnsureManagerUnitTargetAsync(me, user.UnitId, ct);
         }
         else if (RoleGuard.IsManagerLevel(me))
         {
@@ -632,7 +635,12 @@ public sealed class UserAdminService : IUserAdminService
             throw UserAdminManageForbidden("actorRoleNotAllowed", me.Id, targetUserId: null);
 
         if (isManagerUnit)
-            userMatch &= Builders<AppUser>.Filter.Eq(x => x.UnitId, managerUnitId);
+        {
+            var scope = await UnitManagementScope.ResolveAsync(_ctx, me, ct);
+            var unitIds = await _ctx.Units.Find(x => x.Code != null && x.Code.StartsWith(scope!))
+                .Project(x => x.Id).ToListAsync(ct);
+            userMatch &= Builders<AppUser>.Filter.In(x => x.UnitId, unitIds);
+        }
 
         // ====== MANAGER_LEVEL scope ======
         ManagerLevelScope? managerLevelScope = null;

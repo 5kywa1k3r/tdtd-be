@@ -29,6 +29,7 @@ public sealed class WorkDocumentUploadTarget
 
 public sealed class WorkDocumentUploadOptions
 {
+    public List<WorkDocumentUploadTarget> ReadTargets { get; set; } = new();
     public bool CanUploadWork { get; set; }
     public List<WorkDocumentUploadTarget> AssignmentTargets { get; set; } = new();
 }

@@ -36,6 +36,7 @@ public sealed class WorkReportLifecycleProjectionReconciler : IWorkReportLifecyc
     private const int MaxStoredErrorLength = 4000;
 
     private readonly MongoDbContext _ctx;
+    private readonly IConfiguration _configuration;
     private readonly IWorkAssignmentQueueService _queue;
     private readonly IWorkAssignmentStatusSyncService _statusSync;
     private readonly IDocRoleReadModelProjectionService _docRoleProjection;
@@ -55,6 +56,7 @@ public sealed class WorkReportLifecycleProjectionReconciler : IWorkReportLifecyc
 
     public WorkReportLifecycleProjectionReconciler(
         MongoDbContext ctx,
+        IConfiguration configuration,
         IWorkAssignmentQueueService queue,
         IWorkAssignmentStatusSyncService statusSync,
         IDocRoleReadModelProjectionService docRoleProjection,
@@ -73,6 +75,7 @@ public sealed class WorkReportLifecycleProjectionReconciler : IWorkReportLifecyc
         ILogger<WorkReportLifecycleProjectionReconciler> logger)
     {
         _ctx = ctx;
+        _configuration = configuration;
         _queue = queue;
         _statusSync = statusSync;
         _docRoleProjection = docRoleProjection;
@@ -190,7 +193,9 @@ public sealed class WorkReportLifecycleProjectionReconciler : IWorkReportLifecyc
                 ct);
         }
 
-        return attemptedReportIds.Count + backfilled;
+        var aggregateDispatched = await tdtd_be.Services.AggregateMapping.Persistence.AggregateHostIntegration.DispatchAsync(
+            _ctx, _transactions, _configuration, maxReports, ct);
+        return attemptedReportIds.Count + backfilled + aggregateDispatched;
     }
 
     private async Task ReconcileClaimAsync(LifecycleProjectionClaim claim, CancellationToken ct)

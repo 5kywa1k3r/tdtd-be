@@ -24,6 +24,8 @@ public sealed partial class WorkAssignmentBasicSummaryService
             JsonElement body,
             CancellationToken ct)
     {
+        // Tạm khóa luồng tổng hợp cũ; giữ nguyên triển khai bên dưới.
+        LegacyAggregateRetirement.Reject();
         using var isolation =
             StatConfigIsolationGuard.EnterConfigurationMutation(
                 StatConfigOwnerKinds.BasicSummary);
@@ -49,6 +51,8 @@ public sealed partial class WorkAssignmentBasicSummaryService
             JsonElement body,
             CancellationToken ct)
     {
+        // Tạm khóa luồng tổng hợp cũ; giữ nguyên triển khai bên dưới.
+        LegacyAggregateRetirement.Reject();
         using var isolation =
             StatConfigIsolationGuard.EnterConfigurationMutation(
                 StatConfigOwnerKinds.BasicSummary);
@@ -76,6 +80,8 @@ public sealed partial class WorkAssignmentBasicSummaryService
             JsonElement body,
             CancellationToken ct)
     {
+        // Tạm khóa luồng tổng hợp cũ; giữ nguyên triển khai bên dưới.
+        LegacyAggregateRetirement.Reject();
         using var isolation =
             StatConfigIsolationGuard.EnterConfigurationMutation(
                 StatConfigOwnerKinds.BasicSummary);

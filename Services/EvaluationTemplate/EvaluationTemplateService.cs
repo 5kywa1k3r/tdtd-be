@@ -31,8 +31,9 @@ public sealed class EvaluationTemplateService : IEvaluationTemplateService
 
     public async Task<IReadOnlyList<EvaluationTemplateDto>> GetActiveAsync(CancellationToken ct)
     {
+        var scopes = VisibleScopes();
         var rows = await _ctx.EvaluationTemplates
-            .Find(x => !x.IsDeleted && x.IsActive)
+            .Find(x => !x.IsDeleted && x.IsActive && scopes.Contains(x.UnitCodeScope))
             .SortBy(x => x.RepresentativeLabel)
             .ThenBy(x => x.RepresentativeCode)
             .ToListAsync(ct);
@@ -42,8 +43,9 @@ public sealed class EvaluationTemplateService : IEvaluationTemplateService
 
     public async Task<IReadOnlyList<EvaluationTemplateDto>> GetAllAsync(CancellationToken ct)
     {
+        var scopes = VisibleScopes();
         var rows = await _ctx.EvaluationTemplates
-            .Find(x => !x.IsDeleted)
+            .Find(x => !x.IsDeleted && scopes.Contains(x.UnitCodeScope))
             .SortByDescending(x => x.IsActive)
             .ThenBy(x => x.RepresentativeLabel)
             .ThenBy(x => x.RepresentativeCode)
@@ -57,8 +59,9 @@ public sealed class EvaluationTemplateService : IEvaluationTemplateService
         if (string.IsNullOrWhiteSpace(id))
             throw EvaluationTemplateBadRequest(AppErrorCode.EVALUATION_TEMPLATE_ID_REQUIRED, new { id });
 
+        var scopes = VisibleScopes();
         var doc = await _ctx.EvaluationTemplates
-            .Find(x => x.Id == id && !x.IsDeleted)
+            .Find(x => x.Id == id && !x.IsDeleted && scopes.Contains(x.UnitCodeScope))
             .FirstOrDefaultAsync(ct)
             ?? throw EvaluationTemplateNotFound(id);
 
@@ -73,7 +76,9 @@ public sealed class EvaluationTemplateService : IEvaluationTemplateService
         var now = DateTime.UtcNow;
         var representativeCode = NormalizeCode(req.RepresentativeCode);
         var representativeLabel = NormalizeLabel(req.RepresentativeLabel, "representativeLabel");
-        var unitCodeScope = NormalizeScope(req.UnitCodeScope, me);
+        var unitCodeScope = OwnScope(me);
+        if (!string.IsNullOrWhiteSpace(req.UnitCodeScope) && req.UnitCodeScope.Trim() != unitCodeScope)
+            throw AppExceptionFactory.Forbidden(AppErrorCode.EVALUATION_TEMPLATE_MANAGE_FORBIDDEN);
         var items = NormalizeItems(req.Items);
 
         var duplicateCode = await _ctx.EvaluationTemplates
@@ -100,8 +105,52 @@ public sealed class EvaluationTemplateService : IEvaluationTemplateService
         return ToDto(doc);
     }
 
-    public Task<EvaluationTemplateDto> UpdateAsync(string id, UpdateEvaluationTemplateRequest req, CancellationToken ct)
-        => throw EvaluationTemplateBadRequest(AppErrorCode.EVALUATION_TEMPLATE_UPDATE_UNSUPPORTED, new { id });
+    public async Task<EvaluationTemplateDto> UpdateAsync(string id, UpdateEvaluationTemplateRequest req, CancellationToken ct)
+    {
+        var me = _me.RequireMe();
+        EnsureCanManage(me);
+        if (string.IsNullOrWhiteSpace(id))
+            throw EvaluationTemplateBadRequest(AppErrorCode.EVALUATION_TEMPLATE_ID_REQUIRED, new { id });
+
+        var ownScope = OwnScope(me);
+        var doc = await _ctx.EvaluationTemplates
+            .Find(x => x.Id == id && !x.IsDeleted && x.CreatedByUserId == me.Id && x.UnitCodeScope == ownScope)
+            .FirstOrDefaultAsync(ct)
+            ?? throw EvaluationTemplateNotFound(id);
+
+        if (!string.IsNullOrWhiteSpace(req.UnitCodeScope) && req.UnitCodeScope.Trim() != ownScope)
+            throw AppExceptionFactory.Forbidden(AppErrorCode.EVALUATION_TEMPLATE_MANAGE_FORBIDDEN);
+        if (req.IsActive != doc.IsActive)
+            throw EvaluationTemplateBadRequest(AppErrorCode.EVALUATION_TEMPLATE_UPDATE_UNSUPPORTED, new { reason = "USE_DEACTIVATE_ACTION" });
+
+        // Changing codes/labels after a Work has used them would rewrite the
+        // meaning of historical evaluations. Deactivation remains available.
+        var usedByWork = await _ctx.Works.Find(x => x.EvaluationTemplateId == id && !x.IsDeleted).AnyAsync(ct);
+        var usedByAssignment = await _ctx.WorkAssignments.Find(x => x.EvaluationTemplateId == id && !x.IsDeleted).AnyAsync(ct);
+        if (usedByWork || usedByAssignment)
+            throw AppExceptionFactory.Create(AppErrorCode.EVALUATION_TEMPLATE_IN_USE, new { id });
+
+        var label = NormalizeLabel(req.RepresentativeLabel, "representativeLabel");
+        var items = NormalizeItems(req.Items);
+        var now = DateTime.UtcNow;
+        var result = await _ctx.EvaluationTemplates.UpdateOneAsync(
+            x => x.Id == id && !x.IsDeleted && x.CreatedByUserId == me.Id
+                && x.UnitCodeScope == ownScope && x.UpdatedAtUtc == doc.UpdatedAtUtc,
+            Builders<EvaluationTemplate>.Update
+                .Set(x => x.RepresentativeLabel, label)
+                .Set(x => x.Items, items)
+                .Set(x => x.UpdatedAtUtc, now)
+                .Set(x => x.UpdatedByUserId, me.Id),
+            cancellationToken: ct);
+        if (result.MatchedCount == 0)
+            throw AppExceptionFactory.Create(AppErrorCode.EVALUATION_TEMPLATE_UPDATE_CONFLICT, new { id });
+
+        doc.RepresentativeLabel = label;
+        doc.Items = items;
+        doc.UpdatedAtUtc = now;
+        doc.UpdatedByUserId = me.Id;
+        return ToDto(doc);
+    }
 
     public async Task DeactivateAsync(string id, CancellationToken ct)
     {
@@ -111,8 +160,9 @@ public sealed class EvaluationTemplateService : IEvaluationTemplateService
         if (string.IsNullOrWhiteSpace(id))
             throw EvaluationTemplateBadRequest(AppErrorCode.EVALUATION_TEMPLATE_ID_REQUIRED, new { id });
 
+        var ownScope = OwnScope(me);
         var rs = await _ctx.EvaluationTemplates.UpdateOneAsync(
-            x => x.Id == id && !x.IsDeleted,
+            x => x.Id == id && !x.IsDeleted && x.UnitCodeScope == ownScope && x.CreatedByUserId == me.Id,
             Builders<EvaluationTemplate>.Update
                 .Set(x => x.IsActive, false)
                 .Set(x => x.UpdatedAtUtc, DateTime.UtcNow)
@@ -139,18 +189,17 @@ public sealed class EvaluationTemplateService : IEvaluationTemplateService
         return label;
     }
 
-    private static string NormalizeScope(string? requestedScope, MeResponse me)
+    private IReadOnlyList<string> VisibleScopes()
     {
-        var scope = (requestedScope ?? string.Empty).Trim();
-        if (!string.IsNullOrWhiteSpace(scope))
-            return scope.ToUpperInvariant();
-
-        var fromUnitSymbol = (me.UnitSymbol ?? string.Empty).Trim();
-        if (!string.IsNullOrWhiteSpace(fromUnitSymbol))
-            return fromUnitSymbol.ToUpperInvariant();
-
-        return EvaluationTemplatePermissionPolicy.AllowedUnitCode;
+        var scopes = EvaluationTemplatePermissionPolicy.VisibleUnitCodes(_me.RequireMe().UnitCode);
+        if (scopes.Count == 0)
+            throw AppExceptionFactory.Forbidden(AppErrorCode.EVALUATION_TEMPLATE_MANAGE_FORBIDDEN);
+        return scopes;
     }
+
+    private static string OwnScope(MeResponse me)
+        => EvaluationTemplatePermissionPolicy.VisibleUnitCodes(me.UnitCode).FirstOrDefault()
+           ?? throw AppExceptionFactory.Forbidden(AppErrorCode.EVALUATION_TEMPLATE_MANAGE_FORBIDDEN);
 
     private static List<EvaluationTemplateItem> NormalizeItems(IEnumerable<CreateEvaluationTemplateItemRequest> items)
         => NormalizeItems(items.Select((x, i) => new UpdateEvaluationTemplateItemRequest(x.Code, x.Label, x.Order ?? i + 1, x.IsActive ?? true)));
@@ -182,7 +231,7 @@ public sealed class EvaluationTemplateService : IEvaluationTemplateService
         return normalized;
     }
 
-    private static EvaluationTemplateDto ToDto(EvaluationTemplate x)
+    private EvaluationTemplateDto ToDto(EvaluationTemplate x)
         => new(
             x.Id,
             x.RepresentativeCode,
@@ -192,35 +241,26 @@ public sealed class EvaluationTemplateService : IEvaluationTemplateService
             x.UnitCodeScope,
             x.Items.OrderBy(i => i.Order).ThenBy(i => i.Code)
                 .Select(i => new EvaluationTemplateItemDto(i.Code, i.Label, i.Order, i.IsActive))
-                .ToList());
+                .ToList(),
+            x.CreatedByUserId == _me.RequireMe().Id && x.UnitCodeScope == OwnScope(_me.RequireMe()));
 
     private static void EnsureCanManage(MeResponse me)
     {
         var unitCode = (me.UnitCode ?? string.Empty).Trim();
-        var unitSymbol = (me.UnitSymbol ?? string.Empty).Trim();
-        var positionCode = (me.PositionCode ?? string.Empty).Trim();
         var roles = me.Roles ?? new List<string>();
 
         var hasAllowedRole = roles.Any(role =>
             !string.IsNullOrWhiteSpace(role) &&
             EvaluationTemplatePermissionPolicy.AllowedRolePrefixes.Any(prefix =>
-                role.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                (string.Equals(role, prefix, StringComparison.OrdinalIgnoreCase)
+                 || role.StartsWith(prefix + ":", StringComparison.OrdinalIgnoreCase)))
         );
-
-        var isPv01 = string.Equals(unitCode, EvaluationTemplatePermissionPolicy.AllowedUnitCode, StringComparison.OrdinalIgnoreCase)
-            || string.Equals(unitSymbol, EvaluationTemplatePermissionPolicy.AllowedUnitCode, StringComparison.OrdinalIgnoreCase);
-
-        var hasAllowedPosition =
-            !string.IsNullOrWhiteSpace(positionCode) &&
-            EvaluationTemplatePermissionPolicy.AllowedPositionCodes.Contains(positionCode, StringComparer.OrdinalIgnoreCase);
-
-        if (!(isPv01 && hasAllowedPosition) && !hasAllowedRole)
+        var hasManagerAccount = me.AccountKind is "SYSTEM_ADMIN" or "LEVEL_MANAGER" or "UNIT_MANAGER";
+        if ((!hasAllowedRole && !hasManagerAccount) || EvaluationTemplatePermissionPolicy.VisibleUnitCodes(unitCode).Count == 0)
             throw AppExceptionFactory.Forbidden(AppErrorCode.EVALUATION_TEMPLATE_MANAGE_FORBIDDEN, new
             {
                 me.Id,
                 unitCode,
-                unitSymbol,
-                positionCode,
                 roles
             });
     }

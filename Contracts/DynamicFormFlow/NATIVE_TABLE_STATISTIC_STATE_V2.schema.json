@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:tdtd:dynamic-form-native-statistic-state:2",
+  "title": "P8 nativeStatistics v2 full metadata replacement",
+  "$comment": "Authoring drafts are not this wire format. Cross-ID ownership, combined budgets, type/options compatibility, labels/permissions/CAS and snapshots are checked by the P8 service. No new store or job activation.",
+  "type": "object", "additionalProperties": false, "required": ["version", "tables"],
+  "properties": {
+    "version": { "const": 2 },
+    "tables": { "type": "array", "maxItems": 30, "items": {
+      "type": "object", "additionalProperties": false, "required": ["tableId", "statisticTargets"],
+      "properties": {
+        "tableId": { "$ref": "#/$defs/id" },
+        "statisticTargets": { "type": "array", "items": { "$ref": "urn:tdtd:dynamic-form-native-table-definition:1#/$defs/statisticTarget" } },
+        "statisticPlan": { "$ref": "#/$defs/tablePlan" }
+      }
+    } }
+  },
+  "$defs": {
+    "id": { "type": "string", "minLength": 1, "pattern": "^\\S(?:[\\s\\S]*\\S)?$" },
+    "ids": { "type": "array", "minItems": 1, "maxItems": 200, "uniqueItems": true, "items": { "$ref": "#/$defs/id" } },
+    "tablePlan": {
+      "type": "object", "additionalProperties": false, "required": ["version", "targets"],
+      "properties": { "version": { "const": 2 }, "targets": { "type": "array", "maxItems": 30, "items": {
+        "oneOf": [{ "$ref": "#/$defs/enabled" }, { "$ref": "#/$defs/disabled" }]
+      } } }
+    },
+    "disabled": {
+      "type": "object", "additionalProperties": false, "required": ["id", "isStatistic"],
+      "properties": { "id": { "$ref": "#/$defs/id" }, "isStatistic": { "const": false } }
+    },
+    "enabled": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "isStatistic", "selector", "grouping", "input", "order", "operations", "statisticLabelCodes", "showInDetail", "showInTree"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" }, "isStatistic": { "const": true }, "selector": { "$ref": "#/$defs/selector" },
+        "grouping": { "enum": ["selection", "row", "column", "cell", "record"] }, "input": { "$ref": "#/$defs/input" },
+        "order": { "type": "object", "additionalProperties": false, "required": ["cells", "reports", "records"], "properties": {
+          "cells": { "enum": ["rowMajor", "columnMajor"] }, "reports": { "enum": ["reportIdAsc", "sourceUpdatedAtAsc"] }, "records": { "const": "recordIdAsc" }
+        } },
+        "operations": { "type": "array", "minItems": 1, "maxItems": 30, "items": { "$ref": "#/$defs/operation" } },
+        "statisticLabelCodes": { "type": "array", "maxItems": 30, "uniqueItems": true, "items": { "$ref": "#/$defs/id" } },
+        "showInDetail": { "type": "boolean" }, "showInTree": { "type": "boolean" }
+      },
+      "allOf": [{ "if": { "properties": { "selector": { "properties": { "kind": { "const": "matrix" } } } } },
+        "then": { "properties": { "grouping": { "enum": ["selection", "row", "column", "cell"] } } },
+        "else": { "properties": { "grouping": { "enum": ["selection", "column", "record"] } } } }]
+    },
+    "selector": { "oneOf": [
+      { "type": "object", "additionalProperties": false, "required": ["kind", "fieldIds", "rowIds"], "properties": {
+        "kind": { "const": "matrix" }, "fieldIds": { "$ref": "#/$defs/ids" }, "rowIds": { "$ref": "#/$defs/ids" }
+      } },
+      { "type": "object", "additionalProperties": false, "required": ["kind", "fieldIds", "records"], "properties": {
+        "kind": { "const": "records" }, "fieldIds": { "$ref": "#/$defs/ids" }, "records": { "const": "all" }
+      } }
+    ] },
+    "input": { "oneOf": [
+      { "type": "object", "additionalProperties": false, "required": ["mode"], "properties": { "mode": { "const": "all" } } },
+      { "type": "object", "additionalProperties": false, "required": ["mode", "types"], "properties": {
+        "mode": { "const": "types" }, "types": { "type": "array", "minItems": 1, "maxItems": 8, "uniqueItems": true,
+          "items": { "enum": ["plainText", "number", "date", "fullDate", "boolean", "singleSelect", "multiSelect", "stringList"] } }
+      } }
+    ] },
+    "operation": {
+      "type": "object", "additionalProperties": false, "required": ["operationId", "method", "options"],
+      "properties": {
+        "operationId": { "$ref": "#/$defs/id" },
+        "method": { "enum": ["COUNT", "DISTINCT_COUNT", "SUM", "AVG", "MIN", "MAX", "LATEST", "TRUE_COUNT", "FALSE_COUNT", "BUCKET_COUNT", "CONCAT", "STACK_ROWS", "STACK_COLUMNS"] },
+        "options": { "type": "object" }
+      },
+      "allOf": [{ "if": { "properties": { "method": { "const": "CONCAT" } } }, "then": { "properties": { "options": {
+        "type": "object", "additionalProperties": false, "required": ["separator", "itemSeparator", "blankPolicy", "duplicatePolicy", "format", "choiceFormat"],
+        "properties": { "separator": { "type": "string" }, "itemSeparator": { "type": "string" }, "blankPolicy": { "enum": ["keep", "skip"] },
+          "duplicatePolicy": { "enum": ["keep", "distinct"] }, "format": { "enum": ["text", "canonical"] }, "choiceFormat": { "enum": ["code", "label"] } }
+      } } }, "else": { "if": { "properties": { "method": { "const": "BUCKET_COUNT" } } },
+        "then": { "properties": { "options": { "type": "object", "additionalProperties": false, "required": ["mode"], "properties": { "mode": { "enum": ["option", "date"] } } } } },
+        "else": { "properties": { "options": { "maxProperties": 0 } } }
+      } }]
+    }
+  }
+}

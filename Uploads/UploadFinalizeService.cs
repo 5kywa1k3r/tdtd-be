@@ -20,6 +20,7 @@ public sealed class UploadFinalizeService
     private readonly ITusTerminationStore _termination;
     private readonly UploadTokenService _tokens;
     private readonly ILogger<UploadFinalizeService> _log;
+    private readonly IWorkDocumentPermissionService _documentPermission;
 
     public UploadFinalizeService(
         MongoDbContext ctx,
@@ -27,7 +28,8 @@ public sealed class UploadFinalizeService
         Microsoft.Extensions.Options.IOptions<UploadOptions> opt,
         ITusTerminationStore termination,
         UploadTokenService tokens,
-        ILogger<UploadFinalizeService> log)
+        ILogger<UploadFinalizeService> log,
+        IWorkDocumentPermissionService documentPermission)
     {
         _ctx = ctx;
         _minio = minio;
@@ -35,6 +37,7 @@ public sealed class UploadFinalizeService
         _termination = termination;
         _tokens = tokens;
         _log = log;
+        _documentPermission = documentPermission;
     }
 
     public async Task FinalizeAsync(FileCompleteContext ctx)
@@ -233,6 +236,7 @@ public sealed class UploadFinalizeService
             if (work is null)
                 throw AppExceptionFactory.NotFound(AppErrorCode.WORK_NOT_FOUND, new { workId = sourceId });
 
+            await _documentPermission.EnsureCanCreateWorkDocumentAsync(work.Id, payload.UserId, ct);
             return new WorkDocumentScopeInfo(
                 WorkDocumentConstants.ScopeWork,
                 work.Id,
@@ -250,8 +254,7 @@ public sealed class UploadFinalizeService
             if (assignment is null)
                 throw AppExceptionFactory.NotFound(AppErrorCode.WORK_ASSIGNMENT_NOT_FOUND, new { assignmentId = sourceId });
 
-            if (!string.Equals(assignment.CreatedByUserId, payload.UserId, StringComparison.Ordinal))
-                throw AppExceptionFactory.Forbidden(AppErrorCode.AUTH_FORBIDDEN, new { assignmentId = sourceId });
+            await _documentPermission.EnsureCanCreateAssignmentDocumentAsync(assignment.WorkId, assignment.Id, payload.UserId, ct);
 
             return new WorkDocumentScopeInfo(
                 WorkDocumentConstants.ScopeAssignmentBranch,

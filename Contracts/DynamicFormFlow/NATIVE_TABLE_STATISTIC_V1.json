@@ -1,0 +1,49 @@
+{
+  "contractId": "dynamic-form-native-table-statistic",
+  "version": 1,
+  "status": "SOURCE_ONLY_NOT_RUNTIME_ACTIVATED",
+  "owner": "DYNAMIC_FORM",
+  "definitionContract": "dynamic-form-native-table-definition/v1",
+  "command": {
+    "method": "PATCH",
+    "route": "/api/dynamic-forms/{id}/statistics",
+    "envelope": ["commandId", "expectedRevision", "expectedConfigHash", "payload"],
+    "payloadCollection": "nativeTargets",
+    "exclusiveWith": ["fields", "tables"],
+    "targetIdentity": ["tableId", "targetId"],
+    "targetAddressSource": "schema.tables[].statisticTargets[].target",
+    "metadata": ["isStatistic", "statistic", "statisticLabelCodes"],
+    "maximumMutations": 30,
+    "disabled": {"isStatistic": false, "statistic": null, "statisticLabelCodes": []},
+    "replay": "Same commandId and normalized request returns the stored receipt; changing the request conflicts."
+  },
+  "operationVocabulary": "DynamicFormStatisticOperationContract (field operations, never Excel metric operations)",
+  "schemaToCommandOperations": {
+    "count": "COUNT", "sum": "SUM", "avg": "AVG", "min": "MIN", "max": "MAX", "latest": "LATEST",
+    "trueCount": "TRUE_COUNT", "falseCount": "FALSE_COUNT", "bucketCount": "BUCKET_COUNT", "concat": "CONCAT"
+  },
+  "typeResolution": "Highest applied rule order among column, row and cell; unconfigured cell is plainText. Every cell in a target must share a type and choice code/label set.",
+  "readback": ["nativeTargetConfig", "nativeTargetSectionHash", "versions[].nativeTargetConfig", "versions[].nativeTargetSectionHash"],
+  "persistence": "statisticConfigSections.nativeTargetSectionJson and snapshots inside the existing template transaction/receipt",
+  "legacyHash": "Native section absent: preserve the old fields/Excel hash preimage. Native owner: include nativeTargetsVersion and nativeTargetConfig.",
+  "publishedMutation": "BLOCKED_UNTIL_L5_COMPLETE",
+  "projection": "BLOCKED_UNTIL_NATIVE_STATISTIC_CONSUMERS_COMPLETE",
+  "grainDecisionD2": "CELL_INPUT_SELECTED_2026_09_16",
+  "grainDecisionMeaning": "Cells are source observations; operation, grouping and output remain explicit. No universal numeric coercion, SUM or AVG.",
+  "coverageReview": {
+    "status": "REQUIREMENTS_REVISED_NOT_IMPLEMENTED",
+    "document": "docs/features/canvas-workspace/L5_STATISTIC_COVERAGE_AND_CONTRACT_2026_09_16.md",
+    "requiredBeyondV1": ["statistic selector separate from type target", "ranges resolved to stable IDs", "per-row/per-column/per-record/whole-range grouping", "multiple typed operations with explicit options", "literal text separator and deterministic ordering", "complete text result distinct from capped samples", "stacked table output and source provenance"],
+    "v1Limitations": ["only row/column/cell selectors", "no separator or grouping options", "no native reducer/result consumer", "richText statistics unsupported; stringList only COUNT"],
+    "replacementClaim": "Native v1 is insufficient to replace all existing Dynamic Excel report workflows; formula/non-input layout, IO and mapping need separate coverage."
+  },
+  "inputValidation": {
+    "status": "SOURCE_WRITTEN_NOT_WIRED_TO_JOB",
+    "entryPoint": "WorkReportNativeStatisticInput.Read",
+    "configView": "ReadNativeStatisticInputView",
+    "requires": ["published schema integrity", "current LOCKED P8 config with exact generation pins", "unique snapshot identities and current lineage", "explicit source contribution binding", "fresh verified report payload", "valid native values under pinned definition"],
+    "retains": ["full native envelope", "table and target identities", "type rules and option codes", "label snapshots and dependency pins", "source payload and lifecycle pins", "contribution binding and raw policy"],
+    "doesNotProvide": ["observation grain", "reducers", "contribution selection", "permissions", "historical result reading", "job staging or publication"],
+    "legacyP804": "Existing entry points still reject native owners. No field or Excel alias is created."
+  }
+}

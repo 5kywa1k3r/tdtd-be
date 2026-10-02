@@ -1,6 +1,8 @@
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using MongoDB.Driver;
+using MongoDB.Bson;
+using tdtd_be.Services.Works;
 using tdtd_be.Data;
 using tdtd_be.Models;
 using tdtd_be.Models.Enums;
@@ -127,13 +129,15 @@ public sealed class NotificationDueScanJobService : INotificationDueScanJobServi
         var fb = Builders<Work>.Filter;
         var filter = fb.Eq(x => x.IsDeleted, false)
                      & fb.Ne(x => x.Status, WorkStatus.S3)
-                     & fb.Ne(x => x.DueDate, null)
-                     & fb.Lte(x => x.DueDate, now)
-                     & fb.Gte(x => x.DueDate, minDueAt);
+                     & fb.Or(
+                         fb.Ne(x => x.DueDate, null) & fb.Lte(x => x.DueDate, now) & fb.Gte(x => x.DueDate, minDueAt),
+                         fb.Eq(x => x.DueDate, null) & fb.Ne(x => x.EndDate, null)
+                         & fb.Lte(x => x.EndDate, now) & fb.Gte(x => x.EndDate, minDueAt));
 
         var works = await _ctx.Works
-            .Find(filter)
-            .SortBy(x => x.DueDate)
+            .Aggregate().Match(filter)
+            .AppendStage<Work>(new BsonDocument("$set", new BsonDocument("effectiveDeadline", new BsonDocument("$ifNull", new BsonArray { "$dueDate", "$endDate" }))))
+            .Sort(new BsonDocument { { "effectiveDeadline", 1 }, { "_id", 1 } })
             .Limit(_workCap)
             .ToListAsync(ct);
 
@@ -145,7 +149,8 @@ public sealed class NotificationDueScanJobService : INotificationDueScanJobServi
                 work.LeaderDirectiveUserId
             }.Concat(work.LeaderWatchUserIds ?? new List<string>()));
 
-            var dueTicks = work.DueDate?.Ticks.ToString() ?? "none";
+            var effectiveDue = WorkDatePolicy.EffectiveDueDate(work);
+            var dueTicks = effectiveDue?.Ticks.ToString() ?? "none";
             return recipients.Select(userId => new NotificationCommand
             {
                 RecipientUserId = userId,
@@ -157,7 +162,7 @@ public sealed class NotificationDueScanJobService : INotificationDueScanJobServi
                 WorkType = work.Type,
                 WorkName = work.Name,
                 Category = UserNotificationCategories.Status,
-                DueAtUtc = work.DueDate,
+                DueAtUtc = effectiveDue,
                 EventKey = $"due:work:{work.Id}:{dueTicks}:user:{userId}"
             });
         });

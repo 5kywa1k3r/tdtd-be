@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:tdtd:dynamic-form-native-table-definition:1",
+  "title": "Dynamic Form native definition extension v1 (authoring only)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["sections", "fields", "blocks", "nativeTablesVersion", "tables"],
+  "properties": {
+    "sections": { "type": "array", "minItems": 1, "items": { "type": "object", "not": { "anyOf": [{ "required": ["sections"] }, { "required": ["parentSectionId"] }] } } },
+    "fields": { "type": "array", "maxItems": 200, "items": { "type": "object" } },
+    "blocks": { "type": "array", "maxItems": 30, "items": { "type": "object" } },
+    "nativeTablesVersion": { "const": 1 },
+    "tables": { "type": "array", "maxItems": 30, "items": { "$ref": "#/$defs/table" } }
+  },
+  "$comment": "Existing sections/fields/blocks retain their existing contract and guards. Cross-collection identity, ownership, combined budgets and canonical statistic writer checks run in the definition validator. Values/instance/grain are outside v1.",
+  "$defs": {
+    "text": { "type": "string", "minLength": 1 },
+    "order": { "type": "integer", "minimum": 0, "maximum": 2147483647 },
+    "safeInteger": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+    "columnTarget": {
+      "type": "object", "additionalProperties": false, "required": ["scope", "fieldId"],
+      "properties": { "scope": { "const": "column" }, "fieldId": { "$ref": "#/$defs/text" } }
+    },
+    "rowTarget": {
+      "type": "object", "additionalProperties": false, "required": ["scope", "rowId"],
+      "properties": { "scope": { "const": "row" }, "rowId": { "$ref": "#/$defs/text" } }
+    },
+    "cellTarget": {
+      "type": "object", "additionalProperties": false, "required": ["scope", "rowId", "fieldId"],
+      "properties": { "scope": { "const": "cell" }, "rowId": { "$ref": "#/$defs/text" }, "fieldId": { "$ref": "#/$defs/text" } }
+    },
+    "target": { "oneOf": [{ "$ref": "#/$defs/columnTarget" }, { "$ref": "#/$defs/rowTarget" }, { "$ref": "#/$defs/cellTarget" }] },
+    "option": {
+      "type": "object", "additionalProperties": false, "required": ["code", "label"],
+      "properties": { "code": { "$ref": "#/$defs/text" }, "label": { "$ref": "#/$defs/text" } }
+    },
+    "spec": {
+      "type": "object", "additionalProperties": false, "required": ["type", "required"],
+      "properties": {
+        "type": { "enum": ["plainText", "number", "date", "fullDate", "boolean", "singleSelect", "multiSelect", "richText", "stringList"] },
+        "required": { "type": "boolean" },
+        "maxLength": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "options": { "type": "array", "minItems": 1, "maxItems": 100, "items": { "$ref": "#/$defs/option" } }
+      },
+      "allOf": [
+        { "if": { "properties": { "type": { "enum": ["singleSelect", "multiSelect"] } } }, "then": { "required": ["options"] }, "else": { "not": { "required": ["options"] } } },
+        { "if": { "not": { "properties": { "type": { "const": "plainText" } } } }, "then": { "not": { "required": ["maxLength"] } } }
+      ]
+    },
+    "rule": {
+      "type": "object", "additionalProperties": false, "required": ["target", "spec", "order"],
+      "properties": { "target": { "$ref": "#/$defs/target" }, "spec": { "$ref": "#/$defs/spec" }, "order": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 } }
+    },
+    "typeConfig": {
+      "type": "object", "additionalProperties": false, "required": ["version", "sequence", "rules"],
+      "properties": { "version": { "const": 1 }, "sequence": { "$ref": "#/$defs/safeInteger" }, "rules": { "type": "array", "items": { "$ref": "#/$defs/rule" } } }
+    },
+    "column": {
+      "type": "object", "additionalProperties": false, "required": ["id", "name", "order"],
+      "properties": { "id": { "$ref": "#/$defs/text" }, "name": { "$ref": "#/$defs/text" }, "order": { "$ref": "#/$defs/order" } }
+    },
+    "row": {
+      "type": "object", "additionalProperties": false, "required": ["id", "name"],
+      "properties": { "id": { "$ref": "#/$defs/text" }, "name": { "$ref": "#/$defs/text" } }
+    },
+    "statisticTarget": {
+      "type": "object", "additionalProperties": false, "required": ["id", "target", "isStatistic"],
+      "properties": {
+        "id": { "$ref": "#/$defs/text" }, "target": { "$ref": "#/$defs/target" }, "isStatistic": { "type": "boolean" },
+        "statistic": {}, "statisticLabelCodes": { "type": "array", "items": { "type": "string" } }
+      },
+      "$comment": "Readback retains metadata, including missing/invalid legacy config, without supplying defaults. Create/update reject enabled statistic, any supplied config, or nonempty labels until native P8 commands are implemented."
+    },
+    "table": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "sectionId", "name", "order", "layout", "fields", "rows", "typeConfig", "statisticTargets"],
+      "properties": {
+        "id": { "$ref": "#/$defs/text" }, "sectionId": { "$ref": "#/$defs/text" }, "name": { "$ref": "#/$defs/text" },
+        "order": { "$ref": "#/$defs/order" }, "layout": { "enum": ["horizontal", "vertical", "matrix"] },
+        "fields": { "type": "array", "minItems": 1, "maxItems": 200, "items": { "$ref": "#/$defs/column" } },
+        "rows": { "type": "array", "maxItems": 200, "items": { "$ref": "#/$defs/row" } },
+        "typeConfig": { "$ref": "#/$defs/typeConfig" }, "statisticTargets": { "type": "array", "items": { "$ref": "#/$defs/statisticTarget" } },
+        "statisticPlan": { "$ref": "urn:tdtd:dynamic-form-native-statistic-state:2#/$defs/tablePlan" }
+      },
+      "allOf": [{ "if": { "properties": { "layout": { "const": "matrix" } } }, "then": { "properties": { "rows": { "minItems": 1 } } }, "else": { "properties": { "rows": { "maxItems": 0 } } } }]
+    }
+  }
+}

@@ -37,6 +37,9 @@ namespace tdtd_be.Services
             var claims = new List<Claim>
             {
                 new(JwtRegisteredClaimNames.Sub, u.Id),
+                // Bind preview/confirmation commands to one signed access token.
+                // Login and refresh both mint a new identity; stale confirmations must be previewed again.
+                new(JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString("N")),
 
                 new("username", u.Username ?? ""),
                 new("fullName", u.FullName ?? ""),

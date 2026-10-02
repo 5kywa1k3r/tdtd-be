@@ -24,7 +24,13 @@ public sealed record WorkAssignmentAdvancedSummarySourceScopePayload(
 public sealed record WorkAssignmentAdvancedSummarySectionPayload(
     string? SectionId,
     bool? IsCumulative,
-    IReadOnlyList<WorkAssignmentAdvancedSummaryTargetPayload>? Targets);
+    IReadOnlyList<WorkAssignmentAdvancedSummaryTargetPayload>? Targets,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    IReadOnlyList<WorkAssignmentAdvancedSummaryNativeTargetPayload>? NativeTargets = null);
+
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record WorkAssignmentAdvancedSummaryNativeTargetPayload(
+    string? TableId, string? TargetId, string? OperationId);
 
 [JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
 public sealed record WorkAssignmentAdvancedSummaryTargetPayload(

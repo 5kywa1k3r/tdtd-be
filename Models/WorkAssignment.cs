@@ -7,6 +7,11 @@ namespace tdtd_be.Models;
 [BsonCollection("work_assignments")]
 public sealed class WorkAssignment : BaseEntity
 {
+    // Write-conflict fence for native statistic publication; not a business revision.
+    [BsonElement("nativeStatisticPublicationFence")]
+    [BsonIgnoreIfDefault]
+    public long NativeStatisticPublicationFence { get; set; }
+
     [BsonId]
     [BsonRepresentation(BsonType.ObjectId)]
     public string Id { get; set; } = default!;
@@ -69,6 +74,10 @@ public sealed class WorkAssignment : BaseEntity
     [BsonElement("dueDate")]
     public DateTime? DueDate { get; set; }
 
+    // Deadline contraction preserves already generated periods, even empty ones.
+    [BsonElement("deadlineRetainedPeriodsBeforeUtc")]
+    public DateTime? DeadlineRetainedPeriodsBeforeUtc { get; set; }
+
     [BsonElement("completedDate")]
     public DateTime? CompletedDate { get; set; }
 
@@ -90,6 +99,15 @@ public sealed class WorkAssignment : BaseEntity
 
     [BsonElement("parentAssignmentId")]
     public string? ParentAssignmentId { get; set; }
+
+    // The issuer remains in CreatedByUserId for audit. A handover of the parent
+    // moves the current responsibility for reviewing this child separately.
+    [BsonElement("currentReviewerUserId")]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? CurrentReviewerUserId { get; set; }
+
+    [BsonElement("handoverTopologyRevision")]
+    public long HandoverTopologyRevision { get; set; }
 
     [BsonElement("rootAssignmentId")]
     public string RootAssignmentId { get; set; } = default!;

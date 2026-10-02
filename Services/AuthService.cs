@@ -89,6 +89,31 @@ namespace tdtd_be.Services
             return await IssueTokensAsync(user, ct);
         }
 
+        public async Task ChangePasswordAsync(string userId, ChangePasswordRequest req, CancellationToken ct)
+        {
+            var user = await Users.Find(x => x.Id == userId && !x.IsDeleted).FirstOrDefaultAsync(ct)
+                ?? throw AppExceptionFactory.Unauthorized(AppErrorCode.AUTH_UNAUTHORIZED);
+            var oldHash = user.PasswordHash;
+            if (_hasher.VerifyHashedPassword(user, oldHash, req.CurrentPassword) == PasswordVerificationResult.Failed)
+                throw AppExceptionFactory.BadRequest(AppErrorCode.AUTH_CURRENT_PASSWORD_INVALID);
+            if (string.IsNullOrWhiteSpace(req.NewPassword) || req.NewPassword.Length is < 6 or > 128)
+                throw AppExceptionFactory.BadRequest(AppErrorCode.COMMON_VALIDATION_FAILED);
+            if (_hasher.VerifyHashedPassword(user, oldHash, req.NewPassword) != PasswordVerificationResult.Failed)
+                throw AppExceptionFactory.BadRequest(AppErrorCode.AUTH_NEW_PASSWORD_SAME_AS_CURRENT);
+
+            var newHash = _hasher.HashPassword(user, req.NewPassword);
+            var changed = await Users.UpdateOneAsync(
+                x => x.Id == userId && !x.IsDeleted && x.PasswordHash == oldHash,
+                Builders<AppUser>.Update.Set(x => x.PasswordHash, newHash)
+                    .Set(x => x.UpdatedByUserId, userId)
+                    .Set(x => x.UpdatedAtUtc, DateTime.UtcNow),
+                cancellationToken: ct);
+            if (changed.MatchedCount == 0)
+                throw AppExceptionFactory.BadRequest(AppErrorCode.AUTH_CURRENT_PASSWORD_INVALID);
+
+            await RevokeUserSessionsAsync(userId, ct);
+        }
+
         public async Task<(AuthResponse resp, string refreshRaw)> RefreshAsync(string refreshRaw, CancellationToken ct)
         {
             if (string.IsNullOrWhiteSpace(refreshRaw))

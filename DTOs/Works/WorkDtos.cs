@@ -29,7 +29,9 @@ public sealed record WorkUpdateRequest(
     DateTime? EndDate,
     DateTime? DueDate,
     string? Code,
-    WorkPriority? Priority
+    WorkPriority? Priority,
+    string? DeadlineConfirmationToken = null,
+    DateTime? ExpectedUpdatedAtUtc = null
 );
 
 public sealed record CompleteWorkRequest(

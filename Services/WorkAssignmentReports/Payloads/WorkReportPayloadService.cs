@@ -7,6 +7,8 @@ using MongoDB.Driver;
 using tdtd_be.Common.Errors;
 using tdtd_be.Data;
 using tdtd_be.Models;
+using tdtd_be.Services.AggregateMapping;
+using tdtd_be.Services.AggregateMapping.Persistence;
 
 namespace tdtd_be.Services.WorkAssignmentReports.Payloads;
 
@@ -113,6 +115,7 @@ public sealed class WorkReportPayloadService : IWorkReportPayloadReader, IWorkRe
         if (string.IsNullOrWhiteSpace(report.Id))
             report.Id = ObjectId.GenerateNewId().ToString();
 
+        await ValidateContentReferencesAsync(report, tableValuesJson, session, ct);
         var plan = PrepareReportPayload(
             report.Id,
             report.PayloadRevision,
@@ -169,6 +172,31 @@ public sealed class WorkReportPayloadService : IWorkReportPayloadReader, IWorkRe
             session);
 
         return plan.Result;
+    }
+
+    private async Task ValidateContentReferencesAsync(WorkAssignmentReport report, string? json,
+        IClientSessionHandle? session, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(json)) return;
+        using var doc = JsonDocument.Parse(json);
+        if (!doc.RootElement.TryGetProperty("nativeTables", out var native)
+            || !native.TryGetProperty("tables", out var tables)) return;
+        foreach (var table in tables.EnumerateArray())
+        {
+            if (!table.TryGetProperty("contentRef", out var external)) continue;
+            var tableId = table.GetProperty("tableId").GetString()!;
+            var reference = external.Deserialize<AggregateContentReference>(AggregateCanonical.Json)
+                ?? throw new AggregatePreviewException("AGG_CONTENT_UNAVAILABLE");
+            var collection = _ctx.Db.GetCollection<BsonDocument>(AggregateCollections.NativeContent);
+            var filter = new BsonDocument("_id", AggregateCanonical.Key(report.Id, tableId));
+            var row = session == null ? await collection.Find(filter).FirstOrDefaultAsync(ct)
+                : await collection.Find(session, filter).FirstOrDefaultAsync(ct);
+            var binding = row == null ? null : AggregateMongoTransaction.Read<AggregateNativeContentBinding>(row).Value;
+            if (binding == null || binding.ReportId != report.Id || binding.TableId != tableId
+                || binding.SchemaHash != report.DynamicFormSchemaHash || binding.Reference != reference)
+                throw new AggregatePreviewException("AGG_CONTENT_FORBIDDEN");
+            _ = await new AggregateContentTableStore(_ctx).Manifest(report.Id, reference, ct);
+        }
     }
 
     public static WorkReportPayloadWriteResult PreflightReportPayload(
@@ -429,6 +457,8 @@ public sealed class WorkReportPayloadService : IWorkReportPayloadReader, IWorkRe
         if (!CanReadExternalPayload(report))
             return null;
 
+        var capturedPayloadUpdatedAtUtc = report.PayloadUpdatedAtUtc;
+
         var payload = await _ctx.WorkReportPayloads
             .Find(x =>
                 x.ReportId == report.Id &&
@@ -467,7 +497,8 @@ public sealed class WorkReportPayloadService : IWorkReportPayloadReader, IWorkRe
             payload.PayloadSizeBytes + blocks.Sum(x => x.SizeBytes),
             payload.Status,
             IsExternalPayload: true,
-            PayloadHashVerified: string.Equals(actualPayloadHash, payload.PayloadHash, StringComparison.Ordinal));
+            PayloadHashVerified: string.Equals(actualPayloadHash, payload.PayloadHash, StringComparison.Ordinal))
+        { SourcePayloadUpdatedAtUtc = capturedPayloadUpdatedAtUtc };
     }
 
     private static WorkReportPayloadSnapshot BuildEmbeddedSnapshot(WorkAssignmentReport report)
@@ -481,7 +512,8 @@ public sealed class WorkReportPayloadService : IWorkReportPayloadReader, IWorkRe
             report.PayloadSizeBytes,
             report.PayloadStatus,
             IsExternalPayload: false,
-            PayloadHashVerified: true);
+            PayloadHashVerified: true)
+        { SourcePayloadUpdatedAtUtc = report.PayloadUpdatedAtUtc };
 
     private static bool CanReadExternalPayload(WorkAssignmentReport report)
         => !string.IsNullOrWhiteSpace(report.Id)

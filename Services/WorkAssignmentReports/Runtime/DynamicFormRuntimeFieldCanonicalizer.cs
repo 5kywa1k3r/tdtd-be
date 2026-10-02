@@ -80,6 +80,7 @@ public static class DynamicFormRuntimeFieldCanonicalizer
 {
     private static readonly HashSet<string> SupportedTypes = new(StringComparer.Ordinal)
     {
+        "evidence",
         "shortText",
         "longText",
         "richText",
@@ -381,6 +382,7 @@ public static class DynamicFormRuntimeFieldCanonicalizer
                         innerException: ex);
                 }
 
+            case "evidence":
             case "stringList":
                 return CanonicalizeStringList(field, value, validateChoiceCodes: false);
 

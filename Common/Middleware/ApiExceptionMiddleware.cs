@@ -27,6 +27,18 @@ public sealed class ApiExceptionMiddleware : IMiddleware
         {
             await WriteAppExceptionAsync(ctx, ex);
         }
+        catch (tdtd_be.Services.AggregateMapping.AggregatePreviewException ex)
+        {
+            // Same domain errors are used by the existing report/review routes and the
+            // aggregate command routes. Do not turn an expected lock/conflict into HTTP500.
+            ctx.Response.StatusCode = ex.Code == "AGG_SOURCE_LOCKED" ? 423
+                : ex.Code.Contains("FORBIDDEN", StringComparison.Ordinal) ? 403
+                : ex.Code.Contains("UNAVAILABLE", StringComparison.Ordinal) ? 404 : 409;
+            ctx.Response.ContentType = "application/json; charset=utf-8";
+            ctx.Response.Headers.CacheControl = "no-store";
+            await ctx.Response.WriteAsync(JsonSerializer.Serialize(new tdtd_be.DTOs.AggregateMapping.AggregateErrorDto(
+                ex.Code, ctx.TraceIdentifier, [new(ex.Code, ex.Path, "Command was not committed.")], false), JsonOptions));
+        }
         catch (Exception ex)
         {
             _log.LogError(ex, "Unhandled exception: {Path}", ctx.Request.Path);

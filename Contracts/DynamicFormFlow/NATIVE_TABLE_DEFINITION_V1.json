@@ -1,0 +1,31 @@
+{
+  "contractId": "dynamic-form-native-table-definition",
+  "contractVersion": 1,
+  "schemaFile": "NATIVE_TABLE_DEFINITION_V1.schema.json",
+  "status": "AUTHORING_SOURCE_ONLY_UNVERIFIED",
+  "discriminator": "schema.nativeTablesVersion",
+  "collection": "schema.tables",
+  "capabilityEndpoint": "GET /api/dynamic-forms/definition-capabilities",
+  "writeEndpoints": ["POST /api/dynamic-forms/native-definitions/v1", "PUT /api/dynamic-forms/native-definitions/v1/{id}"],
+  "storage": { "owner": "DynamicFormTemplate", "version": "nativeTablesVersion", "definition": "tablesJson" },
+  "supportedSourcePaths": ["createDraft", "updateDraftWithRevision", "detail", "cloneDefinition", "carryForwardVersion", "buildAndValidateSnapshot"],
+  "blockedConsumers": ["publish", "importExcelIntoNativeOwner", "jobProjection", "flowMapping"],
+  "statisticPolicy": "CANONICAL_P8_ONLY_NATIVE_V1_AND_NEGOTIATED_V2_DRAFT_METADATA",
+  "statisticPlanExtension": {
+    "capability": "nativeStatisticPlanVersion=2",
+    "property": "tables[].statisticPlan",
+    "schemaFile": "NATIVE_TABLE_STATISTIC_STATE_V2.schema.json",
+    "writer": "Existing P8 UPDATE_DYNAMIC_FORM_STATISTICS command, nativeStatistics variant",
+    "draftPolicy": "Enabled complete targets plus identity-only disabled markers; unfinished configuration remains local",
+    "snapshotPolicy": "Full native definition is preserved in Form/Phan snapshots; P8 metadata and label pins have their own version/hash/history"
+  },
+  "legacyPolicy": "OMIT_BOTH_NATIVE_PROPERTIES_PRESERVE_LEGACY_SNAPSHOT_BYTES",
+  "explicitClear": { "nativeTablesVersion": 1, "tables": [] },
+  "limits": { "combinedRootAndTableFields": 200, "combinedTablesAndExcelBlocks": 30, "rowsPerMatrix": 200, "optionsPerChoice": 100, "schemaUtf8Bytes": 1048576 },
+  "activation": {
+    "publishedCapabilityCatalogChanged": false,
+    "generatedCatalogChanged": false,
+    "runtimeOrJobEnabled": false,
+    "note": "Additive definition protocol registration only. CURRENT/LOCK and P8/P9/P11 pins remain unchanged. No production activation or readiness claim."
+  }
+}

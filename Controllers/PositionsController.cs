@@ -36,8 +36,9 @@ public sealed class PositionsController : ControllerBase
     public Task<IReadOnlyList<PositionResponse>> List(
         [FromQuery] bool? isDeleted,
         [FromQuery] string? unitTypeCode,
+        [FromQuery] string? unitId,
         CancellationToken ct)
-        => _svc.ListAsync(isDeleted, unitTypeCode, ct);
+        => _svc.ListAsync(isDeleted, unitTypeCode, ct, unitId);
 
     [HttpGet("by-unit-type/{unitTypeCode}")]
     public Task<IReadOnlyList<PositionResponse>> ByUnitType(string unitTypeCode, CancellationToken ct)

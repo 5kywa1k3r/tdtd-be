@@ -9,6 +9,16 @@ public class DashboardMindMapScopeRequest
     public List<string> UnitIds { get; set; } = new();
 }
 
+public sealed class DashboardMindMapWorkOptionDto
+{
+    public string Id { get; set; } = string.Empty;
+    public string AutoCode { get; set; } = string.Empty;
+    public string? Code { get; set; }
+    public string Name { get; set; } = string.Empty;
+    public int Status { get; set; }
+    public int Type { get; set; }
+}
+
 public sealed class DashboardMindMapWorkResponse
 {
     public DashboardWorkTreeWorkDto Work { get; set; } = new();

@@ -177,7 +177,7 @@ internal static class WorkAssignmentReadAccessHelper
         if (assignment is null || string.IsNullOrWhiteSpace(actorUserId))
             return false;
 
-        return string.Equals(assignment.CreatedByUserId, actorUserId, StringComparison.Ordinal) ||
+        return WorkAssignmentCurrentAuthority.IsReviewer(assignment, actorUserId) ||
                (assignment.LeaderWatcherUserIds ?? new List<string>()).Contains(actorUserId) ||
                (assignment.Assignees ?? new List<UserRef>())
                    .Any(x => string.Equals(x.UserId, actorUserId, StringComparison.Ordinal));

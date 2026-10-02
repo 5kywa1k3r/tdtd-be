@@ -7,7 +7,22 @@ namespace tdtd_be.DTOs.DynamicForms;
 [JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
 public sealed record DynamicFormStatisticConfigPayload(
     IReadOnlyList<DynamicFormStatisticFieldPayload>? Fields,
-    IReadOnlyList<DynamicFormStatisticTablePayload>? Tables);
+    IReadOnlyList<DynamicFormStatisticTablePayload>? Tables,
+    IReadOnlyList<DynamicFormNativeStatisticMutation>? NativeTargets = null,
+    DynamicFormNativeStatisticsPayload? NativeStatistics = null);
+
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record DynamicFormNativeStatisticMutation(
+    string? TableId, string? TargetId, bool? IsStatistic,
+    DynamicFormStatisticSettingsPayload? Statistic,
+    IReadOnlyList<string>? StatisticLabelCodes);
+
+public sealed record DynamicFormNativeStatisticConfigDto(
+    string TableId, string TargetId, DynamicFormNativeTargetDto Target,
+    string FieldType, DynamicFormStatisticSettingsPayload Statistic,
+    IReadOnlyList<string> StatisticLabelCodes,
+    IReadOnlyList<DynamicFormStatisticLabelSnapshotDto> LabelSnapshots,
+    string StructureHash);
 
 [JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
 public sealed record DynamicFormStatisticTablePayload(
@@ -60,7 +75,17 @@ public sealed record DynamicFormStatisticConfigResult(
     string FieldSectionHash,
     string TableSectionHash,
     IReadOnlyList<DynamicFormStatisticConfigVersionSnapshotDto> Versions,
-    string? ReceiptId);
+    string? ReceiptId)
+{
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public IReadOnlyList<DynamicFormNativeStatisticConfigDto>? NativeTargetConfig { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? NativeTargetSectionHash { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public DynamicFormNativePlanConfigDto? NativePlanConfig { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? NativePlanSectionHash { get; init; }
+}
 
 public sealed record DynamicFormStatisticFieldConfigDto(
     string FieldId,
@@ -123,7 +148,17 @@ public sealed record DynamicFormStatisticConfigVersionSnapshotDto(
     IReadOnlyList<DynamicFormStatisticTableConfigDto> TableConfig,
     string FieldSectionHash,
     string TableSectionHash,
-    DateTime CreatedAtUtc);
+    DateTime CreatedAtUtc)
+{
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public IReadOnlyList<DynamicFormNativeStatisticConfigDto>? NativeTargetConfig { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? NativeTargetSectionHash { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public DynamicFormNativePlanConfigDto? NativePlanConfig { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? NativePlanSectionHash { get; init; }
+}
 
 public static class DynamicFormStatisticFieldTypes
 {

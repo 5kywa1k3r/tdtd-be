@@ -14,5 +14,6 @@ public sealed record EvaluationTemplateDto(
     int ItemCount,
     bool IsActive,
     string? UnitCodeScope,
-    List<EvaluationTemplateItemDto> Items
+    List<EvaluationTemplateItemDto> Items,
+    bool CanEdit
 );

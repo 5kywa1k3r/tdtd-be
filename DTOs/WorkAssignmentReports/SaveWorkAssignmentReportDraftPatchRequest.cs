@@ -10,9 +10,14 @@ public sealed class SaveWorkAssignmentReportDraftPatchRequest
     public List<WorkReportValuePatchItem>? Values1DPatch { get; set; }
     public string? FieldValuesJson { get; set; }
     public List<WorkReportTableBlockPatch>? TableBlockPatches { get; set; }
+    // Tạm giữ CLR compatibility cho code nội bộ; JSON client không còn được sửa Advanced cũ.
+    [System.Text.Json.Serialization.JsonIgnore]
     public string? DataOrigin { get; set; }
+    [System.Text.Json.Serialization.JsonIgnore]
     public string? CumulativeContributionMode { get; set; }
+    [System.Text.Json.Serialization.JsonIgnore]
     public string? CumulativeContributionPolicyJson { get; set; }
+    [System.Text.Json.Serialization.JsonIgnore]
     public string? SummarySourceJson { get; set; }
     public DateTime? CompletedDate { get; set; }
     public string? LateReason { get; set; }

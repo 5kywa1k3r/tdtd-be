@@ -7,6 +7,8 @@ using tdtd_be.Services.DynamicFlows;
 
 namespace tdtd_be.Controllers;
 
+// Flow runtime chưa nghiệm thu; không đăng ký API ở bản deploy này.
+[NonController]
 [ApiController]
 [Authorize]
 [Route("api")]

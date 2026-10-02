@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType><TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable><TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../DTOs/AggregateMapping/*.cs" LinkBase="Contract" />
+    <Compile Include="../../Services/AggregateMapping/*.cs" Exclude="../../Services/AggregateMapping/AggregateMongoPreviewReader*.cs;../../Services/AggregateMapping/AggregateNativePayloadAdapter.cs" LinkBase="Preview" />
+    <Compile Include="../../Services/AggregateMapping/Persistence/*.cs" Exclude="../../Services/AggregateMapping/Persistence/AggregateMongo*.cs;../../Services/AggregateMapping/Persistence/AggregateHost*.cs;../../Services/AggregateMapping/Persistence/AggregateIntegrationGate.cs;../../Services/AggregateMapping/Persistence/AggregateNativeTargetWriter.cs;../../Services/AggregateMapping/Persistence/AggregateTargetPayload.cs;../../Services/AggregateMapping/Persistence/AggregateViewPersistence.cs;../../Services/AggregateMapping/Persistence/AggregateListReadScopes.cs;../../Services/AggregateMapping/Persistence/AggregateListDisplayMetadata.cs" LinkBase="Persistence" />
+  </ItemGroup>
+  <!-- Infrastructure is exercised by AggregateMappingRuntimeChecks with Mongo/Hangfire/MinIO.
+       Keep this isolated transaction/command suite free of host dependencies. -->
+  <ItemGroup>
+    <Compile Remove="../../Services/AggregateMapping/Persistence/AggregateContentTableStore.cs;../../Services/AggregateMapping/Persistence/AggregateContentSnapshotJob.cs;../../Services/AggregateMapping/Persistence/AggregateContentRetentionJob.cs;../../Services/AggregateMapping/Persistence/AggregateContentScopeGate.cs;../../Services/AggregateMapping/Persistence/AggregatePreviewInvalidation.cs;../../Services/AggregateMapping/Persistence/AggregatePreviewJobs.cs;../../Services/AggregateMapping/Persistence/AggregateListStore.cs" />
+  </ItemGroup>
+</Project>

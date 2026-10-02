@@ -24,6 +24,7 @@ public static class Positions
         ["PHO_TRUONG_CONG_AN_XA_PHU_TRACH"] = "Phó Trưởng Công an xã (Phụ trách)",
         ["PHO_TRUONG_CONG_AN_PHUONG"] = "Phó Trưởng Công an phường",
         ["PHO_TRUONG_CONG_AN_XA"] = "Phó Trưởng Công an xã",
+        ["TO_TRUONG"] = "Tổ trưởng",
     };
 
     public static string? GetName(string? code)
@@ -58,6 +59,7 @@ public static class Positions
             ["PHO_TRUONG_CONG_AN_XA_PHU_TRACH"] = (43, 40),
             ["PHO_TRUONG_CONG_AN_PHUONG"] = (44, 30),
             ["PHO_TRUONG_CONG_AN_XA"] = (45, 30),
+            ["TO_TRUONG"] = (50, 20),
         };
 
     public static IReadOnlyCollection<string> KnownCodes => PositionMeta.Keys.ToArray();

@@ -5,6 +5,7 @@ using tdtd_be.DashboardModel.DTOs.MindMap;
 using tdtd_be.DashboardModel.Services;
 using tdtd_be.DTOs.Common;
 using tdtd_be.DTOs.StatisticsConfiguration;
+using tdtd_be.Models;
 using tdtd_be.Services.StatisticsConfiguration;
 
 namespace tdtd_be.Controllers;
@@ -19,6 +20,18 @@ public sealed class DashboardMindMapController : ControllerBase
     public DashboardMindMapController(IDashboardMindMapQueryService service)
     {
         _service = service;
+    }
+
+    [HttpGet("works")]
+    public async Task<ActionResult<PagedResult<DashboardMindMapWorkOptionDto>>> SearchWorks(
+        [FromQuery] WorkType type,
+        [FromQuery] string? q,
+        [FromQuery] int page = 0,
+        [FromQuery] int pageSize = 20,
+        CancellationToken ct = default)
+    {
+        var result = await _service.SearchWorksAsync(type, q, page, pageSize, ct);
+        return Ok(result);
     }
 
     [HttpGet("works/{workId}")]

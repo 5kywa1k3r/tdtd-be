@@ -52,6 +52,12 @@ public sealed class ScheduleSnapshotDTO
     /// </summary>
     public int[] SemiAnnualDays { get; set; } = Array.Empty<int>();
 
+    /// <summary>Rules for selected quarters and halves; numeric offsets above remain for legacy reports.</summary>
+    public tdtd_be.DTOs.WorkAssignments.QuarterDayRuleDto[] QuarterDayRules { get; set; } =
+        Array.Empty<tdtd_be.DTOs.WorkAssignments.QuarterDayRuleDto>();
+    public tdtd_be.DTOs.WorkAssignments.SemiAnnualDayRuleDto[] SemiAnnualDayRules { get; set; } =
+        Array.Empty<tdtd_be.DTOs.WorkAssignments.SemiAnnualDayRuleDto>();
+
     /// <summary>
     /// Ghi chú thêm cho schedule.
     /// </summary>

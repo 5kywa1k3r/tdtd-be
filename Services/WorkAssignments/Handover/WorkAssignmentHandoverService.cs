@@ -5,6 +5,7 @@ using tdtd_be.Common.Errors;
 using tdtd_be.Data;
 using tdtd_be.DTOs.Common;
 using tdtd_be.DTOs.Operations;
+using tdtd_be.DTOs.Pickers;
 using tdtd_be.DTOs.Users;
 using tdtd_be.DTOs.WorkAssignments;
 using tdtd_be.Models;
@@ -161,6 +162,122 @@ public sealed class WorkAssignmentHandoverService : IWorkAssignmentHandoverServi
         }
     }
 
+    public async Task<WorkAssignmentHandoverUnitScopeDto> ReadUnitScopeAsync(string assignmentId, string actorUserId, CancellationToken ct = default)
+    {
+        EnsureActor(actorUserId);
+        if (!ObjectId.TryParse(assignmentId, out _)) throw AppExceptionFactory.BadRequest(AppErrorCode.WORK_ASSIGNMENT_HANDOVER_UNIT_MISMATCH);
+        var assignment = await _ctx.WorkAssignments.Find(x => x.Id == assignmentId && !x.IsDeleted).FirstOrDefaultAsync(ct)
+            ?? throw AppExceptionFactory.NotFound(AppErrorCode.WORK_ASSIGNMENT_NOT_FOUND);
+        if (!assignment.Assignees.Any(x => x.UserId == actorUserId))
+            throw AppExceptionFactory.Forbidden(AppErrorCode.WORK_ASSIGNMENT_HANDOVER_SOURCE_NOT_IN_ASSIGNMENT);
+        var actor = await _ctx.Users.Find(x => x.Id == actorUserId && !x.IsDeleted).FirstOrDefaultAsync(ct)
+            ?? throw AppExceptionFactory.NotFound(AppErrorCode.WORK_ASSIGNMENT_HANDOVER_SOURCE_USER_NOT_FOUND);
+        var units = (await _ctx.Units.Find(x => !x.IsDeleted).ToListAsync(ct)).ToDictionary(x => x.Id, StringComparer.Ordinal);
+        var ids = !assignment.IsActive || DynamicFlowBranchVisibility.IsFlowAssignment(assignment) ? []
+            : units.Keys.Where(id => WorkAssignmentHandoverUnitScope.Allows(actor.UnitId, id, units)).OrderBy(id => id, StringComparer.Ordinal).ToArray();
+        return new(actor.UnitId ?? "", ids);
+    }
+
+    public async Task<PagedResult<UserPickRow>> SearchCandidatesAsync(
+        string assignmentId,
+        string fromAssigneeUserId,
+        string unitId,
+        string? query,
+        int page,
+        int pageSize,
+        string actorUserId,
+        CancellationToken ct = default)
+    {
+        EnsureActor(actorUserId);
+        if (!string.Equals(actorUserId, fromAssigneeUserId, StringComparison.Ordinal))
+            throw AppExceptionFactory.Forbidden(AppErrorCode.WORK_ASSIGNMENT_HANDOVER_ACTOR_MISMATCH);
+        if (!ObjectId.TryParse(assignmentId, out _) || !ObjectId.TryParse(unitId, out _))
+            throw AppExceptionFactory.BadRequest(AppErrorCode.WORK_ASSIGNMENT_HANDOVER_UNIT_MISMATCH);
+
+        page = Math.Max(0, page);
+        pageSize = Math.Clamp(pageSize, 1, 50);
+        PagedResult<UserPickRow> Empty() => new(new List<UserPickRow>(), 0, page, pageSize);
+
+        var assignment = await _ctx.WorkAssignments
+            .Find(x => x.Id == assignmentId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct)
+            ?? throw AppExceptionFactory.NotFound(AppErrorCode.WORK_ASSIGNMENT_NOT_FOUND);
+        if (!assignment.IsActive || !string.IsNullOrWhiteSpace(assignment.FlowInstanceId))
+            return Empty();
+        var fromAssignee = (assignment.Assignees ?? new List<UserRef>())
+            .FirstOrDefault(x => x.UserId == actorUserId)
+            ?? throw AppExceptionFactory.Forbidden(AppErrorCode.WORK_ASSIGNMENT_HANDOVER_SOURCE_NOT_IN_ASSIGNMENT);
+        var fromUser = await _ctx.Users.Find(x => x.Id == actorUserId && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct)
+            ?? throw AppExceptionFactory.NotFound(AppErrorCode.WORK_ASSIGNMENT_HANDOVER_SOURCE_USER_NOT_FOUND);
+
+        var children = await _ctx.WorkAssignments.Find(x =>
+                x.WorkId == assignment.WorkId && x.ParentAssignmentId == assignment.Id && !x.IsDeleted)
+            .ToListAsync(ct);
+        var units = (await _ctx.Units.Find(x => !x.IsDeleted).ToListAsync(ct))
+            .ToDictionary(x => x.Id, StringComparer.Ordinal);
+        if (!WorkAssignmentHandoverUnitScope.Allows(fromUser.UnitId, unitId, units)) return Empty();
+        if (children.Count > 0)
+        {
+            if (!units.TryGetValue(unitId, out var targetUnit) ||
+                !WorkAssignmentHandoverChildScope.Allows(actorUserId, targetUnit, children, units))
+                return Empty();
+        }
+
+        var existingAssigneeIds = (assignment.Assignees ?? new List<UserRef>())
+            .Select(x => x.UserId).ToHashSet(StringComparer.Ordinal);
+        var boundUserIds = (await _ctx.WorkTemplateAssignees
+                .Find(x => x.WorkAssignmentId == assignment.Id && !x.IsDeleted)
+                .Project(x => x.AssigneeUserId).ToListAsync(ct))
+            .ToHashSet(StringComparer.Ordinal);
+        var periods = await _ctx.WorkReportPeriods.Find(x =>
+                x.WorkAssignmentId == assignment.Id && x.AssigneeUserId == actorUserId && !x.IsDeleted)
+            .ToListAsync(ct);
+        var reports = await _ctx.WorkAssignmentReports.Find(x =>
+                x.WorkAssignmentId == assignment.Id && x.AssigneeUserId == actorUserId && !x.IsDeleted)
+            .ToListAsync(ct);
+        var users = await _ctx.Users.Find(x => x.UnitId == unitId && !x.IsDeleted)
+            .Project(x => new AppUser
+            {
+                Id = x.Id, Username = x.Username, FullName = x.FullName,
+                UnitId = x.UnitId, PositionCode = x.PositionCode, AccountKind = x.AccountKind
+            }).ToListAsync(ct);
+        var text = query?.Trim();
+        var candidates = users.Where(user =>
+                user.Id != actorUserId && !existingAssigneeIds.Contains(user.Id) &&
+                !boundUserIds.Contains(user.Id) &&
+                (string.IsNullOrEmpty(text) ||
+                 (user.Username ?? string.Empty).Contains(text, StringComparison.OrdinalIgnoreCase) ||
+                 (user.FullName ?? string.Empty).Contains(text, StringComparison.OrdinalIgnoreCase)))
+            .Where(user => children.Count == 0 || WorkAssignmentCurrentAuthority.CanLeadChild(user))
+            .Where(user =>
+            {
+                try
+                {
+                    var target = new UserRef { UserId = user.Id, UnitId = user.UnitId };
+                    var keepReportingUnit = ValidateTransition(fromUser, user, fromAssignee, target, units);
+                    var effectiveTarget = keepReportingUnit ? PreserveReportingUnit(target, fromAssignee) : target;
+                    EnsureLifecycleTargetUnitInScope(assignment, periods, reports, effectiveTarget);
+                    return true;
+                }
+                catch (AppException)
+                {
+                    return false;
+                }
+            })
+            .OrderBy(user => user.Username, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        var rows = candidates.Skip(page * pageSize).Take(pageSize).Select(user => new UserPickRow
+        {
+            Id = user.Id,
+            Username = user.Username ?? string.Empty,
+            FullName = user.FullName ?? string.Empty,
+            UnitId = user.UnitId,
+            PositionCode = user.PositionCode
+        }).ToList();
+        return new PagedResult<UserPickRow>(rows, candidates.Count, page, pageSize);
+    }
+
     public async Task<PagedResult<WorkAssignmentHandoverHistoryRow>> SearchHistoryAsync(
         string workId,
         WorkAssignmentHandoverHistorySearchRequest request,
@@ -274,7 +391,11 @@ public sealed class WorkAssignmentHandoverService : IWorkAssignmentHandoverServi
                 ct))
             .First();
 
-        ValidateTransition(fromUser, toUser, fromAssignee, targetAssignee);
+        var activeUnits = (await _ctx.Units.Find(x => !x.IsDeleted).ToListAsync(ct))
+            .ToDictionary(x => x.Id, StringComparer.Ordinal);
+        var keepReportingUnit = ValidateTransition(fromUser, toUser, fromAssignee, targetAssignee, activeUnits);
+        if (keepReportingUnit)
+            targetAssignee = PreserveReportingUnit(targetAssignee, fromAssignee);
 
         var now = DateTime.UtcNow;
         var updatedAssignees = currentAssignees
@@ -392,18 +513,68 @@ public sealed class WorkAssignmentHandoverService : IWorkAssignmentHandoverServi
                     reports,
                     targetAssignee);
 
+                var children = await _ctx.WorkAssignments.Find(session, x =>
+                    x.WorkId == currentAssignment.WorkId && x.ParentAssignmentId == currentAssignment.Id && !x.IsDeleted)
+                    .ToListAsync(transactionCt);
+                var currentUsers = await _ctx.Users.Find(session, x => (x.Id == fromAssigneeUserId || x.Id == toAssigneeUserId) && !x.IsDeleted).ToListAsync(transactionCt);
+                var currentFrom = currentUsers.SingleOrDefault(x => x.Id == fromAssigneeUserId);
+                var currentTo = currentUsers.SingleOrDefault(x => x.Id == toAssigneeUserId);
+                if (currentFrom == null || currentTo == null || currentFrom.UnitId != fromUser.UnitId || currentTo.UnitId != toUser.UnitId
+                    || currentFrom.AccountKind != fromUser.AccountKind || currentTo.AccountKind != toUser.AccountKind || currentTo.PositionCode != toUser.PositionCode)
+                    throw AppExceptionFactory.Create(AppErrorCode.WORK_ASSIGNMENT_HANDOVER_ASSIGNMENT_CHANGED);
+                var units = (await _ctx.Units.Find(session, x => !x.IsDeleted).ToListAsync(transactionCt))
+                    .ToDictionary(x => x.Id, StringComparer.Ordinal);
+                ValidateTransition(currentFrom, currentTo, currentAssignment.Assignees.Single(x => x.UserId == fromAssigneeUserId), targetAssignee, units);
+                if (children.Count > 0)
+                {
+                    if (!WorkAssignmentCurrentAuthority.CanLeadChild(toUser))
+                        throw AppExceptionFactory.BadRequest(AppErrorCode.WORK_ASSIGNMENT_HANDOVER_CHILD_SCOPE_INVALID);
+                    if (toUser.UnitId is null || !units.TryGetValue(toUser.UnitId, out var targetUnit) ||
+                        !WorkAssignmentHandoverChildScope.Allows(fromAssigneeUserId, targetUnit, children, units))
+                        throw AppExceptionFactory.BadRequest(AppErrorCode.WORK_ASSIGNMENT_HANDOVER_CHILD_SCOPE_INVALID);
+                }
+
+                await tdtd_be.Services.AggregateMapping.Persistence.AggregateHostIntegration.RelationshipAsync(
+                    _ctx, session, currentAssignment.WorkId,
+                    children.Select(x => x.Id).Prepend(currentAssignment.Id!).ToArray(),
+                    operationId, transactionCt, preserveIdentity: true);
+                await tdtd_be.Services.AggregateMapping.Persistence.AggregateHostIntegration.HandoverAsync(
+                    _ctx, session, currentAssignment.WorkId, currentAssignment.Id!, binding.Id!, toAssigneeUserId,
+                    operationId, transactionCt);
+
                 var assignmentResult = await _ctx.WorkAssignments.UpdateOneAsync(
+                    // Aggregate ownership and source locks participate in this same transaction.
                     session,
-                    assignmentFilter,
+                    assignmentFilter &
+                    (Builders<WorkAssignment>.Filter.Eq(x => x.HandoverTopologyRevision, currentAssignment.HandoverTopologyRevision) |
+                     (currentAssignment.HandoverTopologyRevision == 0
+                         ? Builders<WorkAssignment>.Filter.Exists(x => x.HandoverTopologyRevision, false)
+                         : Builders<WorkAssignment>.Filter.Empty)),
                     Builders<WorkAssignment>.Update
                         .Set(x => x.Assignees, updatedAssignees)
                         .Set(x => x.UpdatedAtUtc, now)
-                        .Set(x => x.UpdatedByUserId, actorUserId),
+                        .Set(x => x.UpdatedByUserId, actorUserId)
+                        .Inc(x => x.HandoverTopologyRevision, 1),
                     cancellationToken: transactionCt);
                 EnsureExactCas(
                     assignmentResult,
                     1,
                     "P9_HANDOVER_ASSIGNMENT_CAS_LOST");
+
+                foreach (var child in children)
+                {
+                    var changed = await _ctx.WorkAssignments.UpdateOneAsync(session,
+                        Builders<WorkAssignment>.Filter.Eq(x => x.Id, child.Id) &
+                        Builders<WorkAssignment>.Filter.Eq(x => x.WorkId, currentAssignment.WorkId) &
+                        Builders<WorkAssignment>.Filter.Eq(x => x.ParentAssignmentId, currentAssignment.Id) &
+                        Builders<WorkAssignment>.Filter.Eq(x => x.CurrentReviewerUserId, child.CurrentReviewerUserId) &
+                        Builders<WorkAssignment>.Filter.Eq(x => x.UpdatedAtUtc, child.UpdatedAtUtc) &
+                        Builders<WorkAssignment>.Filter.Eq(x => x.IsDeleted, false),
+                        Builders<WorkAssignment>.Update.Set(x => x.CurrentReviewerUserId, toAssigneeUserId)
+                            .Set(x => x.UpdatedAtUtc, now).Set(x => x.UpdatedByUserId, actorUserId),
+                        cancellationToken: transactionCt);
+                    EnsureExactCas(changed, 1, "P9_HANDOVER_CHILD_REVIEWER_CAS_LOST");
+                }
 
                 var bindingResult = await _ctx.WorkTemplateAssignees.UpdateOneAsync(
                     session,
@@ -500,6 +671,7 @@ public sealed class WorkAssignmentHandoverService : IWorkAssignmentHandoverServi
                     currentAssignment,
                     binding.Id,
                     periods.Select(item => item.Id).ToArray(),
+                    children.Select(item => item.Id).ToArray(),
                     periods.Count,
                     reports.Count,
                     queueItems.Count);
@@ -519,12 +691,24 @@ public sealed class WorkAssignmentHandoverService : IWorkAssignmentHandoverServi
                 .ToListAsync(ct);
 
         await _docRole.UpsertWorkAssignmentRolesAsync(assignment, ct);
+        foreach (var childId in mutation.ChildAssignmentIds)
+        {
+            var child = await _ctx.WorkAssignments.Find(x => x.Id == childId && !x.IsDeleted).FirstOrDefaultAsync(ct);
+            if (child is not null) await _docRole.UpsertWorkAssignmentRolesAsync(child, ct);
+        }
         await _docRole.RebuildWorkParticipantRolesFromAssignmentsAsync(assignment.WorkId, actorUserId, ct);
 
         await _statusRepair.RebuildWorkTreeAsync(assignment.WorkId, ct);
 
         foreach (var periodId in sourcePeriodIds.Where(x => !string.IsNullOrWhiteSpace(x)))
             await _docRoleReadModelProjection.RebuildReportPeriodAsync(periodId, actorUserId, ct);
+        if (mutation.ChildAssignmentIds.Count > 0)
+        {
+            var childPeriods = await _ctx.WorkReportPeriods.Find(x => mutation.ChildAssignmentIds.Contains(x.WorkAssignmentId) && !x.IsDeleted)
+                .Project(x => x.Id).ToListAsync(ct);
+            foreach (var periodId in childPeriods)
+                await _docRoleReadModelProjection.RebuildReportPeriodAsync(periodId, actorUserId, ct);
+        }
 
         foreach (var key in oldTemplateKeys
                      .Where(x => !string.IsNullOrWhiteSpace(x.DynamicFormTemplateId))
@@ -926,7 +1110,7 @@ public sealed class WorkAssignmentHandoverService : IWorkAssignmentHandoverServi
                 Builders<WorkAssignmentQueueItem>.Filter.Eq(x => x.AssigneeUserId, fromAssigneeUserId) &
                 Builders<WorkAssignmentQueueItem>.Filter.Eq(x => x.UpdatedAtUtc, queueItem.UpdatedAtUtc) &
                 Builders<WorkAssignmentQueueItem>.Filter.Eq(x => x.IsActive, queueItem.IsActive) &
-                Builders<WorkAssignmentQueueItem>.Filter.Eq(x => x.IsDeleted, false),
+                Builders<WorkAssignmentQueueItem>.Filter.Ne(x => x.IsDeleted, true),
                 Builders<WorkAssignmentQueueItem>.Update
                     .Set(x => x.AssigneeUserId, toAssigneeUserId)
                     .Set(x => x.UpdatedAtUtc, now)
@@ -959,26 +1143,32 @@ public sealed class WorkAssignmentHandoverService : IWorkAssignmentHandoverServi
             throw new InvalidOperationException(reason);
     }
 
-    private static void ValidateTransition(
+    private static bool ValidateTransition(
         AppUser fromUser,
         AppUser toUser,
         UserRef fromAssignee,
-        UserRef toAssignee)
+        UserRef toAssignee,
+        IReadOnlyDictionary<string, Unit> units)
     {
         var fromIsUnitManager = IsUnitManager(fromUser);
         var toIsUnitManager = IsUnitManager(toUser);
         var fromIsNormal = IsNormalUser(fromUser);
         var toIsNormal = IsNormalUser(toUser);
+        var withinReportingUnit = IsWithinReportingUnit(fromAssignee, toUser, toAssignee, units);
+
+        if (!WorkAssignmentHandoverUnitScope.Allows(fromUser.UnitId, toUser.UnitId, units) || !withinReportingUnit)
+            throw UnitMismatch(fromUser, toUser, fromAssignee, toAssignee);
 
         if (fromIsUnitManager && toIsUnitManager)
-            return;
+            return withinReportingUnit;
 
         if ((fromIsUnitManager && toIsNormal) ||
             (fromIsNormal && toIsNormal) ||
             (fromIsNormal && toIsUnitManager))
         {
-            EnsureSameUnit(fromUser, toUser, fromAssignee, toAssignee);
-            return;
+            if (!withinReportingUnit)
+                throw UnitMismatch(fromUser, toUser, fromAssignee, toAssignee);
+            return true;
         }
 
         throw AppExceptionFactory.BadRequest(
@@ -1006,20 +1196,33 @@ public sealed class WorkAssignmentHandoverService : IWorkAssignmentHandoverServi
            (string.IsNullOrWhiteSpace(user.AccountKind) ||
             string.Equals(user.AccountKind, ManagementAccountKind.NormalUser, StringComparison.OrdinalIgnoreCase));
 
-    private static void EnsureSameUnit(
+    private static bool IsWithinReportingUnit(
+        UserRef fromAssignee,
+        AppUser toUser,
+        UserRef toAssignee,
+        IReadOnlyDictionary<string, Unit> units)
+    {
+        var reportingUnitId = NullIfWhiteSpace(fromAssignee.UnitId);
+        var accountUnitId = NullIfWhiteSpace(toUser.UnitId) ?? NullIfWhiteSpace(toAssignee.UnitId);
+        if (reportingUnitId is null || accountUnitId is null ||
+            !units.TryGetValue(reportingUnitId, out var reportingUnit) ||
+            !units.TryGetValue(accountUnitId, out var accountUnit) ||
+            reportingUnit.IsVirtual || accountUnit.IsVirtual)
+            return false;
+
+        return reportingUnitId == accountUnitId ||
+               WorkAssignmentUnitHierarchy.IsStrictAncestor(reportingUnit, accountUnit, units);
+    }
+
+    private static AppException UnitMismatch(
         AppUser fromUser,
         AppUser toUser,
         UserRef fromAssignee,
         UserRef toAssignee)
     {
-        var fromUnitId = NullIfWhiteSpace(fromUser.UnitId) ?? NullIfWhiteSpace(fromAssignee.UnitId);
+        var fromUnitId = NullIfWhiteSpace(fromAssignee.UnitId) ?? NullIfWhiteSpace(fromUser.UnitId);
         var toUnitId = NullIfWhiteSpace(toUser.UnitId) ?? NullIfWhiteSpace(toAssignee.UnitId);
-
-        if (string.IsNullOrWhiteSpace(fromUnitId) ||
-            string.IsNullOrWhiteSpace(toUnitId) ||
-            !string.Equals(fromUnitId, toUnitId, StringComparison.Ordinal))
-        {
-            throw AppExceptionFactory.BadRequest(
+        return AppExceptionFactory.BadRequest(
                 AppErrorCode.WORK_ASSIGNMENT_HANDOVER_UNIT_MISMATCH,
                 new
                 {
@@ -1028,7 +1231,16 @@ public sealed class WorkAssignmentHandoverService : IWorkAssignmentHandoverServi
                     fromUnitId,
                     toUnitId
                 });
-        }
+    }
+
+    private static UserRef PreserveReportingUnit(UserRef target, UserRef source)
+    {
+        var result = CloneUserRef(target);
+        result.UnitId = source.UnitId;
+        result.UnitSymbol = source.UnitSymbol;
+        result.UnitShortName = source.UnitShortName;
+        result.UnitName = source.UnitName;
+        return result;
     }
 
     private static UpdateDefinition<WorkTemplateAssignee> BuildBindingAssigneeUpdate(
@@ -1145,6 +1357,7 @@ public sealed class WorkAssignmentHandoverService : IWorkAssignmentHandoverServi
         WorkAssignment Assignment,
         string BindingId,
         IReadOnlyList<string> PeriodIds,
+        IReadOnlyList<string> ChildAssignmentIds,
         long PeriodCount,
         long ReportCount,
         long QueueItemCount);

@@ -4,6 +4,7 @@ namespace tdtd_be.Services.WorkDocuments;
 
 public interface IWorkDocumentPermissionService
 {
+    Task<WorkDocumentAccessSnapshot> ReadAccessAsync(string workId, string userId, CancellationToken ct);
     Task EnsureCanCreateWorkDocumentAsync(string workId, string userId, CancellationToken ct);
     Task<WorkAssignment> EnsureCanCreateAssignmentDocumentAsync(string workId, string assignmentId, string userId, CancellationToken ct);
     Task<bool> CanReadFileAsync(FileDoc file, string userId, CancellationToken ct);

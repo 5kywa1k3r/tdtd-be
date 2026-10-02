@@ -1,5 +1,8 @@
 using MongoDB.Driver;
 using Microsoft.Extensions.Logging;
+using tdtd_be.Services.DynamicFlows;
+using tdtd_be.Services.AggregateMapping.Persistence;
+using tdtd_be.Services.WorkAssignmentReports.Runtime;
 using System.Globalization;
 using tdtd_be.Common.Errors;
 using tdtd_be.Common.Time;
@@ -18,6 +21,7 @@ namespace tdtd_be.Services.WorkAssignments.Runtime;
 public sealed class WorkAssignmentRuntimeMaterializeService : IWorkAssignmentRuntimeMaterializeService
 {
     private readonly MongoDbContext _ctx;
+    private readonly IDynamicFlowDefinitionTransactionRunner _transactions;
     private readonly IWorkAssignmentQueueService _queue;
     private readonly IWorkAssignmentProgressService _progress;
     private readonly IWorkAssignmentStatusSyncService _sync;
@@ -26,6 +30,7 @@ public sealed class WorkAssignmentRuntimeMaterializeService : IWorkAssignmentRun
 
     public WorkAssignmentRuntimeMaterializeService(
         MongoDbContext ctx,
+        IDynamicFlowDefinitionTransactionRunner transactions,
         IWorkAssignmentQueueService queue,
         IWorkAssignmentProgressService progress,
         IWorkAssignmentStatusSyncService sync,
@@ -33,6 +38,7 @@ public sealed class WorkAssignmentRuntimeMaterializeService : IWorkAssignmentRun
         ILogger<WorkAssignmentRuntimeMaterializeService> log)
     {
         _ctx = ctx;
+        _transactions = transactions;
         _queue = queue;
         _progress = progress;
         _sync = sync;
@@ -172,12 +178,24 @@ public sealed class WorkAssignmentRuntimeMaterializeService : IWorkAssignmentRun
                         UpdatedByUserId = actorUserId
                     };
 
-                    await _ctx.WorkReportPeriods.InsertOneAsync(period, cancellationToken: ct);
+                    await _transactions.ExecuteAsync(async (session, token) =>
+                    {
+                        await EnsureObservedAssignmentAsync(session, assignment, token);
+                        await AggregateHostIntegration.SlotAsync(_ctx, session, assignment.WorkId, binding.Id!,
+                            binding.AssignmentType == "ONCE" ? "ONCE" : item.PeriodKey, "materialize:" + period.Id, token);
+                        if (await _ctx.WorkReportPeriods.Find(session, p => p.WorkTemplateAssigneeId == binding.Id
+                            && p.PeriodKey == item.PeriodKey && !p.IsDeleted).AnyAsync(token))
+                            throw new tdtd_be.Services.AggregateMapping.AggregatePreviewException("AGG_SLOT_ALREADY_MATERIALIZED");
+                        await _ctx.WorkReportPeriods.InsertOneAsync(session, period, cancellationToken: token);
+                        await WorkDirectSourceRevisionFence.IncrementAsync(_ctx, session, assignment.WorkId, token);
+                    }, ct);
                     await _queue.UpsertPeriodAsync(period, actorUserId, ct);
                     await _docRoleReadModelProjection.RebuildReportPeriodAsync(period.Id, actorUserId, ct);
                 }
                 else
                 {
+                    if (assignment.DeadlineRetainedPeriodsBeforeUtc.HasValue &&
+                        existed.CreatedAtUtc <= assignment.DeadlineRetainedPeriodsBeforeUtc.Value) continue;
                     var now = DateTime.UtcNow;
                     var isHistoricalData =
                         existed.IsHistoricalData ||
@@ -199,8 +217,15 @@ public sealed class WorkAssignmentRuntimeMaterializeService : IWorkAssignmentRun
                         updatedIsOverdue = WorkReportPeriodStatusHelper.IsOverdue(updatedStatus);
                     }
 
-                    await _ctx.WorkReportPeriods.UpdateOneAsync(
-                        x => x.Id == existed.Id,
+                    // Reports with lifecycle authority are owned by the report transaction.
+                    if (!string.IsNullOrEmpty(existed.CurrentReportId) || !string.IsNullOrEmpty(existed.SourceLifecycleReportId)) continue;
+                    await _transactions.ExecuteAsync(async (session, token) =>
+                    {
+                    await EnsureObservedAssignmentAsync(session, assignment, token);
+                    await AggregateHostIntegration.SlotAsync(_ctx, session, assignment.WorkId, binding.Id!,
+                        binding.AssignmentType == "ONCE" ? "ONCE" : item.PeriodKey, "materialize:" + existed.Id + ":" + existed.UpdatedAtUtc.Ticks, token);
+                    var result = await _ctx.WorkReportPeriods.UpdateOneAsync(session,
+                        x => x.Id == existed.Id && x.UpdatedAtUtc == existed.UpdatedAtUtc && x.CurrentReportId == null && x.SourceLifecycleReportId == null,
                         Builders<WorkReportPeriod>.Update
                             .Set(x => x.WorkTemplateAssigneeId, binding.Id!)
                             .Set(x => x.IsActive, true)
@@ -215,7 +240,10 @@ public sealed class WorkAssignmentRuntimeMaterializeService : IWorkAssignmentRun
                             .Set(x => x.IsHistoricalData, isHistoricalData)
                             .Set(x => x.UpdatedAtUtc, now)
                             .Set(x => x.UpdatedByUserId, actorUserId),
-                        cancellationToken: ct);
+                        cancellationToken: token);
+                    if (result.MatchedCount != 1) throw new tdtd_be.Services.AggregateMapping.AggregatePreviewException("AGG_SLOT_CHANGED");
+                    await WorkDirectSourceRevisionFence.IncrementAsync(_ctx, session, assignment.WorkId, token);
+                    }, ct);
 
                     existed.WorkTemplateAssigneeId = binding.Id!;
                     existed.IsActive = true;
@@ -255,15 +283,23 @@ public sealed class WorkAssignmentRuntimeMaterializeService : IWorkAssignmentRun
                 return;
         }
 
-        await _queue.DisableByAssignmentAsync(workAssignmentId, actorUserId, ct);
-
-        var disableResult = await _ctx.WorkReportPeriods.UpdateManyAsync(
-            x => x.WorkAssignmentId == workAssignmentId && !x.IsDeleted,
+        if (assignment is null) return;
+        var disableResult = await _transactions.ExecuteAsync(async (session, token) =>
+        {
+        await EnsureObservedAssignmentAsync(session, assignment, token);
+        await AggregateHostIntegration.RelationshipAsync(_ctx, session, assignment.WorkId, [workAssignmentId],
+            "rematerialize:" + assignment.Id + ":" + assignment.UpdatedAtUtc.Ticks, token);
+        var result = await _ctx.WorkReportPeriods.UpdateManyAsync(session,
+            x => x.WorkAssignmentId == workAssignmentId && !x.IsDeleted && x.CurrentReportId == null && x.SourceLifecycleReportId == null,
             Builders<WorkReportPeriod>.Update
                 .Set(x => x.IsActive, false)
                 .Set(x => x.UpdatedAtUtc, DateTime.UtcNow)
                 .Set(x => x.UpdatedByUserId, actorUserId),
-            cancellationToken: ct);
+            cancellationToken: token);
+        await WorkDirectSourceRevisionFence.IncrementAsync(_ctx, session, assignment.WorkId, token);
+        return result;
+        }, ct);
+        await _queue.DisableByAssignmentAsync(workAssignmentId, actorUserId, ct);
 
         var disabledPeriodIds = await _ctx.WorkReportPeriods
             .Find(x => x.WorkAssignmentId == workAssignmentId && !x.IsDeleted)
@@ -281,6 +317,13 @@ public sealed class WorkAssignmentRuntimeMaterializeService : IWorkAssignmentRun
             await _docRoleReadModelProjection.RebuildReportPeriodAsync(periodId, actorUserId, ct);
 
         await MaterializeForAssignmentAsync(workAssignmentId, actorUserId, ct);
+    }
+
+    private async Task EnsureObservedAssignmentAsync(IClientSessionHandle session, WorkAssignment assignment, CancellationToken ct)
+    {
+        if (!await _ctx.WorkAssignments.Find(session, a => a.Id == assignment.Id && !a.IsDeleted && a.IsActive
+            && a.UpdatedAtUtc == assignment.UpdatedAtUtc && a.CompletedAtUtc == null).AnyAsync(ct))
+            throw new tdtd_be.Services.AggregateMapping.AggregatePreviewException("AGG_MATERIALIZE_ASSIGNMENT_STALE");
     }
 
     private static AppException AssignmentWorkNotFound(WorkAssignment assignment)

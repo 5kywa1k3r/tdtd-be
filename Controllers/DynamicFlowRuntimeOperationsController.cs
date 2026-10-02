@@ -10,6 +10,8 @@ using tdtd_be.Services.DynamicFlows;
 
 namespace tdtd_be.Controllers;
 
+// Các thao tác vận hành Flow tạm khóa cùng runtime.
+[NonController]
 [ApiController]
 [Authorize]
 [Route("api/admin/operations/dynamic-flow-runtime")]

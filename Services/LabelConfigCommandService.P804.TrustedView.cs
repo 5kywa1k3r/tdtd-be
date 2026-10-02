@@ -42,6 +42,14 @@ public sealed partial class LabelConfigCommandService
         ValidateP804TrustedTableTargetSnapshot(
             LabelCatalogItem owner,
             DynamicFormStatisticLabelSnapshotDto snapshot)
+        => ValidateTrustedPinnedLabelSnapshot(owner, snapshot, LabelUsages.TableTarget);
+
+    internal static void ValidateTrustedStatisticSnapshot(LabelCatalogItem owner,
+        DynamicFormStatisticLabelSnapshotDto snapshot)
+        => ValidateTrustedPinnedLabelSnapshot(owner, snapshot, LabelUsages.Statistic);
+
+    private static void ValidateTrustedPinnedLabelSnapshot(LabelCatalogItem owner,
+        DynamicFormStatisticLabelSnapshotDto snapshot, string expectedUsage)
     {
         ArgumentNullException.ThrowIfNull(snapshot);
         var versions = P804ValidateTrustedLabelOwner(owner);
@@ -101,7 +109,7 @@ public sealed partial class LabelConfigCommandService
             !snapshot.IsActive ||
             !string.Equals(
                 snapshot.Usage,
-                LabelUsages.TableTarget,
+                expectedUsage,
                 StringComparison.Ordinal))
         {
             throw P804LabelIntegrity(

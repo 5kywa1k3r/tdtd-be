@@ -1,0 +1,1008 @@
+{
+  "datasetId": "VN-38-2025-07-01",
+  "provinceCode": "38",
+  "provinceName": "Thanh Hóa",
+  "effectiveFrom": "2025-07-01",
+  "verifiedOn": "2026-09-28",
+  "sourceDocument": "19/2025/QĐ-TTg",
+  "sourceUrl": "https://congbaocdn.chinhphu.vn/CongBaoCP/VanBan/2025/6/45430/57438-1-2025919-92019-2025-qd-ttg.pdf",
+  "sourceSha256": "e3f35e068dfe69b22ea0b305c2c665a23a7a32cce35f7c9b478fd838b013d1a9",
+  "rows": [
+    {
+      "code": "14758",
+      "name": "Phường Hàm Rồng",
+      "provinceCode": "38",
+      "kind": "WARD"
+    },
+    {
+      "code": "14797",
+      "name": "Phường Hạc Thành",
+      "provinceCode": "38",
+      "kind": "WARD"
+    },
+    {
+      "code": "14812",
+      "name": "Phường Bỉm Sơn",
+      "provinceCode": "38",
+      "kind": "WARD"
+    },
+    {
+      "code": "14818",
+      "name": "Phường Quang Trung",
+      "provinceCode": "38",
+      "kind": "WARD"
+    },
+    {
+      "code": "15853",
+      "name": "Phường Đông Tiến",
+      "provinceCode": "38",
+      "kind": "WARD"
+    },
+    {
+      "code": "15925",
+      "name": "Phường Nguyệt Viên",
+      "provinceCode": "38",
+      "kind": "WARD"
+    },
+    {
+      "code": "16378",
+      "name": "Phường Đông Sơn",
+      "provinceCode": "38",
+      "kind": "WARD"
+    },
+    {
+      "code": "16417",
+      "name": "Phường Đông Quang",
+      "provinceCode": "38",
+      "kind": "WARD"
+    },
+    {
+      "code": "16516",
+      "name": "Phường Nam Sầm Sơn",
+      "provinceCode": "38",
+      "kind": "WARD"
+    },
+    {
+      "code": "16522",
+      "name": "Phường Quảng Phú",
+      "provinceCode": "38",
+      "kind": "WARD"
+    },
+    {
+      "code": "16531",
+      "name": "Phường Sầm Sơn",
+      "provinceCode": "38",
+      "kind": "WARD"
+    },
+    {
+      "code": "16561",
+      "name": "Phường Tĩnh Gia",
+      "provinceCode": "38",
+      "kind": "WARD"
+    },
+    {
+      "code": "16576",
+      "name": "Phường Ngọc Sơn",
+      "provinceCode": "38",
+      "kind": "WARD"
+    },
+    {
+      "code": "16594",
+      "name": "Phường Tân Dân",
+      "provinceCode": "38",
+      "kind": "WARD"
+    },
+    {
+      "code": "16597",
+      "name": "Phường Hải Lĩnh",
+      "provinceCode": "38",
+      "kind": "WARD"
+    },
+    {
+      "code": "16609",
+      "name": "Phường Đào Duy Từ",
+      "provinceCode": "38",
+      "kind": "WARD"
+    },
+    {
+      "code": "16624",
+      "name": "Phường Trúc Lâm",
+      "provinceCode": "38",
+      "kind": "WARD"
+    },
+    {
+      "code": "16645",
+      "name": "Phường Hải Bình",
+      "provinceCode": "38",
+      "kind": "WARD"
+    },
+    {
+      "code": "16654",
+      "name": "Phường Nghi Sơn",
+      "provinceCode": "38",
+      "kind": "WARD"
+    },
+    {
+      "code": "14845",
+      "name": "Xã Mường Lát",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "14848",
+      "name": "Xã Tam Chung",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "14854",
+      "name": "Xã Mường Lý",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "14857",
+      "name": "Xã Trung Lý",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "14860",
+      "name": "Xã Quang Chiểu",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "14863",
+      "name": "Xã Pù Nhi",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "14864",
+      "name": "Xã Nhi Sơn",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "14866",
+      "name": "Xã Mường Chanh",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "14869",
+      "name": "Xã Hồi Xuân",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "14872",
+      "name": "Xã Trung Thành",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "14875",
+      "name": "Xã Trung Sơn",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "14878",
+      "name": "Xã Phú Lệ",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "14890",
+      "name": "Xã Phú Xuân",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "14896",
+      "name": "Xã Hiền Kiệt",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "14902",
+      "name": "Xã Nam Xuân",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "14908",
+      "name": "Xã Thiên Phủ",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "14923",
+      "name": "Xã Bá Thước",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "14932",
+      "name": "Xã Điền Quang",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "14950",
+      "name": "Xã Điền Lư",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "14953",
+      "name": "Xã Quý Lương",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "14956",
+      "name": "Xã Pù Luông",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "14959",
+      "name": "Xã Cổ Lũng",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "14974",
+      "name": "Xã Văn Nho",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "14980",
+      "name": "Xã Thiết Ống",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15001",
+      "name": "Xã Trung Hạ",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15007",
+      "name": "Xã Tam Thanh",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15010",
+      "name": "Xã Sơn Thủy",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15013",
+      "name": "Xã Na Mèo",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15016",
+      "name": "Xã Quan Sơn",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15019",
+      "name": "Xã Tam Lư",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15022",
+      "name": "Xã Sơn Điện",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15025",
+      "name": "Xã Mường Mìn",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15031",
+      "name": "Xã Yên Khương",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15034",
+      "name": "Xã Yên Thắng",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15043",
+      "name": "Xã Giao An",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15049",
+      "name": "Xã Văn Phú",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15055",
+      "name": "Xã Linh Sơn",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15058",
+      "name": "Xã Đồng Lương",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15061",
+      "name": "Xã Ngọc Lặc",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15085",
+      "name": "Xã Thạch Lập",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15091",
+      "name": "Xã Ngọc Liên",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15106",
+      "name": "Xã Nguyệt Ấn",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15112",
+      "name": "Xã Kiên Thọ",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15124",
+      "name": "Xã Minh Sơn",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15127",
+      "name": "Xã Cẩm Thủy",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15142",
+      "name": "Xã Cẩm Thạch",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15148",
+      "name": "Xã Cẩm Tú",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15163",
+      "name": "Xã Cẩm Vân",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15178",
+      "name": "Xã Cẩm Tân",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15187",
+      "name": "Xã Kim Tân",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15190",
+      "name": "Xã Vân Du",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15199",
+      "name": "Xã Thạch Quảng",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15211",
+      "name": "Xã Thạch Bình",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15229",
+      "name": "Xã Thành Vinh",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15250",
+      "name": "Xã Ngọc Trạo",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15271",
+      "name": "Xã Hà Trung",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15274",
+      "name": "Xã Hà Long",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15286",
+      "name": "Xã Hoạt Giang",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15298",
+      "name": "Xã Lĩnh Toại",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15316",
+      "name": "Xã Tống Sơn",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15349",
+      "name": "Xã Vĩnh Lộc",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15361",
+      "name": "Xã Tây Đô",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15382",
+      "name": "Xã Biện Thượng",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15409",
+      "name": "Xã Yên Phú",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15412",
+      "name": "Xã Quý Lộc",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15421",
+      "name": "Xã Yên Trường",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15442",
+      "name": "Xã Yên Ninh",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15448",
+      "name": "Xã Định Hòa",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15457",
+      "name": "Xã Định Tân",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15469",
+      "name": "Xã Yên Định",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15499",
+      "name": "Xã Thọ Xuân",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15505",
+      "name": "Xã Thọ Long",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15520",
+      "name": "Xã Xuân Hòa",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15544",
+      "name": "Xã Lam Sơn",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15553",
+      "name": "Xã Sao Vàng",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15568",
+      "name": "Xã Thọ Lập",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15574",
+      "name": "Xã Xuân Tín",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15592",
+      "name": "Xã Xuân Lập",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15607",
+      "name": "Xã Bát Mọt",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15610",
+      "name": "Xã Yên Nhân",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15622",
+      "name": "Xã Vạn Xuân",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15628",
+      "name": "Xã Lương Sơn",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15634",
+      "name": "Xã Luận Thành",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15643",
+      "name": "Xã Thắng Lộc",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15646",
+      "name": "Xã Thường Xuân",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15658",
+      "name": "Xã Xuân Chinh",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15661",
+      "name": "Xã Tân Thành",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15664",
+      "name": "Xã Triệu Sơn",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15667",
+      "name": "Xã Thọ Bình",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15682",
+      "name": "Xã Hợp Tiến",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15715",
+      "name": "Xã Tân Ninh",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15724",
+      "name": "Xã Đồng Tiến",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15754",
+      "name": "Xã Thọ Ngọc",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15763",
+      "name": "Xã Thọ Phú",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15766",
+      "name": "Xã An Nông",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15772",
+      "name": "Xã Thiệu Hóa",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15778",
+      "name": "Xã Thiệu Tiến",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15796",
+      "name": "Xã Thiệu Quang",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15820",
+      "name": "Xã Thiệu Toán",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15835",
+      "name": "Xã Thiệu Trung",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15865",
+      "name": "Xã Hoằng Hóa",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15880",
+      "name": "Xã Hoằng Giang",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15889",
+      "name": "Xã Hoằng Phú",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15910",
+      "name": "Xã Hoằng Sơn",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15961",
+      "name": "Xã Hoằng Lộc",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15976",
+      "name": "Xã Hoằng Châu",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "15991",
+      "name": "Xã Hoằng Tiến",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "16000",
+      "name": "Xã Hoằng Thanh",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "16012",
+      "name": "Xã Hậu Lộc",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "16021",
+      "name": "Xã Triệu Lộc",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "16033",
+      "name": "Xã Đông Thành",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "16072",
+      "name": "Xã Hoa Lộc",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "16078",
+      "name": "Xã Vạn Lộc",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "16093",
+      "name": "Xã Nga Sơn",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "16108",
+      "name": "Xã Tân Tiến",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "16114",
+      "name": "Xã Nga Thắng",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "16138",
+      "name": "Xã Hồ Vương",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "16144",
+      "name": "Xã Nga An",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "16171",
+      "name": "Xã Ba Đình",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "16174",
+      "name": "Xã Như Xuân",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "16177",
+      "name": "Xã Xuân Bình",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "16186",
+      "name": "Xã Hóa Quỳ",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "16213",
+      "name": "Xã Thanh Phong",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "16222",
+      "name": "Xã Thanh Quân",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "16225",
+      "name": "Xã Thượng Ninh",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "16228",
+      "name": "Xã Như Thanh",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "16234",
+      "name": "Xã Xuân Du",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "16249",
+      "name": "Xã Mậu Lâm",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "16258",
+      "name": "Xã Xuân Thái",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "16264",
+      "name": "Xã Yên Thọ",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "16273",
+      "name": "Xã Thanh Kỳ",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "16279",
+      "name": "Xã Nông Cống",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "16297",
+      "name": "Xã Trung Chính",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "16309",
+      "name": "Xã Thắng Lợi",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "16342",
+      "name": "Xã Thăng Bình",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "16348",
+      "name": "Xã Trường Văn",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "16363",
+      "name": "Xã Tượng Lĩnh",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "16369",
+      "name": "Xã Công Chính",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "16438",
+      "name": "Xã Lưu Vệ",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "16480",
+      "name": "Xã Quảng Yên",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "16489",
+      "name": "Xã Quảng Chính",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "16498",
+      "name": "Xã Quảng Ngọc",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "16540",
+      "name": "Xã Quảng Ninh",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "16543",
+      "name": "Xã Quảng Bình",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "16549",
+      "name": "Xã Tiên Trang",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "16591",
+      "name": "Xã Các Sơn",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    },
+    {
+      "code": "16636",
+      "name": "Xã Trường Lâm",
+      "provinceCode": "38",
+      "kind": "COMMUNE"
+    }
+  ]
+}

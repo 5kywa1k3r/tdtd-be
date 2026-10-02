@@ -1,0 +1,28 @@
+using tdtd_be.Models;
+using tdtd_be.Services.WorkDocuments;
+int checks=0;
+void Check(bool value,string label){if(!value)throw new Exception(label);checks++;}
+WorkAssignment Node(string id,string? parent,string reviewer,string assignee)=>new(){Id=id,WorkId="work",ParentAssignmentId=parent,CreatedByUserId=reviewer,IsActive=true,Assignees=[new(){UserId=assignee}],Path="/forged"};
+var root=Node("pv",null,"cat","pv01");var a=Node("a","pv","pv01","pa02");var b=Node("b","pv","pv01","pa01");var xa=Node("xa","a","pa02","xA");var xb=Node("xb","b","pa01","xB");
+var nodes=new[]{root,a,b,xa,xb};
+WorkDocumentAccessSnapshot Access(string user,bool owner=false)=>new("work",user,true,owner,nodes,[]);
+var xã=Access("xA");
+foreach(var id in new[]{"pv","a","xa"})Check(xã.CanReadAssignment(id),"child reads shared ancestor "+id);
+foreach(var id in new[]{"b","xb"})Check(!xã.CanReadAssignment(id),"child cannot cross branch "+id);
+Check(xã.UploadAssignments.Count==0,"read does not grant upload");
+Check(Access("pa02").UploadAssignments.Select(x=>x.Id).SequenceEqual(new[]{"xa"}),"reviewer may upload only own child");
+foreach(var node in nodes)Check(Access("cat",true).CanReadAssignment(node.Id),"owner reads descendant "+node.Id);
+Check(Access("pv01").ReadableAssignments.Count==5,"parent reads all its descendants");
+Check(xã.AssignmentPath("xa")=="/pv/a/xa","display path follows live parents, ignores stored path");
+Check(xã.IsWithinBranch("xa","a")&&!xã.IsWithinBranch("xb","a"),"subtree selector uses live parent, ignores forged path");
+var doc=new FileDoc{Id="file",WorkId="work",AssignmentId="a",DocumentScope="ASSIGNMENT_BRANCH",SourceType="ASSIGNMENT_DOCUMENT",CreatedByUserId="pv01"};var scope=WorkDocumentScopeResolver.Resolve(doc);
+Check(xã.CanRead(doc,scope),"list/download use same snapshot");Check(!xã.CanDelete(doc,scope),"child cannot mutate inherited file");Check(Access("cat",true).CanDelete(doc,scope),"current owner can manage file");
+var outsider=new WorkDocumentAccessSnapshot("work","outsider",false,false,nodes,[]);Check(!outsider.CanRead(doc,scope),"outsider cannot read");
+doc.SourceType="REPORT_EVIDENCE";Check(!Access("cat",true).CanRead(doc,scope)&&!Access("cat",true).CanDelete(doc,scope),"report evidence remains under report ACL");doc.SourceType="ASSIGNMENT_DOCUMENT";
+a.CurrentReviewerUserId="newReviewer";Check(!Access("pv01").UploadAssignments.Any(x=>x.Id=="a"),"handover removes former reviewer upload");Check(Access("newReviewer").UploadAssignments.Any(x=>x.Id=="a"),"handover authorizes current reviewer");a.CurrentReviewerUserId=null;
+a.IsActive=false;Check(!Access("xA").CanReadAssignment("xa"),"inactive ancestor invalidates descendant scope");a.IsActive=true;
+var wrong=Node("wrong","foreign","pv01","xA");Check(!new WorkDocumentAccessSnapshot("work","xA",true,false,nodes.Append(wrong),[]).CanReadAssignment("wrong"),"missing parent fails closed");
+var cycle1=Node("c1","c2","pv01","xA");var cycle2=Node("c2","c1","pv01","xA");Check(!new WorkDocumentAccessSnapshot("work","xA",true,false,nodes.Concat(new[]{cycle1,cycle2}),[]).CanReadAssignment("c1"),"cycle fails closed");
+var common=new FileDoc{Id="common",WorkId="work",DocumentScope="WORK",SourceType="WORK_DOCUMENT"};var commonScope=WorkDocumentScopeResolver.Resolve(common);
+Check(xã.CanRead(common,commonScope)&&!xã.CanDelete(common,commonScope),"work read separate from owner write");Check(Access("cat",true).CanDelete(common,commonScope),"owner mutations use authoritative role");
+Console.WriteLine($"PASS {checks} Work Document branch authorization checks");

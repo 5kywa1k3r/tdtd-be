@@ -1,0 +1,92 @@
+{
+  "contractId": "dynamic-form-native-statistic-plan",
+  "version": 2,
+  "status": "L5B_REDUCERS_SOURCE_ONLY_UNVERIFIED",
+  "activation": "NATIVE_PUBLISH_AND_JOB_BLOCKED_UNTIL_L5B_L5C_CONSUMERS_COMPLETE",
+  "definitionProtocol": "nativeTablesVersion=1 remains; optional tables[].statisticPlan requires nativeStatisticPlanVersion=2 capability",
+  "owner": "Existing P8 writer/CAS/transaction/receipt with nativeStatistics full metadata variant. NativePlanSectionJson is part of the same DynamicFormTemplate config sections and version snapshots, not a new store.",
+  "scope": "This pure plan contains enabled complete targets. The registered wire state adds identity-only disabled markers; incomplete/disabled settings remain in the local authoring session.",
+  "authoringSource": "tdtd-fe/src/features/dynamicForms/dynamicFormStatisticPlanAuthoring.ts",
+  "authoringHandoff": "docs/features/canvas-workspace/L5A2_AUTHORING_SESSION_2026_09_16.md",
+  "storageHandoff": "docs/features/canvas-workspace/L5A3_P8_STORAGE_SNAPSHOTS_2026_09_16.md",
+  "calculationHandoff": "docs/features/canvas-workspace/L5B_TYPED_REDUCERS_2026_09_16.md",
+  "calculationSource": "tdtd-be/Services/WorkAssignmentReports/Statistics/NativeTableStatisticCalculator.cs",
+  "wireSchemaFile": "NATIVE_TABLE_STATISTIC_STATE_V2.schema.json",
+  "identity": ["tableId", "targetId", "operationId", "group address"],
+  "selectors": {
+    "matrix": "Ordered rowIds x fieldIds. Cell, row, column and range gestures freeze these ID lists at configuration time. No A1/index/name identity.",
+    "records": "Ordered fieldIds with records=all. No per-report recordId in a reusable definition.",
+    "duplicateAddresses": "Duplicate axis IDs are rejected; each selected address occurs once per target.",
+    "nonCartesianCellSet": "Not yet represented. Do not approximate an irregular selection by its bounding rectangle."
+  },
+  "grouping": {
+    "selection": "One group for the selected cells across the authorized source set.",
+    "row": "One group per matrix rowId.",
+    "column": "One group per logical fieldId, including repeating tables.",
+    "cell": "One group per matrix rowId+fieldId across reports.",
+    "record": "Repeating tables only; expand to reportId+recordId. Never join independent records by index or label."
+  },
+  "inputPolicy": {
+    "all": "All selected types must be accepted by each method in each group.",
+    "types": "Explicit type filter. Compiled groups retain excludedCellCount. Reject a group emptied by the filter.",
+    "errors": "Filtering selects definition types only; it must never hide a selected cell's invalid value.",
+    "richText": "Unsupported until an explicit typed text projection is implemented."
+  },
+  "order": {
+    "cells": ["rowMajor", "columnMajor"],
+    "reports": ["reportIdAsc", "sourceUpdatedAtAsc"],
+    "records": "recordIdAsc",
+    "comparison": "Ordinal ID comparison; frozen selector order. For sourceUpdatedAtAsc use the captured payload update time, then reportId ordinal as tie-break.",
+    "iteration": "Source report order is outermost. In each report use selector traversal; repeat record IDs in declared order. For columnMajor repeating input, field order is outermost within that report.",
+    "pinGap": "L5a.3 adds captured payload timestamp, immutable native source pins and source-order digest plus an explicit generation capture method. L5c must invoke capture with frozen authorized sources and persist/revalidate the digest through staging/publication/readback. Existing jobs do not opt in implicitly; missing time blocks time-ordered methods. No clock/ObjectId/cell-edit fallback."
+  },
+  "methods": {
+    "COUNT": "Count present typed cells, including 0 and false; one multiSelect cell counts once. Missing/null/error never become 0 or false.",
+    "DISTINCT_COUNT": "Distinct typed whole-cell values; type participates in equality. Array order and full content are retained; no text sample limit.",
+    "SUM": "Numbers only, exact supported numeric domain; overflow is explicit.",
+    "AVG": "Numbers only; carry sum and numericCount through all hierarchy levels.",
+    "MIN": "One homogeneous number/date/fullDate type; compare values, not source recency. Date precision must also match within the runtime group; mixed year/month/day precision fails explicitly.",
+    "MAX": "One homogeneous number/date/fullDate type; compare values, not source recency. Date precision must also match within the runtime group; no invented first day/month.",
+    "LATEST": "One homogeneous type, requires sourceUpdatedAtAsc; choose the last present cell in the explicit total order. Not the last edited cell.",
+    "TRUE_COUNT": "Boolean true cells only.",
+    "FALSE_COUNT": "Boolean false cells only.",
+    "BUCKET_COUNT": "Explicit mode option/date. Choice requires homogeneous type and identical code/label sets within a group; a code contributes at most once per cell. Date mode keys exact typed date values, not an implicit month/year bucket.",
+    "CONCAT": "Literal separator plus separate itemSeparator, keep/skip blanks, keep/distinct full rendered segments, text/canonical format and code/label choice formatting. All options required; no defaults on read.",
+    "STACK_ROWS": "Append complete selected source blocks vertically. Columns follow frozen fieldIds; source matrix rowIds or sorted recordIds define rows. Keep missing/null cells and every source address.",
+    "STACK_COLUMNS": "Append selected source blocks horizontally, with explicit output coordinates and per-source block dimensions. Independent records displayed at the same row position are not joined. Unequal block heights leave padding outside blocks, not invented source cells."
+  },
+  "textSemantics": {
+    "text": "Only plainText/stringList. Join list items in original order with itemSeparator, then cell segments with separator.",
+    "canonical": "Text unchanged; number uses the exact supported value; boolean true/false; date uses the typed date literal; choices use source snapshot code/label; arrays use itemSeparator in source order.",
+    "blankPolicy": "Applied to the rendered whole-cell segment after item joining. skip excludes empty/whitespace-only segments without trimming retained content; keep preserves empty segments. Never manufactures a value for a missing cell.",
+    "duplicatePolicy": "keep retains repeats; distinct compares full rendered segments ordinally and keeps the first occurrence in the explicit order.",
+    "limits": "Preparation never truncates separator/content. Reducer/storage must chunk full output or fail explicitly at budget; samples and paged result rows cannot be used as full output."
+  },
+  "calculationResult": {
+    "boundary": "Internal pure result version 2 only. L5c must wrap with config/generation/catalog identities, persist/hash complete output and implement readers before activation.",
+    "sourceSet": "Require the complete expected source pin set and its digest. Reject duplicates, missing, extra or changed sources. Reuse full native value validation; no selected or filtered-out error is silently skipped.",
+    "numbers": "Source and output numeric values are exact invariant strings. SUM uses fixed-scale BigInteger accumulation; AVG returns exact Sum/Count without implicit division or rounding. Numeric state merge requires disjoint authorized source sets.",
+    "empty": "COUNT and boolean/distinct counts are zero on no present cells; SUM/AVG/MIN/MAX/LATEST have no scalar value without inputs. Missing/null/present and excluded counters remain separate. CONCAT exposes segmentCount even for kept zero-length segments.",
+    "text": "Concatenate TextChunks by index without adding separators. Literal LF/CRLF/Unicode are preserved. TextSegments identify source cells and ranges in UTF-16 code units across the full concatenation. Format is type-aware; list itemSeparator is independent from inter-cell separator.",
+    "stack": "Typed cell chunks carry absolute output row/column plus report/table/row-or-record/field source address. Source block dimensions distinguish padding from missing cells inside a block.",
+    "budgets": "Caller must supply report/group/cell-visit/retained-byte/output-byte/chunk limits; no production quota is inferred from demo caps. Keep complete output within limits or throw. Text chunks split at Unicode scalar boundaries; a typed stack cell exceeding the supplied chunk budget fails explicitly.",
+    "merge": "Final CONCAT strings, distinct counts and displayed averages are not merge inputs. L5c must combine disjoint numeric Sum/Count or recompute non-additive methods from the deduplicated pinned source set. No current job calls this calculator."
+  },
+  "labels": "Codes are retained in definition metadata; code-array order follows the existing P8 set canonicalization. The pure compiler has no label lookup/default. P8 v2 resolves visible active label versions, checks type/options and global root/v1/v2 uniqueness, and includes snapshots/dependency pins in hashes.",
+  "preparationBounds": {
+    "maxUtf8Bytes": 1048576,
+    "maxTargets": 30,
+    "maxOperationsPerTarget": 30,
+    "maxIdsPerAxis": 200,
+    "meaning": "Source preparation safety bounds. Not a production execution budget or permission to increase existing Form/P8/runtime limits."
+  },
+  "roundTrip": "Strict required/unknown/duplicate-property guards; no automatic v1 migration or config defaults. JSON retains IDs, array order, metadata, literal separators and options. Prepared bindings are detached from the input definition.",
+  "digest": "BE content digest reuses StatConfigCanonicalJson, including existing label-set canonicalization. It is not a published schema hash, P8 config hash, concurrency token or job pin.",
+  "remaining": [
+    "L5a.1-3 and L5b source are written; compile/runtime/QA/API/DB round-trip verification remains unperformed",
+    "L5c must invoke native source capture, persist its order digest, and implement generation/result readers before activation",
+    "L5c must configure execution budgets and preserve exact numeric state, text chunks/segment provenance and stack block/cell geometry through storage and readers",
+    "L5c native generation/result readers and guarded activation",
+    "Execution verification remains unperformed under the user's no-test/build/QA/job constraint"
+  ]
+}

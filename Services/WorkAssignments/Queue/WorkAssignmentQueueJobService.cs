@@ -411,13 +411,20 @@ public sealed class WorkAssignmentQueueJobService : IWorkAssignmentQueueJobServi
         => _transactions.ExecuteAsync(
             async (session, transactionCt) =>
             {
+                if (!await _ctx.WorkReportPeriods.Find(session, BuildObservedPeriodFilter(period)).AnyAsync(transactionCt))
+                    return false;
+                var binding = await _ctx.WorkTemplateAssignees.Find(session, b => b.Id == period.WorkTemplateAssigneeId).FirstOrDefaultAsync(transactionCt);
+                await tdtd_be.Services.AggregateMapping.Persistence.AggregateHostIntegration.SlotAsync(
+                    _ctx, session, period.WorkId, period.WorkTemplateAssigneeId,
+                    binding?.AssignmentType == "ONCE" ? "ONCE" : period.PeriodKey,
+                    "queue:" + period.Id + ":" + period.UpdatedAtUtc.Ticks, transactionCt);
                 var periodUpdate = await _ctx.WorkReportPeriods.UpdateOneAsync(
                     session,
                     BuildObservedPeriodFilter(period),
                     update,
                     cancellationToken: transactionCt);
                 if (periodUpdate.MatchedCount != 1)
-                    return false;
+                    throw new tdtd_be.Services.AggregateMapping.AggregatePreviewException("AGG_SLOT_CHANGED");
                 var sourceRevision = await _ctx.WorkAssignments.UpdateOneAsync(
                     session,
                     x =>

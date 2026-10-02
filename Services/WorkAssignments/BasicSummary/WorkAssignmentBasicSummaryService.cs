@@ -82,6 +82,8 @@ public sealed partial class WorkAssignmentBasicSummaryService :
         string actorUserId,
         CancellationToken ct)
     {
+        // Tạm khóa luồng tổng hợp cũ; giữ nguyên triển khai bên dưới.
+        LegacyAggregateRetirement.Reject();
         EnsureActor(actorUserId);
 
         var scope = await LoadScopeAssignmentAsync(assignmentId?.Trim() ?? string.Empty, ct);
@@ -112,6 +114,8 @@ public sealed partial class WorkAssignmentBasicSummaryService :
         string actorUserId,
         CancellationToken ct)
     {
+        // Tạm khóa luồng tổng hợp cũ; giữ nguyên triển khai bên dưới.
+        LegacyAggregateRetirement.Reject();
         EnsureActor(actorUserId);
 
         var scope = await LoadScopeAssignmentAsync(assignmentId?.Trim() ?? string.Empty, ct);
@@ -167,6 +171,8 @@ public sealed partial class WorkAssignmentBasicSummaryService :
         string actorUserId,
         CancellationToken ct)
     {
+        // Tạm khóa luồng tổng hợp cũ; giữ nguyên triển khai bên dưới.
+        LegacyAggregateRetirement.Reject();
         var candidate = _candidateActivation.RequireCapability(
             StatRunCapabilities.BasicSummary,
             StatRunRouteRegistry.BasicResult);
@@ -249,6 +255,8 @@ public sealed partial class WorkAssignmentBasicSummaryService :
         string actorUserId,
         CancellationToken ct)
     {
+        // Job/hook cũ dừng trước mọi I/O, không tạo vòng retry hay thay dữ liệu lịch sử.
+        if (LegacyAggregateRetirement.IsDisabled) return;
         var candidate = _candidateActivation.RequireCapability(
             StatRunCapabilities.BasicSummary,
             StatRunRouteRegistry.BasicResult);
@@ -352,6 +360,8 @@ public sealed partial class WorkAssignmentBasicSummaryService :
         string actorUserId,
         CancellationToken ct)
     {
+        // Reset là lệnh của người dùng, phải báo đã khóa thay vì tạo job cũ.
+        LegacyAggregateRetirement.Reject();
         EnsureActor(actorUserId);
 
         snapshotId = snapshotId?.Trim() ?? string.Empty;
@@ -1450,7 +1460,8 @@ public sealed partial class WorkAssignmentBasicSummaryService :
         List<WorkAssignment> sourceAssignments,
         List<WorkAssignmentReport> sourceReports,
         string sourceSignatureHash,
-        CancellationToken ct)
+        CancellationToken ct,
+        IReadOnlyDictionary<string, WorkReportPayloadSnapshot>? capturedPayloads = null)
     {
         var fields = ExtractFieldDefinitions(template.FieldsJson)
             .ToList();
@@ -1480,7 +1491,9 @@ public sealed partial class WorkAssignmentBasicSummaryService :
 
         foreach (var report in sourceReports)
         {
-            var payload = await _payloadReader.LoadReportPayloadAsync(report, ct);
+            var payload = capturedPayloads is null
+                ? await _payloadReader.LoadReportPayloadAsync(report, ct)
+                : capturedPayloads[report.Id];
 
             foreach (var fieldValue in ExtractFieldValues(payload.FieldValuesJson, fields))
             {

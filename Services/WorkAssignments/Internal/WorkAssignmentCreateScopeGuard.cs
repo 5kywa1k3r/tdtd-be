@@ -44,7 +44,7 @@ internal static class WorkAssignmentCreateScopeGuard
     {
         EnsureActor(actorUserId);
 
-        var isOwner = string.Equals(parent.CreatedByUserId, actorUserId, StringComparison.Ordinal);
+        var isOwner = WorkAssignmentCurrentAuthority.IsReviewer(parent, actorUserId);
         var isDirectAssignee = parent.Assignees != null &&
                                parent.Assignees.Any(a => string.Equals(a.UserId, actorUserId, StringComparison.Ordinal));
 

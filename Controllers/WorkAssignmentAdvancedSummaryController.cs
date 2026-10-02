@@ -10,6 +10,8 @@ using tdtd_be.Services.WorkAssignments.AdvancedSummary;
 
 namespace tdtd_be.Controllers;
 
+// 30/09/2026: giữ mã cũ, chặn toàn bộ entry point; dùng Aggregate v2 trong báo cáo.
+[tdtd_be.Services.WorkAssignments.LegacyAggregateDisabled]
 [ApiController]
 [Authorize]
 [Route("api/work-assignment-advanced-summary")]
@@ -28,6 +30,77 @@ public sealed class WorkAssignmentAdvancedSummaryController : ControllerBase
         _hierarchy = hierarchy;
         _candidateActivation = candidateActivation;
     }
+
+    // Native result paths have independent typed snapshots; scalar hierarchy
+    // routes keep their guard until their consumers understand native output.
+    [HttpPost("native-summary")]
+    public async Task<IActionResult> NativeSummary([FromBody] JsonElement body, CancellationToken ct)
+        => Ok(await _configs.GetNativeSummaryAsync(StatConfigCanonicalJson.DeserializeStrict<AdvancedNativeSummaryRequest>(body), ct));
+
+    [HttpPost("native-comparison")]
+    [RequestSizeLimit(8192)]
+    public async Task<IActionResult> NativeComparison([FromBody] JsonElement body, CancellationToken ct)
+    {
+        try { return Ok(await _configs.CompareNativeSummaryAsync(StatConfigCanonicalJson.DeserializeStrict<AdvancedNativeComparisonRequest>(body), ct)); }
+        catch (AdvancedNativeComparisonBudgetException ex)
+        {
+            Response.Headers["Retry-After"] = "5";
+            return StatusCode(ex.Message == "ADVANCED_NATIVE_COMPARISON_BUSY" ? 429 : 503, new { code = ex.Message });
+        }
+    }
+
+    [HttpPost("native-refresh")]
+    public async Task<IActionResult> NativeRefresh([FromBody] JsonElement body, CancellationToken ct)
+        => Ok(await _configs.QueueNativeRefreshAsync(StatConfigCanonicalJson.DeserializeStrict<AdvancedNativeSummaryRequest>(body), ct));
+
+    [HttpPost("native-comparison-records")]
+    [RequestSizeLimit(8192)]
+    public async Task<IActionResult> RecordNativeComparison([FromBody] JsonElement body, CancellationToken ct)
+    {
+        try { return Ok(await _configs.RecordNativeComparisonAsync(StatConfigCanonicalJson.DeserializeStrict<AdvancedNativeComparisonRequest>(body), ct)); }
+        catch (AdvancedNativeComparisonBudgetException ex) {
+            Response.Headers["Retry-After"] = "5";
+            return StatusCode(ex.Message == "ADVANCED_NATIVE_COMPARISON_BUSY" ? 429 : 503, new { code = ex.Message });
+        }
+    }
+
+    [HttpGet("native-comparison-records/{id}")]
+    public async Task<IActionResult> ReadNativeComparisonRecord(string id, [FromQuery] string hash, CancellationToken ct)
+        => Ok(await _configs.ReadNativeComparisonRecordAsync(id, hash, ct));
+
+    [HttpGet("native-comparison-records")]
+    public async Task<IActionResult> ListNativeComparisonRecords([FromQuery] string scopeId, [FromQuery] string formId,
+        [FromQuery] string? after, [FromQuery] int limit = 10, CancellationToken ct = default)
+    {
+        try { return Ok(await _configs.ListNativeComparisonRecordsAsync(scopeId, formId, after, limit, ct)); }
+        catch (MongoDB.Driver.MongoExecutionTimeoutException) {
+            return StatusCode(503, new { code = "ADVANCED_NATIVE_COMPARISON_LIST_TIMEOUT" });
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested) {
+            return StatusCode(503, new { code = "ADVANCED_NATIVE_COMPARISON_LIST_TIMEOUT" });
+        }
+    }
+
+    [HttpGet("native-comparison-records/{id}/diagnostic")]
+    public async Task<IActionResult> DiagnoseNativeComparisonRecord(string id, [FromQuery] string hash, CancellationToken ct)
+    {
+        try { return Ok(await _configs.DiagnoseNativeComparisonRecordAsync(id, hash, ct)); }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested) {
+            return StatusCode(503, new { code = "ADVANCED_NATIVE_COMPARISON_DIAGNOSTIC_TIMEOUT" });
+        }
+    }
+
+    [HttpGet("native-refresh/by-command/{commandId}")]
+    public async Task<IActionResult> NativeRefreshByCommand([FromRoute] string commandId, CancellationToken ct)
+        => Ok(await _configs.ReadNativeRefreshByCommandAsync(commandId, ct));
+
+    [HttpGet("native-refresh/{refreshId}")]
+    public async Task<IActionResult> NativeRefreshStatus(string refreshId, CancellationToken ct)
+        => Ok(await _configs.ReadNativeRefreshAsync(refreshId, ct));
+
+    [HttpPost("native-refresh/{refreshId}/retry")]
+    public async Task<IActionResult> NativeRefreshRetry(string refreshId, CancellationToken ct)
+        => Ok(await _configs.RetryNativeRefreshAsync(refreshId, ct));
 
     [HttpGet("assignments/{assignmentId}/templates/{dynamicFormTemplateId}/sections/{sectionId}/config")]
     public async Task<IActionResult> GetConfig(

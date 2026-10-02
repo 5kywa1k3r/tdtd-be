@@ -90,7 +90,7 @@ public sealed class LabelEnumCatalogService : ILabelEnumCatalogService
     {
         var me = _me.RequireMe();
         var doc = await LoadVisibleAsync(id, me, ct);
-        return ToDetail(doc, me);
+        return ToDetail(doc, me) with { IsInUse = await IsReferencedAsync(doc.Id, ct) };
     }
 
     public Task<LabelEnumCatalogDetail> CreateAsync(CreateLabelEnumCatalogReq req, CancellationToken ct)
@@ -129,8 +129,17 @@ public sealed class LabelEnumCatalogService : ILabelEnumCatalogService
         var doc = await LoadVisibleAsync(id, me, ct);
         EnsureCanManage(me, doc);
 
-        var options = NormalizeOptions(req.Options);
+        var options = NormalizeOptions(req.Options, enforceUniqueOrder: false);
         var name = NormalizeName(req.Name);
+        // Referenced catalogs are immutable; only deactivation is allowed. Existing bindings retain usage.
+        var contentChanged = name != doc.Name || NormalizeOptionalText(req.Description) != doc.Description
+            || !options.Select(x => (x.Code, x.Label, x.Order, x.IsActive))
+                .SequenceEqual(doc.Options.OrderBy(x => x.Order).ThenBy(x => x.Code).Select(x => (x.Code, x.Label, x.Order, x.IsActive)));
+        // Permit deactivation of unchanged historical content, including legacy order ties.
+        // Every create or content edit must have unique orders, even for inactive options.
+        if (contentChanged || req.IsActive) EnsureUniqueOptionOrders(options);
+        if (contentChanged || (!doc.IsActive && req.IsActive))
+            await EnsureNotReferencedAsync(id, ct);
         var now = DateTime.UtcNow;
         var nextRevision = Math.Max(1, doc.OptionsRevision + 1);
         var update = Builders<LabelEnumCatalog>.Update
@@ -165,33 +174,7 @@ public sealed class LabelEnumCatalogService : ILabelEnumCatalogService
         var doc = await LoadVisibleAsync(id, me, ct);
         EnsureCanManage(me, doc);
 
-        var usedByLabel = await _ctx.Labels
-            .Find(x => x.ValueSourceCatalogId == id && !x.IsDeleted)
-            .Limit(1)
-            .AnyAsync(ct);
-        if (usedByLabel)
-            throw AppExceptionFactory.Create(AppErrorCode.LABEL_ENUM_CATALOG_IN_USE, new { catalogId = id });
-
-        var catalogRefRegex = BuildCatalogReferenceRegex(id);
-        var usedByDynamicExcel = await _ctx.DynamicExcelTemplates
-            .Find(Builders<DynamicExcelTemplate>.Filter.Eq(x => x.IsDeleted, false)
-                  & Builders<DynamicExcelTemplate>.Filter.Regex(x => x.SpecJson, catalogRefRegex))
-            .Limit(1)
-            .AnyAsync(ct);
-        if (usedByDynamicExcel)
-            throw AppExceptionFactory.Create(AppErrorCode.LABEL_ENUM_CATALOG_IN_USE, new { catalogId = id, source = "DYNAMIC_EXCEL" });
-
-        var formFb = Builders<DynamicFormTemplate>.Filter;
-        var usedByDynamicForm = await _ctx.DynamicFormTemplates
-            .Find(formFb.Eq(x => x.IsDeleted, false)
-                  & formFb.Or(
-                      formFb.Regex(x => x.FieldsJson, catalogRefRegex),
-                      formFb.Regex(x => x.ExcelBlockJson, catalogRefRegex),
-                      formFb.Regex(x => x.BlocksJson, catalogRefRegex)))
-            .Limit(1)
-            .AnyAsync(ct);
-        if (usedByDynamicForm)
-            throw AppExceptionFactory.Create(AppErrorCode.LABEL_ENUM_CATALOG_IN_USE, new { catalogId = id, source = "DYNAMIC_FORM" });
+        await EnsureNotReferencedAsync(id, ct);
 
         var now = DateTime.UtcNow;
         await _ctx.LabelEnumCatalogs.UpdateOneAsync(
@@ -215,6 +198,45 @@ public sealed class LabelEnumCatalogService : ILabelEnumCatalogService
                 .Set(x => x.UpdatedAtUtc, now)
                 .Set(x => x.UpdatedByUserId, me.Id),
             cancellationToken: ct);
+    }
+
+    private async Task EnsureNotReferencedAsync(string id, CancellationToken ct)
+    {
+        if (await IsReferencedAsync(id, ct))
+            throw AppExceptionFactory.Create(AppErrorCode.LABEL_ENUM_CATALOG_IN_USE, new { catalogId = id,
+                reason = "Danh mục đang được dùng: chỉ được ngừng hiệu lực. Muốn thay đổi, tạo danh mục khác." });
+    }
+
+    private async Task<bool> IsReferencedAsync(string id, CancellationToken ct)
+    {
+        var usedByLabel = await _ctx.Labels
+            .Find(x => x.ValueSourceCatalogId == id)
+            .Limit(1)
+            .AnyAsync(ct);
+        if (usedByLabel)
+            return true;
+
+        var catalogRefRegex = BuildCatalogReferenceRegex(id);
+        var usedByDynamicExcel = await _ctx.DynamicExcelTemplates
+            .Find(Builders<DynamicExcelTemplate>.Filter.Regex(x => x.SpecJson, catalogRefRegex))
+            .Limit(1)
+            .AnyAsync(ct);
+        if (usedByDynamicExcel)
+            return true;
+
+        var formFb = Builders<DynamicFormTemplate>.Filter;
+        var usedByDynamicForm = await _ctx.DynamicFormTemplates
+            .Find(formFb.Or(
+                      formFb.Regex(x => x.FieldsJson, catalogRefRegex),
+                      formFb.Regex(x => x.ExcelBlockJson, catalogRefRegex),
+                      formFb.Regex(x => x.BlocksJson, catalogRefRegex),
+                      formFb.Regex(x => x.TablesJson, catalogRefRegex),
+                      formFb.Regex(x => x.PublishedSchemaSnapshotJson, catalogRefRegex)))
+            .Limit(1)
+            .AnyAsync(ct);
+        if (usedByDynamicForm) return true;
+        return await _ctx.WorkAssignmentReports.Find(Builders<WorkAssignmentReport>.Filter.Regex(x => x.SpecJson, catalogRefRegex))
+            .Limit(1).AnyAsync(ct);
     }
 
     private static BsonRegularExpression BuildCatalogReferenceRegex(string catalogId)
@@ -537,22 +559,37 @@ public sealed class LabelEnumCatalogService : ILabelEnumCatalogService
             throw AppExceptionFactory.Forbidden(AppErrorCode.LABEL_ENUM_CATALOG_MANAGER_REQUIRED, new { me.Id, me.Roles });
     }
 
-    private static List<LabelEnumOption> NormalizeOptions(IReadOnlyList<LabelEnumOptionDto>? input)
+    private static void EnsureUniqueOptionOrders(IReadOnlyList<LabelEnumOption> options)
+    {
+        if (options.Any(option => option.Order <= 0))
+            throw AppExceptionFactory.BadRequest(AppErrorCode.LABEL_ENUM_CATALOG_OPTION_INVALID,
+                new { field = "order" }, "Thứ tự phải là số nguyên dương.");
+        var duplicate = options.GroupBy(option => option.Order).FirstOrDefault(group => group.Count() > 1);
+        if (duplicate is not null)
+            throw AppExceptionFactory.BadRequest(AppErrorCode.LABEL_ENUM_CATALOG_OPTION_DUPLICATE,
+                new { field = "order", order = duplicate.Key }, "Thứ tự lựa chọn bị trùng. Nhập số khác.");
+    }
+
+    private static List<LabelEnumOption> NormalizeOptions(IReadOnlyList<LabelEnumOptionDto>? input, bool enforceUniqueOrder = true)
     {
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var labels = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var result = new List<LabelEnumOption>();
         var index = 0;
         foreach (var item in input ?? Array.Empty<LabelEnumOptionDto>())
         {
             var code = item.Code?.Trim();
             var label = item.Label?.Trim();
-            if (string.IsNullOrWhiteSpace(code))
-                continue;
+            if (string.IsNullOrWhiteSpace(code) || string.IsNullOrWhiteSpace(label) || item.Order < 0)
+                throw AppExceptionFactory.BadRequest(AppErrorCode.LABEL_ENUM_CATALOG_OPTION_INVALID,
+                    new { index, code, reason = "Mã, tên và thứ tự lựa chọn phải hợp lệ." });
             var normalizedCode = code.ToLowerInvariant();
             if (!CodeRegex.IsMatch(normalizedCode))
                 throw AppExceptionFactory.BadRequest(AppErrorCode.LABEL_ENUM_CATALOG_OPTION_INVALID, new { code });
             if (!seen.Add(normalizedCode))
                 throw AppExceptionFactory.BadRequest(AppErrorCode.LABEL_ENUM_CATALOG_OPTION_DUPLICATE, new { code = normalizedCode });
+            if (!labels.Add(label!.Normalize(NormalizationForm.FormC)))
+                throw AppExceptionFactory.BadRequest(AppErrorCode.LABEL_ENUM_CATALOG_OPTION_DUPLICATE, new { index, label });
             if (label?.Length > 200)
                 throw AppExceptionFactory.BadRequest(AppErrorCode.LABEL_ENUM_CATALOG_OPTION_INVALID, new { code = normalizedCode, maxLabelLength = 200 });
 
@@ -560,7 +597,7 @@ public sealed class LabelEnumCatalogService : ILabelEnumCatalogService
             {
                 Code = normalizedCode,
                 Label = string.IsNullOrWhiteSpace(label) ? normalizedCode : label,
-                Order = item.Order > 0 ? item.Order : index,
+                Order = item.Order,
                 IsActive = item.IsActive
             });
             index++;
@@ -570,6 +607,7 @@ public sealed class LabelEnumCatalogService : ILabelEnumCatalogService
             throw AppExceptionFactory.BadRequest(AppErrorCode.LABEL_ENUM_CATALOG_OPTION_REQUIRED);
         if (result.Count > 1000)
             throw AppExceptionFactory.BadRequest(AppErrorCode.LABEL_ENUM_CATALOG_OPTION_INVALID, new { count = result.Count, max = 1000 });
+        if (enforceUniqueOrder) EnsureUniqueOptionOrders(result);
         return result.OrderBy(x => x.Order).ThenBy(x => x.Code).ToList();
     }
 

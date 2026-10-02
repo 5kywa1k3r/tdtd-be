@@ -169,6 +169,9 @@ public sealed partial class WorkAssignmentAdvancedSummaryHierarchyService
             });
             if (!string.Equals(recomputed, config.ConfigHash, StringComparison.Ordinal))
                 throw new InvalidOperationException("hash mismatch");
+            if (payload.Sections?.Any(section => section.NativeTargets is { Count: > 0 }) == true)
+                throw AppExceptionFactory.BadRequest(AppErrorCode.COMMON_VALIDATION_FAILED,
+                    new { reason = "ADVANCED_NATIVE_RESULT_CONSUMER_REQUIRED" });
         }
         catch (Exception exception) when (exception is
             System.Text.Json.JsonException or InvalidOperationException)

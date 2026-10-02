@@ -5,6 +5,8 @@ namespace tdtd_be.Services.WorkAssignments;
 
 public interface IWorkAssignmentService
 {
+    Task<AssignmentFormPickerResult> QueryAssignmentFormsAsync(string workId, AssignmentFormPickerQueryRequest request, CancellationToken ct);
+    Task<tdtd_be.DTOs.Pickers.AssignmentPickerScope> GetPickerScopeAsync(tdtd_be.DTOs.Pickers.PickerContext context, CancellationToken ct);
     Task<List<WorkAssignmentListResponse>> GetByWorkIdAsync(string workId, string actorUserId, CancellationToken ct = default);
     Task<List<WorkAssignmentListResponse>> GetMyReportAssignmentsAsync(string workId, string actorUserId, CancellationToken ct = default);
     Task<List<WorkAssignmentListResponse>> GetMyReviewParentAssignmentsAsync(string workId, string actorUserId, CancellationToken ct = default);

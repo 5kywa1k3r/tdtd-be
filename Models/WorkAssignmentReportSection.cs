@@ -73,6 +73,10 @@ public sealed class WorkAssignmentReportSection : BaseEntity
     [BsonElement("blockCount")]
     public int BlockCount { get; set; }
 
+    [BsonElement("nativeTableCount")]
+    [BsonIgnoreIfDefault]
+    public int NativeTableCount { get; set; }
+
     [BsonElement("hasData")]
     public bool HasData { get; set; }
 

@@ -40,6 +40,7 @@ internal static class WorkAssignmentScheduleHelper
 
         return new SaveWorkAssignmentRequest
         {
+            Name = req.Name,
             ParentAssignmentId = string.IsNullOrWhiteSpace(req.ParentAssignmentId)
                 ? null
                 : req.ParentAssignmentId.Trim(),
@@ -126,6 +127,7 @@ internal static class WorkAssignmentScheduleHelper
 
         return new SaveWorkAssignmentRequest
         {
+            Name = req.Name,
             ParentAssignmentId = req.ParentAssignmentId,
             DynamicFormTemplateId = req.DynamicFormTemplateId,
             AssignmentType = req.AssignmentType,
@@ -145,7 +147,10 @@ internal static class WorkAssignmentScheduleHelper
         };
     }
 
-    public static void ValidateRequest(SaveWorkAssignmentRequest req, Work work)
+    public static void ValidateRequest(
+        SaveWorkAssignmentRequest req,
+        Work work,
+        DateTime? inheritedParentDueDate = null)
     {
         if (string.IsNullOrWhiteSpace(req.DynamicFormTemplateId))
             throw AppExceptionFactory.BadRequest(AppErrorCode.DYNAMIC_FORM_TEMPLATE_REQUIRED);
@@ -167,18 +172,26 @@ internal static class WorkAssignmentScheduleHelper
 
         if (req.AssignmentType == WorkAssignmentTypes.Once)
         {
-            if (!req.DueAtUtc.HasValue)
-                throw AppExceptionFactory.BadRequest(AppErrorCode.WORK_ASSIGNMENT_ONCE_DUE_REQUIRED);
-
             if (req.Schedule is not null)
                 throw AppExceptionFactory.BadRequest(AppErrorCode.WORK_ASSIGNMENT_ONCE_SCHEDULE_NOT_ALLOWED);
 
-            ValidateOnceDueAt(req.DueAtUtc.Value, work, req.StartDate, req.DueDate);
+            if (req.DueAtUtc.HasValue)
+                ValidateOnceDueAt(req.DueAtUtc.Value, work, req.StartDate, req.DueDate);
             return;
         }
 
         if (req.AssignmentType == WorkAssignmentTypes.PeriodicReport)
         {
+            if (!string.IsNullOrWhiteSpace(req.ParentAssignmentId) &&
+                inheritedParentDueDate.HasValue &&
+                req.DueDate.HasValue &&
+                req.DueDate.Value.Date > inheritedParentDueDate.Value.Date)
+            {
+                throw AppExceptionFactory.BadRequest(
+                    AppErrorCode.WORK_ASSIGNMENT_PERIODIC_DUE_AFTER_PARENT,
+                    new { req.ParentAssignmentId, req.DueDate, inheritedParentDueDate });
+            }
+
             ValidatePeriodicSchedule(req.Schedule, work, req.StartDate, req.DueDate);
             return;
         }
@@ -277,14 +290,18 @@ internal static class WorkAssignmentScheduleHelper
             StartDate = dto.StartDate?.Date,
             WeekDays = dto.WeekDays ?? new List<int>(),
             MonthDays = dto.MonthDays ?? new List<int>(),
-            QuarterDays = (dto.QuarterDays ?? new List<int>())
-                .Distinct()
-                .OrderBy(x => x)
-                .ToArray(),
-            SemiAnnualDays = (dto.SemiAnnualDays ?? new List<int>())
-                .Distinct()
-                .OrderBy(x => x)
-                .ToArray(),
+            QuarterDays = Array.Empty<int>(),
+            SemiAnnualDays = Array.Empty<int>(),
+            QuarterDayRules = dto.QuarterDays?.Select(x => new QuarterDayRule
+            {
+                Quarter = x.Quarter,
+                Days = (x.Days ?? new List<int>()).ToArray()
+            }).ToList(),
+            SemiAnnualDayRules = dto.SemiAnnualDays?.Select(x => new SemiAnnualDayRule
+            {
+                Half = x.Half,
+                Days = (x.Days ?? new List<int>()).ToArray()
+            }).ToList(),
             Note = dto.Note
         };
     }
@@ -298,8 +315,16 @@ internal static class WorkAssignmentScheduleHelper
             StartDate: model.StartDate,
             WeekDays: model.WeekDays ?? new List<int>(),
             MonthDays: model.MonthDays ?? new List<int>(),
-            QuarterDays: (model.QuarterDays ?? Array.Empty<int>()).ToList(),
-            SemiAnnualDays: (model.SemiAnnualDays ?? Array.Empty<int>()).ToList(),
+            QuarterDays: model.QuarterDayRules is { Count: > 0 }
+                ? model.QuarterDayRules.Select(x => new QuarterDayRuleDto(x.Quarter, (x.Days ?? Array.Empty<int>()).ToList())).ToList()
+                : (model.QuarterDays ?? Array.Empty<int>()).Length > 0
+                    ? Enumerable.Range(1, 4).Select(q => new QuarterDayRuleDto(q, (model.QuarterDays ?? Array.Empty<int>()).ToList())).ToList()
+                    : new List<QuarterDayRuleDto>(),
+            SemiAnnualDays: model.SemiAnnualDayRules is { Count: > 0 }
+                ? model.SemiAnnualDayRules.Select(x => new SemiAnnualDayRuleDto(x.Half, (x.Days ?? Array.Empty<int>()).ToList())).ToList()
+                : (model.SemiAnnualDays ?? Array.Empty<int>()).Length > 0
+                    ? Enumerable.Range(1, 2).Select(h => new SemiAnnualDayRuleDto(h, (model.SemiAnnualDays ?? Array.Empty<int>()).ToList())).ToList()
+                    : new List<SemiAnnualDayRuleDto>(),
             Note: model.Note
         );
     }
@@ -317,8 +342,12 @@ internal static class WorkAssignmentScheduleHelper
             StartDate: dto.StartDate?.Date,
             WeekDays: NormalizeIntList(dto.WeekDays),
             MonthDays: NormalizeIntList(dto.MonthDays),
-            QuarterDays: NormalizeIntList(dto.QuarterDays),
-            SemiAnnualDays: NormalizeIntList(dto.SemiAnnualDays),
+            QuarterDays: dto.QuarterDays?.Select(x =>
+                new QuarterDayRuleDto(x.Quarter, NormalizeIntList(x.Days) ?? new List<int>()))
+                .OrderBy(x => x.Quarter).ToList(),
+            SemiAnnualDays: dto.SemiAnnualDays?.Select(x =>
+                new SemiAnnualDayRuleDto(x.Half, NormalizeIntList(x.Days) ?? new List<int>()))
+                .OrderBy(x => x.Half).ToList(),
             Note: string.IsNullOrWhiteSpace(dto.Note) ? null : dto.Note.Trim()
         );
     }

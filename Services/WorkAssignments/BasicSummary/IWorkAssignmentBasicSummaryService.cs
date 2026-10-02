@@ -5,6 +5,14 @@ namespace tdtd_be.Services.WorkAssignments.BasicSummary;
 
 public interface IWorkAssignmentBasicSummaryService
 {
+    Task<BasicNativeSummaryResponse> GetNativeSummaryAsync(BasicNativeSummaryRequest request, CancellationToken ct);
+
+    Task<BasicNativeRefreshResponse> QueueNativeRefreshAsync(BasicNativeSummaryRequest request, CancellationToken ct);
+    Task<BasicNativeRefreshResponse> ReadNativeRefreshByCommandAsync(string commandId, CancellationToken ct);
+    Task<BasicNativeRefreshResponse> ReadNativeRefreshAsync(string refreshId, CancellationToken ct);
+    Task<BasicNativeRefreshResponse> RetryNativeRefreshAsync(string refreshId, CancellationToken ct);
+    Task RefreshNativeSnapshotJobAsync(string refreshId, CancellationToken ct);
+
     Task<WorkAssignmentBasicSummaryConfigReadback> GetP8ConfigAsync(
         string assignmentId,
         string dynamicFormTemplateId,

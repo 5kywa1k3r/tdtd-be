@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>tdtd-be.IntegrationTests</AssemblyName>
+    <RootNamespace>tdtd_be.CanvasRoundtripTests</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../tdtd-be.csproj" />
+    <Compile Include="../tdtd-be.NativeStatisticTests/Fixtures.cs" Link="NativeArtifactFixtures.cs" />
+  </ItemGroup>
+</Project>

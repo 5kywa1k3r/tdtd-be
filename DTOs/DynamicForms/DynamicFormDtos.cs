@@ -119,11 +119,44 @@ public sealed record UpdateDynamicFormReq(
     int? ExpectedRevision = null
 );
 
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
 public sealed record DynamicFormSchemaDto
 {
-    public List<DynamicFormSectionDto>? Sections { get; init; } = [];
-    public List<DynamicFormFieldDto>? Fields { get; init; } = [];
-    public List<DynamicFormBlockDto>? Blocks { get; init; } = [];
+    private List<DynamicFormSectionDto>? _sections = [];
+    private List<DynamicFormFieldDto>? _fields = [];
+    private List<DynamicFormBlockDto>? _blocks = [];
+    public List<DynamicFormSectionDto>? Sections
+    {
+        get => _sections;
+        init { _sections = value; SectionsSpecified = true; }
+    }
+    public List<DynamicFormFieldDto>? Fields
+    {
+        get => _fields;
+        init { _fields = value; FieldsSpecified = true; }
+    }
+    public List<DynamicFormBlockDto>? Blocks
+    {
+        get => _blocks;
+        init { _blocks = value; BlocksSpecified = true; }
+    }
+    [JsonIgnore]
+    public bool SectionsSpecified { get; private set; }
+    [JsonIgnore]
+    public bool FieldsSpecified { get; private set; }
+    [JsonIgnore]
+    public bool BlocksSpecified { get; private set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public int? NativeTablesVersion { get; init; }
+    private List<DynamicFormNativeTableDto>? _tables;
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public List<DynamicFormNativeTableDto>? Tables
+    {
+        get => _tables;
+        init { _tables = value; TablesSpecified = true; }
+    }
+    [JsonIgnore]
+    public bool TablesSpecified { get; private set; }
 }
 
 public sealed record DynamicFormSectionDto
@@ -157,6 +190,7 @@ public sealed record DynamicFormFieldDto
     public DynamicFormValueSourceDto? ValueSource { get; init; }
     public string[]? StatisticLabelCodes { get; init; }
     public bool? IsStatistic { get; init; }
+    public bool? ShowOnOverview { get; init; }
     public JsonElement? Statistic { get; init; }
 
     [JsonExtensionData]

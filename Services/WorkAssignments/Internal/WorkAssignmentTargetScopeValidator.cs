@@ -27,48 +27,46 @@ internal static class WorkAssignmentTargetScopeValidator
                     AppErrorCode.WORK_ASSIGNMENT_SELF_ASSIGNMENT_NOT_ALLOWED,
                     new { actorUserId = actorUser.Id });
 
-            var targetUnit = ResolveUnit(targetUser, unitById);
-
-            if (IsUnitManager(targetUser))
-            {
-                if (targetUnit is not null &&
-                    (IsPeerUnit(actorUnit, targetUnit) ||
-                     IsDescendantUnit(actorUnit, targetUnit) ||
-                     targetScopePolicy?.AllowsConfiguredTarget(actorUnit, targetUnit, targetUser) == true))
-                {
-                    continue;
-                }
-
-                throw InvalidScope("unitManagerOutsideAllowedUnit", actorUser.Id, targetUser.Id, targetUnit?.Id);
-            }
-
-            if (IsNormalUser(targetUser))
-            {
-                if (!actorUnitHasAssignableDescendants &&
-                    targetUnit is not null &&
-                    string.Equals(actorUnit.Id, targetUnit.Id, StringComparison.Ordinal))
-                {
-                    continue;
-                }
-
-                if (targetUnit is not null &&
-                    targetScopePolicy?.AllowsConfiguredTarget(actorUnit, targetUnit, targetUser) == true)
-                {
-                    continue;
-                }
-
-                throw InvalidScope("normalUserOutsideFinalUnit", actorUser.Id, targetUser.Id, targetUnit?.Id);
-            }
-
-            throw InvalidScope("unsupportedTargetAccountKind", actorUser.Id, targetUser.Id, targetUnit?.Id);
+            var reason = TargetRejectionReason(actorUnit, targetUser, unitById,
+                actorUnitHasAssignableDescendants, targetScopePolicy);
+            if (reason is not null)
+                throw InvalidScope(reason, actorUser.Id, targetUser.Id, ResolveUnit(targetUser, unitById)?.Id);
         }
     }
+
+    // Read-side filtering shares the write policy without throwing an exception per candidate.
+    public static bool CanAssignTarget(AppUser actor, Unit? actorUnit, AppUser target,
+        IReadOnlyDictionary<string, Unit> units, bool hasDescendants, WorkAssignmentTargetScopePolicy? policy = null)
+        => !IsUnitManager(actor) || (actorUnit is not null && actor.Id != target.Id
+            && TargetRejectionReason(actorUnit, target, units, hasDescendants, policy) is null);
+
+    private static string? TargetRejectionReason(Unit actorUnit, AppUser targetUser,
+        IReadOnlyDictionary<string, Unit> unitById, bool hasDescendants, WorkAssignmentTargetScopePolicy? policy)
+    {
+        var targetUnit = ResolveUnit(targetUser, unitById);
+        if (IsUnitManager(targetUser))
+            return targetUnit is not null && (IsPeerUnit(actorUnit, targetUnit) || IsDescendantUnit(actorUnit, targetUnit)
+                || policy?.AllowsConfiguredTarget(actorUnit, targetUnit, targetUser) == true)
+                ? null : "unitManagerOutsideAllowedUnit";
+        if (IsNormalUser(targetUser))
+            return targetUnit is not null && ((actorUnit.Id == targetUnit.Id
+                    && (!hasDescendants || IsDepartmentLeader(targetUser)))
+                || policy?.AllowsConfiguredTarget(actorUnit, targetUnit, targetUser) == true)
+                ? null : "normalUserOutsideFinalUnit";
+        return "unsupportedTargetAccountKind";
+    }
+
+    // A department's child teams do not prevent its unit account from assigning
+    // its own chief/deputy. Position alone never grants access to another unit.
+    private static bool IsDepartmentLeader(AppUser user)
+        => user.PositionCode?.Trim().ToUpperInvariant() is
+            "TRUONG_PHONG" or "PHO_TRUONG_PHONG" or "PHO_TRUONG_PHONG_PHU_TRACH";
 
     public static bool IsUnitManager(AppUser user)
         => string.Equals(user.AccountKind, ManagementAccountKind.UnitManager, StringComparison.OrdinalIgnoreCase) ||
            (user.Username ?? string.Empty).StartsWith(ManagementAccountConvention.UnitManagerPrefix, StringComparison.OrdinalIgnoreCase);
 
-    private static bool IsLevelManager(AppUser user)
+    public static bool IsLevelManager(AppUser user)
         => string.Equals(user.AccountKind, ManagementAccountKind.LevelManager, StringComparison.OrdinalIgnoreCase) ||
            (user.Username ?? string.Empty).StartsWith(ManagementAccountConvention.LevelManagerPrefix, StringComparison.OrdinalIgnoreCase);
 

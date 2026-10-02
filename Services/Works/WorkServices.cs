@@ -12,6 +12,7 @@ using tdtd_be.Enum;
 using tdtd_be.Models;
 using tdtd_be.Services.Common;
 using tdtd_be.Services.WorkDocuments;
+using tdtd_be.Services.DynamicFlows;
 
 namespace tdtd_be.Services.Works
 {
@@ -39,6 +40,7 @@ namespace tdtd_be.Services.Works
             private readonly IUserActionLogService _userActionLog;
             private readonly IWorkPermissionService _permission;
             private readonly ILogger<WorkService> _log;
+            private readonly IDynamicFlowDefinitionTransactionRunner _transactions;
 
             public WorkService(
                 MongoDbContext ctx,
@@ -50,7 +52,8 @@ namespace tdtd_be.Services.Works
                 IDocRoleReadModelFreshnessService docRoleReadModelFreshness,
                 IUserActionLogService userActionLog,
                 IWorkPermissionService permission,
-                ILogger<WorkService> log)
+                ILogger<WorkService> log,
+                IDynamicFlowDefinitionTransactionRunner? transactions = null)
             {
                 _ctx = ctx;
                 _me = me;
@@ -62,6 +65,8 @@ namespace tdtd_be.Services.Works
                 _userActionLog = userActionLog;
                 _permission = permission;
                 _log = log;
+                _transactions = transactions ?? new DynamicFlowDefinitionTransactionRunner(ctx,
+                    Microsoft.Extensions.Logging.Abstractions.NullLogger<DynamicFlowDefinitionTransactionRunner>.Instance);
             }
 
             // ===============================
@@ -154,8 +159,14 @@ namespace tdtd_be.Services.Works
                 if (string.IsNullOrWhiteSpace(evaluationTemplateId))
                     return null;
 
+                var scopes = tdtd_be.Services.EvaluationTemplates.EvaluationTemplatePermissionPolicy
+                    .VisibleUnitCodes(_me.RequireMe().UnitCode);
+                if (scopes.Count == 0)
+                    throw AppExceptionFactory.Forbidden(AppErrorCode.WORK_EVALUATION_TEMPLATE_NOT_FOUND);
+
                 return await _ctx.EvaluationTemplates
-                    .Find(x => x.Id == evaluationTemplateId.Trim() && !x.IsDeleted && x.IsActive)
+                    .Find(x => x.Id == evaluationTemplateId.Trim() && !x.IsDeleted && x.IsActive
+                        && scopes.Contains(x.UnitCodeScope))
                     .FirstOrDefaultAsync(ct)
                     ?? throw AppExceptionFactory.BadRequest(
                         AppErrorCode.WORK_EVALUATION_TEMPLATE_NOT_FOUND,
@@ -173,7 +184,7 @@ namespace tdtd_be.Services.Works
 
                 if (string.IsNullOrWhiteSpace(req.Name))
                     throw AppExceptionFactory.BadRequest(AppErrorCode.WORK_NAME_REQUIRED);
-
+                WorkDatePolicy.Validate(req.StartDate, req.EndDate, req.DueDate);
 
                 var now = DateTime.UtcNow;
                 var year = now.Year;
@@ -203,9 +214,9 @@ namespace tdtd_be.Services.Works
                     EvaluationTemplateCode = evaluationTemplate?.RepresentativeCode,
                     EvaluationTemplateLabel = evaluationTemplate?.RepresentativeLabel,
 
-                    StartDate = req.StartDate,
-                    EndDate = req.EndDate,
-                    DueDate = req.DueDate,
+                    StartDate = WorkDatePolicy.NormalizeDay(req.StartDate),
+                    EndDate = WorkDatePolicy.NormalizeDay(req.EndDate),
+                    DueDate = WorkDatePolicy.NormalizeDay(req.DueDate),
                     Priority = req.Priority ?? WorkPriority.MEDIUM,
                     AttachmentCount = 0,
 
@@ -312,9 +323,12 @@ namespace tdtd_be.Services.Works
 
                 var sort = BuildDocRoleSort(req.SortField, req.SortDirection);
 
-                var total = await _ctx.WorkListDocRoles.CountDocumentsAsync(f, cancellationToken: ct);
+                var query = WorkDeadlineReadQuery.WithDeadline(_ctx.WorkListDocRoles.Aggregate().Match(f),
+                    _ctx.Works.CollectionNamespace.CollectionName);
+                var count = await query.Count().FirstOrDefaultAsync(ct);
+                var total = count?.Count ?? 0;
 
-                var rows = await _ctx.WorkListDocRoles.Find(f)
+                var rows = await query
                     .Sort(sort)
                     .Skip(page * pageSize)
                     .Limit(pageSize)
@@ -383,6 +397,9 @@ namespace tdtd_be.Services.Works
 
                 await _permission.EnsureCanUpdateRootAsync(id, me.Id, ct);
 
+                WorkDatePolicy.Validate(req.StartDate, req.EndDate, req.DueDate);
+                var deadlinePlan = await WorkDeadlineChange.PrepareAsync(_ctx, doc, req, me.Id, ct);
+
                 if (!string.IsNullOrWhiteSpace(req.Name))
                     doc.Name = req.Name.Trim();
 
@@ -422,9 +439,9 @@ namespace tdtd_be.Services.Works
                     needRebuildRoot = true;
                 }
 
-                doc.StartDate = req.StartDate;
-                doc.EndDate = req.EndDate;
-                doc.DueDate = req.DueDate;
+                doc.StartDate = WorkDatePolicy.NormalizeDay(req.StartDate);
+                doc.EndDate = WorkDatePolicy.NormalizeDay(req.EndDate);
+                doc.DueDate = WorkDatePolicy.NormalizeDay(req.DueDate);
 
                 if (req.Priority != null)
                     doc.Priority = req.Priority.Value;
@@ -435,9 +452,7 @@ namespace tdtd_be.Services.Works
                 if (needRebuildRoot || await NeedsBackfillSnapshotAsync(doc, ct))
                     await RebuildRootSnapshotAsync(doc, ct);
 
-                await _ctx.Works.UpdateOneAsync(
-                    x => x.Id == id && !x.IsDeleted,
-                    Builders<Work>.Update
+                var workUpdate = Builders<Work>.Update
                         .Set(x => x.Name, doc.Name)
                         .Set(x => x.Description, doc.Description)
                         .Set(x => x.Note, doc.Note)
@@ -455,8 +470,9 @@ namespace tdtd_be.Services.Works
                         .Set(x => x.DueDate, doc.DueDate)
                         .Set(x => x.Priority, doc.Priority)
                         .Set(x => x.UpdatedAtUtc, doc.UpdatedAtUtc)
-                        .Set(x => x.UpdatedByUserId, doc.UpdatedByUserId),
-                    cancellationToken: ct);
+                        .Set(x => x.UpdatedByUserId, doc.UpdatedByUserId);
+                await _transactions.ExecuteAsync((session, token) =>
+                    WorkDeadlineChange.ApplyAsync(_ctx, session, doc, req, me.Id, deadlinePlan, workUpdate, token), ct);
                 await _docRole.UpsertWorkRootRolesAsync(doc, ct);
 
                 await _history.AppendAsync(
@@ -467,7 +483,8 @@ namespace tdtd_be.Services.Works
                     {
                         { "priority", (int)doc.Priority },
                         { "leaderDirectiveUserId", doc.LeaderDirectiveUserId },
-                        { "leaderWatchCount", doc.LeaderWatchUserIds.Count }
+                        { "leaderWatchCount", doc.LeaderWatchUserIds.Count },
+                        { "deadlineChangesJson", System.Text.Json.JsonSerializer.Serialize(deadlinePlan.Affected) }
                     },
                     ct: ct);
 

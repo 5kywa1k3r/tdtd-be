@@ -6,6 +6,13 @@ namespace tdtd_be.Models;
 [BsonIgnoreExtraElements]
 public abstract class BaseEntity
 {
+    // Aggregate transactions reserve the same business rows used for authorization.
+    // Keep the fence on typed reads/replacements; ignoring it breaks binding readback.
+    [BsonElement("aggregateCommitFence")]
+    [BsonIgnoreIfDefault]
+    [System.Text.Json.Serialization.JsonIgnore]
+    public long AggregateCommitFence { get; set; }
+
     [BsonElement("createdByUserId")]
     [BsonRepresentation(BsonType.ObjectId)]
     public string? CreatedByUserId { get; set; }

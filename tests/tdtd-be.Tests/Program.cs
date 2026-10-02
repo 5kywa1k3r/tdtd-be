@@ -76,6 +76,7 @@ var tests = new (string Name, Action Run)[]
     ("P10 evidence list, readback, and download re-authorize current assignment scope", StatisticReconciliationEvidenceControllerContractTests.Run),
     ("P10 review drift recovery is opaque and recheck returns accepted", StatisticReconciliationRecoveryControllerContractTests.Run),
     ("dual-role SYSTEM_ADMIN authority takes precedence over ADMIN-only user management", UserAdminRolePrecedenceContractTests.Run),
+    ("dashboard global read access is limited to the provincial police director position", DashboardAccessPolicyContractTests.Run),
     ("P8 operations readiness is no-dataset, redacted, authorized, and fail-closed", StatConfigOperationsP808ContractTests.Run),
     ("P8 canonical bundle, empty readiness, freshness, and P9/P10 barriers are exact", StatConfigBundleP809ContractTests.Run),
     ("P8 Basic Summary dependencies reject partial and untrusted state", WorkAssignmentBasicSummaryDependencyIntegrityContractTests.Run),
@@ -91,6 +92,7 @@ var tests = new (string Name, Action Run)[]
     ("dynamic form runtime provenance backfill is bounded and fail closed", DynamicFormRuntimeProvenanceBackfillContractTests.Run),
     ("dynamic form runtime field canonicalizer enforces ten strict types", DynamicFormRuntimeFieldCanonicalizerContractTests.Run),
     ("dynamic form runtime persistence enforces sources, table modes, and payload CAS", DynamicFormRuntimePersistenceContractTests.Run),
+    ("dynamic form native List v2 validates definition, draft, submit, limits, and catalogs", DynamicFormNativeListContractTests.Run),
     ("work report lifecycle commands enforce reviewer CAS and exact replay", WorkReportLifecycleCommandContractTests.Run),
     ("work report lifecycle projections use a durable monotonic outbox", WorkReportLifecycleProjectionOutboxContractTests.Run),
     ("work report section projections create repair and verify exact current rows", WorkAssignmentReportSectionProjectionContractTests.Run),
@@ -167,6 +169,7 @@ var tests = new (string Name, Action Run)[]
     ("statistic concept map resolves dynamic flow mapping targets", StatisticConceptMapResolvesDynamicFlowMappingTargets),
     ("statistic rebuild job dedupe key includes bounded flow scope", StatisticRebuildJobDedupeKeyIncludesBoundedFlowScope),
     ("periodic assignment date range caps occurrence validation", ValidatesPeriodicAssignmentDateRange),
+    ("periodic child due cannot exceed inherited parent due within work", BlocksPeriodicChildDueAfterParentWithinWork),
     ("materialize job backfills elapsed monthly periods before rolling future", MaterializeJobBackfillsElapsedMonthlyPeriodsBeforeRollingFuture),
     ("materialize job limits multi-day monthly schedules to exact occurrences", MaterializeJobLimitsMonthlyMultiDayScheduleToExactOccurrences),
     ("materialize job backfills daily periods before rolling future", MaterializeJobBackfillsDailyPeriodsBeforeRollingFuture),
@@ -4374,6 +4377,51 @@ static void ValidatesPeriodicAssignmentDateRange()
 
     AssertEqual(new DateTime(2026, 5, 1), normalized.StartDate, "assignment start date should normalize to date");
     AssertEqual(new DateTime(2026, 5, 1), normalized.Schedule?.StartDate, "schedule start should default from assignment start date");
+}
+
+static void BlocksPeriodicChildDueAfterParentWithinWork()
+{
+    var work = WorkWithDateRange(
+        new DateTime(2026, 1, 1),
+        new DateTime(2026, 12, 31));
+    var parentDue = new DateTime(2026, 5, 31);
+    var req = new SaveWorkAssignmentRequest
+    {
+        ParentAssignmentId = ObjectId(10),
+        DynamicFormTemplateId = ObjectId(11),
+        AssignmentType = WorkAssignmentTypes.PeriodicReport,
+        AggregationType = WorkAggregationTypes.Matrix,
+        AssigneeUserIds = new List<string> { UserId(2) },
+        StartDate = new DateTime(2026, 5, 1),
+        DueDate = new DateTime(2026, 6, 30),
+        Schedule = new AssignmentScheduleDto(
+            CycleType: ReportCycleTypes.Weekly,
+            StartDate: null,
+            WeekDays: new List<int> { 2 },
+            MonthDays: null,
+            QuarterDays: null,
+            SemiAnnualDays: null,
+            Note: null)
+    };
+
+    var normalized = WorkAssignmentScheduleHelper.NormalizeRequest(req);
+    AssertThrows(
+        AppErrorCode.WORK_ASSIGNMENT_PERIODIC_DUE_AFTER_PARENT,
+        () => WorkAssignmentScheduleHelper.ValidateRequest(normalized, work, parentDue));
+
+    req.DueDate = parentDue;
+    normalized = WorkAssignmentScheduleHelper.NormalizeRequest(req);
+    WorkAssignmentScheduleHelper.ValidateRequest(normalized, work, parentDue);
+
+    req.DueDate = null;
+    var inherited = WorkAssignmentScheduleHelper.ApplyEffectiveDateDefaults(
+        WorkAssignmentScheduleHelper.NormalizeRequest(req),
+        work,
+        new WorkAssignment { Id = req.ParentAssignmentId, DueDate = parentDue },
+        new DateTime(2026, 5, 1),
+        inheritedParentDueDate: parentDue);
+    WorkAssignmentScheduleHelper.ValidateRequest(inherited, work, parentDue);
+    AssertEqual(parentDue, inherited.DueDate, "blank child due should inherit parent due");
 }
 
 static void MaterializeJobBackfillsElapsedMonthlyPeriodsBeforeRollingFuture()

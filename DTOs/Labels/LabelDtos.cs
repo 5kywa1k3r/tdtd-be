@@ -112,7 +112,10 @@ public sealed record LabelEnumCatalogDetail(
     string CreatedByUsername,
     DateTime CreatedAtUtc,
     DateTime UpdatedAtUtc
-);
+)
+{
+    public bool IsInUse { get; init; }
+}
 
 public sealed record LabelEnumCatalogSearchReq(
     string? Q,

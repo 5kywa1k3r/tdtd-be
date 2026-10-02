@@ -10,4 +10,8 @@ public sealed record WorkReportPayloadSnapshot(
     long PayloadSizeBytes,
     string? PayloadStatus,
     bool IsExternalPayload,
-    bool PayloadHashVerified);
+    bool PayloadHashVerified)
+{
+    // Captured from the report accompanying this payload read. Missing stays missing.
+    public DateTime? SourcePayloadUpdatedAtUtc { get; init; }
+}

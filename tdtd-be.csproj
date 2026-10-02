@@ -29,6 +29,7 @@
 
   <ItemGroup>
     <Folder Include="Authentication\" />
+    <EmbeddedResource Include="Data\Catalogs\thanh-hoa-localities-2025.json" />
   </ItemGroup>
 
   <ItemGroup>

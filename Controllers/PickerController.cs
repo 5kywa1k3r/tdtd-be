@@ -1,4 +1,4 @@
-﻿using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using MongoDB.Bson;
 using MongoDB.Driver;
@@ -26,17 +26,20 @@ public sealed class PickersController : ControllerBase
     private readonly MeAccessor _me;
     private readonly WorkAssignmentTargetScopePolicy _targetScopePolicy;
     private readonly ILabelEnumCatalogService _labelEnumCatalogs;
+    private readonly IUnitService _units;
 
     public PickersController(
         MongoDbContext ctx,
         MeAccessor me,
         WorkAssignmentTargetScopePolicy targetScopePolicy,
-        ILabelEnumCatalogService labelEnumCatalogs)
+        ILabelEnumCatalogService labelEnumCatalogs,
+        IUnitService units)
     {
         _ctx = ctx;
         _me = me;
         _targetScopePolicy = targetScopePolicy;
         _labelEnumCatalogs = labelEnumCatalogs;
+        _units = units;
     }
 
     private static FilterDefinition<Unit> ExcludeHiddenRoot(FilterDefinitionBuilder<Unit> fb)
@@ -100,6 +103,7 @@ public sealed class PickersController : ControllerBase
                     Symbol = x.Symbol,
                     Level = x.Level,
                     ParentId = x.ParentUnitId,
+                    PrimaryUnitTypeCode = x.PrimaryUnitTypeCode,
                     IsVirtual = x.IsVirtual
                 })
                 .ToListAsync(ct);
@@ -127,6 +131,7 @@ public sealed class PickersController : ControllerBase
                         Symbol = x.Symbol,
                         Level = x.Level,
                         ParentId = x.ParentUnitId,
+                        PrimaryUnitTypeCode = x.PrimaryUnitTypeCode,
                         IsVirtual = x.IsVirtual
                     })
                     .ToListAsync(ct);
@@ -154,6 +159,7 @@ public sealed class PickersController : ControllerBase
                 Symbol = x.Symbol,
                 Level = x.Level,
                 ParentId = x.ParentUnitId,
+                PrimaryUnitTypeCode = x.PrimaryUnitTypeCode,
                 IsVirtual = x.IsVirtual
             })
             .ToListAsync(ct);
@@ -162,13 +168,14 @@ public sealed class PickersController : ControllerBase
     }
 
     // =========================
-    // UNITS: search nhanh theo CODE
+    // UNITS: partial search by name/symbol/code; legacy code filter remains supported.
     // =========================
     // ✅ OPEN: không chặn theo level nữa
-    // ✅ chỉ search code (không search name)
     [HttpGet("units/search")]
     public async Task<ActionResult<PagedResult<UnitPickRow>>> SearchUnitsByCode(
         [FromQuery] string? code,
+        [FromQuery] string? q = null,
+        [FromQuery] bool browseScope = false,
         [FromQuery] int page = 0,
         [FromQuery] int pageSize = 20,
         CancellationToken ct = default)
@@ -181,9 +188,29 @@ public sealed class PickersController : ControllerBase
         var fb = Builders<Unit>.Filter;
         var filter = fb.And(fb.Eq(x => x.IsDeleted, false), ExcludeHiddenRoot(fb));
 
+        if (!string.IsNullOrWhiteSpace(q))
+        {
+            var rx = new BsonRegularExpression(Regex.Escape(q.Trim()), "i");
+            var queryFilter = fb.Or(fb.Regex(x => x.FullName, rx), fb.Regex(x => x.ShortName, rx),
+                fb.Regex(x => x.Symbol, rx), fb.Regex(x => x.Code, rx));
+            if (ObjectId.TryParse(q.Trim(), out _)) queryFilter |= fb.Eq(x => x.Id, q.Trim());
+            filter &= queryFilter;
+        }
+
+        if (browseScope)
+        {
+            // Use the same server-side roots as the scoped unit tree, including
+            // level managers and the existing peer-level browsing policy.
+            var roots = await _units.GetChildrenAsync(null, ct);
+            var prefixes = roots.Select(x => x.Code).Where(x => !string.IsNullOrWhiteSpace(x)).Distinct().ToList();
+            filter &= prefixes.Count == 0 ? fb.In(x => x.Id, Array.Empty<string>()) :
+                fb.Or(prefixes.Select(prefix => fb.Regex(x => x.Code,
+                    new BsonRegularExpression("^" + Regex.Escape(prefix)))));
+        }
+
         if (!string.IsNullOrWhiteSpace(code))
         {
-            var s = code.Trim();
+            var s = Regex.Escape(code.Trim());
             // chỉ code
             filter = fb.And(filter, fb.Regex(x => x.Code, new BsonRegularExpression(s, "i")));
         }
@@ -203,11 +230,13 @@ public sealed class PickersController : ControllerBase
                 Symbol = x.Symbol,
                 Level = x.Level,
                 ParentId = x.ParentUnitId,
+                PrimaryUnitTypeCode = x.PrimaryUnitTypeCode,
                 IsVirtual = x.IsVirtual
             })
             .ToListAsync(ct);
 
         return Ok(new PagedResult<UnitPickRow>(
+            // Include unit metadata for callers selecting directly from search.
             rows: rows,
             total: total,
             page: page,
@@ -383,9 +412,8 @@ public sealed class PickersController : ControllerBase
 
         if (!string.IsNullOrWhiteSpace(username))
         {
-            var s = username.Trim().ToLowerInvariant();
-            // username đã lowercase, dùng regex i cho tiện (có thể đổi contains nếu muốn)
-            filter = fb.And(filter, fb.Regex(x => x.Username, new BsonRegularExpression(s, "i")));
+            var rx = new BsonRegularExpression(Regex.Escape(username.Trim()), "i");
+            filter &= fb.Or(fb.Regex(x => x.Username, rx), fb.Regex(x => x.FullName, rx));
         }
 
         var total = await _ctx.Users.CountDocumentsAsync(filter, cancellationToken: ct);
@@ -512,8 +540,8 @@ public sealed class PickersController : ControllerBase
 
         if (!string.IsNullOrWhiteSpace(username))
         {
-            var s = username.Trim().ToLowerInvariant();
-            filter = fb.And(filter, fb.Regex(x => x.Username, new BsonRegularExpression(s, "i")));
+            var rx = new BsonRegularExpression(Regex.Escape(username.Trim()), "i");
+            filter &= fb.Or(fb.Regex(x => x.Username, rx), fb.Regex(x => x.FullName, rx));
         }
 
         var total = await _ctx.Users.CountDocumentsAsync(filter, cancellationToken: ct);

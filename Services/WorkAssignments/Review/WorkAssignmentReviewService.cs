@@ -427,7 +427,10 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
             lifecycleCommand.Operation,
             ct);
 
-        if (report.Status != WorkAssignmentReportStatus.Submitted)
+        var returnApproved = report.Status == WorkAssignmentReportStatus.Approved
+            && !DynamicFlowBranchVisibility.IsFlowAssignment(assignment)
+            && await tdtd_be.Services.AggregateMapping.Persistence.AggregateHostIntegration.IsPeriodicWorkAsync(_ctx, report.WorkId, ct);
+        if (report.Status != WorkAssignmentReportStatus.Submitted && !returnApproved)
             throw InvalidReportStatus(
                 AppErrorCode.WORK_ASSIGNMENT_REPORT_RETURN_STATUS_INVALID,
                 report,
@@ -435,10 +438,16 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
 
         var now = DateTime.UtcNow;
 
+        if (returnApproved)
+        {
+            var period = await _ctx.WorkReportPeriods.Find(p => p.Id == report.WorkReportPeriodId && !p.IsDeleted).FirstOrDefaultAsync(ct);
+            await EnsureNoLaterApprovedReportsAsync(period, ct);
+            WorkAssignmentHistoricalMutationPolicy.EnsureApprovedMutationAllowed(report, period, me, "REVIEW_RETURN", now);
+        }
         var returnCommitted = await TryCommitLifecycleCommandAsync(
             report,
             lifecycleCommand,
-            WorkAssignmentReportStatus.Submitted,
+            report.Status,
             expectedIsActive: true,
             Builders<WorkAssignmentReport>.Update
                 .Set(x => x.Status, WorkAssignmentReportStatus.Draft)
@@ -816,7 +825,7 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
 
         var userTypeFilter = GetUserTypeFilter(req);
         if (!string.IsNullOrWhiteSpace(userTypeFilter))
-            filter &= BuildReviewReportUserTypeFilter(userTypeFilter, fb);
+            filter &= await BuildReviewReportUserTypeFilterAsync(userTypeFilter, fb, ct);
 
         if (req.WaitingReviewOnly == true)
         {
@@ -931,16 +940,22 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
             fb.Regex("periodKeys", qRegex));
     }
 
-    private static FilterDefinition<ReviewReportListDocRole> BuildReviewReportUserTypeFilter(
+    private async Task<FilterDefinition<ReviewReportListDocRole>> BuildReviewReportUserTypeFilterAsync(
         string userTypeFilter,
-        FilterDefinitionBuilder<ReviewReportListDocRole> fb)
+        FilterDefinitionBuilder<ReviewReportListDocRole> fb,
+        CancellationToken ct)
     {
         var normalized = (userTypeFilter ?? string.Empty).Trim().ToUpperInvariant();
         if (string.IsNullOrWhiteSpace(normalized) || normalized == "ALL")
             return FilterDefinition<ReviewReportListDocRole>.Empty;
 
         var privilegedRegex = new BsonRegularExpression("^(mu_|ml_)", "i");
-        var privilegedFilter = fb.Regex(x => x.AssigneeUserName, privilegedRegex);
+        var managementIds = await _ctx.Users
+            .Find(x => x.AccountKind == ManagementAccountKind.UnitManager ||
+                       x.AccountKind == ManagementAccountKind.LevelManager)
+            .Project(x => x.Id).ToListAsync(ct);
+        var privilegedFilter = fb.Or(fb.In(x => x.AssigneeUserId, managementIds),
+            fb.Regex(x => x.AssigneeUserName, privilegedRegex));
 
         return normalized switch
         {
@@ -1084,6 +1099,13 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
         var committed = await _transactions.ExecuteAsync(
             async (session, transactionCt) =>
             {
+                var current = await _ctx.WorkAssignmentReports.Find(session,
+                    WorkReportLifecycleCommandContract.BuildCommitFilter(report, command, expectedStatus, expectedIsActive))
+                    .FirstOrDefaultAsync(transactionCt);
+                if (current is null) return false;
+                await tdtd_be.Services.AggregateMapping.Persistence.AggregateHostIntegration.LifecycleAsync(
+                    _ctx, session, _transactions, current, command.Operation, actorUserId, command.CommandId,
+                    resultStatus, command.ExpectedLifecycleRevision + 1, transactionCt);
                 var reportResult = await _ctx.WorkAssignmentReports.UpdateOneAsync(
                     session,
                     WorkReportLifecycleCommandContract.BuildCommitFilter(
@@ -1094,7 +1116,9 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
                     commitUpdate,
                     cancellationToken: transactionCt);
                 if (reportResult.ModifiedCount != 1)
-                    return false;
+                    throw new tdtd_be.Services.AggregateMapping.AggregatePreviewException("AGG_REVISION_CONFLICT");
+                await tdtd_be.Services.AggregateMapping.Persistence.AggregateHostIntegration.InvalidateReportAsync(
+                    _ctx, session, current, command.CommandId, transactionCt);
 
                 // The Work root is the shared membership fence. Keeping this increment
                 // in the source+outbox transaction makes a concurrent Direct publish
@@ -1265,7 +1289,8 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
         var ownedAssignments = await _ctx.WorkAssignments
             .Find(x =>
                 x.WorkId == workId &&
-                x.CreatedByUserId == actorUserId &&
+                (x.CurrentReviewerUserId == actorUserId ||
+                 (x.CurrentReviewerUserId == null && x.CreatedByUserId == actorUserId)) &&
                 !x.IsDeleted)
             .ToListAsync(ct);
 
@@ -1298,7 +1323,7 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
 
             foreach (var assignment in bindingOwnedAssignments)
             {
-                if (!string.IsNullOrWhiteSpace(assignment.Id))
+                if (!string.IsNullOrWhiteSpace(assignment.Id) && WorkAssignmentCurrentAuthority.IsReviewer(assignment, actorUserId))
                     assignmentById[assignment.Id] = assignment;
             }
         }
@@ -1336,6 +1361,12 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
         var fb = Builders<ReviewAssignmentSummaryDocRole>.Filter;
         var filter = fb.Eq(x => x.WorkId, req.WorkId)
                      & fb.Eq(x => x.IsDeleted, false);
+
+        if (!string.IsNullOrWhiteSpace(req.AssignmentId))
+        {
+            if (!ObjectId.TryParse(req.AssignmentId, out _)) throw ReviewWorkIdRequired(req.WorkId);
+            filter &= fb.Eq(x => x.AssignmentId, req.AssignmentId);
+        }
 
         if (!isScopedBranchView)
             filter &= fb.Eq(x => x.ReviewerUserId, me.Id);
@@ -1496,7 +1527,7 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
             assignment.RootAssignmentId,
             assignment.DynamicFormTemplateId,
             assignment.EvaluationTemplateId,
-            ownerUserId = assignment.CreatedByUserId
+            ownerUserId = WorkAssignmentCurrentAuthority.ReviewerId(assignment)
         };
 
     private static AppException ReportNotFound(string? reportId)
@@ -2172,7 +2203,7 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
 
     private static void EnsureCanEvaluateAssignment(WorkAssignment assignment, string actorUserId)
     {
-        if (!string.Equals(assignment.CreatedByUserId, actorUserId, StringComparison.Ordinal))
+        if (!WorkAssignmentCurrentAuthority.IsReviewer(assignment, actorUserId))
             throw AppExceptionFactory.Forbidden(
                 AppErrorCode.WORK_ASSIGNMENT_EVALUATION_FORBIDDEN,
                 new
@@ -2180,7 +2211,7 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
                     assignmentId = assignment.Id,
                     assignment.WorkId,
                     actorUserId,
-                    ownerUserId = assignment.CreatedByUserId
+                    ownerUserId = WorkAssignmentCurrentAuthority.ReviewerId(assignment)
                 });
     }
 

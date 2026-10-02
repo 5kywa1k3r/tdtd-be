@@ -17,6 +17,7 @@ namespace tdtd_be.Jobs;
 
 public static class HangfireRecurringJobRegistrar
 {
+    private static readonly bool DynamicFlowEnabledForRelease = false;
     private static int _recurringRegistrationReady;
 
     public const string WorkAssignmentMaterializeJobId = "work-assignment:materialize-scan";
@@ -218,35 +219,33 @@ public static class HangfireRecurringJobRegistrar
             lifecycleProjectionCron,
             new RecurringJobOptions { TimeZone = tz });
 
-        var mappingOutboxCron =
-            cfg["DynamicFlowMapping:OutboxCron"] ??
-            "*/1 * * * *";
-        var mappingOutboxMaxItems = Math.Clamp(
-            cfg.GetValue<int?>(
-                "DynamicFlowMapping:MaxOutboxItemsPerRun") ??
-            20,
-            1,
-            200);
-        RecurringJob.AddOrUpdate<NonOverlappingRecurringJobRunner>(
-            DynamicFlowMappingOutboxJobId,
-            job => job.ProcessDynamicFlowMappingOutboxAsync(
-                mappingOutboxMaxItems,
-                CancellationToken.None),
-            mappingOutboxCron,
-            new RecurringJobOptions { TimeZone = tz });
+        // Dynamic Flow chưa nghiệm thu; giữ cấu hình lịch để mở lại sau.
+        if (DynamicFlowEnabledForRelease)
+        {
+            var mappingOutboxCron = cfg["DynamicFlowMapping:OutboxCron"] ?? "*/1 * * * *";
+            var mappingOutboxMaxItems = Math.Clamp(
+                cfg.GetValue<int?>("DynamicFlowMapping:MaxOutboxItemsPerRun") ?? 20, 1, 200);
+            RecurringJob.AddOrUpdate<NonOverlappingRecurringJobRunner>(
+                DynamicFlowMappingOutboxJobId,
+                job => job.ProcessDynamicFlowMappingOutboxAsync(mappingOutboxMaxItems, CancellationToken.None),
+                mappingOutboxCron,
+                new RecurringJobOptions { TimeZone = tz });
 
-        var dynamicFlowRuntimeCron = cfg["DynamicFlowRuntime:OutboxCron"] ?? "*/1 * * * *";
-        var dynamicFlowRuntimeMaxItems = Math.Clamp(
-            cfg.GetValue<int?>("DynamicFlowRuntime:MaxOutboxItemsPerRun") ?? 50,
-            1,
-            200);
-        RecurringJob.AddOrUpdate<NonOverlappingRecurringJobRunner>(
-            DynamicFlowRuntimeOutboxJobId,
-            job => job.ProcessDynamicFlowRuntimeOutboxAsync(
-                dynamicFlowRuntimeMaxItems,
-                CancellationToken.None),
-            dynamicFlowRuntimeCron,
-            new RecurringJobOptions { TimeZone = tz });
+            var dynamicFlowRuntimeCron = cfg["DynamicFlowRuntime:OutboxCron"] ?? "*/1 * * * *";
+            var dynamicFlowRuntimeMaxItems = Math.Clamp(
+                cfg.GetValue<int?>("DynamicFlowRuntime:MaxOutboxItemsPerRun") ?? 50, 1, 200);
+            RecurringJob.AddOrUpdate<NonOverlappingRecurringJobRunner>(
+                DynamicFlowRuntimeOutboxJobId,
+                job => job.ProcessDynamicFlowRuntimeOutboxAsync(dynamicFlowRuntimeMaxItems, CancellationToken.None),
+                dynamicFlowRuntimeCron,
+                new RecurringJobOptions { TimeZone = tz });
+        }
+        else
+        {
+            // Gỡ cả lịch đã đăng ký trước đây trong Hangfire storage.
+            RecurringJob.RemoveIfExists(DynamicFlowMappingOutboxJobId);
+            RecurringJob.RemoveIfExists(DynamicFlowRuntimeOutboxJobId);
+        }
 
         Volatile.Write(ref _recurringRegistrationReady, 1);
     }

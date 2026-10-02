@@ -35,6 +35,51 @@ public sealed class WorkAssignmentTemplateResolver : IWorkAssignmentTemplateReso
         return await ResolveDynamicFormAsync(dynamicFormTemplateId.Trim(), actor, ct);
     }
 
+    public async Task<WorkAssignmentTemplateResolution> ResolveForChildAsync(
+        string? dynamicFormTemplateId,
+        string actorUserId,
+        string workId,
+        string parentAssignmentId,
+        CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(actorUserId))
+            throw AppExceptionFactory.Unauthorized();
+        if (string.IsNullOrWhiteSpace(dynamicFormTemplateId))
+            throw AppExceptionFactory.BadRequest(AppErrorCode.DYNAMIC_FORM_TEMPLATE_REQUIRED);
+
+        var actor = await _ctx.Users
+            .Find(x => x.Id == actorUserId.Trim() && !x.IsDeleted)
+            .FirstOrDefaultAsync(ct)
+            ?? throw AppExceptionFactory.Unauthorized();
+        var parent = await _ctx.WorkAssignments
+            .Find(x => x.Id == parentAssignmentId && x.WorkId == workId && !x.IsDeleted && x.IsActive)
+            .FirstOrDefaultAsync(ct);
+        if (parent is null || parent.InvalidatedByFlowEventId is not null ||
+            !string.IsNullOrWhiteSpace(parent.FlowInstanceId) ||
+            (parent.CreatedByUserId != actor.Id && !parent.Assignees.Any(x => x.UserId == actor.Id)))
+            throw DynamicFormBindingAccessPolicy.Forbidden();
+
+        var formId = dynamicFormTemplateId.Trim();
+        // Other Forms retain the normal owner/admin rule. Runtime read access alone
+        // never authorizes binding a received Form in an unrelated branch or work.
+        if (!string.Equals(parent.DynamicFormTemplateId, formId, StringComparison.Ordinal))
+            return await ResolveDynamicFormAsync(formId, actor, ct);
+
+        var form = await _ctx.DynamicFormTemplates
+            .Find(x => x.Id == formId && !x.IsDeleted && x.IsActive && x.IsPublished)
+            .FirstOrDefaultAsync(ct)
+            ?? throw DynamicFormBindingAccessPolicy.Forbidden();
+        var familyId = string.IsNullOrWhiteSpace(form.FamilyId) ? form.Id : form.FamilyId;
+        if (parent.DynamicFormFamilyId != familyId ||
+            parent.DynamicFormVersionNo != Math.Max(1, form.VersionNo) ||
+            string.IsNullOrWhiteSpace(parent.DynamicFormSchemaHash) ||
+            !string.Equals(parent.DynamicFormSchemaHash, form.PublishedSchemaHash, StringComparison.Ordinal))
+            throw DynamicFormBindingAccessPolicy.Forbidden();
+
+        DynamicFormBindingAccessPolicy.EnsurePublishedIntegrity(form);
+        return await BuildResolutionAsync(form, ct);
+    }
+
     private async Task<WorkAssignmentTemplateResolution> ResolveDynamicFormAsync(
         string dynamicFormTemplateId,
         AppUser actor,
@@ -51,6 +96,14 @@ public sealed class WorkAssignmentTemplateResolver : IWorkAssignmentTemplateReso
         // Integrity is evaluated only after the Mongo ACL projection has
         // established that this actor may bind the exact Form.
         DynamicFormBindingAccessPolicy.EnsureMayBind(actor, new[] { form });
+
+        return await BuildResolutionAsync(form, ct);
+    }
+
+    private async Task<WorkAssignmentTemplateResolution> BuildResolutionAsync(
+        DynamicFormTemplate form,
+        CancellationToken ct)
+    {
 
         var excelId = NormalizeId(form.ExcelBlockDynamicExcelTemplateId)
             ?? ExtractExcelTemplateId(form.ExcelBlockJson)
@@ -72,7 +125,7 @@ public sealed class WorkAssignmentTemplateResolver : IWorkAssignmentTemplateReso
             .FirstOrDefaultAsync(ct)
             ?? throw AppExceptionFactory.NotFound(
                 AppErrorCode.DYNAMIC_FORM_EXCEL_BLOCK_NOT_FOUND,
-                new { dynamicFormTemplateId, dynamicExcelTemplateId = excelId });
+                new { dynamicFormTemplateId = form.Id, dynamicExcelTemplateId = excelId });
 
         return new WorkAssignmentTemplateResolution(
             form.Id,

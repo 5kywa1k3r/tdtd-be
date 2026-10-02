@@ -38,12 +38,6 @@ public sealed class UploadsController : ControllerBase
 
     private string Bucket => _cfg["Minio:Bucket"] ?? "tdtd-attachments";
 
-    private static string Sanitize(string name)
-        => name.Replace("\\", "_").Replace("/", "_").Trim();
-
-    private string BuildObjectKey(string uploadId, string fileName)
-        => $"uploads/{uploadId}/{Sanitize(fileName)}";
-
     // ===============================
     // 1️⃣ VERIFY
     // ===============================
@@ -131,7 +125,11 @@ public sealed class UploadsController : ControllerBase
             string.IsNullOrWhiteSpace(fileName))
             throw AppExceptionFactory.BadRequest(AppErrorCode.UPLOAD_DOWNLOAD_ARGUMENTS_REQUIRED);
 
-        var objectKey = BuildObjectKey(uploadId, fileName);
+        var me = _me.RequireMe();
+        var doc = await _ctx.Files.Find(x => x.UploadId == uploadId && !x.IsDeleted).FirstOrDefaultAsync(ct)
+            ?? throw AppExceptionFactory.NotFound(AppErrorCode.UPLOAD_FILE_NOT_FOUND, new { uploadId });
+        await _documentPermission.EnsureCanReadFileAsync(doc, me.Id, ct);
+        var objectKey = doc.ObjectKey;
 
         try
         {
@@ -139,7 +137,7 @@ public sealed class UploadsController : ControllerBase
 
             await _minio.GetObjectAsync(
                 new GetObjectArgs()
-                    .WithBucket(Bucket)
+                    .WithBucket(doc.Bucket)
                     .WithObject(objectKey)
                     .WithCallbackStream(stream =>
                     {
@@ -152,7 +150,7 @@ public sealed class UploadsController : ControllerBase
             return File(
                 memory,
                 "application/octet-stream",
-                fileName);
+                doc.OriginalName);
         }
         catch
         {

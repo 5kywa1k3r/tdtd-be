@@ -549,6 +549,8 @@ public sealed class JobRunManagementService : IJobRunManagementService
         string actorUserId,
         CancellationToken ct = default)
     {
+        // Tạm khóa luồng tổng hợp cũ; giữ nguyên triển khai bên dưới.
+        tdtd_be.Services.WorkAssignments.LegacyAggregateRetirement.Reject();
         StatConfigPhaseBarrier.Reject(StatConfigPhaseBarrierEntries.P9Result);
         var reset = await _basicSummary.ResetSnapshotJobAsync(snapshotId, actorUserId, ct);
         var snapshot = await _ctx.WorkAssignmentBasicSummarySnapshots
@@ -626,6 +628,8 @@ public sealed class JobRunManagementService : IJobRunManagementService
         string actorUserId,
         CancellationToken ct = default)
     {
+        // Tạm khóa luồng tổng hợp cũ; giữ nguyên triển khai bên dưới.
+        tdtd_be.Services.WorkAssignments.LegacyAggregateRetirement.Reject();
         StatConfigPhaseBarrier.Reject(StatConfigPhaseBarrierEntries.P9Result);
         grain = NormalizeAdvancedSummaryGrain(grain);
         nodeId = NullIfWhiteSpace(nodeId)
@@ -648,6 +652,8 @@ public sealed class JobRunManagementService : IJobRunManagementService
         string actorUserId,
         CancellationToken ct = default)
     {
+        // Tạm khóa luồng tổng hợp cũ; giữ nguyên triển khai bên dưới.
+        tdtd_be.Services.WorkAssignments.LegacyAggregateRetirement.Reject();
         StatConfigPhaseBarrier.Reject(StatConfigPhaseBarrierEntries.P9Result);
         request ??= new AdvancedSummaryNodeCleanupRequest();
         actorUserId = NullIfWhiteSpace(actorUserId)

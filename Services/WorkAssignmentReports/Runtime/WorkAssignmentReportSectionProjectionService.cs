@@ -80,7 +80,7 @@ public sealed class WorkAssignmentReportSectionProjectionService
             report,
             payloadSnapshot.FieldValuesJson,
             payloadSnapshot.TableValuesJson);
-        if (IsCompleteProjection(report, contract.Sections, observedSections, payload))
+        if (IsCompleteProjection(report, contract.Sections, observedSections, payload, contract.EnumOptions))
             return Order(observedSections);
 
         return await ProjectAndVerifyCoreAsync(
@@ -193,19 +193,22 @@ public sealed class WorkAssignmentReportSectionProjectionService
         IReadOnlyCollection<DynamicFormSectionSnapshot> expectedSections,
         IReadOnlyCollection<WorkAssignmentReportSection> projectedSections,
         string? canonicalFieldValuesJson,
-        string? canonicalTableValuesJson)
+        string? canonicalTableValuesJson,
+        IReadOnlyDictionary<string, RuntimeEnumOptionSet>? enumOptions = null)
         => IsCompleteProjection(
             report,
             expectedSections,
             projectedSections,
-            ParseProjectionPayload(report, canonicalFieldValuesJson, canonicalTableValuesJson));
+            ParseProjectionPayload(report, canonicalFieldValuesJson, canonicalTableValuesJson), enumOptions);
 
     private static bool IsCompleteProjection(
         WorkAssignmentReport report,
         IReadOnlyCollection<DynamicFormSectionSnapshot> expectedSections,
         IReadOnlyCollection<WorkAssignmentReportSection> projectedSections,
-        ProjectionPayload canonicalPayload)
+        ProjectionPayload canonicalPayload,
+        IReadOnlyDictionary<string, RuntimeEnumOptionSet>? enumOptions)
     {
+        ValidateNativeProjection(report, expectedSections, canonicalPayload.TableRoot, enumOptions);
         if (projectedSections.Count != expectedSections.Count)
             return false;
 
@@ -230,15 +233,17 @@ public sealed class WorkAssignmentReportSectionProjectionService
             var actual = matches[0];
             var expectedFieldValues = BuildSectionFieldValues(canonicalPayload.FieldValues, expected.FieldIds);
             var expectedTableBlocks = BuildSectionTableBlocks(canonicalPayload.TableBlocksById, expected.BlockIds);
-            var expectedPayloadHash = ComputeSectionPayloadHash(expectedFieldValues, expectedTableBlocks);
+            var expectedNative = BuildSectionNativeValues(canonicalPayload.TableRoot, expected.NativeTableIds);
+            var expectedPayloadHash = ComputeSectionPayloadHash(expectedFieldValues, expectedTableBlocks, expectedNative);
             var expectedHasData = JsonObjectHasData(expectedFieldValues) ||
-                                  expectedTableBlocks.OfType<JsonObject>().Any(TableBlockHasEnteredData);
+                                  expectedTableBlocks.OfType<JsonObject>().Any(TableBlockHasEnteredData) || NativeHasData(expectedNative);
             if (!IsProjectionCurrent(report, actual) ||
                 actual.IsDeleted ||
                 actual.SectionTitle != expected.Title ||
                 actual.SectionOrder != expected.Order ||
                 actual.FieldCount != expected.FieldIds.Length ||
                 actual.BlockCount != expected.BlockIds.Length ||
+                actual.NativeTableCount != expected.NativeTableIds.Length ||
                 actual.HasData != expectedHasData ||
                 !string.Equals(actual.PayloadHash, expectedPayloadHash, StringComparison.Ordinal) ||
                 !MatchesProjectedSectionPayload(
@@ -247,6 +252,7 @@ public sealed class WorkAssignmentReportSectionProjectionService
                     canonicalPayload.TableRoot,
                     expectedFieldValues,
                     expectedTableBlocks,
+                    expectedNative,
                     actual))
             {
                 return false;
@@ -287,14 +293,16 @@ public sealed class WorkAssignmentReportSectionProjectionService
         var fieldValues = payload.FieldValues;
         var tableRoot = payload.TableRoot;
         var tableBlocksById = payload.TableBlocksById;
+        ValidateNativeProjection(report, contract.Sections, tableRoot, contract.EnumOptions);
 
         foreach (var templateSection in contract.Sections)
         {
             var sectionValues = BuildSectionFieldValues(fieldValues, templateSection.FieldIds);
             var sectionBlocks = BuildSectionTableBlocks(tableBlocksById, templateSection.BlockIds);
+            var sectionNative = BuildSectionNativeValues(tableRoot, templateSection.NativeTableIds);
             var hasData = JsonObjectHasData(sectionValues) ||
-                          sectionBlocks.OfType<JsonObject>().Any(TableBlockHasEnteredData);
-            var payloadHash = ComputeSectionPayloadHash(sectionValues, sectionBlocks);
+                          sectionBlocks.OfType<JsonObject>().Any(TableBlockHasEnteredData) || NativeHasData(sectionNative);
+            var payloadHash = ComputeSectionPayloadHash(sectionValues, sectionBlocks, sectionNative);
             existingBySectionId.TryGetValue(templateSection.SectionId, out var existing);
             var changed = existing is null ||
                           !string.Equals(existing.PayloadHash, payloadHash, StringComparison.Ordinal);
@@ -323,9 +331,10 @@ public sealed class WorkAssignmentReportSectionProjectionService
                 SectionOrder = templateSection.Order,
                 Status = report.Status,
                 FieldValuesJson = BuildSectionFieldValuesJson(report, templateSection.SchemaVersion, sectionValues, now),
-                TableValuesJson = BuildSectionTableValuesJson(report, tableRoot, sectionBlocks, now),
+                TableValuesJson = BuildSectionTableValuesJson(report, tableRoot, sectionBlocks, now, sectionNative),
                 FieldCount = templateSection.FieldIds.Length,
                 BlockCount = templateSection.BlockIds.Length,
+                NativeTableCount = templateSection.NativeTableIds.Length,
                 HasData = hasData,
                 LastUpdatedAtUtc = lastUpdatedAtUtc,
                 LastUpdatedByUserId = lastUpdatedByUserId,
@@ -374,7 +383,7 @@ public sealed class WorkAssignmentReportSectionProjectionService
                 .SortBy(x => x.SectionOrder)
                 .ThenBy(x => x.SectionId)
                 .ToListAsync(ct);
-        if (!IsCompleteProjection(report, contract.Sections, projected, payload))
+        if (!IsCompleteProjection(report, contract.Sections, projected, payload, contract.EnumOptions))
             throw IncompleteProjection(report, contract.SectionIds, projected);
 
         return projected;
@@ -414,9 +423,28 @@ public sealed class WorkAssignmentReportSectionProjectionService
 
         EnsurePublishedRuntimeBinding(report, template);
         var sections = DynamicFormSectionSnapshotBuilder.Build(template).Sections;
+        // Only server-validated published List fields can supply catalog identities.
+        // Catalog deactivation blocks new authoring, not an existing report binding.
+        var catalogIds = (DynamicFormNativeTableDefinition.ReadStored(template.NativeTablesVersion, template.TablesJson) ?? [])
+            .Where(table => table.Presentation?.Kind == "LIST")
+            .SelectMany(table => table.TypeConfig!.Rules!)
+            .Select(rule => rule.Spec?.ValueSource)
+            .Where(source => source?.SourceType == "ENUM_CATALOG" && !string.IsNullOrWhiteSpace(source.CatalogId))
+            .Select(source => source!.CatalogId!).Distinct(StringComparer.Ordinal).ToArray();
+        var enumOptions = new Dictionary<string, RuntimeEnumOptionSet>(StringComparer.Ordinal);
+        if (catalogIds.Length > 0)
+        {
+            var catalogsFilter = Builders<LabelEnumCatalog>.Filter.Where(catalog => catalogIds.Contains(catalog.Id) && !catalog.IsDeleted);
+            var catalogs = session is null
+                ? await _ctx.LabelEnumCatalogs.Find(catalogsFilter).ToListAsync(ct)
+                : await _ctx.LabelEnumCatalogs.Find(session, catalogsFilter).ToListAsync(ct);
+            foreach (var catalog in catalogs)
+                enumOptions[catalog.Id] = new RuntimeEnumOptionSet(catalog.Id,
+                    catalog.Options.Where(option => option.IsActive).Select(option => option.Code).ToHashSet(StringComparer.OrdinalIgnoreCase));
+        }
         return new PublishedTemplateContract(
             sections,
-            sections.Select(x => x.SectionId).ToHashSet(StringComparer.Ordinal));
+            sections.Select(x => x.SectionId).ToHashSet(StringComparer.Ordinal), enumOptions);
     }
 
     private static void EnsurePublishedRuntimeBinding(
@@ -644,6 +672,8 @@ public sealed class WorkAssignmentReportSectionProjectionService
         }
 
         var tableRoot = ParseJsonObjectOrThrow(report, tableValuesJson, "tableValuesJson");
+        if (tableRoot?.ContainsKey("nativeTables") == true && Encoding.UTF8.GetByteCount(tableValuesJson!) > DynamicFormNativeTableValues.MaximumBytes)
+            throw InvalidProjectionPayload(report, "nativeTables", "NATIVE_VALUES_BYTE_LIMIT");
         var tableBlocksById = BuildTableBlockMap(report, tableRoot);
         return new ProjectionPayload(fieldValues, tableRoot, tableBlocksById);
     }
@@ -773,12 +803,44 @@ public sealed class WorkAssignmentReportSectionProjectionService
         return result;
     }
 
+    private static void ValidateNativeProjection(WorkAssignmentReport report,
+        IReadOnlyCollection<DynamicFormSectionSnapshot> sections, JsonObject? root,
+        IReadOnlyDictionary<string, RuntimeEnumOptionSet>? enumOptions)
+    {
+        if (root is null || !root.ContainsKey("nativeTables")) return; // Unentered report: preserve absence.
+        if (!sections.Any(section => section.NativeTablesJson is not null))
+            throw InvalidProjectionPayload(report, "nativeTables", "NATIVE_VALUES_WITHOUT_DEFINITION");
+        if (Encoding.UTF8.GetByteCount(root.ToJsonString(JsonOptions)) > DynamicFormNativeTableValues.MaximumBytes)
+            throw InvalidProjectionPayload(report, "nativeTables", "NATIVE_VALUES_BYTE_LIMIT");
+        var definitions = sections.SelectMany(section => DynamicFormNativeTableDefinition.ReadStored(
+            section.NativeTablesJson is null ? null : 1, section.NativeTablesJson) ?? []).ToArray();
+        using var document = JsonDocument.Parse(root["nativeTables"]?.ToJsonString(JsonOptions) ?? "null");
+        DynamicFormNativeTableValues.ValidateEnvelope(definitions, report.DynamicFormSchemaHash, document.RootElement, submitting: false, enumOptions);
+    }
+
+    private static JsonObject? BuildSectionNativeValues(JsonObject? root, IReadOnlyCollection<string> tableIds)
+    {
+        if (tableIds.Count == 0 || root?["nativeTables"] is not JsonObject envelope) return null;
+        var ids = tableIds.ToHashSet(StringComparer.Ordinal);
+        var result = new JsonObject { ["version"] = Clone(envelope["version"]), ["schemaHash"] = Clone(envelope["schemaHash"]) };
+        result["tables"] = new JsonArray(((JsonArray)envelope["tables"]!).OfType<JsonObject>()
+            .Where(table => ids.Contains(ReadString(table, "tableId")!)).Select(Clone).ToArray());
+        return result;
+    }
+
+    private static bool NativeHasData(JsonObject? envelope)
+        => envelope?["tables"] is JsonArray tables && tables.OfType<JsonObject>().Any(table =>
+            table["contentRef"]?["rowCount"]?.GetValue<int>() > 0 || (table["rows"] ?? table["records"]) is JsonArray rows && rows.OfType<JsonObject>().Any(row =>
+                row["cells"] is JsonObject cells && cells.Select(pair => pair.Value).OfType<JsonObject>().Any(cell =>
+                    ReadString(cell, "state") == "error" || ReadString(cell, "state") == "value" && JsonNodeHasData(cell["value"]))));
+
     private static bool MatchesProjectedSectionPayload(
         WorkAssignmentReport report,
         int schemaVersion,
         JsonObject? canonicalTableRoot,
         JsonObject expectedFieldValues,
         JsonArray expectedTableBlocks,
+        JsonObject? expectedNative,
         WorkAssignmentReportSection actual)
     {
         try
@@ -795,7 +857,7 @@ public sealed class WorkAssignmentReportSectionProjectionService
             if (!JsonNode.DeepEquals(actualFieldRoot, expectedFieldRoot))
                 return false;
 
-            var expectedTableRoot = BuildSectionTableValuesRoot(report, canonicalTableRoot, expectedTableBlocks);
+            var expectedTableRoot = BuildSectionTableValuesRoot(report, canonicalTableRoot, expectedTableBlocks, expectedNative);
             if (expectedTableRoot is null)
                 return string.IsNullOrWhiteSpace(actual.TableValuesJson);
 
@@ -847,12 +909,18 @@ public sealed class WorkAssignmentReportSectionProjectionService
     private static JsonObject? BuildSectionTableValuesRoot(
         WorkAssignmentReport report,
         JsonObject? tableRoot,
-        JsonArray blocks)
+        JsonArray blocks,
+        JsonObject? native = null)
     {
-        if (blocks.Count == 0)
+        if (blocks.Count == 0 && native is null)
             return null;
 
-        var root = Clone(tableRoot) as JsonObject ?? new JsonObject();
+        var root = tableRoot?.ContainsKey("nativeTables") == true
+            ? new JsonObject(tableRoot.Where(pair => pair.Key is not ("nativeTables" or "blocks"))
+                .Select(pair => new KeyValuePair<string, JsonNode?>(pair.Key, Clone(pair.Value))))
+            : Clone(tableRoot) as JsonObject ?? new JsonObject();
+        root.Remove("nativeTables"); // Never copy the whole report's tables into one section.
+        if (native is not null) root["nativeTables"] = Clone(native);
         root.Remove("updatedAtUtc");
         root["dynamicFormTemplateId"] = report.DynamicFormTemplateId;
         root["dynamicFormTemplateCode"] = report.DynamicFormTemplateCode;
@@ -876,9 +944,10 @@ public sealed class WorkAssignmentReportSectionProjectionService
         WorkAssignmentReport report,
         JsonObject? tableRoot,
         JsonArray blocks,
-        DateTime updatedAtUtc)
+        DateTime updatedAtUtc,
+        JsonObject? native = null)
     {
-        var root = BuildSectionTableValuesRoot(report, tableRoot, blocks);
+        var root = BuildSectionTableValuesRoot(report, tableRoot, blocks, native);
         if (root is null)
             return null;
 
@@ -886,13 +955,14 @@ public sealed class WorkAssignmentReportSectionProjectionService
         return root.ToJsonString(JsonOptions);
     }
 
-    internal static string ComputeSectionPayloadHash(JsonObject sectionValues, JsonArray sectionBlocks)
+    internal static string ComputeSectionPayloadHash(JsonObject sectionValues, JsonArray sectionBlocks, JsonObject? native = null)
     {
         var root = new JsonObject
         {
             ["fieldValues"] = Clone(sectionValues),
             ["tableBlocks"] = Clone(sectionBlocks)
         };
+        if (native is not null) root["nativeTables"] = Clone(native);
         var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(root.ToJsonString(JsonOptions)));
         return Convert.ToHexString(bytes).ToLowerInvariant();
     }
@@ -958,7 +1028,8 @@ public sealed class WorkAssignmentReportSectionProjectionService
 
     private sealed record PublishedTemplateContract(
         IReadOnlyList<DynamicFormSectionSnapshot> Sections,
-        IReadOnlySet<string> SectionIds);
+        IReadOnlySet<string> SectionIds,
+        IReadOnlyDictionary<string, RuntimeEnumOptionSet> EnumOptions);
 
     private sealed record ProjectionPayload(
         JsonObject FieldValues,

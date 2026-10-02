@@ -7,6 +7,8 @@ using tdtd_be.Services.WorkAssignments.Aggregate;
 
 namespace tdtd_be.Controllers;
 
+// 30/09/2026: giữ mã cũ, chặn toàn bộ entry point; dùng Aggregate v2 trong báo cáo.
+[tdtd_be.Services.WorkAssignments.LegacyAggregateDisabled]
 [ApiController]
 [Authorize]
 [Route("api/work-assignment-aggregate-table")]

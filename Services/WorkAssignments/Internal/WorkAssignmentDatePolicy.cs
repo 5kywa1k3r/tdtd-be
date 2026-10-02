@@ -48,22 +48,10 @@ internal static class WorkAssignmentDatePolicy
     }
 
     public static DateTime? ResolveWorkRootDueDate(Work work)
-        => work.DueDate?.Date ?? work.EndDate?.Date;
+        => tdtd_be.Services.Works.WorkDatePolicy.EffectiveDueDate(work)?.Date;
 
     public static DateTime? ResolveWorkBoundaryEndDate(Work work)
-    {
-        var endDate = work.EndDate?.Date;
-        var dueDate = work.DueDate?.Date;
-
-        if (!endDate.HasValue)
-            return dueDate;
-        if (!dueDate.HasValue)
-            return endDate;
-
-        return dueDate.Value > endDate.Value
-            ? dueDate.Value
-            : endDate.Value;
-    }
+        => ResolveWorkRootDueDate(work);
 
     private static DateTime? ResolveInheritedDueDate(Work work, WorkAssignment? parent)
     {

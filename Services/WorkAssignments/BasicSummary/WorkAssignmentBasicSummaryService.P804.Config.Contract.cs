@@ -149,7 +149,8 @@ public sealed partial class WorkAssignmentBasicSummaryService
             NormalizeP804PeriodRule(input.PeriodRule),
             NormalizeP804GroupingHints(input.GroupingHints),
             NormalizeP804DetailHints(input.DetailHints),
-            NormalizeP804Targets(input.Targets));
+            NormalizeP804Targets(input.Targets),
+            NormalizeP804NativeTargets(input.NativeTargets));
     }
 
     private static WorkAssignmentBasicSummarySourceScopePayload

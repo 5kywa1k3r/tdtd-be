@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType><TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable>
+    <AssemblyName>tdtd-be.Tests</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <!-- Use the isolated host compilation. Never start the API or build into its live output. -->
+    <Reference Include="../AggregateMappingPersistenceChecks/bin/host-compile/*.dll" />
+    <Compile Include="../tdtd-be.Tests/WorkReportPayloadPreflightContractTests.cs" Link="PayloadPreflight.cs" />
+    <Compile Include="../tdtd-be.Tests/WorkReportLifecycleCommandContractTests.cs" Link="LifecycleCommand.cs" />
+    <Compile Include="../tdtd-be.Tests/WorkReportLifecycleProjectionOutboxContractTests.cs" Link="LifecycleOutbox.cs" />
+  </ItemGroup>
+</Project>

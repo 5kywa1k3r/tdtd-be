@@ -12,7 +12,7 @@ public interface IPositionAdminService
     Task<PositionResponse> CreateAsync(CreatePositionRequest req, CancellationToken ct);
     Task<PositionResponse> UpdateAsync(string id, UpdatePositionRequest req, CancellationToken ct);
     Task DeleteAsync(string id, CancellationToken ct);
-    Task<IReadOnlyList<PositionResponse>> ListAsync(bool? isDeleted, string? unitTypeCode, CancellationToken ct);
+    Task<IReadOnlyList<PositionResponse>> ListAsync(bool? isDeleted, string? unitTypeCode, CancellationToken ct, string? unitId = null);
     Task ValidatePositionForUnitTypeAsync(
         string? positionCode,
         string? unitTypeCode,
@@ -121,24 +121,49 @@ public sealed class PositionAdminService : IPositionAdminService
             throw PositionNotFound(id);
     }
 
-    public async Task<IReadOnlyList<PositionResponse>> ListAsync(bool? isDeleted, string? unitTypeCode, CancellationToken ct)
+    public async Task<IReadOnlyList<PositionResponse>> ListAsync(bool? isDeleted, string? unitTypeCode, CancellationToken ct, string? unitId = null)
     {
         var me = _me.RequireMe();
-        RoleGuard.RequireAdminOrSystemAdmin(me);
+        // Quản trị cấp/đơn vị cần đọc chức vụ để tạo người dùng.
+        // Chỉ quản trị hệ thống được đọc mục đã xóa; quyền ghi không thay đổi.
+        if (isDeleted == true ||
+            (!RoleGuard.IsManagerLevel(me) && !RoleGuard.TryGetManagerUnit(me, out _)))
+            RoleGuard.RequireAdminOrSystemAdmin(me);
 
         var filter = Builders<Position>.Filter.Empty;
         filter &= Builders<Position>.Filter.Eq(x => x.IsDeleted, isDeleted ?? false);
 
         var typeCode = NormalizeOptionalCode(unitTypeCode);
+        Unit? targetUnit = null;
+        if (!string.IsNullOrWhiteSpace(unitId))
+        {
+            targetUnit = await _ctx.Units.Find(x => x.Id == unitId && !x.IsDeleted && !x.IsVirtual).FirstOrDefaultAsync(ct);
+            if (targetUnit is null || string.IsNullOrWhiteSpace(targetUnit.PrimaryUnitTypeCode))
+                return Array.Empty<PositionResponse>();
+            if (!RoleGuard.IsAdmin(me) && !RoleGuard.IsSystemAdmin(me) && RoleGuard.TryGetManagerUnit(me, out _))
+                UnitManagementScope.Require(await UnitManagementScope.ResolveAsync(_ctx, me, ct), targetUnit.Code);
+            typeCode = NormalizeOptionalCode(targetUnit.PrimaryUnitTypeCode);
+        }
+        UnitType? unitType = null;
         if (!string.IsNullOrWhiteSpace(typeCode))
-            filter &= Builders<Position>.Filter.AnyEq(x => x.UnitTypeCodes, typeCode);
+        {
+            unitType = await _ctx.UnitTypes.Find(x => x.Code == typeCode && !x.IsDeleted).FirstOrDefaultAsync(ct);
+            if (unitType is null) return Array.Empty<PositionResponse>();
+            var rules = unitType.PositionRules ?? new();
+            if (rules.Count > 0)
+                filter &= Builders<Position>.Filter.In(x => x.Code,
+                    rules.Where(x => x.IsEnabled).Select(x => x.PositionCode));
+            else
+                filter &= Builders<Position>.Filter.AnyEq(x => x.UnitTypeCodes, typeCode);
+        }
 
         var list = await _ctx.Positions.Find(filter)
             .SortBy(x => x.Order)
             .ThenBy(x => x.Code)
             .ToListAsync(ct);
 
-        return list.Select(ToResp).ToList();
+        return list.Where(x => unitType is null || AccountAdministrationRules.PositionAllowed(x, unitType, targetUnit))
+            .Select(ToResp).ToList();
     }
 
     public async Task ValidatePositionForUnitTypeAsync(
@@ -160,34 +185,15 @@ public sealed class PositionAdminService : IPositionAdminService
             .Find(x => x.Code == utc && !x.IsDeleted)
             .FirstOrDefaultAsync(ct);
 
-        var rules = unitType?.PositionRules ?? new();
-        if (rules.Count > 0)
-        {
-            var rule = rules.FirstOrDefault(x =>
-                x.IsEnabled &&
-                string.Equals(x.PositionCode, pc, StringComparison.OrdinalIgnoreCase));
-
-            if (rule is null)
-                throw InvalidPositionForUnitType(pc, utc, unitId, "ruleMissing");
-
-            var positionExists = await _ctx.Positions
-                .Find(x => x.Code == pc && !x.IsDeleted)
-                .AnyAsync(ct);
-            if (!positionExists)
-                throw InvalidPositionForUnitType(pc, utc, unitId, "positionMissing");
-
-            await EnsurePositionQuotaAsync(pc, unitId, excludeUserId, rule.MaxUsersPerUnit, ct);
-            return;
-        }
-
-        var exists = await _ctx.Positions
-            .Find(x => x.Code == pc && !x.IsDeleted && x.UnitTypeCodes.Contains(utc))
-            .AnyAsync(ct);
-
-        if (!exists)
+        var position = await _ctx.Positions.Find(x => x.Code == pc && !x.IsDeleted).FirstOrDefaultAsync(ct);
+        var targetUnit = string.IsNullOrWhiteSpace(unitId) ? null
+            : await _ctx.Units.Find(x => x.Id == unitId).FirstOrDefaultAsync(ct);
+        if (unitType is null || position is null || !AccountAdministrationRules.PositionAllowed(position, unitType, targetUnit))
             throw InvalidPositionForUnitType(pc, utc, unitId, "notAllowed");
 
-        await EnsurePositionQuotaAsync(pc, unitId, excludeUserId, null, ct);
+        var rule = unitType.PositionRules?.FirstOrDefault(x =>
+            x.IsEnabled && string.Equals(x.PositionCode, pc, StringComparison.OrdinalIgnoreCase));
+        await EnsurePositionQuotaAsync(pc, unitId, excludeUserId, rule?.MaxUsersPerUnit, ct);
     }
 
     private async Task EnsurePositionQuotaAsync(

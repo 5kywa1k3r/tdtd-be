@@ -8,6 +8,12 @@ namespace tdtd_be.Models;
 [BsonCollection("dynamic_form_templates")]
 public sealed class DynamicFormTemplate : BaseEntity
 {
+    // Native publication transactions increment this field. P8 replacements
+    // must retain it instead of dropping an untyped concurrency fence.
+    [BsonElement("nativeStatisticPublicationFence")]
+    [BsonIgnoreIfDefault]
+    public long NativeStatisticPublicationFence { get; set; }
+
     [BsonId]
     [BsonRepresentation(BsonType.ObjectId)]
     public string Id { get; set; } = default!;
@@ -86,6 +92,15 @@ public sealed class DynamicFormTemplate : BaseEntity
     [BsonElement("blocksJson")]
     public string BlocksJson { get; set; } = "[]";
 
+    // Null marks a legacy definition; [] is an explicit native empty collection.
+    [BsonElement("nativeTablesVersion")]
+    [BsonIgnoreIfNull]
+    public int? NativeTablesVersion { get; set; }
+
+    [BsonElement("tablesJson")]
+    [BsonIgnoreIfNull]
+    public string? TablesJson { get; set; }
+
     [BsonElement("excelBlockDynamicExcelTemplateId")]
     [BsonRepresentation(BsonType.ObjectId)]
     public string? ExcelBlockDynamicExcelTemplateId { get; set; }
@@ -143,6 +158,13 @@ public sealed class DynamicFormStatisticConfigSections
 
     [BsonElement("tableSectionJson")]
     public string TableSectionJson { get; set; } = "[]";
+
+    [BsonElement("nativeTargetSectionJson")]
+    [BsonIgnoreIfNull]
+    public string? NativeTargetSectionJson { get; set; }
+    [BsonElement("nativePlanSectionJson")]
+    [BsonIgnoreIfNull]
+    public string? NativePlanSectionJson { get; set; }
 }
 
 [BsonIgnoreExtraElements]

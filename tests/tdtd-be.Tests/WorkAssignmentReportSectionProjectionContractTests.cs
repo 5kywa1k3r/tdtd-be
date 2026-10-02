@@ -137,14 +137,14 @@ internal static class WorkAssignmentReportSectionProjectionContractTests
         Contains(projection, "x.Id == templateId && x.IsPublished && !x.IsDeleted", "published exact template lookup");
         Contains(projection, "InsertOneAsync", "missing-section creation path");
         Contains(projection, "RetireUnexpectedSectionsAsync", "unexpected-section repair path");
-        Contains(projection, "IsCompleteProjection(report, contract.Sections, projected, payload)", "post-write exact payload verification");
+        Contains(projection, "IsCompleteProjection(report, contract.Sections, projected, payload, contract.EnumOptions)", "post-write exact payload verification with bound catalog options");
         Contains(projection, "MatchesProjectedSectionPayload", "exact projected field/table payload verifier");
         Contains(projection, "JsonNode.DeepEquals", "structural payload equality");
         Contains(projection, "actual.PayloadHash, expectedPayloadHash", "recomputed section payload hash verification");
         Before(
             projection,
             "var payloadSnapshot = await LoadCurrentPayloadAsync(report, ct);",
-            "if (IsCompleteProjection(report, contract.Sections, observedSections, payload))",
+            "if (IsCompleteProjection(report, contract.Sections, observedSections, payload, contract.EnumOptions))",
             "canonical payload must load before the read fast-path");
         Contains(projection, "DYNAMIC_FORM_SECTION_PROJECTION_INCOMPLETE", "fail-closed verification reason");
         Contains(reconciler, "_sectionProjection.ProjectCurrentAndVerifyAsync", "durable retry canonical projection");

@@ -222,6 +222,7 @@ public static class LabelValueSourceTypes
     public const string FixedEnum = "FIXED_ENUM";
     public const string EnumCatalog = "ENUM_CATALOG";
     public const string SystemUnit = "SYSTEM_UNIT";
+    public const string SystemLocality = "SYSTEM_LOCALITY";
     public const string SystemUser = "SYSTEM_USER";
     public const string SystemPosition = "SYSTEM_POSITION";
     public const string SystemUnitType = "SYSTEM_UNIT_TYPE";
@@ -241,6 +242,7 @@ public static class LabelValueSourceTypes
             "CUSTOM_ENUM" => EnumCatalog,
             "CUSTOM_ENUM_CATALOG" => EnumCatalog,
             SystemUnit => SystemUnit,
+            SystemLocality => SystemLocality,
             "UNIT" => SystemUnit,
             "UNITS" => SystemUnit,
             SystemUser => SystemUser,
@@ -259,7 +261,7 @@ public static class LabelValueSourceTypes
     public static bool UsesCatalog(string? value)
     {
         var normalized = Normalize(value);
-        return normalized is EnumCatalog or SystemUnit or SystemUser or SystemPosition or SystemUnitType;
+        return normalized is EnumCatalog or SystemUnit or SystemLocality or SystemUser or SystemPosition or SystemUnitType;
     }
 }
 

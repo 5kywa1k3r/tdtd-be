@@ -17,6 +17,11 @@ namespace tdtd_be.Services.WorkAssignmentReports;
 /// </summary>
 public interface IWorkAssignmentReportService
 {
+    Task<tdtd_be.Models.WorkAssignmentReport> AuthorizeEvidenceAsync(string reportId, string fieldId, string actorUserId, bool write, CancellationToken ct);
+    Task<tdtd_be.Models.WorkAssignmentReport> AuthorizeContentReadAsync(string reportId, string actorUserId, CancellationToken ct);
+    Task<PagedResult<tdtd_be.DTOs.Labels.LabelEnumOptionPickRow>> SearchFieldEnumOptionsAsync(
+        string? reportId, string? assignmentId, string fieldId, string catalogId, string? q, int page, int pageSize, string actorUserId, CancellationToken ct);
+    Task<ReportSelectedEnumLabelsResponse> GetSelectedEnumLabelsAsync(string reportId, string actorUserId, CancellationToken ct);
     /// <summary>
     /// Danh sách ngoài cùng của user trong 1 Work, nhóm theo template runtime hiện hành.
     /// </summary>

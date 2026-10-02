@@ -379,7 +379,8 @@ builder.Services.AddScoped<IUserActionLogService, UserActionLogService>();
 builder.Services.AddScoped<IJobRunManagementService, JobRunManagementService>();
 builder.Services.AddScoped<IDocRoleService, DocRoleService>();
 builder.Services.AddScoped<INotificationService, NotificationService>();
-builder.Services.AddScoped<INotificationDueScanJobService, NotificationDueScanJobService>();
+builder.Services.AddScoped<tdtd_be.Services.WorkInbox.WorkInboxService>();
+builder.Services.AddScoped<INotificationDueScanJobService, tdtd_be.Services.WorkInbox.WorkInboxNotificationJob>();
 
 builder.Services.AddScoped<IWorkCodeGenerator, WorkCodeGenerator>();
 builder.Services.AddScoped<IWorkService, WorkService>();

@@ -24,6 +24,8 @@ public sealed class WorkAssignmentListResponse
     public string AggregationType { get; set; } = string.Empty;
     public DateTime? StartDate { get; set; }
     public DateTime? DueDate { get; set; }
+    public DateTime? EffectiveDueDate { get; set; }
+    public int? EffectiveDueSourceDepth { get; set; }
     public DateTime? CompletedDate { get; set; }
     public DateTime? CompletedAtUtc { get; set; }
     public string? CompletedByUserId { get; set; }

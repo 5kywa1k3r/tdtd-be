@@ -31,7 +31,9 @@ internal static class DynamicFormVersionMetadataBackfill
         { "sectionsJson", 1 },
         { "fieldsJson", 1 },
         { "blocksJson", 1 },
-        { "excelBlockJson", 1 }
+        { "excelBlockJson", 1 },
+        { "nativeTablesVersion", 1 },
+        { "tablesJson", 1 }
     };
 
     private static readonly string[] ObservedMetadataFields =
@@ -51,7 +53,9 @@ internal static class DynamicFormVersionMetadataBackfill
         "sectionsJson",
         "fieldsJson",
         "blocksJson",
-        "excelBlockJson"
+        "excelBlockJson",
+        "nativeTablesVersion",
+        "tablesJson"
     };
 
     private static readonly BsonDocument CandidateFilter = new("$or", new BsonArray
@@ -227,6 +231,8 @@ internal static class DynamicFormVersionMetadataBackfill
             FieldsJson = ReadSchemaJson(document, "fieldsJson", "[]", context),
             BlocksJson = ReadSchemaJson(document, "blocksJson", "[]", context),
             ExcelBlockJson = ReadSchemaJson(document, "excelBlockJson", null!, context),
+            NativeTablesVersion = ReadOptionalInt32(document, "nativeTablesVersion", context),
+            TablesJson = ReadSchemaJson(document, "tablesJson", null!, context),
             IsPublished = true,
             PublishedSchemaSnapshotJson = snapshotJson,
             PublishedSchemaHash = schemaHash

@@ -4,6 +4,7 @@ using tdtd_be.Data;
 using tdtd_be.Models;
 using tdtd_be.Services.Common;
 using tdtd_be.Services.Works;
+using tdtd_be.Services.WorkAssignments.Internal;
 
 namespace tdtd_be.Services.WorkDocuments;
 
@@ -40,64 +41,31 @@ public sealed class WorkDocumentPermissionService : IWorkDocumentPermissionServi
         if (assignment is null)
             throw AppExceptionFactory.NotFound(AppErrorCode.WORK_ASSIGNMENT_NOT_FOUND, new { workId, assignmentId });
 
-        if (!string.Equals(assignment.CreatedByUserId, userId, StringComparison.Ordinal))
+        if (!(await ReadAccessAsync(workId, userId, ct)).UploadAssignments.Any(a => a.Id == assignmentId))
             throw AppExceptionFactory.Forbidden(AppErrorCode.AUTH_FORBIDDEN, new { workId, assignmentId });
 
         return assignment;
     }
 
+    public async Task<WorkDocumentAccessSnapshot> ReadAccessAsync(string workId, string userId, CancellationToken ct)
+    {
+        await EnsureWorkExistsAsync(workId, ct);
+        var roles = await _ctx.DocRoles.Find(r => r.UserId == userId && !r.IsDeleted &&
+            (r.DocType == DocType.WORK && r.DocId == workId || r.DocType == DocType.WORK_ASSIGNMENT)).ToListAsync(ct);
+        var assignments = await _ctx.WorkAssignments.Find(a => a.WorkId == workId && a.IsActive && !a.IsDeleted).ToListAsync(ct);
+        return new(workId, userId, roles.Any(r => r.DocType == DocType.WORK && r.DocId == workId),
+            roles.Any(r => r.DocType == DocType.WORK && r.DocId == workId && r.Role == DocRoleType.OWNER), assignments,
+            roles.Where(r => r.DocType == DocType.WORK_ASSIGNMENT).Select(r => r.DocId));
+    }
+
     public async Task<bool> CanReadFileAsync(FileDoc file, string userId, CancellationToken ct)
     {
+        if (file.SourceType == "REPORT_EVIDENCE" || file.IsDeleted) return false;
         var scope = WorkDocumentScopeResolver.Resolve(file);
-
-        if (string.Equals(scope.Scope, WorkDocumentConstants.ScopeWork, StringComparison.Ordinal))
-        {
-            if (string.IsNullOrWhiteSpace(scope.WorkId))
-                return false;
-
-            return await _docRole.HasAnyRoleAsync(DocType.WORK, scope.WorkId, userId, ct);
-        }
-
-        if (string.Equals(scope.Scope, WorkDocumentConstants.ScopeAssignmentBranch, StringComparison.Ordinal))
-        {
-            if (string.IsNullOrWhiteSpace(scope.AssignmentId))
-                return false;
-
-            var assignment = await LoadActiveAssignmentAsync(scope.AssignmentId, scope.WorkId, ct);
-            if (assignment is null)
-                return false;
-
-            var ancestorIds = WorkDocumentScopeResolver.ParseAssignmentPath(assignment.Path, assignment.Id);
-            var roleFb = Builders<AssignmentListDocRole>.Filter;
-            var roleFilter =
-                roleFb.Eq(x => x.WorkId, assignment.WorkId) &
-                roleFb.Eq(x => x.UserId, userId) &
-                roleFb.In(x => x.AssignmentId, ancestorIds) &
-                roleFb.Eq(x => x.IsDeleted, false) &
-                roleFb.SizeGt(x => x.Roles, 0);
-
-            var hasProjectedRole = await _ctx.AssignmentListDocRoles
-                .Find(roleFilter)
-                .AnyAsync(ct);
-
-            if (hasProjectedRole)
-                return true;
-
-            var assignmentFb = Builders<WorkAssignment>.Filter;
-            var assignmentFilter =
-                assignmentFb.Eq(x => x.WorkId, assignment.WorkId) &
-                assignmentFb.In(x => x.Id, ancestorIds) &
-                assignmentFb.Eq(x => x.IsActive, true) &
-                assignmentFb.Eq(x => x.IsDeleted, false);
-
-            var ancestorNodes = await _ctx.WorkAssignments
-                .Find(assignmentFilter)
-                .ToListAsync(ct);
-
-            return ancestorNodes.Any(x => IsBranchMember(x, userId));
-        }
-
-        return string.Equals(file.CreatedByUserId, userId, StringComparison.Ordinal);
+        if (scope.Scope is not (WorkDocumentConstants.ScopeWork or WorkDocumentConstants.ScopeAssignmentBranch)) return file.CreatedByUserId == userId;
+        if (string.IsNullOrWhiteSpace(scope.WorkId)) return false;
+        var access = await ReadAccessAsync(scope.WorkId, userId, ct);
+        return access.CanRead(file, scope);
     }
 
     public async Task EnsureCanReadFileAsync(FileDoc file, string userId, CancellationToken ct)
@@ -117,32 +85,11 @@ public sealed class WorkDocumentPermissionService : IWorkDocumentPermissionServi
 
     public async Task<bool> CanDeleteFileAsync(FileDoc file, string userId, CancellationToken ct)
     {
+        if (file.SourceType == "REPORT_EVIDENCE" || file.IsDeleted) return false;
         var scope = WorkDocumentScopeResolver.Resolve(file);
-
-        if (string.Equals(scope.Scope, WorkDocumentConstants.ScopeWork, StringComparison.Ordinal))
-        {
-            if (string.IsNullOrWhiteSpace(scope.WorkId))
-                return false;
-
-            return await IsWorkOwnerAsync(scope.WorkId, userId, ct);
-        }
-
-        if (string.Equals(scope.Scope, WorkDocumentConstants.ScopeAssignmentBranch, StringComparison.Ordinal))
-        {
-            if (string.IsNullOrWhiteSpace(scope.AssignmentId))
-                return false;
-
-            var assignment = await LoadActiveAssignmentAsync(scope.AssignmentId, scope.WorkId, ct);
-            if (assignment is null)
-                return false;
-
-            if (string.Equals(assignment.CreatedByUserId, userId, StringComparison.Ordinal))
-                return true;
-
-            return await IsWorkOwnerAsync(assignment.WorkId, userId, ct);
-        }
-
-        return string.Equals(file.CreatedByUserId, userId, StringComparison.Ordinal);
+        if (scope.Scope is not (WorkDocumentConstants.ScopeWork or WorkDocumentConstants.ScopeAssignmentBranch)) return file.CreatedByUserId == userId;
+        if (string.IsNullOrWhiteSpace(scope.WorkId)) return false;
+        return (await ReadAccessAsync(scope.WorkId, userId, ct)).CanDelete(file, scope);
     }
 
     public async Task EnsureCanDeleteFileAsync(FileDoc file, string userId, CancellationToken ct)
@@ -152,18 +99,7 @@ public sealed class WorkDocumentPermissionService : IWorkDocumentPermissionServi
     }
 
     public async Task<List<WorkAssignment>> GetAssignmentUploadTargetsAsync(string workId, string userId, CancellationToken ct)
-    {
-        await EnsureWorkExistsAsync(workId, ct);
-
-        return await _ctx.WorkAssignments
-            .Find(x =>
-                x.WorkId == workId &&
-                x.CreatedByUserId == userId &&
-                x.IsActive &&
-                !x.IsDeleted)
-            .SortBy(x => x.Path)
-            .ToListAsync(ct);
-    }
+        => (await ReadAccessAsync(workId, userId, ct)).UploadAssignments.ToList();
 
     private async Task<Work?> EnsureWorkExistsAsync(string workId, CancellationToken ct)
     {
@@ -177,35 +113,4 @@ public sealed class WorkDocumentPermissionService : IWorkDocumentPermissionServi
         return work;
     }
 
-    private async Task<bool> IsWorkOwnerAsync(string workId, string userId, CancellationToken ct)
-    {
-        return await _ctx.Works
-            .Find(x => x.Id == workId && x.CreatedByUserId == userId && !x.IsDeleted)
-            .AnyAsync(ct);
-    }
-
-    private async Task<WorkAssignment?> LoadActiveAssignmentAsync(string assignmentId, string? workId, CancellationToken ct)
-    {
-        var fb = Builders<WorkAssignment>.Filter;
-        var filter = fb.Eq(x => x.Id, assignmentId) & fb.Eq(x => x.IsActive, true) & fb.Eq(x => x.IsDeleted, false);
-        if (!string.IsNullOrWhiteSpace(workId))
-            filter &= fb.Eq(x => x.WorkId, workId);
-
-        return await _ctx.WorkAssignments.Find(filter).FirstOrDefaultAsync(ct);
-    }
-
-    private static bool IsBranchMember(WorkAssignment assignment, string userId)
-    {
-        if (string.Equals(assignment.CreatedByUserId, userId, StringComparison.Ordinal))
-            return true;
-
-        if ((assignment.Assignees ?? new List<UserRef>())
-            .Any(x => string.Equals(x.UserId, userId, StringComparison.Ordinal)))
-            return true;
-
-        return (assignment.LeaderWatcherUserIds ?? new List<string>())
-            .Any(x => string.Equals(x, userId, StringComparison.Ordinal)) ||
-            (assignment.LeaderWatchers ?? new List<UserRef>())
-            .Any(x => string.Equals(x.UserId, userId, StringComparison.Ordinal));
-    }
 }

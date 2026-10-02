@@ -19,6 +19,13 @@ namespace tdtd_be.DashboardModel.Services;
 
 public interface IDashboardMindMapQueryService
 {
+    Task<PagedResult<DashboardMindMapWorkOptionDto>> SearchWorksAsync(
+        WorkType type,
+        string? q,
+        int page = 0,
+        int pageSize = 20,
+        CancellationToken ct = default);
+
     Task<DashboardMindMapWorkResponse> GetWorkTreeAsync(
         string workId,
         DashboardMindMapScopeRequest? scope,
@@ -157,6 +164,90 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
 
     private static AppException DashboardForbidden(AppErrorCode code, object details)
         => AppExceptionFactory.Forbidden(code, details);
+
+    public async Task<PagedResult<DashboardMindMapWorkOptionDto>> SearchWorksAsync(
+        WorkType type,
+        string? q,
+        int page = 0,
+        int pageSize = 20,
+        CancellationToken ct = default)
+    {
+        var me = _me.RequireMe();
+        var safePage = Math.Max(page, 0);
+        var safePageSize = ClampPageSize(pageSize);
+
+        if (DashboardAccessPolicy.HasGlobalReadAccess(me))
+        {
+            var fb = Builders<Work>.Filter;
+            var filter = fb.Eq(x => x.IsDeleted, false) & fb.Eq(x => x.Type, type);
+
+            if (!string.IsNullOrWhiteSpace(q))
+            {
+                var regex = new BsonRegularExpression(Regex.Escape(q.Trim()), "i");
+                filter &= fb.Or(
+                    fb.Regex(x => x.AutoCode, regex),
+                    fb.Regex(x => x.Code, regex),
+                    fb.Regex(x => x.Name, regex));
+            }
+
+            var total = await _ctx.Works.CountDocumentsAsync(filter, cancellationToken: ct);
+            var rows = await _ctx.Works
+                .Find(filter)
+                .SortByDescending(x => x.CreatedAtUtc)
+                .Skip(safePage * safePageSize)
+                .Limit(safePageSize)
+                .Project(x => new DashboardMindMapWorkOptionDto
+                {
+                    Id = x.Id,
+                    AutoCode = x.AutoCode,
+                    Code = x.Code,
+                    Name = x.Name,
+                    Status = (int)x.Status,
+                    Type = (int)x.Type,
+                })
+                .ToListAsync(ct);
+
+            return new PagedResult<DashboardMindMapWorkOptionDto>(rows, total, safePage, safePageSize);
+        }
+
+        var rb = Builders<WorkListDocRole>.Filter;
+        var readFilter = rb.Eq(x => x.IsDeleted, false)
+            & rb.Eq(x => x.DocType, DocType.WORK)
+            & rb.Eq(x => x.UserId, me.Id)
+            & rb.Eq(x => x.Type, type);
+
+        if (!string.IsNullOrWhiteSpace(q))
+        {
+            var regex = new BsonRegularExpression(Regex.Escape(q.Trim()), "i");
+            readFilter &= rb.Or(
+                rb.Regex(x => x.AutoCode, regex),
+                rb.Regex(x => x.Code, regex),
+                rb.Regex(x => x.Name, regex));
+        }
+
+        var visibleTotal = await _ctx.WorkListDocRoles.CountDocumentsAsync(readFilter, cancellationToken: ct);
+        var visibleRows = await _ctx.WorkListDocRoles
+            .Find(readFilter)
+            .SortByDescending(x => x.WorkCreatedAtUtc)
+            .Skip(safePage * safePageSize)
+            .Limit(safePageSize)
+            .Project(x => new DashboardMindMapWorkOptionDto
+            {
+                Id = x.WorkId,
+                AutoCode = x.AutoCode,
+                Code = x.Code,
+                Name = x.Name,
+                Status = (int)x.Status,
+                Type = (int)x.Type,
+            })
+            .ToListAsync(ct);
+
+        return new PagedResult<DashboardMindMapWorkOptionDto>(
+            visibleRows,
+            visibleTotal,
+            safePage,
+            safePageSize);
+    }
 
     public async Task<DashboardMindMapWorkResponse> GetWorkTreeAsync(
         string workId,
@@ -1894,7 +1985,8 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
                 AppErrorCode.DASHBOARD_WORK_NOT_FOUND,
                 new { workId });
 
-        var hasFullAccess = string.Equals(work.CreatedByUserId, actorUserId, StringComparison.Ordinal)
+        var hasFullAccess = DashboardAccessPolicy.HasGlobalReadAccess(_me.RequireMe())
+            || string.Equals(work.CreatedByUserId, actorUserId, StringComparison.Ordinal)
             || await HasFullWorkReadRoleAsync(workId, actorUserId, ct);
 
         if (hasFullAccess)

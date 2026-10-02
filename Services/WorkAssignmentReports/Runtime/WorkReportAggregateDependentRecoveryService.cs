@@ -42,6 +42,8 @@ public sealed class WorkReportAggregateDependentRecoveryService : IWorkReportAgg
         string actorUserId,
         CancellationToken ct = default)
     {
+        // Luồng v2 được dispatch riêng trong lifecycle reconciler.
+        if (tdtd_be.Services.WorkAssignments.LegacyAggregateRetirement.IsDisabled) return;
         // An approved aggregate can itself be a source for another aggregate. Its lifecycle
         // outbox stays pending and the recurring runner continues the chain without recursion.
         if (WorkReportAggregateDependentRecoveryExecution.IsActive)
@@ -71,6 +73,7 @@ public sealed class WorkReportAggregateDependentRecoveryService : IWorkReportAgg
         string actorUserId,
         CancellationToken ct = default)
     {
+        if (tdtd_be.Services.WorkAssignments.LegacyAggregateRetirement.IsDisabled) return Task.CompletedTask;
         ArgumentNullException.ThrowIfNull(source);
         ArgumentNullException.ThrowIfNull(pending);
 

@@ -21,6 +21,8 @@ public sealed partial class WorkAssignmentBasicSummaryService
             string dynamicFormTemplateId,
             CancellationToken ct)
     {
+        // Tạm khóa luồng tổng hợp cũ; giữ nguyên triển khai bên dưới.
+        LegacyAggregateRetirement.Reject();
         var me = _me.RequireMe();
         assignmentId = P804NormalizeAssignmentId(assignmentId);
         var assignment = await P804LoadAuthorizedAssignmentAsync(
@@ -54,6 +56,8 @@ public sealed partial class WorkAssignmentBasicSummaryService
             string dynamicFormTemplateId,
             CancellationToken ct)
     {
+        // Tạm khóa luồng tổng hợp cũ; giữ nguyên triển khai bên dưới.
+        LegacyAggregateRetirement.Reject();
         var readback = await GetP8ConfigAsync(
             assignmentId,
             dynamicFormTemplateId,
@@ -69,6 +73,8 @@ public sealed partial class WorkAssignmentBasicSummaryService
             int versionNo,
             CancellationToken ct)
     {
+        // Tạm khóa luồng tổng hợp cũ; giữ nguyên triển khai bên dưới.
+        LegacyAggregateRetirement.Reject();
         var me = _me.RequireMe();
         assignmentId = P804NormalizeAssignmentId(assignmentId);
         var assignment = await P804LoadAuthorizedAssignmentAsync(
@@ -154,7 +160,8 @@ public sealed partial class WorkAssignmentBasicSummaryService
         var filter = P804AssignmentAuthorizationFilter(
             assignmentId,
             me,
-            requireManage);
+            requireManage,
+            requireManage ? Array.Empty<string>() : await LoadLeadershipWorkIdsAsync(me.Id, ct));
         var assignment = session is null
             ? await _ctx.WorkAssignments
                 .Find(filter)
@@ -175,11 +182,20 @@ public sealed partial class WorkAssignmentBasicSummaryService
             });
     }
 
+    // Read permission follows current Work leadership, so removal takes effect
+    // without rewriting every descendant assignment. This is never a manage grant.
+    private async Task<string[]> LoadLeadershipWorkIdsAsync(string actorUserId, CancellationToken ct)
+        => (await _ctx.Works.Find(work => !work.IsDeleted &&
+                (work.CreatedByUserId == actorUserId || work.LeaderDirectiveUserId == actorUserId ||
+                 work.LeaderWatchUserIds.Contains(actorUserId)))
+            .Project(work => work.Id).ToListAsync(ct)).ToArray();
+
     private static FilterDefinition<WorkAssignment>
         P804AssignmentAuthorizationFilter(
             string assignmentId,
             MeResponse me,
-            bool requireManage)
+            bool requireManage,
+            IReadOnlyCollection<string>? leadershipWorkIds = null)
     {
         var filter = Builders<WorkAssignment>.Filter;
         var result =
@@ -196,6 +212,7 @@ public sealed partial class WorkAssignmentBasicSummaryService
         }
         return result &
                filter.Or(
+                   filter.In(item => item.WorkId, leadershipWorkIds ?? Array.Empty<string>()),
                    filter.Eq(
                        item => item.CreatedByUserId,
                        me.Id),
@@ -487,6 +504,7 @@ public sealed partial class WorkAssignmentBasicSummaryService
         var templateContext =
             P804BuildTemplateDependencyContext(template);
         var pins = templateContext.Pins.ToList();
+        var targets = payload.Targets ?? throw P804Schema("$.payload.targets", "TARGETS_REQUIRED");
         using var fieldsDocument = P804ParseArray(
             template.FieldsJson,
             "$.template.fields",
@@ -496,18 +514,17 @@ public sealed partial class WorkAssignmentBasicSummaryService
             "$.template.blocks",
             "TEMPLATE_BLOCKS_INVALID");
         var rowLabelCodes = new HashSet<string>(
-            payload.Targets!
+            targets
                 .Where(target =>
                     target.ConceptKind ==
                     WorkAssignmentBasicSummaryConfigContract.RowLabel)
                 .Select(target => target.ConceptKey!),
             StringComparer.Ordinal);
         var modernRowLabels =
-            templateContext.StatisticConfig is null
+            templateContext.TableSectionJson is null
                 ? null
                 : P804ResolveModernRowLabelSnapshots(
-                    templateContext.StatisticConfig
-                        .TableSectionJson,
+                    templateContext.TableSectionJson,
                     rowLabelCodes);
 
         IReadOnlyDictionary<string, LabelCatalogItem>
@@ -571,9 +588,9 @@ public sealed partial class WorkAssignmentBasicSummaryService
             new Dictionary<string, LabelCatalogItem>(
                 StringComparer.Ordinal);
 
-        for (var index = 0; index < payload.Targets.Count; index++)
+        for (var index = 0; index < targets.Count; index++)
         {
-            var target = payload.Targets[index];
+            var target = targets[index];
             var actualType = target.ConceptKind switch
             {
                 WorkAssignmentBasicSummaryConfigContract.Field =>
@@ -635,6 +652,8 @@ public sealed partial class WorkAssignmentBasicSummaryService
                     $"{label.VersionNo}:{label.ConfigHash}");
             }
         }
+        pins.AddRange(await P804ResolveNativeDependencyPinsAsync(
+            session, templateContext.NativeConfig, payload.NativeTargets, me, ct));
         return pins
             .Distinct(StringComparer.Ordinal)
             .OrderBy(value => value, StringComparer.Ordinal)
@@ -1020,6 +1039,16 @@ public sealed partial class WorkAssignmentBasicSummaryService
         P804BuildTemplateDependencyContext(
         DynamicFormTemplate template)
     {
+        if (template.NativeTablesVersion is not null)
+        {
+            var native = P804ReadNativeConfig(template);
+            return new P804TemplateDependencyContext(new[]
+            {
+                $"DYNAMIC_FORM_SCHEMA:{template.Id}:{template.VersionNo}:{template.PublishedSchemaHash}",
+                $"DYNAMIC_FORM_STAT_CONFIG:{template.Id}:{native.ConfigId}:{native.VersionId}:" +
+                $"{native.VersionNo}:{native.Revision}:{native.ConfigHash}"
+            }.OrderBy(value => value, StringComparer.Ordinal).ToList(), native.TableSectionJson, native);
+        }
         DynamicFormStatisticConfigCommandService
             .P804TrustedPersistedView? trusted;
         try
@@ -1071,7 +1100,7 @@ public sealed partial class WorkAssignmentBasicSummaryService
             }
             .OrderBy(value => value, StringComparer.Ordinal)
             .ToList();
-        return new P804TemplateDependencyContext(pins, trusted);
+        return new P804TemplateDependencyContext(pins, trusted?.TableSectionJson, null);
     }
 
     private static IReadOnlyList<string> P804BuildTemplatePins(
@@ -1080,8 +1109,8 @@ public sealed partial class WorkAssignmentBasicSummaryService
 
     private sealed record P804TemplateDependencyContext(
         IReadOnlyList<string> Pins,
-        DynamicFormStatisticConfigCommandService
-            .P804TrustedPersistedView? StatisticConfig);
+        string? TableSectionJson,
+        DynamicFormStatisticConfigCommandService.NativeStatisticInputView? NativeConfig);
 
     private sealed record P804ModernRowLabelResolution(
         DynamicFormStatisticLabelSnapshotDto Snapshot,

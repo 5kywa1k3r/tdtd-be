@@ -10,6 +10,8 @@ using tdtd_be.Services.StatisticsConfiguration;
 
 namespace tdtd_be.Controllers;
 
+// Bản deploy gọn: tạm khóa toàn bộ API quản lý quota, giữ mã để mở lại.
+[NonController]
 [ApiController]
 [Authorize]
 [Route("api/work-summary-tokens")]

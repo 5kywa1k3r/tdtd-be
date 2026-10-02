@@ -30,7 +30,7 @@ using tdtd_be.Services.Notifications;
 
 namespace tdtd_be.Services.WorkAssignments;
 
-public sealed class WorkAssignmentService : IWorkAssignmentService
+public sealed partial class WorkAssignmentService : IWorkAssignmentService
 {
     private readonly MongoDbContext _ctx;
     private readonly IDocRoleService _docRole;
@@ -224,6 +224,13 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
 
         var work = await _lookup.LoadWorkAsync(workId, ct);
 
+        if (work.CreatedByUserId != actorUserId)
+        {
+            var actor = await _ctx.Users.Find(x => x.Id == actorUserId && !x.IsDeleted).FirstOrDefaultAsync(ct);
+            if (actor is null || !WorkAssignmentCurrentAuthority.CanLeadChild(actor))
+                return new List<WorkAssignmentListResponse>();
+        }
+
         if (!await EnsureAssignmentListDocRolesForUserWorkAsync(workId, actorUserId, ct))
             return new List<WorkAssignmentListResponse>();
 
@@ -251,9 +258,38 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
             .ThenBy(x => x.Path)
             .ToListAsync(ct);
 
-        return items
+        var candidates = items
             .Select(ToListResponse)
             .ToList();
+
+        foreach (var candidate in candidates)
+        {
+            candidate.EffectiveDueDate = candidate.DueDate?.Date
+                ?? (!candidate.CompletedAtUtc.HasValue ? candidate.CompletedDate?.Date : null)
+                ?? candidate.DueAtUtc?.Date
+                ?? candidate.LatestDueAtUtc?.Date;
+
+            if (candidate.EffectiveDueDate.HasValue)
+            {
+                candidate.EffectiveDueSourceDepth = 0;
+            }
+            else
+            {
+                var dueSource = await ResolveInheritedParentDueSourceAsync(
+                    work,
+                    new WorkAssignment
+                    {
+                        Id = candidate.Id,
+                        WorkId = workId,
+                        ParentAssignmentId = candidate.ParentAssignmentId
+                    },
+                    ct);
+                candidate.EffectiveDueDate = dueSource.DueDate;
+                candidate.EffectiveDueSourceDepth = dueSource.ParentDepth;
+            }
+        }
+
+        return candidates;
     }
 
     public async Task<WorkAssignmentResponse?> GetByIdAsync(
@@ -331,6 +367,7 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
         string actorUserId,
         CancellationToken ct = default)
     {
+        LegacyAggregateRetirement.RequireManualSourceRules(req.DynamicFormDataSourceRulesJson);
         EnsureActor(actorUserId);
 
         var work = await _lookup.LoadWorkAsync(workId, ct);
@@ -410,18 +447,25 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
             now,
             inheritedParentDueDate);
 
-        WorkAssignmentScheduleHelper.ValidateRequest(normalizedReq, work);
+        WorkAssignmentScheduleHelper.ValidateRequest(normalizedReq, work, inheritedParentDueDate);
 
         WorkAssignmentCreateScopeGuard.EnsureCanCreateWithinScope(
             work,
             parent,
             actorUserId,
             normalizedReq.AssigneeUserIds);
+        if (parent is not null)
+        {
+            var childActor = await _ctx.Users.Find(x => x.Id == actorUserId && !x.IsDeleted).FirstOrDefaultAsync(ct)
+                ?? throw AppExceptionFactory.Unauthorized(AppErrorCode.WORK_ASSIGNMENT_ACTOR_REQUIRED);
+            if (!WorkAssignmentCurrentAuthority.CanLeadChild(childActor))
+                throw AppExceptionFactory.Forbidden(AppErrorCode.WORK_ASSIGNMENT_BRANCH_CREATE_FORBIDDEN);
+        }
 
-        var template = await _templateResolver.ResolveAsync(
-            normalizedReq.DynamicFormTemplateId,
-            actorUserId,
-            ct);
+        var template = parent is null
+            ? await _templateResolver.ResolveAsync(normalizedReq.DynamicFormTemplateId, actorUserId, ct)
+            : await _templateResolver.ResolveForChildAsync(
+                normalizedReq.DynamicFormTemplateId, actorUserId, workId, parent.Id, ct);
 
         var dynamicFormTemplate = await _ctx.DynamicFormTemplates
             .Find(x => x.Id == template.DynamicFormTemplateId && !x.IsDeleted)
@@ -448,6 +492,8 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
 
         var assignees = await WorkAssignmentUserHelper.BuildAssigneesAsync(_ctx, normalizedReq.AssigneeUserIds, ct);
         await EnsureAssignmentTargetsAllowedAsync(actorUserId, assignees, ct);
+        if (parent is not null)
+            await EnsureChildTargetsBelowActorAsync(actorUserId, assignees, ct);
         var tenantPins = await ResolveAssignmentTenantPinsAsync(actorUserId, assignees, ct);
 
         var leaderWatchers = await WorkAssignmentUserHelper.BuildLeaderWatchersAsync(
@@ -456,7 +502,8 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
             assignees,
             ct);
 
-        var willBeActive = normalizedReq.IsActive ?? true;
+        // Assignment activation is fixed; legacy clients cannot create inactive assignments.
+        var willBeActive = true;
 
         await EnsureNoActiveAssigneeDynamicFormBindingConflictAsync(
             workId,
@@ -536,6 +583,7 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
             CreatedAtUtc = now,
             UpdatedAtUtc = now,
             CreatedByUserId = actorUserId,
+            CurrentReviewerUserId = actorUserId,
             UpdatedByUserId = actorUserId,
             DueAtUtc = NormalizeDueDateUtc(normalizedReq.DueAtUtc),
         };
@@ -557,6 +605,7 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
                     session,
                     workFilter.Eq(x => x.Id, workId) &
                     workFilter.Eq(x => x.IsDeleted, false) &
+                    workFilter.Eq(x => x.UpdatedAtUtc, work.UpdatedAtUtc) &
                     noRuntimeOwner &
                     legacyTopology,
                     Builders<Work>.Update.Set(
@@ -582,6 +631,28 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
                     session,
                     entity,
                     cancellationToken: transactionCt);
+                if (parent is not null)
+                {
+                    var currentParent = await _ctx.WorkAssignments.Find(session, a => a.Id == parent.Id && !a.IsDeleted).FirstOrDefaultAsync(transactionCt);
+                    if (currentParent == null || currentParent.CompletedAtUtc.HasValue)
+                        throw new tdtd_be.Services.AggregateMapping.AggregatePreviewException("AGG_PARENT_MUST_REOPEN");
+                    WorkAssignmentCreateScopeGuard.EnsureCanCreateBranch(currentParent, actorUserId);
+                    if (currentParent.HandoverTopologyRevision != parent.HandoverTopologyRevision)
+                        throw AppExceptionFactory.Forbidden(AppErrorCode.WORK_ASSIGNMENT_BRANCH_CREATE_FORBIDDEN);
+                    var revisionFilter = Builders<WorkAssignment>.Filter.Eq(x => x.HandoverTopologyRevision, parent.HandoverTopologyRevision);
+                    if (parent.HandoverTopologyRevision == 0)
+                        revisionFilter |= Builders<WorkAssignment>.Filter.Exists(x => x.HandoverTopologyRevision, false);
+                    var fenced = await _ctx.WorkAssignments.UpdateOneAsync(session,
+                        Builders<WorkAssignment>.Filter.Eq(x => x.Id, parent.Id) & revisionFilter &
+                        Builders<WorkAssignment>.Filter.Eq(x => x.IsDeleted, false),
+                        Builders<WorkAssignment>.Update.Inc(x => x.HandoverTopologyRevision, 1),
+                        cancellationToken: transactionCt);
+                    if (fenced.ModifiedCount != 1)
+                        throw AppExceptionFactory.Forbidden(AppErrorCode.WORK_ASSIGNMENT_BRANCH_CREATE_FORBIDDEN);
+                }
+                await tdtd_be.Services.AggregateMapping.Persistence.AggregateHostIntegration.RelationshipAsync(
+                    _ctx, session, entity.WorkId, [entity.Id!], "assignment-create:" + entity.Id, transactionCt, preserveIdentity: true);
+                await WorkDirectSourceRevisionFence.IncrementAsync(_ctx, session, entity.WorkId, transactionCt);
             },
             ct);
 
@@ -662,6 +733,8 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
         string actorUserId,
         CancellationToken ct = default)
     {
+        // Tạm khóa nguồn theo phần cũ; Aggregate v2 cấu hình trong báo cáo.
+        LegacyAggregateRetirement.Reject();
         EnsureActor(actorUserId);
 
         var entity = await _ctx.WorkAssignments
@@ -914,7 +987,8 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
                             x => x.ReportLifecycleLeaseId,
                             completionLease.LeaseId);
                 }
-                var rs = await _ctx.WorkAssignments.UpdateOneAsync(
+                var rs = await CommitAggregateAwareCompletionAsync(
+                    entity, work, completedDate,
                     completionFilter,
                     Builders<WorkAssignment>.Update
                         .Set(x => x.CompletedDate, completedDate)
@@ -927,7 +1001,7 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
                         .Set(x => x.UpdatedAtUtc, now)
                         .Set(x => x.UpdatedByUserId, actorUserId)
                         .Inc(x => x.DynamicFlowMaterializationRevision, 1),
-                    cancellationToken: ct);
+                    ct);
 
                 if (rs.ModifiedCount > 0)
                 {
@@ -1259,6 +1333,10 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
                     entity.WorkId,
                     transactionCt);
 
+                await tdtd_be.Services.AggregateMapping.Persistence.AggregateHostIntegration.RelationshipAsync(
+                    _ctx, session, entity.WorkId, [entity.Id!], "assignment-inactive:" + entity.Id + ":" + now.Ticks,
+                    transactionCt, preserveIdentity: true);
+
                 return (true, periodIds);
             },
             ct);
@@ -1402,6 +1480,10 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
                     session,
                     entity.WorkId,
                     transactionCt);
+
+                await tdtd_be.Services.AggregateMapping.Persistence.AggregateHostIntegration.RelationshipAsync(
+                    _ctx, session, entity.WorkId, [entity.Id!], "assignment-active:" + entity.Id + ":" + now.Ticks,
+                    transactionCt, preserveIdentity: true);
 
                 return (true, periodIds);
             },
@@ -1765,7 +1847,7 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
 
     private static bool CanConfigureDataSourceRules(WorkAssignment assignment, string actorUserId)
     {
-        if (string.Equals(assignment.CreatedByUserId, actorUserId, StringComparison.Ordinal))
+        if (WorkAssignmentCurrentAuthority.IsReviewer(assignment, actorUserId))
             return true;
 
         return (assignment.Assignees ?? new List<UserRef>())
@@ -2299,12 +2381,21 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
                ?? string.Empty;
     }
 
+    private readonly record struct AssignmentDueSource(DateTime? DueDate, int? ParentDepth);
+
     private async Task<DateTime?> ResolveInheritedParentDueDateAsync(
+        Work work,
+        WorkAssignment parent,
+        CancellationToken ct)
+        => (await ResolveInheritedParentDueSourceAsync(work, parent, ct)).DueDate;
+
+    private async Task<AssignmentDueSource> ResolveInheritedParentDueSourceAsync(
         Work work,
         WorkAssignment parent,
         CancellationToken ct)
     {
         var current = parent;
+        var parentDepth = 0;
         var visited = new HashSet<string>(StringComparer.Ordinal);
 
         while (current is not null && !string.IsNullOrWhiteSpace(current.Id))
@@ -2314,7 +2405,7 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
 
             var ownDueDate = ResolveAssignmentOwnDueDate(current);
             if (ownDueDate.HasValue)
-                return ownDueDate.Value.Date;
+                return new AssignmentDueSource(ownDueDate.Value.Date, parentDepth);
 
             if (string.IsNullOrWhiteSpace(current.ParentAssignmentId))
                 break;
@@ -2325,9 +2416,10 @@ public sealed class WorkAssignmentService : IWorkAssignmentService
                     x.WorkId == work.Id &&
                     !x.IsDeleted)
                 .FirstOrDefaultAsync(ct);
+            parentDepth++;
         }
 
-        return WorkAssignmentDatePolicy.ResolveWorkRootDueDate(work);
+        return new AssignmentDueSource(WorkAssignmentDatePolicy.ResolveWorkRootDueDate(work), null);
     }
 
     private static DateTime? ResolveAssignmentOwnDueDate(WorkAssignment assignment)

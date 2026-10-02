@@ -1093,6 +1093,8 @@ public sealed class WorkReportLabelStatisticsService : IWorkReportLabelStatistic
             SourceReportId = source.SourceReportId,
             SourcePayloadRevision = source.SourcePayloadRevision,
             SourcePayloadHash = source.SourcePayloadHash,
+            SourcePayloadUpdatedAtUtc = source.SourcePayloadUpdatedAtUtc,
+            NativeSourceOrderHash = source.NativeSourceOrderHash,
             SourceLifecycleRevision = source.SourceLifecycleRevision,
             DirectSourceRevision = source.DirectSourceRevision,
             DynamicFormFamilyId = source.DynamicFormFamilyId,

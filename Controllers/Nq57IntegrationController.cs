@@ -5,6 +5,8 @@ using tdtd_be.Services.Nq57;
 
 namespace tdtd_be.Controllers;
 
+// Đợt nghiệm thu: không đăng ký API tạo dữ liệu và đẩy dữ liệu NQ57.
+[NonController]
 [ApiController]
 [Route("api/nq57")]
 [Authorize]

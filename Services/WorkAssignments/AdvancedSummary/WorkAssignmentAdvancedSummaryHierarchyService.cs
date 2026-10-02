@@ -72,6 +72,8 @@ public sealed partial class WorkAssignmentAdvancedSummaryHierarchyService : IWor
         string actorUserId,
         CancellationToken ct)
     {
+        // Tạm khóa luồng tổng hợp cũ; giữ nguyên triển khai bên dưới.
+        LegacyAggregateRetirement.Reject();
         var candidate = RequireBuildCandidate();
         EnsureActor(actorUserId);
         var normalizedDayKey = NormalizeDayKey(dayKey);
@@ -170,6 +172,8 @@ public sealed partial class WorkAssignmentAdvancedSummaryHierarchyService : IWor
         string correlationId,
         CancellationToken ct)
     {
+        // Job/hook cũ dừng trước mọi I/O, không tạo vòng retry hay thay dữ liệu lịch sử.
+        if (LegacyAggregateRetirement.IsDisabled) return;
         var candidate = RequireBuildCandidate();
         EnsureActor(actorUserId);
         var normalizedDayKey = NormalizeDayKey(dayKey);
@@ -253,6 +257,8 @@ public sealed partial class WorkAssignmentAdvancedSummaryHierarchyService : IWor
         string actorUserId,
         CancellationToken ct)
     {
+        // Tạm khóa luồng tổng hợp cũ; giữ nguyên triển khai bên dưới.
+        LegacyAggregateRetirement.Reject();
         var candidate = RequireBuildCandidate();
         EnsureActor(actorUserId);
         var normalizedMonthKey = NormalizeMonthKey(monthKey);
@@ -351,6 +357,8 @@ public sealed partial class WorkAssignmentAdvancedSummaryHierarchyService : IWor
         string correlationId,
         CancellationToken ct)
     {
+        // Job/hook cũ dừng trước mọi I/O, không tạo vòng retry hay thay dữ liệu lịch sử.
+        if (LegacyAggregateRetirement.IsDisabled) return;
         var candidate = RequireBuildCandidate();
         EnsureActor(actorUserId);
         var normalizedMonthKey = NormalizeMonthKey(monthKey);
@@ -429,6 +437,8 @@ public sealed partial class WorkAssignmentAdvancedSummaryHierarchyService : IWor
         string actorUserId,
         CancellationToken ct)
     {
+        // Tạm khóa luồng tổng hợp cũ; giữ nguyên triển khai bên dưới.
+        LegacyAggregateRetirement.Reject();
         var candidate = RequireBuildCandidate();
         EnsureActor(actorUserId);
         var normalizedYearKey = NormalizeYearKey(yearKey);
@@ -525,6 +535,8 @@ public sealed partial class WorkAssignmentAdvancedSummaryHierarchyService : IWor
         string correlationId,
         CancellationToken ct)
     {
+        // Job/hook cũ dừng trước mọi I/O, không tạo vòng retry hay thay dữ liệu lịch sử.
+        if (LegacyAggregateRetirement.IsDisabled) return;
         var candidate = RequireBuildCandidate();
         EnsureActor(actorUserId);
         var normalizedYearKey = NormalizeYearKey(yearKey);
@@ -602,6 +614,8 @@ public sealed partial class WorkAssignmentAdvancedSummaryHierarchyService : IWor
         string actorUserId,
         CancellationToken ct)
     {
+        // Tạm khóa luồng tổng hợp cũ; giữ nguyên triển khai bên dưới.
+        LegacyAggregateRetirement.Reject();
         _ = RequireResultCandidate();
         EnsureActor(actorUserId);
         var startDayKey = NormalizeQueryDayKey(req.StartDayKey, "startDayKey");
@@ -713,6 +727,8 @@ public sealed partial class WorkAssignmentAdvancedSummaryHierarchyService : IWor
         string actorUserId,
         CancellationToken ct)
     {
+        // Tạm khóa luồng tổng hợp cũ; giữ nguyên triển khai bên dưới.
+        LegacyAggregateRetirement.Reject();
         _ = RequireResultCandidate();
         EnsureActor(actorUserId);
         req ??= new DiagnoseWorkAssignmentAdvancedSummaryDayNodeRequest();
@@ -753,6 +769,8 @@ public sealed partial class WorkAssignmentAdvancedSummaryHierarchyService : IWor
         string actorUserId,
         CancellationToken ct)
     {
+        // Tạm khóa luồng tổng hợp cũ; giữ nguyên triển khai bên dưới.
+        LegacyAggregateRetirement.Reject();
         _ = RequireResultCandidate();
         EnsureActor(actorUserId);
         req ??= new DiagnoseWorkAssignmentAdvancedSummaryMonthNodeRequest();
@@ -791,6 +809,8 @@ public sealed partial class WorkAssignmentAdvancedSummaryHierarchyService : IWor
         string actorUserId,
         CancellationToken ct)
     {
+        // Tạm khóa luồng tổng hợp cũ; giữ nguyên triển khai bên dưới.
+        LegacyAggregateRetirement.Reject();
         _ = RequireResultCandidate();
         EnsureActor(actorUserId);
         req ??= new DiagnoseWorkAssignmentAdvancedSummaryYearNodeRequest();
@@ -1824,6 +1844,9 @@ public sealed partial class WorkAssignmentAdvancedSummaryHierarchyService : IWor
             .FirstOrDefaultAsync(ct)
             ?? throw AppExceptionFactory.NotFound(AppErrorCode.DYNAMIC_FORM_TEMPLATE_NOT_FOUND, new { config.DynamicFormTemplateId });
 
+        if (template.NativeTablesVersion is not null)
+            throw AppExceptionFactory.BadRequest(AppErrorCode.COMMON_VALIDATION_FAILED,
+                new { reason = "ADVANCED_NATIVE_RESULT_CONSUMER_REQUIRED" });
         return new AdvancedSummaryBuildContext(scope, template);
     }
 

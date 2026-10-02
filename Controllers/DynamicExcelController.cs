@@ -6,6 +6,9 @@ using tdtd_be.Services;
 
 namespace tdtd_be.Controllers;
 
+// Đợt nghiệm thu: không đăng ký toàn bộ API Bảng biểu động, kể cả với quản trị viên.
+// Giữ mã nguồn và dữ liệu để có thể mở lại sau nghiệm thu.
+[NonController]
 [ApiController]
 [Route("api/dynamic-excel")]
 [Authorize]

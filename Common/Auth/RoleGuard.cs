@@ -29,10 +29,12 @@ public static class RoleGuard
         if (!IsManagerLevel(me)) return false;
 
         var username = (me.Username ?? string.Empty).Trim().ToLowerInvariant();
-        if (!username.StartsWith(GeneratedLevelManagerPrefix, StringComparison.OrdinalIgnoreCase))
+        var prefix = username.StartsWith("admin_lv", StringComparison.OrdinalIgnoreCase)
+            ? "admin_lv" : GeneratedLevelManagerPrefix;
+        if (!username.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
             return false;
 
-        var raw = username[GeneratedLevelManagerPrefix.Length..].Trim();
+        var raw = username[prefix.Length..].Trim();
         return int.TryParse(raw, out level) && level >= 0;
     }
 
@@ -44,10 +46,12 @@ public static class RoleGuard
         if (string.IsNullOrWhiteSpace(username)) return false;
 
         if (string.Equals(me.AccountKind, AccountKindUnitManager, StringComparison.OrdinalIgnoreCase))
-            return username.StartsWith(GeneratedUnitManagerPrefix, StringComparison.OrdinalIgnoreCase);
+            return TryGetManagerUnit(me, out var unitId) &&
+                   string.Equals(unitId, me.UnitId, StringComparison.Ordinal);
 
         if (string.Equals(me.AccountKind, AccountKindLevelManager, StringComparison.OrdinalIgnoreCase))
-            return username.StartsWith(GeneratedLevelManagerPrefix, StringComparison.OrdinalIgnoreCase);
+            return username.StartsWith(GeneratedLevelManagerPrefix, StringComparison.OrdinalIgnoreCase) ||
+                   TryGetGeneratedLevelManager(me, out _);
 
         return false;
     }

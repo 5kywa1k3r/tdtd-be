@@ -2,6 +2,7 @@ using MongoDB.Bson;
 using MongoDB.Driver;
 using tdtd_be.DTOs.Auth;
 using tdtd_be.Models;
+using tdtd_be.Services.StatisticsConfiguration;
 
 namespace tdtd_be.Services.DynamicForms;
 
@@ -31,7 +32,11 @@ public sealed partial class DynamicFormStatisticConfigCommandService
         string FieldSectionJson,
         string TableSectionJson,
         IReadOnlyList<PersistedFieldConfig> Fields,
-        IReadOnlyList<PersistedTableConfig> Tables);
+        IReadOnlyList<PersistedTableConfig> Tables)
+    {
+        internal string? NativeTargetSectionJson { get; init; }
+        internal string? NativePlanSectionJson { get; init; }
+    }
 
     internal static P804TrustedPersistedView?
         GetP804TrustedPersistedView(
@@ -214,8 +219,21 @@ public sealed partial class DynamicFormStatisticConfigCommandService
 
     private static TrustedPersistedState?
         ValidateTrustedPersistedState(
-            DynamicFormTemplate owner)
+            DynamicFormTemplate owner,
+            bool nativeIntake = false)
     {
+        // Existing P804 callers remain legacy-only. The separate L5 intake
+        // must explicitly request and retain the native section and its pins.
+        if (!nativeIntake)
+            DynamicFormNativeTableDefinition.RequireLegacyConsumer(owner, "statisticProjection");
+        if (nativeIntake && !DynamicFormNativeTableDefinition.IsNative(owner))
+            throw IntegrityConflict(owner.Id, "NATIVE_OWNER_REQUIRED");
+        if (!nativeIntake && (owner.StatisticConfigSections?.NativePlanSectionJson is not null
+            || DynamicFormNativeTableDefinition.IsNative(owner)
+            && DynamicFormNativeStatisticState.HasPlan(DynamicFormNativeTableDefinition.ReadStored(owner.NativeTablesVersion, owner.TablesJson)!)))
+            throw IntegrityConflict(owner.Id, "NATIVE_PLAN_V2_CONSUMER_REQUIRES_L5C");
+        if (!nativeIntake && owner.StatisticConfigSections?.NativeTargetSectionJson is not null)
+            throw IntegrityConflict(owner.Id, "NATIVE_SECTION_WITHOUT_SCHEMA");
         if (!HasStatisticConfigFootprint(owner))
             return null;
 
@@ -293,6 +311,29 @@ public sealed partial class DynamicFormStatisticConfigCommandService
         var snapshotTableSectionJson = CanonicalSectionJson(
             snapshotSections.TableSectionJson,
             "$.currentSnapshot.tableConfig");
+        string? nativeSectionJson = null;
+        string? nativePlanSectionJson = null;
+        if (nativeIntake)
+        {
+            if (sections.NativeTargetSectionJson is not string nativeJson
+                || snapshotSections.NativeTargetSectionJson is not string snapshotNativeJson)
+                throw IntegrityConflict(owner.Id, "NATIVE_SECTION_REQUIRED");
+            nativeSectionJson = ValidateNativeSection(owner, NativeTables(owner), DeserializeNativeSection(nativeJson)!);
+            if (StatConfigCanonicalJson.Canonicalize(ParseElement(snapshotNativeJson)) != nativeSectionJson)
+                throw IntegrityConflict(owner.Id, "NATIVE_CURRENT_SNAPSHOT");
+            var nativeTables = NativeTables(owner);
+            if (DynamicFormNativeStatisticState.HasPlan(nativeTables))
+            {
+                if (sections.NativePlanSectionJson is not string planJson
+                    || snapshotSections.NativePlanSectionJson is not string snapshotPlanJson)
+                    throw IntegrityConflict(owner.Id, "NATIVE_PLAN_SECTION_REQUIRED");
+                nativePlanSectionJson = ValidateNativePlanSection(owner, nativeTables, DeserializeNativePlanSection(planJson)!);
+                if (StatConfigCanonicalJson.Canonicalize(ParseElement(snapshotPlanJson)) != nativePlanSectionJson)
+                    throw IntegrityConflict(owner.Id, "NATIVE_PLAN_CURRENT_SNAPSHOT");
+            }
+            else if (sections.NativePlanSectionJson is not null || snapshotSections.NativePlanSectionJson is not null)
+                throw IntegrityConflict(owner.Id, "NATIVE_PLAN_WITHOUT_DEFINITION");
+        }
         if (!string.Equals(
                 snapshotFieldSectionJson,
                 fieldSectionJson,
@@ -317,7 +358,10 @@ public sealed partial class DynamicFormStatisticConfigCommandService
             owner.Id);
         ValidatePersistedTableStructure(tables, owner);
         EnsureUniqueStatisticLabelTargets(fields, tables);
-        var dependencyPins = BuildDependencyPins(fields, tables);
+        ValidateNativeTargetLimits(fields, tables, nativeSectionJson, nativePlanSectionJson);
+        var dependencyPins = nativeSectionJson is null
+            ? BuildDependencyPins(fields, tables)
+            : NativeDependencyPins(BuildDependencyPins(fields, tables), nativeSectionJson, nativePlanSectionJson);
         if (!(owner.StatisticConfigDependencyPins ??
               new List<string>()).SequenceEqual(
                 dependencyPins,
@@ -334,7 +378,8 @@ public sealed partial class DynamicFormStatisticConfigCommandService
             owner.Id,
             fieldSectionJson,
             tableSectionJson,
-            dependencyPins);
+            dependencyPins,
+            nativeSectionJson, nativePlanSectionJson);
         if (!string.Equals(
                 owner.StatisticConfigHash,
                 recomputed,
@@ -355,7 +400,11 @@ public sealed partial class DynamicFormStatisticConfigCommandService
             fieldSectionJson,
             tableSectionJson,
             fields,
-            tables);
+            tables)
+        {
+            NativeTargetSectionJson = nativeSectionJson,
+            NativePlanSectionJson = nativePlanSectionJson
+        };
     }
 
     private static bool HasStatisticConfigFootprint(

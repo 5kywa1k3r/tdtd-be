@@ -5,6 +5,18 @@ namespace tdtd_be.Services.WorkAssignments.AdvancedSummary;
 
 public interface IWorkAssignmentAdvancedSummaryConfigService
 {
+    Task<AdvancedNativeComparisonResponse> CompareNativeSummaryAsync(AdvancedNativeComparisonRequest request, CancellationToken ct);
+    Task<AdvancedNativeComparisonRecordResponse> RecordNativeComparisonAsync(AdvancedNativeComparisonRequest request, CancellationToken ct);
+    Task<AdvancedNativeComparisonRecordResponse> ReadNativeComparisonRecordAsync(string id, string hash, CancellationToken ct);
+    Task<AdvancedNativeComparisonRecordDiagnostic> DiagnoseNativeComparisonRecordAsync(string id, string hash, CancellationToken ct);
+    Task<AdvancedNativeComparisonRecordPage> ListNativeComparisonRecordsAsync(string scopeId, string formId, string? after, int limit, CancellationToken ct);
+    Task<AdvancedNativeSummaryResponse> GetNativeSummaryAsync(AdvancedNativeSummaryRequest request, CancellationToken ct);
+    Task<AdvancedNativeRefreshResponse> QueueNativeRefreshAsync(AdvancedNativeSummaryRequest request, CancellationToken ct);
+    Task<AdvancedNativeRefreshResponse> ReadNativeRefreshByCommandAsync(string commandId, CancellationToken ct);
+    Task<AdvancedNativeRefreshResponse> ReadNativeRefreshAsync(string refreshId, CancellationToken ct);
+    Task<AdvancedNativeRefreshResponse> RetryNativeRefreshAsync(string refreshId, CancellationToken ct);
+    Task RefreshNativeSnapshotJobAsync(string refreshId, CancellationToken ct);
+
     Task<WorkAssignmentAdvancedSummaryConfigReadback> GetP8ConfigAsync(
         string assignmentId,
         string dynamicFormTemplateId,

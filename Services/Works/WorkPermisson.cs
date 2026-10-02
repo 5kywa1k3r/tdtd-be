@@ -27,7 +27,10 @@ namespace tdtd_be.Services.Works
         {
             if (me == null ||
                 string.IsNullOrWhiteSpace(me.Id) ||
-                !RoleGuard.IsGeneratedManagementAccount(me))
+                me.IsDeleted ||
+                !(RoleGuard.IsGeneratedManagementAccount(me) ||
+                  (string.Equals(me.PositionCode, "GIAM_DOC_CAT", StringComparison.OrdinalIgnoreCase) &&
+                   me.UnitTypeCodes.Any(code => string.Equals(code, "TINH", StringComparison.OrdinalIgnoreCase)))))
                 throw AppExceptionFactory.Forbidden(AppErrorCode.WORK_CREATE_FORBIDDEN);
         }
 

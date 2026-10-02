@@ -11,6 +11,8 @@ using tdtd_be.Services.StatisticsRun;
 
 namespace tdtd_be.Controllers;
 
+// 30/09/2026: giữ mã cũ, chặn toàn bộ entry point; dùng Aggregate v2 trong báo cáo.
+[tdtd_be.Services.WorkAssignments.LegacyAggregateDisabled]
 [ApiController]
 [Authorize]
 [Route("api/work-assignment-basic-summary")]
@@ -110,6 +112,29 @@ public sealed class WorkAssignmentBasicSummaryController : ControllerBase
         var result = await _service.GetSummaryAsync(req, actorUserId, ct);
         return Ok(result);
     }
+
+    [HttpPost("native-summary")]
+    public async Task<IActionResult> NativeSummary([FromBody] JsonElement body, CancellationToken ct)
+    {
+        _candidateActivation.RequireCapability(StatRunCapabilities.BasicSummary, StatRunRouteRegistry.BasicResult);
+        return Ok(await _service.GetNativeSummaryAsync(StatConfigCanonicalJson.DeserializeStrict<BasicNativeSummaryRequest>(body), ct));
+    }
+
+    [HttpPost("native-refresh")]
+    public async Task<IActionResult> NativeRefresh([FromBody] JsonElement body, CancellationToken ct)
+        => Ok(await _service.QueueNativeRefreshAsync(StatConfigCanonicalJson.DeserializeStrict<BasicNativeSummaryRequest>(body), ct));
+
+    [HttpGet("native-refresh/by-command/{commandId}")]
+    public async Task<IActionResult> NativeRefreshByCommand([FromRoute] string commandId, CancellationToken ct)
+        => Ok(await _service.ReadNativeRefreshByCommandAsync(commandId, ct));
+
+    [HttpGet("native-refresh/{refreshId}")]
+    public async Task<IActionResult> NativeRefreshStatus([FromRoute] string refreshId, CancellationToken ct)
+        => Ok(await _service.ReadNativeRefreshAsync(refreshId, ct));
+
+    [HttpPost("native-refresh/{refreshId}/retry")]
+    public async Task<IActionResult> RetryNativeRefresh([FromRoute] string refreshId, CancellationToken ct)
+        => Ok(await _service.RetryNativeRefreshAsync(refreshId, ct));
 
     [HttpPost("once")]
     public async Task<IActionResult> Once(

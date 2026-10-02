@@ -293,6 +293,7 @@ public sealed class AdminOperationsController : ControllerBase
     }
 
     [HttpPost("job-runs/dynamic-flow-mapping-outbox/process")]
+    [NonAction] // Flow chưa mở trong bản deploy này.
     public async Task<IActionResult> ProcessDynamicFlowMappingOutbox(
         [FromQuery] int maxItems = 20,
         CancellationToken ct = default)
@@ -434,6 +435,8 @@ public sealed class AdminOperationsController : ControllerBase
             ct));
     }
 
+    // Luồng tổng hợp cũ tạm khóa; giữ action để đối chiếu.
+    [tdtd_be.Services.WorkAssignments.LegacyAggregateDisabled]
     [HttpGet("job-runs/basic-summary-jobs")]
     public async Task<IActionResult> SearchBasicSummaryJobs(
         [FromQuery] string? status = null,
@@ -464,6 +467,8 @@ public sealed class AdminOperationsController : ControllerBase
         }, ct));
     }
 
+    // Luồng tổng hợp cũ tạm khóa; giữ action để đối chiếu.
+    [tdtd_be.Services.WorkAssignments.LegacyAggregateDisabled]
     [HttpPost("job-runs/basic-summary-jobs/{snapshotId}/reset")]
     public async Task<IActionResult> ResetBasicSummaryJob(
         string snapshotId,
@@ -476,6 +481,8 @@ public sealed class AdminOperationsController : ControllerBase
         return Ok(await _jobRuns.ResetBasicSummaryJobAsync(snapshotId, me.Id, ct));
     }
 
+    // Luồng tổng hợp cũ tạm khóa; giữ action để đối chiếu.
+    [tdtd_be.Services.WorkAssignments.LegacyAggregateDisabled]
     [HttpGet("job-runs/advanced-summary-nodes")]
     public async Task<IActionResult> SearchAdvancedSummaryNodes(
         [FromQuery] string? status = null,
@@ -512,6 +519,8 @@ public sealed class AdminOperationsController : ControllerBase
         }, ct));
     }
 
+    // Luồng tổng hợp cũ tạm khóa; giữ action để đối chiếu.
+    [tdtd_be.Services.WorkAssignments.LegacyAggregateDisabled]
     [HttpPost("job-runs/advanced-summary-nodes/{grain}/{nodeId}/reset")]
     public async Task<IActionResult> ResetAdvancedSummaryNode(
         string grain,
@@ -525,6 +534,8 @@ public sealed class AdminOperationsController : ControllerBase
         return Ok(await _jobRuns.ResetAdvancedSummaryNodeAsync(grain, nodeId, me.Id, ct));
     }
 
+    // Luồng tổng hợp cũ tạm khóa; giữ action để đối chiếu.
+    [tdtd_be.Services.WorkAssignments.LegacyAggregateDisabled]
     [HttpPost("job-runs/advanced-summary-nodes/cleanup")]
     public async Task<IActionResult> CleanupAdvancedSummaryNodes(
         [FromBody] AdvancedSummaryNodeCleanupRequest? request,
@@ -549,6 +560,8 @@ public sealed class AdminOperationsController : ControllerBase
         }
     }
 
+    // Luồng tổng hợp cũ tạm khóa; giữ action để đối chiếu.
+    [tdtd_be.Services.WorkAssignments.LegacyAggregateDisabled]
     [HttpPost("job-runs/advanced-summary-nodes/diagnostics/day")]
     public async Task<IActionResult> DiagnoseAdvancedSummaryDayNode(
         [FromBody] DiagnoseWorkAssignmentAdvancedSummaryDayNodeRequest? request,
@@ -567,6 +580,8 @@ public sealed class AdminOperationsController : ControllerBase
             ct));
     }
 
+    // Luồng tổng hợp cũ tạm khóa; giữ action để đối chiếu.
+    [tdtd_be.Services.WorkAssignments.LegacyAggregateDisabled]
     [HttpPost("job-runs/advanced-summary-nodes/diagnostics/month")]
     public async Task<IActionResult> DiagnoseAdvancedSummaryMonthNode(
         [FromBody] DiagnoseWorkAssignmentAdvancedSummaryMonthNodeRequest? request,
@@ -585,6 +600,8 @@ public sealed class AdminOperationsController : ControllerBase
             ct));
     }
 
+    // Luồng tổng hợp cũ tạm khóa; giữ action để đối chiếu.
+    [tdtd_be.Services.WorkAssignments.LegacyAggregateDisabled]
     [HttpPost("job-runs/advanced-summary-nodes/diagnostics/year")]
     public async Task<IActionResult> DiagnoseAdvancedSummaryYearNode(
         [FromBody] DiagnoseWorkAssignmentAdvancedSummaryYearNodeRequest? request,

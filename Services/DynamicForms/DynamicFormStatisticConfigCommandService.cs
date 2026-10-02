@@ -16,6 +16,7 @@ namespace tdtd_be.Services.DynamicForms;
 
 public interface IDynamicFormStatisticConfigCommandService
 {
+    Task PublishNativeAsync(string id, int expectedRevision, DynamicFormPublishedSchemaSnapshot snapshot, CancellationToken ct);
     Task<DynamicFormStatisticConfigResult> GetAsync(
         string id,
         CancellationToken ct);
@@ -37,7 +38,7 @@ public sealed partial class DynamicFormStatisticConfigCommandService :
     private const string CommandKind = "UPDATE_DYNAMIC_FORM_STATISTICS";
     private static readonly HashSet<string> StatisticProperties =
         new(
-            new[] { "isStatistic", "statisticLabelCodes", "statistic" },
+            new[] { "isStatistic", "statisticLabelCodes", "statistic", "showOnOverview" },
             StringComparer.Ordinal);
 
     private readonly MongoDbContext _ctx;
@@ -98,8 +99,17 @@ public sealed partial class DynamicFormStatisticConfigCommandService :
             throw OwnerNotFound(id);
 
         var command = NormalizeCommand(body);
+        // Form field/native Table calculations are now authored by Aggregate Canvas.
+        // Keep P8 reads, history and the separate legacy Excel table command intact.
+        if (command.Payload.Fields is not null || command.Payload.NativeTargets is not null
+            || command.Payload.NativeStatistics is not null)
+            throw Schema("$.payload", "FORM_CALCULATION_AUTHORING_MOVED_TO_AGGREGATE_CANVAS");
         var mutations = NormalizeMutationSyntax(command.Payload);
-        object normalizedPayload = mutations.Fields is not null
+        object normalizedPayload = mutations.NativeStatistics is not null
+            ? new { nativeStatistics = mutations.NativeStatistics }
+            : mutations.NativeTargets is not null
+            ? new { nativeTargets = mutations.NativeTargets }
+            : mutations.Fields is not null
             ? new { fields = mutations.Fields }
             : new { tables = mutations.Tables };
         command = command with
@@ -144,13 +154,26 @@ public sealed partial class DynamicFormStatisticConfigCommandService :
                         me,
                         transactionCt);
                     EnsureCas(current, command);
-                    var next = await ApplyMutationsAsync(
+                    var next = mutations.NativeStatistics is not null
+                        ? await ApplyNativeStatisticsAsync(session, owner, current, mutations.NativeStatistics, me, transactionCt)
+                        : mutations.NativeTargets is not null
+                        ? await ApplyNativeMutationsAsync(session, owner, current, mutations.NativeTargets, me, transactionCt)
+                        : await ApplyMutationsAsync(
                         session,
                         owner,
                         current,
                         mutations,
                         me,
                         transactionCt);
+
+                    next = CompleteNativeState(owner, next,
+                        next.NativeTargetSectionJson ?? current.NativeTargetSectionJson,
+                        next.NativeTablesJson ?? current.NativeTablesJson,
+                        mutations.NativeStatistics is not null ? next.NativePlanSectionJson : current.NativePlanSectionJson);
+
+                    if (owner.IsPublished && DynamicFormNativeTableDefinition.IsNative(owner)
+                        && DeserializeNativeSection(next.NativeTargetSectionJson)?.Count > 0)
+                        throw Schema("$.nativeStatistics", "NATIVE_PUBLISHED_ACTIVE_V1_REQUIRES_EXPLICIT_UPGRADE");
 
                     var priorOwnerRevision = owner.Revision;
                     var hadPersistedIdentity =
@@ -163,6 +186,13 @@ public sealed partial class DynamicFormStatisticConfigCommandService :
                         next,
                         me.Id,
                         mutationNow);
+
+                    // Keep complete history or fail the transaction; never trim old
+                    // versions/separators to fit the Mongo document limit.
+                    var enforceNativeHistoryBudget = mutations.NativeStatistics is not null
+                        || owner.StatisticConfigSnapshots?.Any(s => s.Sections?.NativePlanSectionJson is not null) == true;
+                    if (enforceNativeHistoryBudget && owner.ToBson().LongLength > 15L * 1024 * 1024)
+                        throw Schema("$.nativeStatistics", "NATIVE_STATISTIC_HISTORY_STORAGE_BUDGET_EXCEEDED");
 
                     var replacement = await _ctx.DynamicFormTemplates
                         .ReplaceOneAsync(
@@ -182,15 +212,18 @@ public sealed partial class DynamicFormStatisticConfigCommandService :
                         next,
                         me,
                         receiptId);
-                    await _ctx.StatConfigCommandReceipts.InsertOneAsync(
-                        session,
-                        CreateReceipt(
+                    var receipt = CreateReceipt(
                             receiptId,
                             command,
                             next,
                             result,
                             me.Id,
-                            mutationNow),
+                            mutationNow);
+                    if (enforceNativeHistoryBudget && receipt.ToBson().LongLength > 15L * 1024 * 1024)
+                        throw Schema("$.nativeStatistics", "NATIVE_STATISTIC_RECEIPT_STORAGE_BUDGET_EXCEEDED");
+                    await _ctx.StatConfigCommandReceipts.InsertOneAsync(
+                        session,
+                        receipt,
                         cancellationToken: transactionCt);
                     return result;
                 },
@@ -227,6 +260,12 @@ public sealed partial class DynamicFormStatisticConfigCommandService :
             var envelope = StatConfigCanonicalJson.DeserializeStrict<
                 StatConfigMutationEnvelope<
                     DynamicFormStatisticConfigPayload>>(body);
+            if (envelope.Payload?.NativeStatistics is not null)
+            {
+                body.GetProperty("payload").GetProperty("nativeStatistics").TryGetProperty("tables", out var nativeTables);
+                DynamicFormNativeStatisticState.ValidateWirePlans(
+                    nativeTables, metadata: true);
+            }
             return StatConfigCanonicalJson.NormalizeCommand(
                 envelope,
                 CommandKind);
@@ -502,6 +541,8 @@ public sealed partial class DynamicFormStatisticConfigCommandService :
         MeResponse me,
         CancellationToken ct)
     {
+        var nativeSectionJson = await ReadNativeSectionAsync(session, owner, me, ct);
+        var nativePlanSectionJson = await ReadNativePlanSectionAsync(session, owner, me, ct);
         var fieldArray = ParseFieldArray(owner.FieldsJson);
         var schemaFields = BuildSchemaFieldMap(fieldArray);
         var hasPersistedIdentity =
@@ -526,12 +567,13 @@ public sealed partial class DynamicFormStatisticConfigCommandService :
             EnsureUniqueStatisticLabelTargets(
                 initialFields,
                 initialTables);
+            ValidateNativeTargetLimits(initialFields, initialTables, nativeSectionJson, nativePlanSectionJson);
             var initialFieldSectionJson =
                 StatConfigCanonicalJson.Canonicalize(initialFields);
             var initialTableSectionJson =
                 StatConfigCanonicalJson.Canonicalize(initialTables);
             var initialDependencyPins =
-                BuildDependencyPins(initialFields, initialTables);
+                NativeDependencyPins(BuildDependencyPins(initialFields, initialTables), nativeSectionJson, nativePlanSectionJson);
             return new ConfigState(
                 owner.Id,
                 owner.Id,
@@ -543,7 +585,7 @@ public sealed partial class DynamicFormStatisticConfigCommandService :
                     owner.Id,
                     initialFieldSectionJson,
                     initialTableSectionJson,
-                    initialDependencyPins),
+                    initialDependencyPins, nativeSectionJson, nativePlanSectionJson),
                 initialDependencyPins,
                 initialFieldSectionJson,
                 initialTableSectionJson,
@@ -551,7 +593,7 @@ public sealed partial class DynamicFormStatisticConfigCommandService :
                 initialTables,
                 owner.FieldsJson,
                 owner.BlocksJson,
-                IsVirtual: true);
+                IsVirtual: true) { NativeTargetSectionJson = nativeSectionJson, NativePlanSectionJson = nativePlanSectionJson, NativeTablesJson = owner.TablesJson };
         }
 
         if (string.IsNullOrWhiteSpace(owner.StatisticConfigId) ||
@@ -613,7 +655,8 @@ public sealed partial class DynamicFormStatisticConfigCommandService :
         ValidatePersistedFieldStructure(fields, schemaFields, owner.Id);
         ValidatePersistedTableStructure(tables, owner);
         EnsureUniqueStatisticLabelTargets(fields, tables);
-        var dependencyPins = BuildDependencyPins(fields, tables);
+        ValidateNativeTargetLimits(fields, tables, nativeSectionJson, nativePlanSectionJson);
+        var dependencyPins = NativeDependencyPins(BuildDependencyPins(fields, tables), nativeSectionJson, nativePlanSectionJson);
         if (!(owner.StatisticConfigDependencyPins ??
               new List<string>()).SequenceEqual(
                 dependencyPins,
@@ -626,7 +669,7 @@ public sealed partial class DynamicFormStatisticConfigCommandService :
             owner.Id,
             fieldSectionJson,
             tableSectionJson,
-            dependencyPins);
+            dependencyPins, nativeSectionJson, nativePlanSectionJson);
         if (!string.Equals(
                 owner.StatisticConfigHash,
                 recomputed,
@@ -650,7 +693,7 @@ public sealed partial class DynamicFormStatisticConfigCommandService :
             tables,
             owner.FieldsJson,
             owner.BlocksJson,
-            IsVirtual: false);
+            IsVirtual: false) { NativeTargetSectionJson = nativeSectionJson, NativePlanSectionJson = nativePlanSectionJson, NativeTablesJson = owner.TablesJson };
     }
 
     private async Task<List<PersistedFieldConfig>>
@@ -1273,6 +1316,7 @@ public sealed partial class DynamicFormStatisticConfigCommandService :
 
         owner.FieldsJson = next.FieldsJson;
         owner.BlocksJson = next.BlocksJson;
+        if (DynamicFormNativeTableDefinition.IsNative(owner)) owner.TablesJson = next.NativeTablesJson;
         owner.StatisticConfigId = next.ConfigId;
         owner.StatisticConfigPreviousVersionId =
             next.PreviousVersionId;
@@ -1287,7 +1331,9 @@ public sealed partial class DynamicFormStatisticConfigCommandService :
             new DynamicFormStatisticConfigSections
             {
                 FieldSectionJson = next.FieldSectionJson,
-                TableSectionJson = next.TableSectionJson
+                TableSectionJson = next.TableSectionJson,
+                NativeTargetSectionJson = next.NativeTargetSectionJson,
+                NativePlanSectionJson = next.NativePlanSectionJson
             };
         owner.StatisticConfigSnapshots.Add(
             CreateSnapshot(next, now, actorUserId));
@@ -1318,7 +1364,9 @@ public sealed partial class DynamicFormStatisticConfigCommandService :
             Sections = new DynamicFormStatisticConfigSections
             {
                 FieldSectionJson = state.FieldSectionJson,
-                TableSectionJson = state.TableSectionJson
+                TableSectionJson = state.TableSectionJson,
+                NativeTargetSectionJson = state.NativeTargetSectionJson,
+                NativePlanSectionJson = state.NativePlanSectionJson
             },
             CreatedAtUtc = createdAtUtc,
             CreatedByUserId = actorUserId
@@ -1341,12 +1389,12 @@ public sealed partial class DynamicFormStatisticConfigCommandService :
                 ? owner.StatisticConfigSnapshots
                     .OrderBy(
                         snapshot => snapshot.VersionNo)
-                    .Select(ToSnapshotDto)
+                    .Select(snapshot => ToSnapshotDto(owner.Id, snapshot))
                     .ToList()
                 : new List<
                     DynamicFormStatisticConfigVersionSnapshotDto>
                 {
-                    ToSnapshotDto(
+                    ToSnapshotDto(owner.Id,
                         CreateSnapshot(
                             state,
                             owner.CreatedAtUtc,
@@ -1375,11 +1423,18 @@ public sealed partial class DynamicFormStatisticConfigCommandService :
             StatConfigCanonicalJson.HashUtf8(
                 state.TableSectionJson),
             snapshots,
-            receiptId);
+            receiptId)
+        {
+            NativeTargetConfig = DeserializeNativeSection(state.NativeTargetSectionJson),
+            NativeTargetSectionHash = state.NativeTargetSectionJson is null ? null : StatConfigCanonicalJson.HashUtf8(state.NativeTargetSectionJson),
+            NativePlanConfig = DeserializeNativePlanSection(state.NativePlanSectionJson),
+            NativePlanSectionHash = state.NativePlanSectionJson is null ? null : StatConfigCanonicalJson.HashUtf8(state.NativePlanSectionJson)
+        };
     }
 
     private static DynamicFormStatisticConfigVersionSnapshotDto
         ToSnapshotDto(
+            string ownerId,
             DynamicFormStatisticConfigVersionSnapshot snapshot)
     {
         var sections = snapshot.Sections ??
@@ -1390,6 +1445,21 @@ public sealed partial class DynamicFormStatisticConfigCommandService :
         var tableSectionJson = CanonicalSectionJson(
             sections.TableSectionJson,
             "$.versions.tableConfig");
+        // Native history before its first v2 plan still carries a native section
+        // and hash. Verify those snapshots too; do not silently trust their pins.
+        if (sections.NativeTargetSectionJson is not null || sections.NativePlanSectionJson is not null)
+        {
+            var historicalFields = DeserializeFieldSection(fieldSectionJson);
+            var historicalTables = DeserializeTableSection(tableSectionJson);
+            var nativeJson = sections.NativeTargetSectionJson ?? throw IntegrityConflict(ownerId, "NATIVE_HISTORY_SECTION_REQUIRED");
+            var planJson = sections.NativePlanSectionJson is null ? null
+                : StatConfigCanonicalJson.Canonicalize(DeserializeNativePlanSection(sections.NativePlanSectionJson));
+            var pins = NativeDependencyPins(BuildDependencyPins(historicalFields, historicalTables), nativeJson, planJson);
+            ValidateNativeTargetLimits(historicalFields, historicalTables, nativeJson, planJson);
+            if (!(snapshot.DependencyPins ?? new()).SequenceEqual(pins, StringComparer.Ordinal)
+                || snapshot.ConfigHash != ComputeConfigHash(ownerId, fieldSectionJson, tableSectionJson, pins, nativeJson, planJson))
+                throw IntegrityConflict(ownerId, "NATIVE_HISTORY_HASH_OR_PINS");
+        }
         return new DynamicFormStatisticConfigVersionSnapshotDto(
             snapshot.VersionId,
             snapshot.PreviousVersionId,
@@ -1406,7 +1476,13 @@ public sealed partial class DynamicFormStatisticConfigCommandService :
                 .ToList(),
             StatConfigCanonicalJson.HashUtf8(fieldSectionJson),
             StatConfigCanonicalJson.HashUtf8(tableSectionJson),
-            snapshot.CreatedAtUtc);
+            snapshot.CreatedAtUtc)
+        {
+            NativeTargetConfig = DeserializeNativeSection(sections.NativeTargetSectionJson),
+            NativeTargetSectionHash = sections.NativeTargetSectionJson is null ? null : StatConfigCanonicalJson.HashUtf8(sections.NativeTargetSectionJson),
+            NativePlanConfig = DeserializeNativePlanSection(sections.NativePlanSectionJson),
+            NativePlanSectionHash = sections.NativePlanSectionJson is null ? null : StatConfigCanonicalJson.HashUtf8(sections.NativePlanSectionJson)
+        };
     }
 
     private static DynamicFormStatisticFieldConfigDto ToFieldDto(
@@ -1555,10 +1631,28 @@ public sealed partial class DynamicFormStatisticConfigCommandService :
         string ownerId,
         string fieldSectionJson,
         string tableSectionJson,
-        IReadOnlyList<string> dependencyPins)
+        IReadOnlyList<string> dependencyPins,
+        string? nativeTargetSectionJson = null,
+        string? nativePlanSectionJson = null)
     {
         var fields = ParseElement(fieldSectionJson);
         var tables = ParseElement(tableSectionJson);
+        if (nativePlanSectionJson is not null)
+            return StatConfigCanonicalJson.HashObject(new
+            {
+                ownerKind = StatConfigOwnerKinds.DynamicForm, ownerId,
+                fieldConfig = fields, tableConfig = tables, nativeTargetsVersion = 1,
+                nativeTargetConfig = ParseElement(nativeTargetSectionJson ?? throw IntegrityConflict(ownerId, "NATIVE_SECTION_REQUIRED")),
+                nativePlanVersion = 2, nativePlanConfig = ParseElement(nativePlanSectionJson), dependencyPins
+            });
+        if (nativeTargetSectionJson is not null)
+            return StatConfigCanonicalJson.HashObject(new
+            {
+                ownerKind = StatConfigOwnerKinds.DynamicForm, ownerId,
+                fieldConfig = fields, tableConfig = tables,
+                nativeTargetsVersion = 1,
+                nativeTargetConfig = ParseElement(nativeTargetSectionJson), dependencyPins
+            });
         return StatConfigCanonicalJson.HashObject(new
         {
             ownerKind = StatConfigOwnerKinds.DynamicForm,
@@ -1853,7 +1947,12 @@ public sealed partial class DynamicFormStatisticConfigCommandService :
         IReadOnlyList<PersistedTableConfig> Tables,
         string FieldsJson,
         string BlocksJson,
-        bool IsVirtual);
+        bool IsVirtual)
+    {
+        public string? NativeTargetSectionJson { get; init; }
+        public string? NativePlanSectionJson { get; init; }
+        public string? NativeTablesJson { get; init; }
+    }
 
     private sealed record SchemaField(
         string Id,

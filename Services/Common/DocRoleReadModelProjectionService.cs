@@ -434,7 +434,7 @@ public sealed class DocRoleReadModelProjectionService : IDocRoleReadModelProject
         foreach (var role in roles)
             AddRole(map, role.UserId, role.Role, role.User);
 
-        AddRole(map, assignment.CreatedByUserId, DocRoleType.ASSIGNER, null);
+        AddRole(map, tdtd_be.Services.WorkAssignments.Internal.WorkAssignmentCurrentAuthority.ReviewerId(assignment), DocRoleType.ASSIGNER, null);
 
         foreach (var assignee in (assignment.Assignees ?? new List<UserRef>())
                      .Where(x => !string.IsNullOrWhiteSpace(x.UserId)))
@@ -456,7 +456,7 @@ public sealed class DocRoleReadModelProjectionService : IDocRoleReadModelProject
 
             if (parent is not null)
             {
-                AddRole(map, parent.CreatedByUserId, DocRoleType.ASSIGNMENT_BRANCH_VIEWER, null);
+                AddRole(map, tdtd_be.Services.WorkAssignments.Internal.WorkAssignmentCurrentAuthority.ReviewerId(parent), DocRoleType.ASSIGNMENT_BRANCH_VIEWER, null);
 
                 foreach (var parentAssignee in (parent.Assignees ?? new List<UserRef>())
                              .Where(x => !string.IsNullOrWhiteSpace(x.UserId)))
@@ -714,7 +714,7 @@ public sealed class DocRoleReadModelProjectionService : IDocRoleReadModelProject
         DateTime now,
         CancellationToken ct)
     {
-        var reviewerIds = new[] { assignment.CreatedByUserId }
+        var reviewerIds = new[] { tdtd_be.Services.WorkAssignments.Internal.WorkAssignmentCurrentAuthority.ReviewerId(assignment) }
             .Where(x => !string.IsNullOrWhiteSpace(x))
             .Select(x => x!)
             .Distinct(StringComparer.Ordinal)

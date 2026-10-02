@@ -99,7 +99,7 @@ public static class AssignmentScheduleOccurrenceHelper
         DateTime end)
     {
         var result = new List<DateTime>();
-        var quarterDays = (schedule.QuarterDays ?? Array.Empty<int>())
+        var legacyQuarterDays = (schedule.QuarterDays ?? Array.Empty<int>())
             .Distinct()
             .OrderBy(x => x)
             .ToList();
@@ -108,6 +108,10 @@ public static class AssignmentScheduleOccurrenceHelper
         {
             for (var quarter = 1; quarter <= 4; quarter++)
             {
+                var quarterDays = schedule.QuarterDayRules is { Count: > 0 }
+                    ? schedule.QuarterDayRules.Where(x => x.Quarter == quarter)
+                        .SelectMany(x => x.Days).Distinct().OrderBy(x => x).ToList()
+                    : legacyQuarterDays;
                 var quarterStart = SchedulePeriodHelper.GetQuarterStartDate(year, quarter);
                 var quarterEnd = quarterStart.AddMonths(3).AddDays(-1);
 
@@ -129,7 +133,7 @@ public static class AssignmentScheduleOccurrenceHelper
         DateTime end)
     {
         var result = new List<DateTime>();
-        var halfDays = (schedule.SemiAnnualDays ?? Array.Empty<int>())
+        var legacyHalfDays = (schedule.SemiAnnualDays ?? Array.Empty<int>())
             .Distinct()
             .OrderBy(x => x)
             .ToList();
@@ -138,6 +142,10 @@ public static class AssignmentScheduleOccurrenceHelper
         {
             for (var half = 1; half <= 2; half++)
             {
+                var halfDays = schedule.SemiAnnualDayRules is { Count: > 0 }
+                    ? schedule.SemiAnnualDayRules.Where(x => x.Half == half)
+                        .SelectMany(x => x.Days).Distinct().OrderBy(x => x).ToList()
+                    : legacyHalfDays;
                 var halfStart = SchedulePeriodHelper.GetHalfStartDate(year, half);
                 var halfEnd = halfStart.AddMonths(6).AddDays(-1);
 

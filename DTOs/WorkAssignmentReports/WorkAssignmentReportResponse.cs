@@ -101,6 +101,8 @@ public sealed class WorkAssignmentReportResponse
     public bool LifecycleProjectionPending { get; set; }
     public bool CanEditPayload { get; set; }
     public bool CanSubmit { get; set; }
+    public bool AggregateSubmissionPreviewRequired { get; set; }
+    public tdtd_be.DTOs.AggregateMapping.AggregateReportEditHintDto? AggregateEditHint { get; set; }
     public bool CanWithdraw { get; set; }
     public string? PayloadHash { get; set; }
     public long PayloadSizeBytes { get; set; }

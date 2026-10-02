@@ -28,12 +28,18 @@ public static class ScheduleValidator
                 schedule.MonthDays.All(IsValidMonthDay),
 
             ReportCycleTypes.Quarterly =>
-                schedule.QuarterDays is { Length: > 0 } &&
-                schedule.QuarterDays.All(IsValidQuarterDay),
+                schedule.QuarterDayRules is { Count: > 0 }
+                    ? schedule.QuarterDayRules.All(IsValidQuarterRule) &&
+                      schedule.QuarterDayRules.Select(x => x.Quarter).Distinct().Count() == schedule.QuarterDayRules.Count
+                    : schedule.QuarterDays is { Length: > 0 } &&
+                      schedule.QuarterDays.All(IsValidQuarterDay),
 
             ReportCycleTypes.SemiAnnual =>
-                schedule.SemiAnnualDays is { Length: > 0 } &&
-                schedule.SemiAnnualDays.All(IsValidHalfDay),
+                schedule.SemiAnnualDayRules is { Count: > 0 }
+                    ? schedule.SemiAnnualDayRules.All(IsValidHalfRule) &&
+                      schedule.SemiAnnualDayRules.Select(x => x.Half).Distinct().Count() == schedule.SemiAnnualDayRules.Count
+                    : schedule.SemiAnnualDays is { Length: > 0 } &&
+                      schedule.SemiAnnualDays.All(IsValidHalfDay),
 
             _ => false
         };
@@ -42,4 +48,10 @@ public static class ScheduleValidator
     private static bool IsValidMonthDay(int day) => day >= 1 && day <= 31;
     private static bool IsValidQuarterDay(int day) => day >= 1 && day <= 92;
     private static bool IsValidHalfDay(int day) => day >= 1 && day <= 184;
+    private static bool IsValidQuarterRule(QuarterDayRule rule) =>
+        rule.Quarter is >= 1 and <= 4 &&
+        rule.Days is { Length: > 0 } && rule.Days.All(IsValidQuarterDay);
+    private static bool IsValidHalfRule(SemiAnnualDayRule rule) =>
+        rule.Half is >= 1 and <= 2 &&
+        rule.Days is { Length: > 0 } && rule.Days.All(IsValidHalfDay);
 }

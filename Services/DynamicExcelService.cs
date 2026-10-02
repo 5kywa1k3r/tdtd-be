@@ -1519,6 +1519,11 @@ public sealed class DynamicExcelService : IDynamicExcelService
 
         if (TryGetDynamicExcelValueSource(owner, out var valueSource))
         {
+            if (valueSource.SourceType == LabelValueSourceTypes.SystemLocality)
+                throw DynamicExcelValidation(
+                    "Nguồn địa danh hiện chỉ hỗ trợ trường thường của Dynamic Form.",
+                    new { field, dataType, sourceType = valueSource.SourceType });
+
             if (valueSource.SourceType == LabelValueSourceTypes.EnumCatalog)
             {
                 if (!string.IsNullOrWhiteSpace(valueSource.CatalogId))

@@ -7,9 +7,11 @@ public sealed class UnitPickRow
     public string FullName { get; set; } = default!;
     public string? ShortName { get; set; }
     public string? Symbol { get; set; }
+    public string? PrimaryUnitTypeCode { get; set; }
     public int Level { get; set; }
     public string? ParentId { get; set; }
     public bool IsVirtual { get; set; }
+    public bool Selectable { get; set; } = true;
 }
 
 public sealed class UserPickRow

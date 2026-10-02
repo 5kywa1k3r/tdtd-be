@@ -8,6 +8,8 @@ using tdtd_be.Services.DynamicFlows;
 
 namespace tdtd_be.Controllers;
 
+// Bản deploy gọn: tạm ngừng thiết kế Dynamic Flow, giữ mã để mở lại.
+[NonController]
 [ApiController]
 [Authorize]
 [Route("api/dynamic-flow-templates")]

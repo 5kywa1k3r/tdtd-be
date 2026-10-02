@@ -48,6 +48,7 @@ public sealed class DashboardOverviewService : IDashboardOverviewService
     {
         var me = _me.RequireMe();
         req ??= new DashboardOverviewRequest();
+        var hasGlobalReadAccess = DashboardAccessPolicy.HasGlobalReadAccess(me);
 
         var mode = NormalizeMode(req.Mode);
         var range = DashboardTimeRangeHelper.NormalizeMonthRange(req.FromUtc, req.ToUtc);
@@ -55,11 +56,26 @@ public sealed class DashboardOverviewService : IDashboardOverviewService
         var assignmentId = string.IsNullOrWhiteSpace(req.AssignmentId) ? "_" : req.AssignmentId.Trim();
         var topUnitCount = req.TopUnitCount <= 0 ? 3 : Math.Min(req.TopUnitCount, 10);
 
-        var cacheKey = BuildCacheKey(me.Id, mode, range, unitIds, assignmentId, topUnitCount);
+        var cacheKey = BuildCacheKey(
+            me.Id,
+            hasGlobalReadAccess,
+            mode,
+            range,
+            unitIds,
+            assignmentId,
+            topUnitCount);
 
         return await _cache.GetOrCreateAsync(
             cacheKey,
-            innerCt => LoadOverviewAsync(me.Id, mode, range, unitIds, assignmentId, topUnitCount, innerCt),
+            innerCt => LoadOverviewAsync(
+                me.Id,
+                hasGlobalReadAccess,
+                mode,
+                range,
+                unitIds,
+                assignmentId,
+                topUnitCount,
+                innerCt),
             ct: ct,
             forceRefresh: req.ForceRefresh,
             ttl: TimeSpan.FromMinutes(15));
@@ -71,6 +87,7 @@ public sealed class DashboardOverviewService : IDashboardOverviewService
     {
         var me = _me.RequireMe();
         req ??= new DashboardReportAssignmentOptionsRequest();
+        var hasGlobalReadAccess = DashboardAccessPolicy.HasGlobalReadAccess(me);
 
         var unitIds = NormalizeIds(req.UnitIds);
         var range = DashboardTimeRangeHelper.NormalizeMonthRange(req.FromUtc, req.ToUtc);
@@ -79,6 +96,7 @@ public sealed class DashboardOverviewService : IDashboardOverviewService
         // không nên siết theo time-filter của assignment; khoảng ngày sẽ áp khi load report.
         var assignments = await LoadDashboardAssignmentScopeAsync(
             me.Id,
+            hasGlobalReadAccess,
             unitIds,
             range,
             ct,
@@ -126,6 +144,7 @@ public sealed class DashboardOverviewService : IDashboardOverviewService
 
     private async Task<DashboardOverviewResponse> LoadOverviewAsync(
         string actorUserId,
+        bool hasGlobalReadAccess,
         string mode,
         DashboardNormalizedRange range,
         List<string> unitIds,
@@ -135,27 +154,31 @@ public sealed class DashboardOverviewService : IDashboardOverviewService
     {
         return mode switch
         {
-            "WORK_TASK" => await BuildWorkOverviewAsync(actorUserId, mode, range, unitIds, topUnitCount, ct),
-            "WORK_TARGET" => await BuildWorkOverviewAsync(actorUserId, mode, range, unitIds, topUnitCount, ct),
-            "ASSIGNMENT_CREATED" => await BuildAssignmentCreatedOverviewAsync(actorUserId, range, unitIds, topUnitCount, ct),
-            "ASSIGNMENT_RECEIVED" => await BuildAssignmentReceivedOverviewAsync(actorUserId, range, unitIds, topUnitCount, ct),
-            "REPORT" => await BuildReportOverviewAsync(actorUserId, range, unitIds, assignmentId, topUnitCount, ct),
-            _ => await BuildWorkOverviewAsync(actorUserId, "WORK_TASK", range, unitIds, topUnitCount, ct)
+            "WORK_TASK" => await BuildWorkOverviewAsync(actorUserId, hasGlobalReadAccess, mode, range, unitIds, topUnitCount, ct),
+            "WORK_TARGET" => await BuildWorkOverviewAsync(actorUserId, hasGlobalReadAccess, mode, range, unitIds, topUnitCount, ct),
+            "ASSIGNMENT_CREATED" => await BuildAssignmentCreatedOverviewAsync(actorUserId, hasGlobalReadAccess, range, unitIds, topUnitCount, ct),
+            "ASSIGNMENT_RECEIVED" => await BuildAssignmentReceivedOverviewAsync(actorUserId, hasGlobalReadAccess, range, unitIds, topUnitCount, ct),
+            "REPORT" => await BuildReportOverviewAsync(actorUserId, hasGlobalReadAccess, range, unitIds, assignmentId, topUnitCount, ct),
+            _ => await BuildWorkOverviewAsync(actorUserId, hasGlobalReadAccess, "WORK_TASK", range, unitIds, topUnitCount, ct)
         };
     }
 
     private async Task<DashboardOverviewResponse> BuildWorkOverviewAsync(
         string actorUserId,
+        bool hasGlobalReadAccess,
         string mode,
         DashboardNormalizedRange range,
         List<string> unitIds,
         int topUnitCount,
         CancellationToken ct)
     {
+        var workFilter = Builders<Work>.Filter.Eq(x => x.IsDeleted, false)
+            & BuildWorkTimeFilter(range);
+        if (!hasGlobalReadAccess)
+            workFilter &= Builders<Work>.Filter.Eq(x => x.CreatedByUserId, actorUserId);
+
         var works = await _ctx.Works
-            .Find(Builders<Work>.Filter.Eq(x => x.IsDeleted, false)
-                & Builders<Work>.Filter.Eq(x => x.CreatedByUserId, actorUserId)
-                & BuildWorkTimeFilter(range))
+            .Find(workFilter)
             .SortByDescending(x => x.UpdatedAtUtc)
             .ThenByDescending(x => x.CreatedAtUtc)
             .ToListAsync(ct);
@@ -242,17 +265,20 @@ public sealed class DashboardOverviewService : IDashboardOverviewService
 
     private async Task<DashboardOverviewResponse> BuildAssignmentCreatedOverviewAsync(
         string actorUserId,
+        bool hasGlobalReadAccess,
         DashboardNormalizedRange range,
         List<string> unitIds,
         int topUnitCount,
         CancellationToken ct)
     {
-        var scopedAssignments = await LoadOwnedAssignmentBranchAsync(
-            actorUserId,
-            unitIds,
-            range,
-            ct,
-            applyTimeFilter: false);
+        var scopedAssignments = hasGlobalReadAccess
+            ? await LoadAllAssignmentScopeAsync(unitIds, range, ct, applyTimeFilter: false)
+            : await LoadOwnedAssignmentBranchAsync(
+                actorUserId,
+                unitIds,
+                range,
+                ct,
+                applyTimeFilter: false);
 
         if (scopedAssignments.Count == 0)
             return EmptyResponse("ASSIGNMENT_CREATED", range);
@@ -367,17 +393,20 @@ public sealed class DashboardOverviewService : IDashboardOverviewService
 
     private async Task<DashboardOverviewResponse> BuildAssignmentReceivedOverviewAsync(
         string actorUserId,
+        bool hasGlobalReadAccess,
         DashboardNormalizedRange range,
         List<string> unitIds,
         int topUnitCount,
         CancellationToken ct)
     {
-        var scopedAssignments = await LoadReceivedAssignmentBranchAsync(
-            actorUserId,
-            unitIds,
-            range,
-            ct,
-            applyTimeFilter: false);
+        var scopedAssignments = hasGlobalReadAccess
+            ? await LoadAllAssignmentScopeAsync(unitIds, range, ct, applyTimeFilter: false)
+            : await LoadReceivedAssignmentBranchAsync(
+                actorUserId,
+                unitIds,
+                range,
+                ct,
+                applyTimeFilter: false);
 
         if (scopedAssignments.Count == 0)
             return EmptyResponse("ASSIGNMENT_RECEIVED", range);
@@ -489,6 +518,7 @@ public sealed class DashboardOverviewService : IDashboardOverviewService
 
     private async Task<DashboardOverviewResponse> BuildReportOverviewAsync(
         string actorUserId,
+        bool hasGlobalReadAccess,
         DashboardNormalizedRange range,
         List<string> unitIds,
         string assignmentId,
@@ -497,6 +527,7 @@ public sealed class DashboardOverviewService : IDashboardOverviewService
     {
         var assignments = await LoadDashboardAssignmentScopeAsync(
             actorUserId,
+            hasGlobalReadAccess,
             unitIds,
             range,
             ct,
@@ -739,11 +770,15 @@ public sealed class DashboardOverviewService : IDashboardOverviewService
 
     private async Task<List<WorkAssignment>> LoadDashboardAssignmentScopeAsync(
         string actorUserId,
+        bool hasGlobalReadAccess,
         List<string> unitIds,
         DashboardNormalizedRange range,
         CancellationToken ct,
         bool applyTimeFilter = true)
     {
+        if (hasGlobalReadAccess)
+            return await LoadAllAssignmentScopeAsync(unitIds, range, ct, applyTimeFilter);
+
         var ownedSeedsTask = LoadOwnedAssignmentSeedsAsync(actorUserId, ct);
         var receivedSeedsTask = LoadReceivedAssignmentSeedsAsync(actorUserId, ct);
 
@@ -756,6 +791,27 @@ public sealed class DashboardOverviewService : IDashboardOverviewService
             .ToList();
 
         return await LoadBranchAssignmentsBySeedsAsync(seeds, unitIds, range, ct, applyTimeFilter);
+    }
+
+    private async Task<List<WorkAssignment>> LoadAllAssignmentScopeAsync(
+        List<string> unitIds,
+        DashboardNormalizedRange range,
+        CancellationToken ct,
+        bool applyTimeFilter = true)
+    {
+        var filter = Builders<WorkAssignment>.Filter.Eq(x => x.IsDeleted, false)
+            & Builders<WorkAssignment>.Filter.Eq(x => x.IsActive, true)
+            & BuildAssignmentUnitFilter(unitIds);
+
+        if (applyTimeFilter)
+            filter &= BuildAssignmentTimeFilter(range);
+
+        return await _ctx.WorkAssignments
+            .Find(filter)
+            .SortByDescending(x => x.HasOverduePeriod)
+            .ThenBy(x => x.LatestDueAtUtc)
+            .ThenBy(x => x.Path)
+            .ToListAsync(ct);
     }
 
     private async Task<List<WorkAssignment>> LoadOwnedAssignmentSeedsAsync(
@@ -1470,6 +1526,7 @@ public sealed class DashboardOverviewService : IDashboardOverviewService
 
     private static string BuildCacheKey(
         string actorUserId,
+        bool hasGlobalReadAccess,
         string mode,
         DashboardNormalizedRange range,
         List<string> unitIds,
@@ -1480,6 +1537,7 @@ public sealed class DashboardOverviewService : IDashboardOverviewService
         {
             "dashboard-overview-v2",
             actorUserId,
+            hasGlobalReadAccess ? "global" : "scoped",
             mode,
             range.FromUtc.ToString("O"),
             range.ToUtc.ToString("O"),
@@ -1523,35 +1581,7 @@ public sealed class DashboardOverviewService : IDashboardOverviewService
             .ToList();
     }
 
-    private static FilterDefinition<Work> BuildWorkTimeFilter(DashboardNormalizedRange range)
-    {
-        var fb = Builders<Work>.Filter;
-
-        var overlapByStartEnd = fb.And(
-            fb.Ne(x => x.StartDate, null),
-            fb.Lte(x => x.StartDate, range.ToDate),
-            fb.Or(
-                fb.Eq(x => x.EndDate, null),
-                fb.Gte(x => x.EndDate, range.FromDate)
-            )
-        );
-
-        var byDueDate = fb.And(
-            fb.Ne(x => x.DueDate, null),
-            fb.Gte(x => x.DueDate, range.FromDate),
-            fb.Lte(x => x.DueDate, range.ToDate)
-        );
-
-        var fallbackUpdated = fb.And(
-            fb.Eq(x => x.StartDate, null),
-            fb.Eq(x => x.EndDate, null),
-            fb.Eq(x => x.DueDate, null),
-            fb.Gte(x => x.UpdatedAtUtc, range.FromUtc),
-            fb.Lte(x => x.UpdatedAtUtc, range.ToUtc)
-        );
-
-        return fb.Or(overlapByStartEnd, byDueDate, fallbackUpdated);
-    }
+    private static FilterDefinition<Work> BuildWorkTimeFilter(DashboardNormalizedRange range) => tdtd_be.Services.Works.WorkDeadlineReadQuery.Overlaps(range.FromDate, range.ToDate, range.FromUtc, range.ToUtc);
 
     private static FilterDefinition<WorkAssignment> BuildAssignmentTimeFilter(DashboardNormalizedRange range)
     {

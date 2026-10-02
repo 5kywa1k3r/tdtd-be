@@ -66,15 +66,21 @@ public sealed class WorkDocumentsController : ControllerBase
         if (!string.IsNullOrWhiteSpace(normalizedScope) && normalizedScope != "ALL")
             filter &= BuildScopeFilter(fb, normalizedScope);
 
+        var treeAccess = await _permission.ReadAccessAsync(workId, me.Id, ct);
         if (!string.IsNullOrWhiteSpace(normalizedAssignmentId))
-            filter &= BuildAssignmentFilter(fb, normalizedAssignmentId);
+        {
+            if (!treeAccess.CanReadAssignment(normalizedAssignmentId))
+                throw AppExceptionFactory.Forbidden(AppErrorCode.AUTH_FORBIDDEN, new { workId, assignmentId });
+            var subtree = treeAccess.ReadableAssignments.Where(a => (treeAccess.IsWithinBranch(a.Id, normalizedAssignmentId) || treeAccess.IsWithinBranch(normalizedAssignmentId, a.Id))).Select(a => a.Id).ToArray();
+            filter &= BuildScopeFilter(fb, WorkDocumentConstants.ScopeAssignmentBranch) & fb.Or(fb.In(x => x.AssignmentId, subtree), fb.In(x => x.SourceId, subtree));
+        }
 
         var rows = await _ctx.Files
             .Find(filter)
             .SortByDescending(x => x.CreatedAtUtc)
             .ToListAsync(ct);
 
-        var access = await LoadListAccessAsync(workId, me.Id, rows, ct);
+        var access = treeAccess;
         var visible = rows
             .Where(file => access.CanRead(file, WorkDocumentScopeResolver.Resolve(file)))
             .ToList();
@@ -114,22 +120,14 @@ public sealed class WorkDocumentsController : ControllerBase
         CancellationToken ct)
     {
         var me = _me.RequireMe();
+        var readAccess = await _permission.ReadAccessAsync(workId, me.Id, ct);
+        WorkDocumentUploadTarget Target(WorkAssignment x) => new() { AssignmentId = x.Id, Code = x.Code, Path = readAccess.AssignmentPath(x.Id), Label = BuildAssignmentLabel(x) };
         var options = new WorkDocumentUploadOptions
         {
-            CanUploadWork = await CanUploadWorkDocumentAsync(workId, me.Id, ct)
+            CanUploadWork = readAccess.IsWorkOwner,
+            AssignmentTargets = readAccess.UploadAssignments.Select(Target).ToList(),
+            ReadTargets = readAccess.ReadableAssignments.Select(Target).ToList()
         };
-
-        var assignments = await _permission.GetAssignmentUploadTargetsAsync(workId, me.Id, ct);
-        options.AssignmentTargets = assignments
-            .Select(x => new WorkDocumentUploadTarget
-            {
-                AssignmentId = x.Id,
-                Code = x.Code,
-                Path = x.Path,
-                Label = BuildAssignmentLabel(x)
-            })
-            .ToList();
-
         return Ok(options);
     }
 
@@ -388,19 +386,6 @@ public sealed class WorkDocumentsController : ControllerBase
             throw AppExceptionFactory.BadRequest(AppErrorCode.UPLOAD_FILE_TOO_LARGE, new { req.Size, maxBytes = _opt.MaxUploadBytes });
     }
 
-    private async Task<bool> CanUploadWorkDocumentAsync(string workId, string userId, CancellationToken ct)
-    {
-        try
-        {
-            await _permission.EnsureCanCreateWorkDocumentAsync(workId, userId, ct);
-            return true;
-        }
-        catch (AppException)
-        {
-            return false;
-        }
-    }
-
     private async Task<Dictionary<string, AppUser>> LoadUsersAsync(IEnumerable<string?> ids, CancellationToken ct)
     {
         var userIds = ids
@@ -450,6 +435,8 @@ public sealed class WorkDocumentsController : ControllerBase
     private static string? NormalizeScope(string? value)
     {
         var trimmed = NullIfWhiteSpace(value)?.ToUpperInvariant();
+        if (trimmed is not (null or "ALL" or "WORK" or "ASSIGNMENT_BRANCH" or "ASSIGNMENT"))
+            throw AppExceptionFactory.BadRequest(AppErrorCode.COMMON_VALIDATION_FAILED, new { scope = value });
         if (trimmed == "ASSIGNMENT")
             return WorkDocumentConstants.ScopeAssignmentBranch;
 
@@ -470,205 +457,5 @@ public sealed class WorkDocumentsController : ControllerBase
                     fb.Eq(x => x.SourceType, WorkDocumentConstants.SourceTypeAssignmentDocument))
                 : fb.Eq(x => x.Id, "__no_matching_work_document_scope__");
 
-    private static FilterDefinition<FileDoc> BuildAssignmentFilter(
-        FilterDefinitionBuilder<FileDoc> fb,
-        string assignmentId)
-        => BuildScopeFilter(fb, WorkDocumentConstants.ScopeAssignmentBranch) &
-           fb.Or(
-               fb.Eq(x => x.AssignmentId, assignmentId),
-               fb.Eq(x => x.SourceId, assignmentId));
-
-    private async Task<WorkDocumentListAccess> LoadListAccessAsync(
-        string workId,
-        string userId,
-        IReadOnlyCollection<FileDoc> files,
-        CancellationToken ct)
-    {
-        var workReadTask = _ctx.DocRoles
-            .Find(x => x.DocType == DocType.WORK && x.DocId == workId && x.UserId == userId && !x.IsDeleted)
-            .Limit(1)
-            .AnyAsync(ct);
-
-        var workOwnerTask = _ctx.Works
-            .Find(x => x.Id == workId && x.CreatedByUserId == userId && !x.IsDeleted)
-            .Limit(1)
-            .AnyAsync(ct);
-
-        var branchScopes = files
-            .Select(WorkDocumentScopeResolver.Resolve)
-            .Where(x => string.Equals(x.Scope, WorkDocumentConstants.ScopeAssignmentBranch, StringComparison.Ordinal))
-            .ToList();
-
-        var branchAssignmentIds = branchScopes
-            .Select(x => NullIfWhiteSpace(x.AssignmentId))
-            .Where(x => !string.IsNullOrWhiteSpace(x))
-            .Select(x => x!)
-            .Distinct(StringComparer.Ordinal)
-            .ToList();
-        var activeBranchAssignmentPathIds = new Dictionary<string, IReadOnlyList<string>>(StringComparer.Ordinal);
-        var ownedBranchAssignments = new HashSet<string>(StringComparer.Ordinal);
-        var branchPathIds = new List<string>();
-        if (branchAssignmentIds.Count > 0)
-        {
-            var directAssignments = await _ctx.WorkAssignments
-                .Find(x =>
-                    branchAssignmentIds.Contains(x.Id) &&
-                    x.WorkId == workId &&
-                    x.IsActive &&
-                    !x.IsDeleted)
-                .Project(x => new WorkDocumentAssignmentPathProjection
-                {
-                    Id = x.Id,
-                    Path = x.Path,
-                    CreatedByUserId = x.CreatedByUserId
-                })
-                .ToListAsync(ct);
-
-            foreach (var assignment in directAssignments)
-            {
-                var pathIds = ResolveAssignmentPathIds(assignment.Path, assignment.Id);
-                activeBranchAssignmentPathIds[assignment.Id] = pathIds;
-
-                if (string.Equals(assignment.CreatedByUserId, userId, StringComparison.Ordinal))
-                    ownedBranchAssignments.Add(assignment.Id);
-            }
-
-            branchPathIds = activeBranchAssignmentPathIds.Values
-                .SelectMany(x => x)
-                .Distinct(StringComparer.Ordinal)
-                .ToList();
-        }
-
-        var projectedReadable = new HashSet<string>(StringComparer.Ordinal);
-        if (branchPathIds.Count > 0)
-        {
-            var roleFb = Builders<AssignmentListDocRole>.Filter;
-            var roleRows = await _ctx.AssignmentListDocRoles
-                .Find(
-                    roleFb.Eq(x => x.WorkId, workId) &
-                    roleFb.Eq(x => x.UserId, userId) &
-                    roleFb.In(x => x.AssignmentId, branchPathIds) &
-                    roleFb.Eq(x => x.IsDeleted, false) &
-                    roleFb.SizeGt(x => x.Roles, 0))
-                .Project(x => x.AssignmentId)
-                .ToListAsync(ct);
-
-            projectedReadable = roleRows.ToHashSet(StringComparer.Ordinal);
-        }
-
-        var sourceReadable = new HashSet<string>(StringComparer.Ordinal);
-        if (branchPathIds.Count > 0)
-        {
-            var assignmentFb = Builders<WorkAssignment>.Filter;
-            var assignments = await _ctx.WorkAssignments
-                .Find(
-                    assignmentFb.Eq(x => x.WorkId, workId) &
-                    assignmentFb.In(x => x.Id, branchPathIds) &
-                    assignmentFb.Eq(x => x.IsActive, true) &
-                    assignmentFb.Eq(x => x.IsDeleted, false))
-                .ToListAsync(ct);
-
-            sourceReadable = assignments
-                .Where(x => IsBranchMember(x, userId))
-                .Select(x => x.Id)
-                .ToHashSet(StringComparer.Ordinal);
-        }
-
-        var canReadWork = await workReadTask;
-        var isWorkOwner = await workOwnerTask;
-
-        return new WorkDocumentListAccess(
-            userId,
-            canReadWork,
-            isWorkOwner,
-            activeBranchAssignmentPathIds,
-            projectedReadable,
-            sourceReadable,
-            ownedBranchAssignments);
-    }
-
-    private static IReadOnlyList<string> ResolveAssignmentPathIds(string? assignmentPath, string? assignmentId)
-    {
-        var ids = (assignmentPath ?? string.Empty)
-            .Split('/', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-            .Where(x => !string.IsNullOrWhiteSpace(x))
-            .Distinct(StringComparer.Ordinal)
-            .ToList();
-
-        var normalizedAssignmentId = NullIfWhiteSpace(assignmentId);
-        if (!string.IsNullOrWhiteSpace(normalizedAssignmentId) && !ids.Contains(normalizedAssignmentId, StringComparer.Ordinal))
-            ids.Add(normalizedAssignmentId);
-
-        return ids;
-    }
-
-    private static bool IsBranchMember(WorkAssignment assignment, string userId)
-    {
-        if (string.Equals(assignment.CreatedByUserId, userId, StringComparison.Ordinal))
-            return true;
-
-        if ((assignment.Assignees ?? new List<UserRef>())
-            .Any(x => string.Equals(x.UserId, userId, StringComparison.Ordinal)))
-            return true;
-
-        return (assignment.LeaderWatcherUserIds ?? new List<string>())
-            .Any(x => string.Equals(x, userId, StringComparison.Ordinal)) ||
-            (assignment.LeaderWatchers ?? new List<UserRef>())
-            .Any(x => string.Equals(x.UserId, userId, StringComparison.Ordinal));
-    }
-
-    private static string? NullIfWhiteSpace(string? value)
-        => string.IsNullOrWhiteSpace(value) ? null : value.Trim();
-
-    private sealed record WorkDocumentListAccess(
-        string UserId,
-        bool CanReadWorkDocuments,
-        bool IsWorkOwner,
-        Dictionary<string, IReadOnlyList<string>> ActiveBranchAssignmentPathIds,
-        HashSet<string> ProjectedReadableAssignmentIds,
-        HashSet<string> SourceReadableAssignmentIds,
-        HashSet<string> OwnedBranchAssignmentIds)
-    {
-        public bool CanRead(FileDoc file, WorkDocumentScopeInfo scope)
-        {
-            if (string.Equals(scope.Scope, WorkDocumentConstants.ScopeWork, StringComparison.Ordinal))
-                return CanReadWorkDocuments;
-
-            if (string.Equals(scope.Scope, WorkDocumentConstants.ScopeAssignmentBranch, StringComparison.Ordinal))
-            {
-                var assignmentId = NullIfWhiteSpace(scope.AssignmentId);
-                if (assignmentId is null || !ActiveBranchAssignmentPathIds.TryGetValue(assignmentId, out var pathIds))
-                    return false;
-
-                return pathIds
-                    .Any(id => ProjectedReadableAssignmentIds.Contains(id) || SourceReadableAssignmentIds.Contains(id));
-            }
-
-            return string.Equals(file.CreatedByUserId, UserId, StringComparison.Ordinal);
-        }
-
-        public bool CanDelete(FileDoc file, WorkDocumentScopeInfo scope)
-        {
-            if (string.Equals(scope.Scope, WorkDocumentConstants.ScopeWork, StringComparison.Ordinal))
-                return IsWorkOwner;
-
-            if (string.Equals(scope.Scope, WorkDocumentConstants.ScopeAssignmentBranch, StringComparison.Ordinal))
-            {
-                var assignmentId = NullIfWhiteSpace(scope.AssignmentId);
-                if (assignmentId is null || !ActiveBranchAssignmentPathIds.ContainsKey(assignmentId))
-                    return false;
-
-                return IsWorkOwner || OwnedBranchAssignmentIds.Contains(assignmentId);
-            }
-
-            return string.Equals(file.CreatedByUserId, UserId, StringComparison.Ordinal);
-        }
-    }
-
-    private sealed class WorkDocumentAssignmentPathProjection
-    {
-        public string Id { get; set; } = default!;
-        public string? Path { get; set; }
-        public string? CreatedByUserId { get; set; }
-    }
+    private static string? NullIfWhiteSpace(string? value) => string.IsNullOrWhiteSpace(value) ? null : value.Trim();
 }

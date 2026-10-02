@@ -9,7 +9,8 @@ namespace tdtd_be.Services.DynamicForms;
 /// <summary>
 /// Authorizes design-time use of an exact Dynamic Form version by assignments
 /// and Dynamic Flow templates. Runtime participation and clone approval are read
-/// or copy grants only; neither grants permission to mint a new binding.
+/// or copy grants only. Exact inherited child bindings are authorized separately
+/// by WorkAssignmentTemplateResolver within the same parent/work scope.
 /// </summary>
 internal static class DynamicFormBindingAccessPolicy
 {
@@ -50,8 +51,13 @@ internal static class DynamicFormBindingAccessPolicy
         // Published snapshot integrity is validated here, after ACL and before
         // any caller can enrich provenance or persist a new runtime binding.
         foreach (var form in materialized.Where(form => form.IsPublished))
-        {
-            try
+            EnsurePublishedIntegrity(form);
+    }
+
+    // The caller must establish binding authorization before inspecting integrity.
+    internal static void EnsurePublishedIntegrity(DynamicFormTemplate form)
+    {
+        try
             {
                 DynamicFormPublishedSchemaSnapshotBuilder.ValidateAgainstTemplate(form);
             }
@@ -66,7 +72,6 @@ internal static class DynamicFormBindingAccessPolicy
                     },
                     innerException: ex);
             }
-        }
     }
 
     /// <summary>
@@ -85,6 +90,22 @@ internal static class DynamicFormBindingAccessPolicy
         var fb = Builders<DynamicFormTemplate>.Filter;
         var filter = fb.In(form => form.Id, formIds) &
                      fb.Eq(form => form.IsDeleted, false) &
+                     fb.Eq(form => form.IsActive, true);
+        if (requirePublished)
+            filter &= fb.Eq(form => form.IsPublished, true);
+        if (!IsSystemAdministrator(actor))
+            filter &= fb.Eq(form => form.CreatedByUserId, actor.Id);
+        return filter;
+    }
+
+    // Apply bind ACL before count/skip/limit in assignment Form searches.
+    internal static FilterDefinition<DynamicFormTemplate> BuildMayBindSearchFilter(
+        AppUser actor,
+        bool requirePublished)
+    {
+        ArgumentNullException.ThrowIfNull(actor);
+        var fb = Builders<DynamicFormTemplate>.Filter;
+        var filter = fb.Eq(form => form.IsDeleted, false) &
                      fb.Eq(form => form.IsActive, true);
         if (requirePublished)
             filter &= fb.Eq(form => form.IsPublished, true);

@@ -290,12 +290,19 @@ public sealed partial class WorkAssignmentAdvancedSummaryConfigService
         var targets = NormalizeP805Targets(
             section.Targets,
             section.IsCumulative.Value);
+        var nativeTargets = NormalizeP805NativeTargets(section.NativeTargets);
+        var limit = section.IsCumulative.Value
+            ? WorkAssignmentAdvancedSummaryConfigContract.MaxCumulativeTargets
+            : WorkAssignmentAdvancedSummaryConfigContract.MaxNonCumulativeTargets;
+        if (targets.Count + (nativeTargets?.Count ?? 0) > limit)
+            throw P805Schema("$.payload.sections[0]", "TARGET_LIMIT_EXCEEDED");
         return new[]
         {
             new WorkAssignmentAdvancedSummarySectionPayload(
                 sectionId,
                 section.IsCumulative.Value,
-                targets)
+                targets,
+                nativeTargets)
         };
     }
 

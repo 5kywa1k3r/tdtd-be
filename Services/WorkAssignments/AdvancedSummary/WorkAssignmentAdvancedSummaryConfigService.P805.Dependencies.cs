@@ -24,7 +24,7 @@ public sealed partial class WorkAssignmentAdvancedSummaryConfigService
             .OrderBy(value => value, StringComparer.Ordinal)
             .ToList();
 
-    private Task<IReadOnlyList<string>>
+    private async Task<IReadOnlyList<string>>
         P805ResolveDependencyPinsAsync(
             IClientSessionHandle session,
             P805OwnerContext owner,
@@ -93,11 +93,12 @@ public sealed partial class WorkAssignmentAdvancedSummaryConfigService
                         field)));
         }
 
+        pins.AddRange(await P805NativeDependencyPinsAsync(session, owner, payload, ct));
         IReadOnlyList<string> result = pins
             .Distinct(StringComparer.Ordinal)
             .OrderBy(value => value, StringComparer.Ordinal)
             .ToList();
-        return Task.FromResult(result);
+        return result;
     }
 
     private async Task P805EnsureDependenciesCurrentAsync(
@@ -214,7 +215,7 @@ public sealed partial class WorkAssignmentAdvancedSummaryConfigService
             WorkAssignmentAdvancedSummaryConfigPayload payload)
     {
         var section = payload.Sections![0];
-        var targetCount = section.Targets!.Count;
+        var targetCount = section.Targets!.Count + (section.NativeTargets?.Count ?? 0);
         var targetLimit = section.IsCumulative!.Value
             ? WorkAssignmentAdvancedSummaryConfigContract
                 .MaxCumulativeTargets

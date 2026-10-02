@@ -61,6 +61,17 @@ namespace tdtd_be.Controllers
             return Ok(resp);
         }
 
+        [HttpPost("change-password")]
+        [Authorize]
+        public async Task<IActionResult> ChangePassword([FromBody] ChangePasswordRequest req, CancellationToken ct)
+        {
+            if (!HttpContext.Items.TryGetValue("me", out var context) || context is not MeResponse me)
+                throw AppExceptionFactory.Unauthorized(AppErrorCode.AUTH_ME_NOT_AVAILABLE);
+            await _svc.ChangePasswordAsync(me.Id, req, ct);
+            ClearRefreshCookie();
+            return NoContent();
+        }
+
         // FE gọi endpoint này, refresh token tự gửi qua cookie HttpOnly
         [HttpPost("refresh")]
         [AllowAnonymous]

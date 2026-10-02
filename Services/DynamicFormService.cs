@@ -21,9 +21,17 @@ namespace tdtd_be.Services;
 
 public interface IDynamicFormService
 {
+    Task<PagedResult<DynamicFormSectionSourceRow>> SearchSectionSourcesAsync(DynamicFormSectionSourceQuery req, CancellationToken ct);
+    Task<DynamicFormDetail> GetSectionSourceAsync(string id, CancellationToken ct);
     Task<PagedResult<DynamicFormRow>> SearchAsync(DynamicFormSearchReq req, CancellationToken ct);
     Task<DynamicFormDetail> GetByIdAsync(string id, CancellationToken ct);
+    Task<DynamicFormStorageDiagnostic> GetStorageDiagnosticAsync(string id, CancellationToken ct);
+    Task<DynamicFormReferenceAssessment> GetReferenceAssessmentAsync(string id, string expectedStorageSha256, CancellationToken ct);
+    Task<DynamicFormDependencyAssessment> GetDependencyAssessmentAsync(string id, string expectedStorageSha256, CancellationToken ct);
+    Task<DynamicFormArtifactAssessment> GetArtifactAssessmentAsync(string id, string expectedStorageSha256, CancellationToken ct);
+    Task<DynamicFormSnapshotAssessment> GetSnapshotAssessmentAsync(string id, string expectedStorageSha256, string kind, string snapshotId, string? refreshId, CancellationToken ct);
     Task<NextCodeResp> GetNextCodeAsync(int? year, CancellationToken ct);
+    Task<DynamicFormCodeAvailability> GetCodeAvailabilityAsync(string? code, CancellationToken ct);
     Task<DynamicFormDetail> CreateAsync(CreateDynamicFormReq req, CancellationToken ct);
     Task<DynamicFormVersionHistoryResp> GetVersionHistoryAsync(string id, CancellationToken ct);
     Task<DynamicFormDetail> CreateNextVersionAsync(
@@ -52,7 +60,7 @@ public interface IDynamicFormService
     Task DeleteAsync(string id, int? expectedRevision, CancellationToken ct);
 }
 
-public sealed class DynamicFormService : IDynamicFormService
+public sealed partial class DynamicFormService : IDynamicFormService
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private static readonly Regex LabelCodeRegex = new("^[a-z0-9][a-z0-9_.-]{0,63}$", RegexOptions.Compiled);
@@ -93,6 +101,7 @@ public sealed class DynamicFormService : IDynamicFormService
     private const int MaxSearchOffset = 100_000;
     private static readonly HashSet<string> AllowedFieldTypes = new(StringComparer.Ordinal)
     {
+        "evidence",
         "shortText",
         "longText",
         "richText",
@@ -115,6 +124,7 @@ public sealed class DynamicFormService : IDynamicFormService
         LabelValueSourceTypes.FixedEnum,
         LabelValueSourceTypes.EnumCatalog,
         LabelValueSourceTypes.SystemUnit,
+        LabelValueSourceTypes.SystemLocality,
         LabelValueSourceTypes.SystemUser,
         LabelValueSourceTypes.SystemPosition,
         LabelValueSourceTypes.SystemUnitType
@@ -347,6 +357,8 @@ public sealed class DynamicFormService : IDynamicFormService
             blocksJson);
 
         var now = DateTime.UtcNow;
+        DynamicFormNativeTableDefinition.ValidateStored(source);
+        EnsureSchemaPayloadBudget(source.SectionsJson, source.FieldsJson, blocksJson, source.TablesJson);
         var versionId = ObjectId.GenerateNewId().ToString();
         var next = new DynamicFormTemplate
         {
@@ -371,6 +383,8 @@ public sealed class DynamicFormService : IDynamicFormService
             FieldsJson = source.FieldsJson,
             ExcelBlockJson = excelBlockJson,
             BlocksJson = blocksJson,
+            NativeTablesVersion = source.NativeTablesVersion,
+            TablesJson = source.TablesJson,
             ExcelBlockDynamicExcelTemplateId =
                 source.ExcelBlockDynamicExcelTemplateId
                 ?? ExtractPrimaryBlockDynamicExcelTemplateId(excelBlockJson, blocksJson),
@@ -431,6 +445,9 @@ public sealed class DynamicFormService : IDynamicFormService
         EnsureSchemaPayloadBudget(sectionsJson, fieldsJson, blocksJson);
         EnsureTypedSchemaProjection(sectionsJson, fieldsJson, excelBlockJson, blocksJson);
 
+        var native = DynamicFormNativeTableDefinition.PrepareWrite(req.Schema, null, sectionsJson, fieldsJson, blocksJson);
+        await _enumCatalogs.ValidateVisibleActiveCatalogsAsync(ExtractEnumCatalogIds(native.Json), ct);
+        EnsureSchemaPayloadBudget(sectionsJson, fieldsJson, blocksJson, native.Json);
         var docId = ObjectId.GenerateNewId().ToString();
         var doc = new DynamicFormTemplate
         {
@@ -451,6 +468,8 @@ public sealed class DynamicFormService : IDynamicFormService
             FieldsJson = fieldsJson,
             ExcelBlockJson = excelBlockJson,
             BlocksJson = blocksJson,
+            NativeTablesVersion = native.Version,
+            TablesJson = native.Json,
             ExcelBlockDynamicExcelTemplateId = ExtractPrimaryBlockDynamicExcelTemplateId(excelBlockJson, blocksJson),
             CreatedAtUtc = now,
             UpdatedAtUtc = now,
@@ -459,7 +478,7 @@ public sealed class DynamicFormService : IDynamicFormService
             IsDeleted = false,
         };
 
-        await InsertDynamicFormAsync(doc, ct);
+        await InsertDynamicFormAsync(doc, ct, autoCode: string.IsNullOrWhiteSpace(req.Code));
         return await ToDetailAsync(doc, me, ct);
     }
 
@@ -515,6 +534,9 @@ public sealed class DynamicFormService : IDynamicFormService
         EnsureSchemaPayloadBudget(sectionsJson, fieldsJson, blocksJson);
         EnsureTypedSchemaProjection(sectionsJson, fieldsJson, excelBlockJson, blocksJson);
 
+        var native = DynamicFormNativeTableDefinition.PrepareWrite(req.Schema, doc, sectionsJson, fieldsJson, blocksJson);
+        await _enumCatalogs.ValidateVisibleActiveCatalogsAsync(ExtractEnumCatalogIds(native.Json), ct);
+        EnsureSchemaPayloadBudget(sectionsJson, fieldsJson, blocksJson, native.Json);
         var update = Builders<DynamicFormTemplate>.Update
             .Set(x => x.Name, NormalizeName(req.Name))
             .Set(x => x.Description, NormalizeOptionalText(req.Description))
@@ -529,6 +551,9 @@ public sealed class DynamicFormService : IDynamicFormService
             .Set(x => x.UpdatedAtUtc, now)
             .Set(x => x.UpdatedByUserId, me.Id)
             .Set(x => x.Revision, expectedRevision + 1);
+
+        if (native.Version.HasValue)
+            update = update.Set(x => x.NativeTablesVersion, native.Version).Set(x => x.TablesJson, native.Json);
 
         UpdateResult res;
         try
@@ -568,7 +593,8 @@ public sealed class DynamicFormService : IDynamicFormService
         string id,
         JsonElement body,
         CancellationToken ct)
-        => _statisticConfig.PatchAsync(id, body, ct);
+        => throw AppExceptionFactory.BadRequest(AppErrorCode.COMMON_VALIDATION_FAILED,
+            new { reason = "FORM_LEGACY_STATISTIC_AUTHORING_DISABLED" });
 
     public Task<DynamicFormStatisticConfigResult> GetStatisticConfigAsync(
         string id,
@@ -621,19 +647,27 @@ public sealed class DynamicFormService : IDynamicFormService
             blocksJson,
             ct);
         await _enumCatalogs.ValidateVisibleActiveCatalogsAsync(
-            ExtractEnumCatalogIds(doc.FieldsJson, excelBlockJson, blocksJson),
+            ExtractEnumCatalogIds(doc.FieldsJson, excelBlockJson, blocksJson, doc.TablesJson),
             ct);
         EnsureTableStatisticContract(excelBlockJson, "ExcelBlockJson");
         EnsureBlocksTableStatisticContract(blocksJson, "BlocksJson");
         EnsureUniqueLabelStatisticTargets(doc.FieldsJson, blocksJson);
-        EnsureSchemaPayloadBudget(doc.SectionsJson, doc.FieldsJson, blocksJson);
-        EnsurePublishableSchema(doc.SectionsJson, doc.FieldsJson, blocksJson);
+        DynamicFormNativeTableDefinition.ValidateStored(doc);
+        EnsureSchemaPayloadBudget(doc.SectionsJson, doc.FieldsJson, blocksJson, doc.TablesJson);
+        EnsurePublishableSchema(doc.SectionsJson, doc.FieldsJson, blocksJson, doc.TablesJson);
         EnsureTypedSchemaProjection(doc.SectionsJson, doc.FieldsJson, excelBlockJson, blocksJson);
         var publishedSnapshot = DynamicFormPublishedSchemaSnapshotBuilder.Build(
             doc.SchemaVersion,
             doc.SectionsJson,
             doc.FieldsJson,
-            blocksJson);
+            blocksJson,
+            doc.NativeTablesVersion,
+            doc.TablesJson);
+        if (DynamicFormNativeTableDefinition.IsNative(doc))
+        {
+            await _statisticConfig.PublishNativeAsync(id, expectedRevision, publishedSnapshot, ct);
+            return await GetByIdAsync(id, ct);
+        }
         var lockedStatisticSnapshots =
             PrepareStatisticConfigForPublish(doc);
 
@@ -690,6 +724,8 @@ public sealed class DynamicFormService : IDynamicFormService
         var me = _me.RequireMe();
         var source = await LoadAsync(id, ct);
         await RequireCanCloneAsync(me, source, ct);
+        DynamicFormNativeTableDefinition.ValidateStored(source);
+        EnsureSchemaPayloadBudget(source.SectionsJson, source.FieldsJson, source.BlocksJson, source.TablesJson);
         if (source.IsPublished)
             _ = RequirePublishedSchemaIntegrity(source);
         EnsureTypedSchemaProjection(
@@ -747,6 +783,8 @@ public sealed class DynamicFormService : IDynamicFormService
             FieldsJson = source.FieldsJson,
             ExcelBlockJson = sourceExcelBlockJson,
             BlocksJson = sourceBlocksJson,
+            NativeTablesVersion = source.NativeTablesVersion,
+            TablesJson = source.TablesJson,
             ExcelBlockDynamicExcelTemplateId =
                 source.ExcelBlockDynamicExcelTemplateId
                 ?? ExtractPrimaryBlockDynamicExcelTemplateId(sourceExcelBlockJson, sourceBlocksJson),
@@ -903,6 +941,7 @@ public sealed class DynamicFormService : IDynamicFormService
         var doc = await LoadAsync(id, ct);
 
         RequireCanMutate(me, doc);
+        DynamicFormNativeTableDefinition.RequireLegacyConsumer(doc, "importExcel");
         var expectedRevision = RequireExpectedRevision(req.ExpectedRevision, doc);
         EnsureDraftTemplate(doc);
         await EnsureNotLinkedToRuntimeAsync(id, ct);
@@ -938,7 +977,7 @@ public sealed class DynamicFormService : IDynamicFormService
         EnsureBlocksTableStatisticContract(blocksJson, "BlocksJson");
         await EnsureLabelReferencesAsync(me, doc.TagCodes, doc.SectionsJson, doc.FieldsJson, excelBlockJson, blocksJson, ct);
         await _enumCatalogs.ValidateVisibleActiveCatalogsAsync(
-            ExtractEnumCatalogIds(doc.FieldsJson, excelBlockJson, blocksJson),
+            ExtractEnumCatalogIds(doc.FieldsJson, excelBlockJson, blocksJson, doc.TablesJson),
             ct);
         EnsureUniqueLabelStatisticTargets(doc.FieldsJson, blocksJson);
         EnsureSchemaPayloadBudget(doc.SectionsJson, doc.FieldsJson, blocksJson);
@@ -1020,18 +1059,31 @@ public sealed class DynamicFormService : IDynamicFormService
         return new BsonRegularExpression(Regex.Escape(normalized), "i");
     }
 
-    private async Task InsertDynamicFormAsync(DynamicFormTemplate doc, CancellationToken ct)
+    private async Task InsertDynamicFormAsync(DynamicFormTemplate doc, CancellationToken ct, bool autoCode = false)
     {
+        for (var attempt = 0; ; attempt++)
+        {
         try
         {
             await _ctx.DynamicFormTemplates.InsertOneAsync(doc, cancellationToken: ct);
+            return;
         }
         catch (MongoWriteException ex) when (ex.WriteError?.Category == ServerErrorCategory.DuplicateKey)
         {
+            // A concurrent create may have claimed the suggested code. The unique
+            // index remains authoritative; retry only automatic code allocation.
+            if (autoCode && attempt < 20)
+            {
+                ct.ThrowIfCancellationRequested();
+                var (_, _, nextCode) = await ComputeNextCodeAsync(doc.CreatedAtUtc.Year, ct);
+                doc.Code = nextCode;
+                continue;
+            }
             throw new AppException(
                 AppErrorCode.DYNAMIC_FORM_CODE_CONFLICT,
                 new { doc.Code },
                 innerException: ex);
+        }
         }
     }
 
@@ -1216,7 +1268,9 @@ public sealed class DynamicFormService : IDynamicFormService
                 x.SectionsJson,
                 x.FieldsJson,
                 x.ExcelBlockJson,
-                blocksJson));
+                blocksJson,
+                x.NativeTablesVersion,
+                x.TablesJson));
     }
 
     private static DynamicFormRow ToRow(
@@ -1498,6 +1552,7 @@ public sealed class DynamicFormService : IDynamicFormService
     {
         var canMutate = CanMutate(me, doc);
         var isDraft = !doc.IsPublished;
+        var legacyConsumers = !DynamicFormNativeTableDefinition.IsNative(doc);
         return new DynamicFormActionCapabilities(
             CanRead: true,
             CanUpdate: canMutate && isDraft,
@@ -1507,8 +1562,8 @@ public sealed class DynamicFormService : IDynamicFormService
             CanViewHistory: RoleGuard.IsSystemAdmin(me) ||
                             string.Equals(doc.CreatedByUserId, me.Id, StringComparison.Ordinal),
             CanClone: CanClone(me, doc, canViewByCloneGrant),
-            CanImport: canMutate && isDraft,
-            CanUpdateStatistics: canMutate);
+            CanImport: canMutate && isDraft && legacyConsumers,
+            CanUpdateStatistics: false);
     }
 
     private static void RequireCanReadDynamicExcel(MeResponse me, DynamicExcelTemplate doc)
@@ -2968,6 +3023,13 @@ public sealed class DynamicFormService : IDynamicFormService
 
             EnsureOptionalBooleanProperty(field, "required", path, id);
             EnsureOptionalBooleanProperty(field, "isStatistic", path, id);
+            EnsureOptionalBooleanProperty(field, "showOnOverview", path, id);
+            if (field.TryGetProperty("localFormula", out var withdrawnFormula)
+                && withdrawnFormula.ValueKind != JsonValueKind.Null)
+                throw DynamicFormFieldConfigInvalid(
+                    $"{path}.localFormula",
+                    "Cấu hình công thức tại từng trường đã tạm dừng.",
+                    new { fieldId = id, reason = "LOCAL_FORMULA_WITHDRAWN" });
 
             var hasFieldOptions = field.TryGetProperty("options", out var fieldOptions)
                                   && fieldOptions.ValueKind != JsonValueKind.Null;
@@ -2989,7 +3051,7 @@ public sealed class DynamicFormService : IDynamicFormService
                 if (string.IsNullOrWhiteSpace(valueSourceType) || !AllowedFieldValueSourceTypes.Contains(valueSourceType))
                     throw DynamicFormFieldConfigInvalid(
                         $"{path}.valueSource.sourceType",
-                        "valueSource.sourceType nam ngoai 6 nguon duoc cong bo.",
+                        "valueSource.sourceType khong thuoc cac nguon duoc ho tro.",
                         new
                         {
                             fieldId = id,
@@ -3056,6 +3118,11 @@ public sealed class DynamicFormService : IDynamicFormService
                     "FIXED_ENUM phai co it nhat mot option o field hoac valueSource.",
                     new { fieldId = id, type });
             }
+
+            if (type == "evidence" && (ReadBoolean(field, "showOnOverview") || ReadBoolean(field, "isStatistic")
+                || ReadLabelCodes(field, "statisticLabelCodes").Count > 0
+                || field.TryGetProperty("statistic", out var evidenceStatistic) && evidenceStatistic.ValueKind != JsonValueKind.Null))
+                throw DynamicFormFieldConfigInvalid(path, "Trường Đính kèm tệp chỉ dùng trong báo cáo, không dùng để tổng hợp hoặc hiển thị trên tổng quan.", new { fieldId = id });
 
             if (string.Equals(type, "richText", StringComparison.Ordinal)
                 && (ReadBoolean(field, "isStatistic")
@@ -3207,14 +3274,16 @@ public sealed class DynamicFormService : IDynamicFormService
                 $"Dynamic Form chi toi da {MaxFieldsPerForm} fields.");
     }
 
-    private static void EnsureSchemaPayloadBudget(
+    internal static void EnsureSchemaPayloadBudget(
         string? sectionsJson,
         string? fieldsJson,
-        string? blocksJson)
+        string? blocksJson,
+        string? tablesJson = null)
     {
         var actualBytes = Encoding.UTF8.GetByteCount(sectionsJson ?? "[]")
                           + Encoding.UTF8.GetByteCount(fieldsJson ?? "[]")
                           + Encoding.UTF8.GetByteCount(blocksJson ?? "[]")
+                          + Encoding.UTF8.GetByteCount(tablesJson ?? string.Empty)
                           + 64;
         if (actualBytes <= MaxSchemaPayloadBytes)
             return;
@@ -3259,7 +3328,8 @@ public sealed class DynamicFormService : IDynamicFormService
     private static void EnsurePublishableSchema(
         string sectionsJson,
         string fieldsJson,
-        string blocksJson)
+        string blocksJson,
+        string? tablesJson = null)
     {
         using var sections = ParseJson(sectionsJson, "SectionsJson");
         using var fields = ParseJson(fieldsJson, "FieldsJson");
@@ -3270,7 +3340,9 @@ public sealed class DynamicFormService : IDynamicFormService
                 "Bieu mau can it nhat mot section truoc khi cong bo.",
                 new { path = "SectionsJson" });
 
-        if (fields.RootElement.GetArrayLength() == 0 && blocks.RootElement.GetArrayLength() == 0)
+        using var nativeTables = tablesJson is null ? null : ParseJson(tablesJson, "TablesJson");
+        if (fields.RootElement.GetArrayLength() == 0 && blocks.RootElement.GetArrayLength() == 0
+            && (nativeTables?.RootElement.GetArrayLength() ?? 0) == 0)
             throw DynamicFormValidation(
                 AppErrorCode.DYNAMIC_FORM_FIELD_CONFIG_INVALID,
                 "Bieu mau can it nhat mot field hoac table block truoc khi cong bo.",
@@ -3930,7 +4002,9 @@ public sealed class DynamicFormService : IDynamicFormService
                          "metricLabelTargets",
                          "allowedRowLabelCodes",
                          "statisticColumns",
-                         "statisticColumnLabels"
+                         "statisticColumnLabels",
+                         "statisticsDisabled",
+                         "statisticsDisabledReason"
                      })
             {
                 CopyTableStatisticProperty(
@@ -3938,16 +4012,8 @@ public sealed class DynamicFormService : IDynamicFormService
                     nextBlock,
                     property);
             }
-            if (ReadBoolean(
-                    currentBlock,
-                    "statisticsDisabled"))
-            {
-                nextBlock["statisticsDisabled"] = true;
-                CopyTableStatisticProperty(
-                    currentBlock,
-                    nextBlock,
-                    "statisticsDisabledReason");
-            }
+            // Preserve explicit false as well as true and any retained reason.
+            // Absence stays absent; only P8 may change these properties.
             CarryForwardMetricAggregateOperations(
                 currentBlock,
                 nextBlock);
@@ -4047,7 +4113,7 @@ public sealed class DynamicFormService : IDynamicFormService
         JsonElement next)
     {
         var statisticProperties = new HashSet<string>(
-            new[] { "isStatistic", "statisticLabelCodes", "statistic" },
+            new[] { "isStatistic", "statisticLabelCodes", "statistic", "showOnOverview" },
             StringComparer.Ordinal);
         var names = current.EnumerateObject()
             .Select(property => property.Name)

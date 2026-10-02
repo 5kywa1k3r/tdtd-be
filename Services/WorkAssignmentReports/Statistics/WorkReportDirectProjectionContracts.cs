@@ -1,6 +1,8 @@
 using tdtd_be.Models;
 using tdtd_be.Models.Statistics;
 using tdtd_be.Services.StatisticsRun;
+using tdtd_be.Services.WorkAssignmentReports.Payloads;
+using System.Collections.ObjectModel;
 
 namespace tdtd_be.Services.WorkAssignmentReports.Statistics;
 
@@ -30,6 +32,38 @@ public sealed record WorkReportDirectGenerationContext(
         SourceContributionBindings,
     DateTime ComputedAtUtc)
 {
+    internal IReadOnlyDictionary<string, WorkReportNativeSourcePin>? NativeSourcePins { get; private init; }
+    internal string? NativeSourceOrderHash { get; private init; }
+
+    // Explicit native capture boundary. The existing legacy generation path does
+    // not opt in implicitly; L5c calls this once after freezing authorized sources.
+    internal WorkReportDirectGenerationContext CaptureNativeSources(
+        IEnumerable<(WorkAssignmentReport Report, WorkReportPayloadSnapshot Payload)> sources)
+    {
+        var pins = new Dictionary<string, WorkReportNativeSourcePin>(StringComparer.Ordinal);
+        foreach (var (report, payload) in sources)
+            if (!SourceContributionBindings.ContainsKey(report.Id)
+                || !pins.TryAdd(report.Id, WorkReportNativeSourcePin.Capture(report, payload)))
+                throw WorkReportDirectGenerationValidationException.SourceDrift();
+        if (pins.Count != SourceContributionBindings.Count)
+            throw WorkReportDirectGenerationValidationException.SourceDrift();
+        return this with { NativeSourcePins = new ReadOnlyDictionary<string, WorkReportNativeSourcePin>(pins),
+            NativeSourceOrderHash = WorkReportNativeSourcePin.Digest(pins.Values) };
+    }
+
+    internal WorkReportDirectProjectionPin CreateNativePin(WorkAssignmentReport source,
+        WorkReportPayloadSnapshot payload, bool requiresTimestamp)
+    {
+        if (NativeSourcePins is null || !NativeSourcePins.TryGetValue(source.Id, out var captured)
+            || !StatRunCanonicalJson.IsCanonicalSha256(NativeSourceOrderHash))
+            throw WorkReportDirectGenerationValidationException.SourceDrift();
+        captured.Validate(source, payload, requiresTimestamp);
+        var pin = CreatePin(source);
+        pin.SourcePayloadUpdatedAtUtc = captured.PayloadUpdatedAtUtc;
+        pin.NativeSourceOrderHash = NativeSourceOrderHash;
+        return pin;
+    }
+
     public WorkReportCumulativeContributionPolicy ResolveContributionPolicy(
         WorkAssignmentReport source)
     {

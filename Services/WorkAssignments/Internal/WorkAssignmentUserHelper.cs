@@ -126,7 +126,7 @@ internal static class WorkAssignmentUserHelper
             .Select(id => finalMap[id])
             .ToList();
 
-        if (allowedUnitIds is not null && allowedUnitIds.Count > 0)
+        if (allowedUnitIds is not null)
         {
             if (result.Any(x =>
                     string.IsNullOrWhiteSpace(x.UnitId) ||

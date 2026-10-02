@@ -9,7 +9,15 @@ public sealed record WorkAssignmentBasicSummaryConfigPayload(
     WorkAssignmentBasicSummaryPeriodRulePayload? PeriodRule,
     IReadOnlyList<string>? GroupingHints,
     WorkAssignmentBasicSummaryDetailHintsPayload? DetailHints,
-    IReadOnlyList<WorkAssignmentBasicSummaryTargetPayload>? Targets);
+    IReadOnlyList<WorkAssignmentBasicSummaryTargetPayload>? Targets,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    IReadOnlyList<WorkAssignmentBasicSummaryNativeTargetPayload>? NativeTargets = null);
+
+// Exact references into the locked Form plan; options/types are never copied
+// or defaulted by Basic. Omission preserves canonical hashes of legacy configs.
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record WorkAssignmentBasicSummaryNativeTargetPayload(
+    string? TableId, string? TargetId, string? OperationId);
 
 [JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
 public sealed record WorkAssignmentBasicSummarySourceScopePayload(

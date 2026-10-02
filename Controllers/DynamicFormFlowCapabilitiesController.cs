@@ -6,6 +6,8 @@ using tdtd_be.DTOs.Capabilities;
 
 namespace tdtd_be.Controllers;
 
+// Catalog khả năng Flow cũng tạm khóa cùng chức năng Flow ở bản deploy này.
+[NonController]
 [ApiController]
 [Authorize]
 [Route("api/capabilities/dynamic-form-flow")]

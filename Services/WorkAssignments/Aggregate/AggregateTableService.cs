@@ -54,6 +54,8 @@ public sealed class AggregateTableService : IAggregateTableService
         AggregateTableRequest req,
         CancellationToken ct)
     {
+        // Tạm khóa luồng tổng hợp cũ; giữ nguyên triển khai bên dưới.
+        LegacyAggregateRetirement.Reject();
         StatConfigPhaseBarrier.Reject(StatConfigPhaseBarrierEntries.P9Result);
         var me = _me.RequireMe();
         var normalized = NormalizeRequest(req);
@@ -92,6 +94,8 @@ public sealed class AggregateTableService : IAggregateTableService
         DynamicFormAggregateRequest req,
         CancellationToken ct)
     {
+        // Tạm khóa luồng tổng hợp cũ; giữ nguyên triển khai bên dưới.
+        LegacyAggregateRetirement.Reject();
         StatConfigPhaseBarrier.Reject(StatConfigPhaseBarrierEntries.P9Result);
         var me = _me.RequireMe();
         var normalized = NormalizeDynamicFormRequest(req);
@@ -188,6 +192,8 @@ public sealed class AggregateTableService : IAggregateTableService
         string assignmentId,
         CancellationToken ct)
     {
+        // Tạm khóa luồng tổng hợp cũ; giữ nguyên triển khai bên dưới.
+        LegacyAggregateRetirement.Reject();
         var me = _me.RequireMe();
         var assignment = await LoadAggregateParentAsync(assignmentId, me.Id, ct, allowBranchRead: true);
         var config = await _ctx.WorkAssignmentAggregateConfigs
@@ -203,6 +209,8 @@ public sealed class AggregateTableService : IAggregateTableService
         SaveWorkAssignmentAggregateConfigRequest req,
         CancellationToken ct)
     {
+        // Tạm khóa luồng tổng hợp cũ; giữ nguyên triển khai bên dưới.
+        LegacyAggregateRetirement.Reject();
         var me = _me.RequireMe();
         var assignment = await LoadAggregateParentAsync(assignmentId, me.Id, ct, allowBranchRead: false);
         var now = DateTime.UtcNow;

@@ -1,6 +1,7 @@
 using System.Reflection;
 using System.Text.Json;
 using Microsoft.AspNetCore.Http;
+using tdtd_be.Controllers;
 using tdtd_be.Common.Errors;
 using tdtd_be.Data.Infrastructure;
 using tdtd_be.DTOs.DynamicForms;
@@ -18,7 +19,7 @@ internal static class DynamicFormStatisticConfigContractTests
         StrictPayloadExposesOnlyTheFrozenStatisticAllowlist();
         ExactOperationAndBucketMatrixHasNoFallback();
         ResultAndModelPersistVersionedFieldAndTableSections();
-        ControllerForwardsRawJsonToTheCanonicalCommandBoundary();
+        ControllerRetiresLegacyStatisticWrites();
         MutationSourceIsIsolatedFromResultMaterializers();
         PublishLocksThePersistedCurrentStatisticVersionAtomically();
         StableFieldStatisticErrorsAreBadRequests();
@@ -214,7 +215,7 @@ internal static class DynamicFormStatisticConfigContractTests
             "configured field structure hash readback");
     }
 
-    private static void ControllerForwardsRawJsonToTheCanonicalCommandBoundary()
+    private static void ControllerRetiresLegacyStatisticWrites()
     {
         var controller = ReadBackendSource(
             "Controllers/DynamicFormController.cs");
@@ -226,15 +227,35 @@ internal static class DynamicFormStatisticConfigContractTests
         AssertContains(
             controller,
             "[HttpPatch(\"{id}/statistics\")]",
-            "statistics PATCH route");
+            "retired statistics PATCH route returns a controlled error");
         AssertContains(
             controller,
             "[FromBody] JsonElement body",
             "raw body preserves authorization-before-schema ordering");
         AssertContains(
             controller,
+            "FORM_LEGACY_STATISTIC_AUTHORING_DISABLED",
+            "legacy statistics writes are disabled");
+        AssertNotContains(
+            controller,
             "_svc.UpdateStatisticConfigAsync(id, body, ct)",
-            "canonical statistic command forwarding");
+            "retired route cannot forward mutations");
+        AssertContains(
+            service,
+            "CanUpdateStatistics: false",
+            "Form actions cannot advertise the retired writer");
+        AssertContains(
+            service,
+            "FORM_LEGACY_STATISTIC_AUTHORING_DISABLED",
+            "Form service also rejects legacy statistic writes");
+        AssertNotContains(
+            service,
+            "_statisticConfig.PatchAsync(id, body, ct)",
+            "Form service cannot reach the retired mutation engine");
+        using var payload = JsonDocument.Parse("{\"payload\":{\"tables\":[]}}");
+        ExpectError(AppErrorCode.COMMON_VALIDATION_FAILED,
+            () => new DynamicFormController(null!).UpdateStatisticConfig(
+                "form-id", payload.RootElement, CancellationToken.None));
         AssertNotContains(
             controller,
             "UpdateDynamicFormStatisticConfigReq",

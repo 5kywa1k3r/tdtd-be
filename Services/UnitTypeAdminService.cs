@@ -151,7 +151,9 @@ public sealed class UnitTypeAdminService : IUnitTypeAdminService
     public async Task<IReadOnlyList<UnitTypeResponse>> ListAsync(bool? isDeleted, CancellationToken ct)
     {
         var me = _me.RequireMe();
-        RoleGuard.RequireAdminOrSystemAdmin(me);
+        if (isDeleted == true ||
+            (!RoleGuard.IsManagerLevel(me) && !RoleGuard.TryGetManagerUnit(me, out _)))
+            RoleGuard.RequireAdminOrSystemAdmin(me);
 
         var filter = Builders<UnitType>.Filter.Empty;
         if (isDeleted.HasValue)

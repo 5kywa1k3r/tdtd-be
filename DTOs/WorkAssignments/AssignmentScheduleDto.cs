@@ -15,7 +15,7 @@ public sealed record AssignmentScheduleDto(
     DateTime? StartDate,
     List<int>? WeekDays,
     List<int>? MonthDays,
-    List<int>? QuarterDays,
-    List<int>? SemiAnnualDays,
+    List<QuarterDayRuleDto>? QuarterDays,
+    List<SemiAnnualDayRuleDto>? SemiAnnualDays,
     string? Note
 );

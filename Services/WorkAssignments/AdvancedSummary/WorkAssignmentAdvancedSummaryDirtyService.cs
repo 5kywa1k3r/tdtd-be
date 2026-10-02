@@ -31,6 +31,8 @@ public sealed class WorkAssignmentAdvancedSummaryDirtyService : IWorkAssignmentA
         string actorUserId,
         CancellationToken ct)
     {
+        // Job/hook cũ dừng trước mọi I/O, không tạo vòng retry hay thay dữ liệu lịch sử.
+        if (LegacyAggregateRetirement.IsDisabled) return;
         if (!ShouldDirtyForStatusMutation(report, fromStatus, toStatus))
             return;
 
@@ -49,6 +51,8 @@ public sealed class WorkAssignmentAdvancedSummaryDirtyService : IWorkAssignmentA
         string actorUserId,
         CancellationToken ct)
     {
+        // Job/hook cũ dừng trước mọi I/O, không tạo vòng retry hay thay dữ liệu lịch sử.
+        if (LegacyAggregateRetirement.IsDisabled) return;
         if (report.Status != WorkAssignmentReportStatus.Approved)
             return;
 

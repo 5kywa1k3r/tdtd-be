@@ -1,6 +1,7 @@
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using tdtd_be.Common.Errors;
 using tdtd_be.Models;
 
@@ -23,7 +24,13 @@ public sealed record DynamicFormSectionSnapshot(
     string[] BlockIds,
     string FieldsJson,
     string BlocksJson,
-    string ContentHash);
+    string ContentHash)
+{
+    [JsonIgnore]
+    public string[] NativeTableIds { get; init; } = [];
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? NativeTablesJson { get; init; }
+}
 
 public sealed class DynamicFormSectionSnapshotSet
 {
@@ -83,6 +90,8 @@ public static class DynamicFormSectionSnapshotBuilder
         var sections = ParseArray(template, template.SectionsJson, "SectionsJson");
         var fields = ParseArray(template, template.FieldsJson, "FieldsJson");
         var blocks = ParseArray(template, template.BlocksJson, "BlocksJson");
+        DynamicFormNativeTableDefinition.ValidateStored(template);
+        var native = DynamicFormNativeTableDefinition.IsNative(template);
 
         var sectionSeeds = ReadSections(template, sections);
         var sectionIds = sectionSeeds
@@ -104,6 +113,8 @@ public static class DynamicFormSectionSnapshotBuilder
             sectionIds);
 
         var schemaVersion = Math.Max(1, template.SchemaVersion);
+        var nativeBySection = native ? ReadMembersBySection(template, ParseArray(template, template.TablesJson, "TablesJson"),
+            "TablesJson", "id", "sectionId", sectionIds) : null;
         var snapshots = sectionSeeds
             .OrderBy(x => x.Order)
             .ThenBy(x => x.SectionId, StringComparer.Ordinal)
@@ -115,6 +126,8 @@ public static class DynamicFormSectionSnapshotBuilder
                 var blockIds = sectionBlocks.Select(x => x.Id).ToArray();
                 var fieldsJson = CanonicalizeArray(sectionFields.Select(x => x.Element));
                 var blocksJson = CanonicalizeArray(sectionBlocks.Select(x => x.Element));
+                var nativeMembers = nativeBySection?[seed.SectionId];
+                var nativeJson = nativeMembers is null ? null : CanonicalizeArray(nativeMembers.Select(x => x.Element));
                 var sectionJson = Canonicalize(seed.Element);
                 var contentHash = ComputeContentHash(
                     template.Id,
@@ -123,7 +136,8 @@ public static class DynamicFormSectionSnapshotBuilder
                     fieldIds,
                     blockIds,
                     fieldsJson,
-                    blocksJson);
+                    blocksJson,
+                    nativeJson);
 
                 return new DynamicFormSectionSnapshot(
                     template.Id,
@@ -139,7 +153,11 @@ public static class DynamicFormSectionSnapshotBuilder
                     blockIds,
                     fieldsJson,
                     blocksJson,
-                    contentHash);
+                    contentHash)
+                {
+                    NativeTableIds = nativeMembers?.Select(x => x.Id).ToArray() ?? [],
+                    NativeTablesJson = nativeJson
+                };
             })
             .ToArray();
 
@@ -398,7 +416,8 @@ public static class DynamicFormSectionSnapshotBuilder
         IReadOnlyList<string> fieldIds,
         IReadOnlyList<string> blockIds,
         string fieldsJson,
-        string blocksJson)
+        string blocksJson,
+        string? nativeTablesJson = null)
     {
         using var stream = new MemoryStream();
         using (var writer = new Utf8JsonWriter(stream))
@@ -416,6 +435,12 @@ public static class DynamicFormSectionSnapshotBuilder
             writer.WriteRawValue(fieldsJson, skipInputValidation: true);
             writer.WritePropertyName("blocks");
             writer.WriteRawValue(blocksJson, skipInputValidation: true);
+            if (nativeTablesJson is not null)
+            {
+                writer.WriteNumber("nativeTablesVersion", 1);
+                writer.WritePropertyName("nativeTables");
+                writer.WriteRawValue(nativeTablesJson, skipInputValidation: true);
+            }
             writer.WriteEndObject();
         }
 
@@ -442,7 +467,7 @@ public static class DynamicFormSectionSnapshotBuilder
     private static string MemberKind(string payloadName)
         => string.Equals(payloadName, "FieldsJson", StringComparison.Ordinal)
             ? "FIELD"
-            : "BLOCK";
+            : payloadName == "TablesJson" ? "NATIVE_TABLE" : "BLOCK";
 
     private sealed record SectionSeed(
         string SectionId,

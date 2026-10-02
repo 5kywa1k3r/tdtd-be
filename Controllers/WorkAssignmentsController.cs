@@ -3,6 +3,7 @@ using Microsoft.AspNetCore.Mvc;
 using System.Security.Claims;
 using tdtd_be.Common.Errors;
 using tdtd_be.DTOs.Common;
+using tdtd_be.DTOs.Pickers;
 using tdtd_be.DTOs.WorkAssignments;
 using tdtd_be.Services.WorkAssignments;
 using tdtd_be.Services.WorkAssignments.Handover;
@@ -99,6 +100,8 @@ public sealed class WorkAssignmentsController : ControllerBase
         return CreatedAtAction(nameof(GetById), new { id = rs.Id }, rs);
     }
 
+    // Luồng tổng hợp cũ tạm khóa; giữ action để đối chiếu.
+    [tdtd_be.Services.WorkAssignments.LegacyAggregateDisabled]
     [HttpPatch("work-assignments/{id}/dynamic-form-data-source-rules")]
     public async Task<ActionResult<WorkAssignmentResponse>> UpdateDataSourceRules(
         [FromRoute] string id,
@@ -142,28 +145,18 @@ public sealed class WorkAssignmentsController : ControllerBase
     }
 
     [HttpPost("work-assignments/{id}/deactivate")]
-    public async Task<ActionResult> Deactivate(
-        [FromRoute] string id,
-        CancellationToken ct)
+    public async Task<ActionResult> Deactivate([FromRoute] string id, CancellationToken ct)
     {
-        var actorUserId = GetActorUserId();
-        var ok = await _service.DeactivateAsync(id, actorUserId, ct);
-        if (!ok)
+        if (!await _service.DeactivateAsync(id, GetActorUserId(), ct))
             throw AppExceptionFactory.NotFound(AppErrorCode.WORK_ASSIGNMENT_NOT_FOUND, new { assignmentId = id });
-
         return NoContent();
     }
 
     [HttpPost("work-assignments/{id}/activate")]
-    public async Task<ActionResult> Activate(
-        [FromRoute] string id,
-        CancellationToken ct)
+    public async Task<ActionResult> Activate([FromRoute] string id, CancellationToken ct)
     {
-        var actorUserId = GetActorUserId();
-        var ok = await _service.ActivateAsync(id, actorUserId, ct);
-        if (!ok)
+        if (!await _service.ActivateAsync(id, GetActorUserId(), ct))
             throw AppExceptionFactory.NotFound(AppErrorCode.WORK_ASSIGNMENT_NOT_FOUND, new { assignmentId = id });
-
         return NoContent();
     }
 
@@ -176,6 +169,28 @@ public sealed class WorkAssignmentsController : ControllerBase
         var actorUserId = GetActorUserId();
         var rs = await _handover.HandoverAsync(id, req, actorUserId, ct);
         return Ok(rs);
+    }
+
+    [HttpGet("work-assignments/{id}/handover-unit-scope")]
+    public async Task<ActionResult<WorkAssignmentHandoverUnitScopeDto>> ReadHandoverUnitScope([FromRoute] string id, CancellationToken ct)
+    {
+        Response.Headers.CacheControl = "no-store";
+        return Ok(await _handover.ReadUnitScopeAsync(id, GetActorUserId(), ct));
+    }
+
+    [HttpGet("work-assignments/{id}/handover-candidates")]
+    public async Task<ActionResult<PagedResult<UserPickRow>>> SearchHandoverCandidates(
+        [FromRoute] string id,
+        [FromQuery] string fromAssigneeUserId,
+        [FromQuery] string unitId,
+        [FromQuery] string? q,
+        [FromQuery] int page = 0,
+        [FromQuery] int pageSize = 20,
+        CancellationToken ct = default)
+    {
+        var rows = await _handover.SearchCandidatesAsync(
+            id, fromAssigneeUserId, unitId, q, page, pageSize, GetActorUserId(), ct);
+        return Ok(rows);
     }
 
     [HttpPost("works/{workId}/assignment-handovers")]

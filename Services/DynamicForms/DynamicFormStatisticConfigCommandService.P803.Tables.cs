@@ -21,6 +21,18 @@ public sealed partial class DynamicFormStatisticConfigCommandService
     private static NormalizedMutationBatch NormalizeMutationSyntax(
         DynamicFormStatisticConfigPayload payload)
     {
+        if (payload.NativeStatistics is not null)
+        {
+            if (payload.Fields is not null || payload.Tables is not null || payload.NativeTargets is not null)
+                throw Schema("$.payload", "NATIVE_AND_LEGACY_MUTATIONS_CONFLICT");
+            return new NormalizedMutationBatch(null, null, null, NormalizeNativeStatisticsSyntax(payload.NativeStatistics));
+        }
+        if (payload.NativeTargets is not null)
+        {
+            if (payload.Fields is not null || payload.Tables is not null)
+                throw Schema("$.payload", "NATIVE_AND_LEGACY_MUTATIONS_CONFLICT");
+            return new NormalizedMutationBatch(null, null, NormalizeNativeMutationSyntax(payload.NativeTargets));
+        }
         var hasFields = payload.Fields is { Count: > 0 };
         var hasTables = payload.Tables is { Count: > 0 };
         if (hasFields && hasTables)
@@ -2115,7 +2127,9 @@ public sealed partial class DynamicFormStatisticConfigCommandService
 
     private sealed record NormalizedMutationBatch(
         IReadOnlyList<NormalizedMutation>? Fields,
-        IReadOnlyList<NormalizedTableMutation>? Tables);
+        IReadOnlyList<NormalizedTableMutation>? Tables,
+        IReadOnlyList<DynamicFormNativeStatisticMutation>? NativeTargets = null,
+        DynamicFormNativeStatisticsPayload? NativeStatistics = null);
 
     private sealed record NormalizedTableMutation(
         string BlockId,

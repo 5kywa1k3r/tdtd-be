@@ -79,16 +79,23 @@ public sealed class UnitService : IUnitService
     public async Task<UnitResponse> CreateAsync(CreateUnitRequest req, CancellationToken ct)
     {
         var me = _me.RequireMe();
-        RoleGuard.RequireAdminOrSystemAdmin(me);
+        var scope = await UnitManagementScope.ResolveAsync(_ctx, me, ct);
 
         var now = DateTime.UtcNow;
         var primaryUnitTypeCode = await RequireUnitTypeCodeAsync(req.PrimaryUnitTypeCode, ct);
         var unitTypeCodes = MergeUnitTypeCodes(primaryUnitTypeCode, req.UnitTypeCodes);
+        await EnsureManagedUnitTypesAsync(me, scope, unitTypeCodes, ct);
 
         string? parentId = string.IsNullOrWhiteSpace(req.ParentUnitId)
             ? null
             : req.ParentUnitId.Trim();
         parentId ??= (await FindHiddenRootAsync(ct))?.Id;
+        if (scope is not null)
+        {
+            var scopedParent = await _ctx.Units.Find(x => x.Id == parentId && !x.IsDeleted).FirstOrDefaultAsync(ct);
+            UnitManagementScope.Require(scope, scopedParent?.Code);
+            EnsureManagedParentTypes(scopedParent?.PrimaryUnitTypeCode, unitTypeCodes);
+        }
 
         var symbol = string.IsNullOrWhiteSpace(req.Symbol) ? null : req.Symbol.Trim();
         if (!string.IsNullOrWhiteSpace(symbol))
@@ -151,17 +158,25 @@ public sealed class UnitService : IUnitService
     public async Task<UnitResponse> UpdateAsync(string unitId, UpdateUnitRequest req, CancellationToken ct)
     {
         var me = _me.RequireMe();
-        RoleGuard.RequireAdminOrSystemAdmin(me);
+        var scope = await UnitManagementScope.ResolveAsync(_ctx, me, ct);
 
         var existing = await _ctx.Units
             .Find(x => x.Id == unitId && !x.IsDeleted)
             .FirstOrDefaultAsync(ct)
             ?? throw UnitNotFound(unitId);
 
+        UnitManagementScope.Require(scope, existing.Code, includeSelf: false);
+
         var now = DateTime.UtcNow;
         var primaryUnitTypeCode = await RequireUnitTypeCodeAsync(req.PrimaryUnitTypeCode, ct);
         var unitTypeCodes = MergeUnitTypeCodes(primaryUnitTypeCode, req.UnitTypeCodes);
+        await EnsureManagedUnitTypesAsync(me, scope, unitTypeCodes, ct);
         var symbol = string.IsNullOrWhiteSpace(req.Symbol) ? null : req.Symbol.Trim();
+        if (scope is not null)
+        {
+            var parent = await _ctx.Units.Find(x => x.Id == existing.ParentUnitId && !x.IsDeleted).FirstOrDefaultAsync(ct);
+            EnsureManagedParentTypes(parent?.PrimaryUnitTypeCode, unitTypeCodes);
+        }
 
         if (req.IsVirtual)
             await EnsureNoDirectNormalUsersAsync(unitId, ct);
@@ -229,7 +244,7 @@ public sealed class UnitService : IUnitService
     public async Task DeleteAsync(string unitId, CancellationToken ct)
     {
         var me = _me.RequireMe();
-        RoleGuard.RequireAdminOrSystemAdmin(me);
+        var scope = await UnitManagementScope.ResolveAsync(_ctx, me, ct);
 
         var unit = await _ctx.Units
             .Find(x => x.Id == unitId && !x.IsDeleted)
@@ -237,6 +252,7 @@ public sealed class UnitService : IUnitService
             ?? throw UnitNotFound(unitId);
 
         var prefix = unit.Code;
+        UnitManagementScope.Require(scope, prefix, includeSelf: false);
 
         // 🔹 1. Lấy subtree UnitId (Units << Users nên bước này rẻ)
         var subtreeIds = await _ctx.Units
@@ -680,6 +696,27 @@ public sealed class UnitService : IUnitService
             throw AppExceptionFactory.NotFound(AppErrorCode.UNIT_TYPE_NOT_FOUND, new { code = normalized });
 
         return normalized;
+    }
+
+    private static void EnsureManagedParentTypes(string? parentType, IEnumerable<string> typeCodes)
+    {
+        if (typeCodes.Any(code => !AccountAdministrationRules.ChildUnitTypeAllowed(parentType, code)))
+            throw AppExceptionFactory.Forbidden(AppErrorCode.UNIT_SCOPE_FORBIDDEN,
+                new { reason = "unitTypeOutsideParentHierarchy", parentType, typeCodes });
+    }
+
+    private async Task EnsureManagedUnitTypesAsync(
+        tdtd_be.DTOs.Auth.MeResponse me, string? scope, IEnumerable<string> typeCodes, CancellationToken ct)
+    {
+        if (scope is null) return;
+        if (!RoleGuard.TryGetManagerUnit(me, out var managerUnitId))
+            throw AppExceptionFactory.Forbidden(AppErrorCode.UNIT_SCOPE_FORBIDDEN);
+        var managerUnit = await _ctx.Units.Find(x => x.Id == managerUnitId && !x.IsDeleted && !x.IsVirtual)
+            .FirstOrDefaultAsync(ct);
+        if (managerUnit is null || typeCodes.Any(code =>
+            !AccountAdministrationRules.ChildUnitTypeAllowed(managerUnit.PrimaryUnitTypeCode, code)))
+            throw AppExceptionFactory.Forbidden(AppErrorCode.UNIT_SCOPE_FORBIDDEN,
+                new { reason = "unitTypeOutsideManagerAuthority", managerUnitId, typeCodes });
     }
 
     private static List<string> MergeUnitTypeCodes(string primary, IEnumerable<string>? secondaryCodes)

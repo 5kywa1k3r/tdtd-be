@@ -1,5 +1,6 @@
 using MongoDB.Bson;
 using MongoDB.Bson.Serialization.Attributes;
+using System.Text.Json.Serialization;
 
 namespace tdtd_be.Models.Statistics;
 
@@ -29,6 +30,18 @@ public sealed class WorkReportDirectProjectionPin
 
     [BsonElement("sourcePayloadHash")]
     public string SourcePayloadHash { get; set; } = default!;
+
+    // Native v2 only. Legacy rows keep these fields absent; no inferred timestamp.
+    [BsonElement("sourcePayloadUpdatedAtUtc")]
+    [BsonIgnoreIfNull]
+    [BsonDateTimeOptions(Kind = DateTimeKind.Utc)]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public DateTime? SourcePayloadUpdatedAtUtc { get; set; }
+
+    [BsonElement("nativeSourceOrderHash")]
+    [BsonIgnoreIfNull]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? NativeSourceOrderHash { get; set; }
 
     [BsonElement("sourceLifecycleRevision")]
     public int SourceLifecycleRevision { get; set; }

@@ -2,9 +2,27 @@
 
 namespace tdtd_be.Models;
 
+public sealed class QuarterDayRule
+{
+    [BsonElement("quarter")]
+    public int Quarter { get; set; }
+
+    [BsonElement("days")]
+    public int[] Days { get; set; } = Array.Empty<int>();
+}
+
+public sealed class SemiAnnualDayRule
+{
+    [BsonElement("half")]
+    public int Half { get; set; }
+
+    [BsonElement("days")]
+    public int[] Days { get; set; } = Array.Empty<int>();
+}
+
 public sealed class AssignmentSchedule
 {
-    // WEEKLY / MONTHLY / QUARTERLY / SEMI_ANNUAL
+    // DAILY / WEEKLY / MONTHLY / QUARTERLY / SEMI_ANNUAL
     [BsonElement("cycleType")]
     public string? CycleType { get; set; }
 
@@ -20,14 +38,20 @@ public sealed class AssignmentSchedule
     [BsonElement("monthDays")]
     public List<int>? MonthDays { get; set; }
 
-    // QUARTERLY: map theo quý
-    // Q1: [5, 20], Q2: [10], ...
+    // Legacy offsets repeat in every quarter. Keep for existing assignments.
     [BsonElement("quarterDays")]
     public int[] QuarterDays { get; set; }
 
-    // SEMI_ANNUAL: nửa năm 1 và nửa năm 2
+    // Legacy offsets repeat in both halves. Keep for existing assignments.
     [BsonElement("semiAnnualDays")]
     public int[] SemiAnnualDays { get; set; }
+
+    // New rules retain the selected quarter/half instead of repeating offsets.
+    [BsonElement("quarterDayRules")]
+    public List<QuarterDayRule>? QuarterDayRules { get; set; }
+
+    [BsonElement("semiAnnualDayRules")]
+    public List<SemiAnnualDayRule>? SemiAnnualDayRules { get; set; }
 
     [BsonElement("note")]
     public string? Note { get; set; }

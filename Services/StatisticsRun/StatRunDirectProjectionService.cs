@@ -8,6 +8,7 @@ using tdtd_be.Models.Statistics;
 using tdtd_be.Services.DynamicFlows;
 using tdtd_be.Services.DynamicForms;
 using tdtd_be.Services.WorkAssignmentReports.Runtime;
+using tdtd_be.Services.WorkAssignmentReports.Payloads;
 using tdtd_be.Services.WorkAssignmentReports.Statistics;
 
 namespace tdtd_be.Services.StatisticsRun;
@@ -149,7 +150,8 @@ public sealed partial class StatRunDirectProjectionService : IStatRunDirectProje
         IWorkReportTableStatisticsService tableStatistics,
         IWorkReportLabelStatisticsService labelStatistics,
         IDynamicFlowDefinitionTransactionRunner transactionRunner,
-        ILogger<StatRunDirectProjectionService> logger)
+        ILogger<StatRunDirectProjectionService> logger,
+        IWorkReportPayloadReader? payloadReader = null)
     {
         _ctx = ctx;
         _activation = activation;
@@ -158,6 +160,7 @@ public sealed partial class StatRunDirectProjectionService : IStatRunDirectProje
         _labelStatistics = labelStatistics;
         _transactionRunner = transactionRunner;
         _logger = logger;
+        _nativePayloadReader = payloadReader;
     }
 
     public bool IsCandidateEnabled()
@@ -241,9 +244,7 @@ public sealed partial class StatRunDirectProjectionService : IStatRunDirectProje
         var template = await LoadPinnedTemplateAsync(source.Report, source.Assignment, ct);
         ValidateSourcePeriod(source.Report, source.Period);
         EnsureContributionPolicyWellFormed(source.Report);
-        var trusted = DynamicFormStatisticConfigCommandService
-            .GetP804TrustedPersistedView(template);
-        if (trusted is null)
+        if (!ValidateProjectionStatisticConfig(template))
         {
             return await CompleteZeroWriteAsync(
                 source.Report.Id,
@@ -252,7 +253,6 @@ public sealed partial class StatRunDirectProjectionService : IStatRunDirectProje
                 foundationPin is null,
                 ct);
         }
-        ValidateLockedStatisticConfig(template, trusted);
 
         var members = await ResolveMembershipAsync(
             source.Report.WorkId,
@@ -300,7 +300,7 @@ public sealed partial class StatRunDirectProjectionService : IStatRunDirectProje
             }
         }
 
-        var membershipSignature = BuildMembershipSignature(members);
+        var membershipSignature = BuildProjectionMembershipSignature(members, template);
         if (foundationPin is not null)
         {
             if (reversal is not null)
@@ -424,6 +424,9 @@ public sealed partial class StatRunDirectProjectionService : IStatRunDirectProje
 
         try
         {
+            var native = template.NativeTablesVersion is null ? null
+                : await StageNativeProjectionAsync(source, template, binding, context,
+                    actorUserId, reversal is null, ct);
             var memberReportIds = members
                 .Select(member => member.Report.Id)
                 .OrderBy(reportId => reportId, StringComparer.Ordinal)
@@ -481,12 +484,13 @@ public sealed partial class StatRunDirectProjectionService : IStatRunDirectProje
                     stores = orderedDigests
                 });
 
+            generationHash = NativeStatisticPublicationContract.BindHash(generationHash, native?.Publication);
             await RevalidateBeforePublishAsync(
                 source, template, binding, context, membershipSignature,
                 reversal is null, ct);
             var published = await PublishAsync(
                 claim.Job!, claim.WorkerId!, claim.ClaimToken!, source, context,
-                identity, generationHash, digests, contributionAudit, reversalAudit,
+                identity, generationHash, digests, contributionAudit, reversalAudit, native,
                 members.Count,
                 actorUserId, ct);
             if (identity.LinkLifecycleEntry)
@@ -952,10 +956,8 @@ public sealed partial class StatRunDirectProjectionService : IStatRunDirectProje
         CancellationToken ct)
     {
         var template = await LoadPinnedTemplateAsync(report, assignment, ct);
-        var trusted = DynamicFormStatisticConfigCommandService
-            .GetP804TrustedPersistedView(template)
-            ?? throw Fail("LOCKED_CONFIG_MISSING");
-        ValidateLockedStatisticConfig(template, trusted);
+        if (!ValidateProjectionStatisticConfig(template))
+            throw Fail("LOCKED_CONFIG_MISSING");
         return template;
     }
 
@@ -1183,6 +1185,14 @@ public sealed partial class StatRunDirectProjectionService : IStatRunDirectProje
         var sourceLedgerRevision = FindContributionSourceLifecycleRevision(
             publication,
             source.Report.Id);
+        if (publication.NativeStatisticPublication is not null)
+        {
+            var artifact = await NativeStatisticPublicationContract.ReadAsync(_ctx.Db, publication, ct);
+            var nativeRevision = artifact.Sources.SingleOrDefault(item => item.ReportId == source.Report.Id)?.LifecycleRevision;
+            if (sourceLedgerRevision is not null && nativeRevision is not null && sourceLedgerRevision != nativeRevision)
+                throw Fail("NATIVE_REVERSAL_LEDGER_MISMATCH");
+            sourceLedgerRevision ??= nativeRevision;
+        }
         var pinnedRevisions = await LoadDirectSourceLifecycleRevisionsAsync(
             publication.GenerationId!,
             source.Report.Id,
@@ -1410,6 +1420,14 @@ public sealed partial class StatRunDirectProjectionService : IStatRunDirectProje
             : string.Equals(job.GenerationHash, v1Hash, StringComparison.Ordinal) ||
               string.Equals(job.GenerationHash, v2Hash, StringComparison.Ordinal) ||
               string.Equals(job.GenerationHash, reversalHash, StringComparison.Ordinal);
+        if (job.NativeStatisticPublication is not null)
+        {
+            _ = await NativeStatisticPublicationContract.ReadAsync(_ctx.Db, job, ct);
+            generationHashValid = contributionV2 && string.Equals(job.GenerationHash,
+                NativeStatisticPublicationContract.BindHash(
+                    job.ReversalAudit is null ? v3Hash : reversalHashV2, job.NativeStatisticPublication),
+                StringComparison.Ordinal);
+        }
         if (!generationHashValid)
         {
             throw Fail("CURRENT_PUBLICATION_GENERATION_HASH_MISMATCH");
@@ -2131,7 +2149,7 @@ public sealed partial class StatRunDirectProjectionService : IStatRunDirectProje
             string.Equals(item.Report.Id, observed.Report.Id, StringComparison.Ordinal));
         if (containsSource != expectSourceEffective ||
             !string.Equals(
-                BuildMembershipSignature(members),
+                BuildProjectionMembershipSignature(members, template),
                 expectedMembershipSignature,
                 StringComparison.Ordinal))
         {
@@ -2218,6 +2236,12 @@ public sealed partial class StatRunDirectProjectionService : IStatRunDirectProje
             return;
 
         var prior = current[0];
+        var expectedNativeReversal = prior.NativeStatisticPublication is not null &&
+            job.ReversalAudit is { } inverse && inverse.PriorRunId == prior.Id &&
+            inverse.PriorGenerationId == prior.GenerationId && inverse.PriorGenerationHash == prior.GenerationHash &&
+            inverse.PriorLedgerHash == prior.FlowContributionLedgerHash &&
+            prior.FreshnessState == WorkReportStatisticRebuildJobFreshnessStates.Stale &&
+            prior.StaleReason == "LIFECYCLE_REVERSAL_PENDING";
         if (!string.Equals(
                 prior.Status,
                 WorkReportStatisticRebuildJobStatuses.Completed,
@@ -2226,10 +2250,10 @@ public sealed partial class StatRunDirectProjectionService : IStatRunDirectProje
             prior.DirectPublicationRevision is not > 0 ||
             !StatRunCanonicalJson.IsCanonicalSha256(prior.GenerationId) ||
             !StatRunCanonicalJson.IsCanonicalSha256(prior.GenerationHash) ||
-            !string.Equals(
+            (!expectedNativeReversal && !string.Equals(
                 prior.FreshnessState,
                 WorkReportStatisticRebuildJobFreshnessStates.Fresh,
-                StringComparison.Ordinal) ||
+                StringComparison.Ordinal)) ||
             !string.Equals(
                 prior.StateHash,
                 BuildStateHash(
@@ -2260,7 +2284,8 @@ public sealed partial class StatRunDirectProjectionService : IStatRunDirectProje
                     filter.Eq(value => value.StateHash, prior.StateHash) &
                     filter.Eq(
                         value => value.FreshnessState,
-                        WorkReportStatisticRebuildJobFreshnessStates.Fresh);
+                        prior.FreshnessState) &
+                    filter.Eq(value => value.StaleReason, prior.StaleReason);
         var result = await _ctx.WorkReportStatisticRebuildJobs.UpdateOneAsync(
             session,
             fence,
@@ -2280,6 +2305,7 @@ public sealed partial class StatRunDirectProjectionService : IStatRunDirectProje
         IReadOnlyCollection<WorkReportDirectStoreDigest> digests,
         FlowContributionAudit contributionAudit,
         WorkReportStatisticReversalAudit? reversalAudit,
+        NativeProjectionStage? native,
         int memberCount,
         string actorUserId,
         CancellationToken ct)
@@ -2287,6 +2313,8 @@ public sealed partial class StatRunDirectProjectionService : IStatRunDirectProje
         return await _transactionRunner.ExecuteAsync(
             async (session, transactionCt) =>
             {
+                if (native is not null)
+                    await FenceNativeProjectionAsync(session, native, transactionCt);
                 var now = DateTime.UtcNow;
                 var nextRevision = job.StateRevision + 1;
                 var nextStateHash = BuildStateHash(
@@ -2361,6 +2389,7 @@ public sealed partial class StatRunDirectProjectionService : IStatRunDirectProje
                         .Set(x => x.PublishedAtUtc, now)
                         .Set(x => x.GenerationHash, generationHash)
                         .Set(x => x.DirectStoreDigests, digests.ToList())
+                        .Set(x => x.NativeStatisticPublication, native == null ? null : native.Publication)
                         .Set(x => x.FlowContributionLedgerHash, contributionAudit.LedgerHash)
                         .Set(x => x.FlowContributionReversalBaselineHash, contributionAudit.ReversalBaselineHash)
                         .Set(x => x.FlowContributionSourceCount, contributionAudit.Sources.Count)
@@ -4650,6 +4679,16 @@ public sealed partial class StatRunDirectProjectionService : IStatRunDirectProje
                 reversalAuditHash = reversalAudit.AuditHash,
                 stores = orderedDigests
             });
+        if ((template.NativeTablesVersion is not null) != (job.NativeStatisticPublication is not null))
+            throw Fail("NATIVE_PUBLICATION_REQUIRED");
+        if (job.NativeStatisticPublication is not null)
+        {
+            var artifact = await NativeStatisticPublicationContract.ReadAsync(_ctx.Db, job, ct);
+            var inputs = await ReloadNativeProjectionInputsAsync(source, template, binding, context,
+                actorUserId, reversal is null, ct);
+            NativeStatisticGenerationStage.Revalidate(artifact, inputs.Template, inputs.AuthorizedSources, ct);
+        }
+        generationHash = NativeStatisticPublicationContract.BindHash(generationHash, job.NativeStatisticPublication);
         if (!string.Equals(job.GenerationHash, generationHash, StringComparison.Ordinal))
             throw Fail("COMPLETED_GENERATION_HASH_MISMATCH");
     }

@@ -172,6 +172,18 @@ internal static class DynamicFormRuntimePersistenceContractTests
         AssertMutationOrder(submit, "submit");
         AssertContains(save, "BuildPayloadMutationCommitFilter(entity, payloadCommand)", "save header commit must use CAS filter");
         AssertContains(submit, "BuildPayloadMutationCommitFilter(entity, payloadCommand)", "submit header commit must use CAS filter");
+        AssertContains(save, "persistPayload: async (session, before, token) =>", "save payload write must stay inside the commit transaction");
+        AssertContains(submit, "persistPayload: async (session, before, token) =>", "submit payload write must stay inside the commit transaction");
+
+        var commit = Slice(
+            source,
+            "private async Task<UpdateResult> CommitLegacyLifecycleWithDirectSourceFenceAsync(",
+            "private static WorkReportLifecycleCommand");
+        AssertBefore(commit, "ReservePayloadMutationCommandAsync(", "await persistPayload(session, before, transactionCt)",
+            "payload reservation must precede the transactional payload write");
+        AssertBefore(commit, "await persistPayload(session, before, transactionCt)", "_ctx.WorkAssignmentReports.UpdateOneAsync(",
+            "transactional payload write must precede the header commit");
+        AssertContains(commit, "_dynamicFlowTransactions.ExecuteAsync(", "payload and header writes must share the transaction");
 
         var commitFilter = Slice(
             source,
@@ -335,11 +347,10 @@ internal static class DynamicFormRuntimePersistenceContractTests
             "ReservePayloadMutationCommandAsync(",
             "_payloadWriter.SaveReportPayloadAsync(",
             $"{operation}: CAS reservation before external payload writes");
-        AssertBefore(
-            body,
-            "_payloadWriter.SaveReportPayloadAsync(",
-            commitMarker,
-            $"{operation}: payload write before atomic header commit");
+        AssertContains(body, "_payloadWriter.SaveReportPayloadAsync(",
+            $"{operation}: authoritative payload writer must be used");
+        AssertContains(body, commitMarker,
+            $"{operation}: header commit must use the expected CAS filter");
     }
 
     private static object? ResolvePayloadCommand(

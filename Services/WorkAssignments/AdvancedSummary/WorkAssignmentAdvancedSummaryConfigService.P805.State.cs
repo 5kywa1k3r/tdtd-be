@@ -21,6 +21,8 @@ public sealed partial class WorkAssignmentAdvancedSummaryConfigService
             string sectionId,
             CancellationToken ct)
     {
+        // Tạm khóa luồng tổng hợp cũ; giữ nguyên triển khai bên dưới.
+        LegacyAggregateRetirement.Reject();
         var me = _me.RequireMe();
         var owner = await P805LoadOwnerContextAsync(
             null,
@@ -41,6 +43,8 @@ public sealed partial class WorkAssignmentAdvancedSummaryConfigService
             string sectionId,
             CancellationToken ct)
     {
+        // Tạm khóa luồng tổng hợp cũ; giữ nguyên triển khai bên dưới.
+        LegacyAggregateRetirement.Reject();
         var me = _me.RequireMe();
         var owner = await P805LoadOwnerContextAsync(
             null,
@@ -69,6 +73,8 @@ public sealed partial class WorkAssignmentAdvancedSummaryConfigService
             int versionNo,
             CancellationToken ct)
     {
+        // Tạm khóa luồng tổng hợp cũ; giữ nguyên triển khai bên dưới.
+        LegacyAggregateRetirement.Reject();
         var me = _me.RequireMe();
         var owner = await P805LoadOwnerContextAsync(
             null,
@@ -168,7 +174,8 @@ public sealed partial class WorkAssignmentAdvancedSummaryConfigService
             assignment,
             template,
             section,
-            published);
+            published,
+            me);
     }
 
     private async Task<WorkAssignment>
@@ -647,7 +654,8 @@ public sealed partial class WorkAssignmentAdvancedSummaryConfigService
         WorkAssignment Assignment,
         DynamicFormTemplate Template,
         DynamicFormSectionSnapshot Section,
-        DynamicFormPublishedSchemaSnapshot Published);
+        DynamicFormPublishedSchemaSnapshot Published,
+        MeResponse Actor);
 
     private sealed record P805ConfigState(
         WorkAssignmentAdvancedSummaryConfig? Entity,

@@ -45,17 +45,18 @@ public interface IStatisticReconciliationActualPinnedDirectResultService
 /// published P9-02 generation. Authorization is resolved from server-owned
 /// assignments before work, job, generation, or result existence is inspected.
 /// </summary>
-public sealed class P9DirectResultService :
+public sealed partial class P9DirectResultService :
     IP9DirectResultService,
     IStatisticReconciliationActualPinnedDirectResultService
 {
     private readonly MongoDbContext _ctx;
     private readonly MeAccessor _me;
 
-    public P9DirectResultService(MongoDbContext ctx, MeAccessor me)
+    public P9DirectResultService(MongoDbContext ctx, MeAccessor me, StatRunDirectProjectionService? nativePublicationOwner = null)
     {
         _ctx = ctx;
         _me = me;
+        _nativePublicationOwner = nativePublicationOwner;
     }
 
     public Task<FieldStatisticSummaryResponse> ReadFieldAsync(

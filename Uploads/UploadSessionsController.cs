@@ -40,6 +40,8 @@ public sealed class UploadSessionsController : ControllerBase
     [HttpPost]
     public IActionResult Create([FromBody] CreateUploadSessionReq req)
     {
+        if (string.Equals(req.SourceType?.Trim(), "REPORT_EVIDENCE", StringComparison.OrdinalIgnoreCase))
+            throw AppExceptionFactory.Forbidden(AppErrorCode.AUTH_FORBIDDEN);
         if (string.IsNullOrWhiteSpace(req.FileName))
             throw AppExceptionFactory.BadRequest(AppErrorCode.UPLOAD_FILE_NAME_REQUIRED);
         if (req.Size <= 0)

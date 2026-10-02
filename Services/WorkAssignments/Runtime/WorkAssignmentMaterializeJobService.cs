@@ -323,8 +323,13 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
 
             periodDate = periodDate.Date;
 
+            var actualDueAtUtc = isOnceAssignment
+                ? ResolveOnceDueAtUtc(assignment, work, parent)
+                : item.DueAtUtc;
+            if (isOnceAssignment && !actualDueAtUtc.HasValue)
+                periodDate = assignment.CreatedAtUtc.Date;
             var (periodStart, periodEnd) = isOnceAssignment
-                ? GetOncePeriodRange(assignment, work, parent, item.DueAtUtc)
+                ? GetOncePeriodRange(assignment, work, parent, actualDueAtUtc)
                 : AssignmentScheduleTimeHelper.GetPeriodRange(assignment.Schedule!, periodDate);
 
             while (assigneeIndex < bindings.Count && targets.Count < targetBatchSize)
@@ -340,6 +345,7 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
                 targets.Add(new MaterializeTarget(
                     Binding: binding,
                     DueItem: item,
+                    DueAtUtc: actualDueAtUtc,
                     PeriodDate: periodDate,
                     PeriodStart: periodStart,
                     PeriodEnd: periodEnd));
@@ -490,18 +496,21 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
         var currentBindingById = currentBindings
             .ToDictionary(x => x.Id, x => x, StringComparer.Ordinal);
 
+        // ONCE has one scheduled occurrence per assignee. A changed or newly
+        // supplied deadline must reuse its identity, including legacy date keys.
+        var isOnceAssignment = IsOnceAssignment(assignment);
         var existingPeriods = await _ctx.WorkReportPeriods
             .Find(
                 session,
                 x => x.WorkAssignmentId == assignment.Id &&
                      assigneeUserIds.Contains(x.AssigneeUserId) &&
-                     periodKeys.Contains(x.PeriodKey) &&
+                     (isOnceAssignment || periodKeys.Contains(x.PeriodKey)) &&
                      (x.PeriodKind == null || x.PeriodKind == WorkReportPeriodKind.Scheduled) &&
                      !x.IsDeleted)
             .ToListAsync(ct);
 
         var existingByAssigneeAndKey = existingPeriods
-            .GroupBy(x => PeriodLookupKey(x.AssigneeUserId, x.PeriodKey), StringComparer.Ordinal)
+            .GroupBy(x => PeriodLookupKey(x.AssigneeUserId, isOnceAssignment ? "ONCE" : x.PeriodKey), StringComparer.Ordinal)
             .ToDictionary(
                 x => x.Key,
                 // Corrupt/legacy duplicates fail closed: if any row carries
@@ -545,19 +554,22 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
                 continue;
             }
 
-            var lookupKey = PeriodLookupKey(assigneeUserId, item.PeriodKey);
+            var lookupKey = PeriodLookupKey(assigneeUserId, isOnceAssignment ? "ONCE" : item.PeriodKey);
             var isHistoricalData = WorkAssignmentBackfillPeriodPolicy.IsBackfillHistoricalPeriod(
                 assignment,
                 target.PeriodStart,
                 target.PeriodEnd,
-                item.DueAtUtc,
+                target.DueAtUtc ?? target.PeriodDate,
                 now);
 
             if (!existingByAssigneeAndKey.TryGetValue(lookupKey, out var existed))
             {
+                await tdtd_be.Services.AggregateMapping.Persistence.AggregateHostIntegration.SlotAsync(
+                    _ctx, session, assignment.WorkId, binding.Id, binding.AssignmentType == "ONCE" ? "ONCE" : item.PeriodKey,
+                    "materialize:" + binding.Id + ":" + item.PeriodKey, ct);
                 var status = isHistoricalData
                     ? WorkReportPeriodStatus.Pending
-                    : WorkReportPeriodStatusHelper.ResolveInitialStatus(item.DueAtUtc, now);
+                    : WorkReportPeriodStatusHelper.ResolveInitialStatus(target.DueAtUtc, now);
                 var period = new WorkReportPeriod
                 {
                     Id = ObjectId.GenerateNewId().ToString(),
@@ -582,7 +594,7 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
                     ReportDate = target.PeriodDate,
                     PeriodStart = target.PeriodStart,
                     PeriodEnd = target.PeriodEnd,
-                    DueAtUtc = item.DueAtUtc,
+                    DueAtUtc = target.DueAtUtc,
                     Status = status,
                     IsOverdue = WorkReportPeriodStatusHelper.IsOverdue(status),
                     IsHistoricalData = isHistoricalData,
@@ -600,7 +612,7 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
                     period.WorkAssignmentId,
                     period.AssigneeUserId,
                     period.PeriodKey,
-                    item.DueAtUtc,
+                    target.DueAtUtc,
                     status,
                     !isHistoricalData && WorkReportPeriodStatusHelper.ShouldKeepQueueActive(status),
                     now));
@@ -612,7 +624,9 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
             // P9 lifecycle owns these rows. A legacy materializer must not
             // rewrite their status, visibility, time window, form pin, or
             // queue state even when its pre-read saw an older Pending row.
-            if (HasLifecycleAuthority(existed))
+            if (HasLifecycleAuthority(existed) ||
+                (assignment.DeadlineRetainedPeriodsBeforeUtc.HasValue &&
+                 existed.CreatedAtUtc <= assignment.DeadlineRetainedPeriodsBeforeUtc.Value))
             {
                 skipped++;
                 continue;
@@ -627,7 +641,7 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
             {
                 updatedStatus = updatedIsHistoricalData
                     ? WorkReportPeriodStatus.Pending
-                    : WorkReportPeriodStatusHelper.ResolveInitialStatus(item.DueAtUtc, now);
+                    : WorkReportPeriodStatusHelper.ResolveInitialStatus(target.DueAtUtc, now);
                 updatedIsOverdue = WorkReportPeriodStatusHelper.IsOverdue(updatedStatus);
             }
 
@@ -636,7 +650,7 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
             if (IsExistingPeriodCurrent(
                     existed,
                     binding.Id!,
-                    item.DueAtUtc,
+                    target.DueAtUtc,
                     target.PeriodStart,
                     target.PeriodEnd,
                     updatedStatus,
@@ -648,6 +662,9 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
                 continue;
             }
 
+            await tdtd_be.Services.AggregateMapping.Persistence.AggregateHostIntegration.SlotAsync(
+                _ctx, session, assignment.WorkId, binding.Id, binding.AssignmentType == "ONCE" ? "ONCE" : item.PeriodKey,
+                "materialize:" + existed.Id + ":" + existed.UpdatedAtUtc.Ticks, ct);
             var periodFilter = Builders<WorkReportPeriod>.Filter;
             periodWrites.Add(new UpdateOneModel<WorkReportPeriod>(
                 periodFilter.Eq(x => x.Id, existed.Id) &
@@ -667,10 +684,10 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
                 Builders<WorkReportPeriod>.Update
                     .Set(x => x.WorkTemplateAssigneeId, binding.Id!)
                     .Set(x => x.IsActive, updatedPeriodIsActive)
-                    .Set(x => x.DueAtUtc, item.DueAtUtc)
+                    .Set(x => x.DueAtUtc, target.DueAtUtc)
                     .Set(x => x.PeriodInstanceKey, string.IsNullOrWhiteSpace(existed.PeriodInstanceKey) ? existed.PeriodKey : existed.PeriodInstanceKey)
                     .Set(x => x.PeriodKind, WorkReportPeriodKind.Scheduled)
-                    .Set(x => x.ReportDate, target.PeriodDate)
+                    .Set(x => x.ReportDate, isOnceAssignment ? existed.ReportDate : target.PeriodDate)
                     .Set(x => x.PeriodStart, target.PeriodStart)
                     .Set(x => x.PeriodEnd, target.PeriodEnd)
                     .Set(x => x.Status, updatedStatus)
@@ -684,7 +701,7 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
                 existed.WorkAssignmentId,
                 existed.AssigneeUserId,
                 existed.PeriodKey,
-                item.DueAtUtc,
+                target.DueAtUtc,
                 updatedStatus,
                 !updatedIsHistoricalData && WorkReportPeriodStatusHelper.ShouldKeepQueueActive(updatedStatus),
                 now));
@@ -816,7 +833,7 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
         string workAssignmentId,
         string assigneeUserId,
         string periodKey,
-        DateTime dueAtUtc,
+        DateTime? dueAtUtc,
         WorkReportPeriodStatus status,
         bool isActive,
         DateTime now)
@@ -834,7 +851,7 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
                 .Set(x => x.AssigneeUserId, assigneeUserId)
                 .Set(x => x.PeriodKey, periodKey)
                 .Set(x => x.DueAtUtc, dueAtUtc)
-                .Set(x => x.NextScanAtUtc, dueAtUtc)
+                .Set(x => x.NextScanAtUtc, dueAtUtc ?? now.AddHours(6))
                 .Set(x => x.IsActive, isActive)
                 .Set(x => x.LastObservedPeriodStatus, (int)status)
                 .Set(x => x.UpdatedAtUtc, now)
@@ -867,9 +884,13 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
     {
         if (IsOnceAssignment(assignment))
         {
+            var due = BuildOnceDueItem(assignment, work, parent);
+            var boundary = WorkAssignmentDatePolicy.ResolveEffectiveDueDate(assignment, work, parent);
+            if (boundary.HasValue && due.DueAtUtc.Date > boundary.Value.Date)
+                return new List<AssignmentScheduleDueItem>();
             return new List<AssignmentScheduleDueItem>
             {
-                BuildOnceDueItem(assignment, work, parent)
+                due
             };
         }
 
@@ -935,7 +956,7 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
     private static bool IsExistingPeriodCurrent(
         WorkReportPeriod existed,
         string bindingId,
-        DateTime dueAtUtc,
+        DateTime? dueAtUtc,
         DateTime? periodStart,
         DateTime? periodEnd,
         WorkReportPeriodStatus status,
@@ -961,7 +982,9 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
         Work work,
         WorkAssignment? parent)
     {
-        var dueAtUtc = NormalizeOnceDueAtUtc(assignment, work, parent);
+        // The date key is only an occurrence anchor, never a fallback deadline.
+        var dueAtUtc = ResolveOnceDueAtUtc(assignment, work, parent)
+            ?? assignment.CreatedAtUtc.Date;
         var periodKey = dueAtUtc.ToString("yyyyMMdd", CultureInfo.InvariantCulture);
 
         return new AssignmentScheduleDueItem
@@ -971,7 +994,7 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
         };
     }
 
-    private static DateTime NormalizeOnceDueAtUtc(
+    private static DateTime? ResolveOnceDueAtUtc(
         WorkAssignment assignment,
         Work work,
         WorkAssignment? parent)
@@ -979,25 +1002,19 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
         if (assignment.DueAtUtc.HasValue)
             return assignment.DueAtUtc.Value;
 
-        // fallback chỉ để chống dữ liệu cũ, không nên còn được dùng cho create mới
-        var dueDate = WorkAssignmentDatePolicy.ResolveEffectiveCompletedDate(assignment, work, parent)
-            ?? WorkAssignmentDatePolicy.ResolveEffectiveStartDate(assignment, DateTime.UtcNow);
-
-        return dueDate == default
-            ? DateTime.UtcNow.Date
-            : dueDate;
+        return WorkAssignmentDatePolicy.ResolveEffectiveDueDate(assignment, work, parent);
     }
 
-    private static (DateTime PeriodStart, DateTime PeriodEnd) GetOncePeriodRange(
+    private static (DateTime PeriodStart, DateTime? PeriodEnd) GetOncePeriodRange(
         WorkAssignment assignment,
         Work work,
         WorkAssignment? parent,
-        DateTime dueAtUtc)
+        DateTime? dueAtUtc)
     {
         var periodStart = WorkAssignmentDatePolicy.ResolveEffectiveStartDate(assignment, DateTime.UtcNow);
 
         var periodEnd = WorkAssignmentDatePolicy.ResolveEffectiveCompletedDate(assignment, work, parent)
-            ?? dueAtUtc.Date;
+            ?? dueAtUtc?.Date;
         if (periodEnd < periodStart)
             periodEnd = periodStart;
 
@@ -1204,6 +1221,7 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
     private sealed record MaterializeTarget(
         WorkTemplateAssignee Binding,
         AssignmentScheduleDueItem DueItem,
+        DateTime? DueAtUtc,
         DateTime PeriodDate,
         DateTime? PeriodStart,
         DateTime? PeriodEnd);

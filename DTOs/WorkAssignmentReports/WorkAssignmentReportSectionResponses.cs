@@ -1,3 +1,5 @@
+using System.Text.Json.Serialization;
+
 namespace tdtd_be.DTOs.WorkAssignmentReports;
 
 public sealed class WorkAssignmentReportSectionSummaryRow
@@ -7,6 +9,8 @@ public sealed class WorkAssignmentReportSectionSummaryRow
     public int SectionOrder { get; set; }
     public int FieldCount { get; set; }
     public int BlockCount { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public int NativeTableCount { get; set; }
     public bool HasData { get; set; }
     public DateTime? LastUpdatedAtUtc { get; set; }
     public string? LastUpdatedByUserId { get; set; }
@@ -30,6 +34,8 @@ public sealed class WorkAssignmentReportSectionDetailResponse
     public int SectionOrder { get; set; }
     public int FieldCount { get; set; }
     public int BlockCount { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public int NativeTableCount { get; set; }
     public bool HasData { get; set; }
     public DateTime? LastUpdatedAtUtc { get; set; }
     public string? LastUpdatedByUserId { get; set; }
@@ -51,6 +57,10 @@ public sealed class WorkAssignmentReportSectionDetailResponse
     public string? DynamicFormSchemaHash { get; set; }
     public string FieldsJson { get; set; } = "[]";
     public string BlocksJson { get; set; } = "[]";
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public int? NativeTablesVersion { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? NativeTablesJson { get; set; }
     public string? FieldValuesJson { get; set; }
     public string? TableValuesJson { get; set; }
 }

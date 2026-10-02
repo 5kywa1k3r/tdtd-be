@@ -1,4 +1,4 @@
-﻿using MongoDB.Bson;
+using MongoDB.Bson;
 using MongoDB.Driver;
 using System.Security.Cryptography;
 using System.Text;
@@ -347,35 +347,7 @@ public sealed class DashboardQueryService : IDashboardQueryService
             .ToListAsync(ct);
     }
 
-    private FilterDefinition<Work> BuildWorkTimeFilter(DashboardNormalizedRange range)
-    {
-        var fb = Builders<Work>.Filter;
-
-        var overlapByStartEnd = fb.And(
-            fb.Ne(x => x.StartDate, null),
-            fb.Lte(x => x.StartDate, range.ToDate),
-            fb.Or(
-                fb.Eq(x => x.EndDate, null),
-                fb.Gte(x => x.EndDate, range.FromDate)
-            )
-        );
-
-        var byDueDate = fb.And(
-            fb.Ne(x => x.DueDate, null),
-            fb.Gte(x => x.DueDate, range.FromDate),
-            fb.Lte(x => x.DueDate, range.ToDate)
-        );
-
-        var fallbackUpdated = fb.And(
-            fb.Eq(x => x.StartDate, null),
-            fb.Eq(x => x.EndDate, null),
-            fb.Eq(x => x.DueDate, null),
-            fb.Gte(x => x.UpdatedAtUtc, range.FromUtc),
-            fb.Lte(x => x.UpdatedAtUtc, range.ToUtc)
-        );
-
-        return fb.Or(overlapByStartEnd, byDueDate, fallbackUpdated);
-    }
+    private FilterDefinition<Work> BuildWorkTimeFilter(DashboardNormalizedRange range) => tdtd_be.Services.Works.WorkDeadlineReadQuery.Overlaps(range.FromDate, range.ToDate, range.FromUtc, range.ToUtc);
 
     private FilterDefinition<WorkReportPeriod> BuildPeriodTimeFilter(DashboardNormalizedRange range)
     {
@@ -407,7 +379,7 @@ public sealed class DashboardQueryService : IDashboardQueryService
             Status = (int)x.Status,
             StartDate = x.StartDate,
             EndDate = x.EndDate,
-            DueDate = x.DueDate,
+            DueDate = tdtd_be.Services.Works.WorkDatePolicy.EffectiveDueDate(x),
             UpdatedAtUtc = x.UpdatedAtUtc,
 
             ActiveRootAssignmentCount = x.ActiveRootAssignmentCount,
@@ -434,7 +406,7 @@ public sealed class DashboardQueryService : IDashboardQueryService
             Status = (int)x.Status,
             StartDate = x.StartDate,
             EndDate = x.EndDate,
-            DueDate = x.DueDate,
+            DueDate = tdtd_be.Services.Works.WorkDatePolicy.EffectiveDueDate(x),
             UpdatedAtUtc = x.UpdatedAtUtc,
 
             ActiveRootAssignmentCount = filteredRoots.Count,

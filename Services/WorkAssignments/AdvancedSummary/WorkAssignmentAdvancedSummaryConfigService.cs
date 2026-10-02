@@ -79,6 +79,8 @@ public sealed partial class WorkAssignmentAdvancedSummaryConfigService : IWorkAs
         string actorUserId,
         CancellationToken ct)
     {
+        // Tạm khóa luồng tổng hợp cũ; giữ nguyên triển khai bên dưới.
+        LegacyAggregateRetirement.Reject();
         EnsureActor(actorUserId);
         var context = await LoadContextAsync(assignmentId, dynamicFormTemplateId, sectionId, actorUserId, ct);
         var lockedCount = await CountLockedAsync(context.Scope.Id, context.Template.Id, context.Section.Id, ct);
@@ -109,6 +111,8 @@ public sealed partial class WorkAssignmentAdvancedSummaryConfigService : IWorkAs
         string actorUserId,
         CancellationToken ct)
     {
+        // Tạm khóa luồng tổng hợp cũ; giữ nguyên triển khai bên dưới.
+        LegacyAggregateRetirement.Reject();
         throw BuildP805LegacyMutationBlocked();
         EnsureActor(actorUserId);
         var context = await LoadContextAsync(assignmentId, dynamicFormTemplateId, sectionId, actorUserId, ct);
@@ -185,6 +189,8 @@ public sealed partial class WorkAssignmentAdvancedSummaryConfigService : IWorkAs
         string actorUserId,
         CancellationToken ct)
     {
+        // Tạm khóa luồng tổng hợp cũ; giữ nguyên triển khai bên dưới.
+        LegacyAggregateRetirement.Reject();
         throw BuildP805LegacyMutationBlocked();
         EnsureActor(actorUserId);
         configId = configId?.Trim() ?? string.Empty;
@@ -277,6 +283,8 @@ public sealed partial class WorkAssignmentAdvancedSummaryConfigService : IWorkAs
         string actorUserId,
         CancellationToken ct)
     {
+        // Tạm khóa luồng tổng hợp cũ; giữ nguyên triển khai bên dưới.
+        LegacyAggregateRetirement.Reject();
         _candidateActivation.RequireCapability(
             StatRunCapabilities.AdvancedSummary,
             StatRunRouteRegistry.AdvancedBuild);
@@ -337,6 +345,8 @@ public sealed partial class WorkAssignmentAdvancedSummaryConfigService : IWorkAs
         string correlationId,
         CancellationToken ct)
     {
+        // Job/hook cũ dừng trước mọi I/O, không tạo vòng retry hay thay dữ liệu lịch sử.
+        if (LegacyAggregateRetirement.IsDisabled) return;
         _candidateActivation.RequireCapability(
             StatRunCapabilities.AdvancedSummary,
             StatRunRouteRegistry.AdvancedBuild);
@@ -453,6 +463,10 @@ public sealed partial class WorkAssignmentAdvancedSummaryConfigService : IWorkAs
                 AppErrorCode.DYNAMIC_FORM_TEMPLATE_NOT_FOUND,
                 new { dynamicFormTemplateId });
 
+        // The legacy preview/config DTO only knows fields. Native metadata must
+        // use P805, then a native result consumer; never silently drop Tables.
+        if (template.NativeTablesVersion is not null)
+            throw P805Schema("$.template", "ADVANCED_NATIVE_RESULT_CONSUMER_REQUIRED");
         var section = ResolveSection(template, sectionId);
         return new AdvancedSummaryContext(scope, template, section);
     }

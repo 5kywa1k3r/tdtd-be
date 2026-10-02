@@ -22,12 +22,17 @@ public sealed class ManagementAccountConvention
 
     public string BuildUnitManagerUsername(Unit unit)
     {
-        return UnitManagerPrefix + BuildSymbolKey(unit);
+        if (string.Equals(unit.PrimaryUnitTypeCode, "TINH", StringComparison.OrdinalIgnoreCase))
+            return "cat";
+        var key = BuildSymbolKey(unit);
+        if (key.StartsWith("cax_", StringComparison.Ordinal) || key.StartsWith("cap_", StringComparison.Ordinal))
+            return key[..4] + key[4..].Replace("_", "");
+        return key;
     }
 
     public string BuildLevelManagerUsername(Unit unit)
     {
-        return LevelManagerPrefix + BuildSymbolKey(unit);
+        return "admin_lv" + unit.Level.ToString(System.Globalization.CultureInfo.InvariantCulture);
     }
 
     public string NormalizeUsername(string username) => username.Trim().ToLowerInvariant();
@@ -127,9 +132,9 @@ public sealed class ManagementAccountProvisioner : IManagementAccountProvisioner
 
         result.Add(await EnsureUserAsync(
             username: _convention.BuildLevelManagerUsername(unit),
-            fullName: $"Quản trị cấp {unit.Level} - {unit.ShortName ?? unit.FullName}",
+            fullName: $"Quản trị cấp {unit.Level}",
             accountKind: ManagementAccountKind.LevelManager,
-            unitId: unit.Id,
+            unitId: null,
             roles: new List<string> { Roles.MANAGER_LEVEL },
             legacyUsernames: Array.Empty<string>(),
             byUserId,

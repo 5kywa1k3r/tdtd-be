@@ -4,6 +4,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using tdtd_be.Common.Errors;
 using tdtd_be.DTOs.DynamicForms;
 using tdtd_be.Models;
 
@@ -30,7 +31,7 @@ public static class DynamicFormPublishedSchemaSnapshotBuilder
         {
             throw;
         }
-        catch (Exception ex) when (ex is JsonException or ArgumentException or NotSupportedException)
+        catch (Exception ex) when (ex is JsonException or ArgumentException or NotSupportedException or AppException)
         {
             // All published-integrity callers intentionally map InvalidOperationException
             // to the stable 409 contract. Do not let malformed legacy/live JSON escape as
@@ -49,6 +50,10 @@ public static class DynamicFormPublishedSchemaSnapshotBuilder
             template.PublishedSchemaHash);
         using var snapshotDocument = JsonDocument.Parse(snapshot.Json);
         var snapshotRoot = snapshotDocument.RootElement;
+        var nativeVersion = ReadNativeVersion(snapshotRoot);
+        if (nativeVersion != template.NativeTablesVersion
+            || nativeVersion.HasValue != (template.TablesJson is not null))
+            throw new InvalidOperationException("Published native Table format differs from live definition.");
         var snapshotSchemaVersion = snapshotRoot.GetProperty("schemaVersion").GetInt32();
         var liveSchemaVersion = Math.Max(1, template.SchemaVersion);
         if (snapshotSchemaVersion != liveSchemaVersion)
@@ -69,7 +74,9 @@ public static class DynamicFormPublishedSchemaSnapshotBuilder
             template.SectionsJson,
             template.FieldsJson,
             template.ExcelBlockJson,
-            effectiveBlocksJson);
+            effectiveBlocksJson,
+            template.NativeTablesVersion,
+            template.TablesJson);
 
         EnsureStructuralMatch(
             "sections",
@@ -90,6 +97,14 @@ public static class DynamicFormPublishedSchemaSnapshotBuilder
             stripStatisticConfig: true,
             removeFieldStatisticLabels: false);
 
+        if (nativeVersion.HasValue)
+        {
+            // P8 configuration versions can change methods/labels independently.
+            // IDs, axes, type rules and options must still match the frozen Form.
+            if (DynamicFormNativeStatisticState.StructureJson(ReadSnapshotArray(snapshotRoot, "tables"))
+                != DynamicFormNativeStatisticState.StructureJson(template.TablesJson!))
+                throw new InvalidOperationException("Published native Table structure differs from its immutable snapshot.");
+        }
         return snapshot;
     }
 
@@ -160,7 +175,9 @@ public static class DynamicFormPublishedSchemaSnapshotBuilder
                 schemaVersion,
                 ReadSnapshotArray(root, "sections"),
                 ReadSnapshotArray(root, "fields"),
-                ReadSnapshotArray(root, "blocks"));
+                ReadSnapshotArray(root, "blocks"),
+                ReadNativeVersion(root),
+                root.TryGetProperty("tables", out _) ? ReadSnapshotArray(root, "tables") : null);
         }
         catch (JsonException ex)
         {
@@ -197,18 +214,24 @@ public static class DynamicFormPublishedSchemaSnapshotBuilder
             Math.Max(1, template.SchemaVersion),
             template.SectionsJson,
             template.FieldsJson,
-            ResolveEffectiveBlocksJson(template.BlocksJson, template.ExcelBlockJson));
+            ResolveEffectiveBlocksJson(template.BlocksJson, template.ExcelBlockJson),
+            template.NativeTablesVersion,
+            template.TablesJson);
     }
 
     public static DynamicFormPublishedSchemaSnapshot Build(
         int schemaVersion,
         string sectionsJson,
         string fieldsJson,
-        string blocksJson)
+        string blocksJson,
+        int? nativeTablesVersion = null,
+        string? tablesJson = null)
     {
         using var sections = ParseArray(sectionsJson, nameof(sectionsJson));
         using var fields = ParseArray(fieldsJson, nameof(fieldsJson));
         using var blocks = ParseArray(blocksJson, nameof(blocksJson));
+        ValidateNativeSnapshot(nativeTablesVersion, tablesJson, sectionsJson, fieldsJson, blocksJson);
+        using var tables = tablesJson is null ? null : ParseArray(tablesJson, nameof(tablesJson));
 
         var buffer = new ArrayBufferWriter<byte>();
         using (var writer = new Utf8JsonWriter(buffer, new JsonWriterOptions { Indented = false }))
@@ -221,6 +244,13 @@ public static class DynamicFormPublishedSchemaSnapshotBuilder
             WriteCanonical(writer, fields.RootElement);
             writer.WritePropertyName("blocks");
             WriteCanonical(writer, blocks.RootElement);
+            // Omit both properties for legacy snapshots: existing canonical bytes/hash stay unchanged.
+            if (nativeTablesVersion.HasValue)
+            {
+                writer.WriteNumber("nativeTablesVersion", nativeTablesVersion.Value);
+                writer.WritePropertyName("tables");
+                WriteCanonical(writer, tables!.RootElement);
+            }
             writer.WriteEndObject();
             writer.Flush();
         }
@@ -229,6 +259,35 @@ public static class DynamicFormPublishedSchemaSnapshotBuilder
         var json = Encoding.UTF8.GetString(bytes);
         var hash = Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
         return new DynamicFormPublishedSchemaSnapshot(json, hash);
+    }
+
+    private static int? ReadNativeVersion(JsonElement root)
+    {
+        var hasVersion = root.TryGetProperty("nativeTablesVersion", out var value);
+        var hasTables = root.TryGetProperty("tables", out _);
+        if (!hasVersion && !hasTables) return null;
+        if (!hasVersion || !hasTables || !value.TryGetInt32(out var version)
+            || version is not (DynamicFormNativeTableDefinition.Version or DynamicFormNativeTableDefinition.ListVersion))
+            throw new InvalidOperationException("Published native Table format is missing or unsupported.");
+        return version;
+    }
+
+    private static void ValidateNativeSnapshot(int? version, string? json,
+        string sections, string fields, string blocks)
+    {
+        try
+        {
+            var tables = DynamicFormNativeTableDefinition.ReadStored(version, json);
+            if (tables is not null)
+            {
+                DynamicFormNativeTableDefinition.Validate(tables, sections, fields, blocks, version);
+                DynamicFormNativeStatisticState.ValidateSemantics(tables, sections, fields, blocks);
+            }
+        }
+        catch (Exception ex) when (ex is JsonException or AppException or ArgumentException)
+        {
+            throw new InvalidOperationException("Native Table snapshot cannot preserve the definition safely.", ex);
+        }
     }
 
     private static JsonDocument ParseArray(string? json, string name)

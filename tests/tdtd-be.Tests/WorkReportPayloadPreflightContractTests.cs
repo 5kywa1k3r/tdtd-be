@@ -1,6 +1,8 @@
+using System.Text.Json;
 using System.Text.Json.Nodes;
 using MongoDB.Bson;
 using tdtd_be.Common.Errors;
+using tdtd_be.DTOs.WorkAssignmentReports;
 using tdtd_be.Models;
 using tdtd_be.Services.WorkAssignmentReports.Payloads;
 
@@ -16,6 +18,39 @@ internal static class WorkReportPayloadPreflightContractTests
         OversizedLaterBlockFailsDuringPurePreflight();
         InvalidMongoIdentityFailsDuringPurePreflight();
         SavePreflightsAllDocumentsBeforeFirstMongoWrite();
+        LegacyAdvancedSettingsAreNotInReportCommandJson();
+    }
+
+    private static void LegacyAdvancedSettingsAreNotInReportCommandJson()
+    {
+        const string json = """
+            {
+              "values1D": [],
+              "dataOrigin": "AUTO_SUMMARY",
+              "cumulativeContributionMode": "EXCLUDE",
+              "cumulativeContributionPolicyJson": "{}",
+              "summarySourceJson": "{}"
+            }
+            """;
+        var options = new JsonSerializerOptions(JsonSerializerDefaults.Web);
+        var save = JsonSerializer.Deserialize<SaveWorkAssignmentReportDraftRequest>(json, options)!;
+        var patch = JsonSerializer.Deserialize<SaveWorkAssignmentReportDraftPatchRequest>(json, options)!;
+        var submit = JsonSerializer.Deserialize<SubmitWorkAssignmentReportRequest>(json, options)!;
+
+        AssertEqual<string?>(null, save.DataOrigin, "save must ignore legacy data origin JSON");
+        AssertEqual<string?>(null, patch.CumulativeContributionMode, "patch must ignore legacy cumulative JSON");
+        AssertEqual<string?>(null, submit.SummarySourceJson, "submit must ignore legacy summary source JSON");
+
+        var serialized = JsonSerializer.Serialize(new SaveWorkAssignmentReportDraftRequest
+        {
+            DataOrigin = "AUTO_SUMMARY",
+            CumulativeContributionMode = "EXCLUDE",
+            CumulativeContributionPolicyJson = "{}",
+            SummarySourceJson = "{}"
+        }, options);
+        AssertNotContains(serialized, "dataOrigin", "save JSON contract must omit legacy Advanced settings");
+        AssertNotContains(serialized, "cumulativeContribution", "save JSON contract must omit legacy cumulative settings");
+        AssertNotContains(serialized, "summarySourceJson", "save JSON contract must omit legacy summary source");
     }
 
     private static void PurePreflightKeepsRevisionContractWithoutMutatingReport()

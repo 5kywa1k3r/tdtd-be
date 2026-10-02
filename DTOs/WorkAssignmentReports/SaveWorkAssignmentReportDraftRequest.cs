@@ -35,25 +35,15 @@ public sealed class SaveWorkAssignmentReportDraftRequest
     /// </summary>
     public string? TableValuesJson { get; set; }
 
-    /// <summary>
-    /// Nguồn dữ liệu của report: nhập tay, tự tổng hợp, copy tổng hợp, hoặc mapping một phần.
-    /// Nếu đổi nguồn mà không gửi CumulativeContributionMode, BE tự áp default theo nguồn.
-    /// </summary>
+    // Legacy Advanced editor contract is paused. Keep these CLR properties for
+    // internal aggregate compatibility, but do not expose them on report save JSON.
+    [System.Text.Json.Serialization.JsonIgnore]
     public string? DataOrigin { get; set; }
-
-    /// <summary>
-    /// INCLUDE: report này được tính vào thống kê/lũy kế; EXCLUDE: bỏ khỏi thống kê/lũy kế.
-    /// </summary>
+    [System.Text.Json.Serialization.JsonIgnore]
     public string? CumulativeContributionMode { get; set; }
-
-    /// <summary>
-    /// JSON policy override theo field/cell/metric cho luồng partial mapping.
-    /// </summary>
+    [System.Text.Json.Serialization.JsonIgnore]
     public string? CumulativeContributionPolicyJson { get; set; }
-
-    /// <summary>
-    /// JSON mô tả nguồn tổng hợp/mapping để audit và mở lại draft.
-    /// </summary>
+    [System.Text.Json.Serialization.JsonIgnore]
     public string? SummarySourceJson { get; set; }
 
     public DateTime? CompletedDate { get; set; }

@@ -1,5 +1,7 @@
 ﻿using MongoDB.Driver;
 using Microsoft.Extensions.Logging;
+using tdtd_be.Services.AggregateMapping;
+using tdtd_be.Services.AggregateMapping.Persistence;
 using MongoDB.Bson;
 using System.Globalization;
 using System.Text.Json;
@@ -288,7 +290,7 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
             .FirstOrDefaultAsync(ct)
             ?? throw ReportAssignmentNotFound(workAssignmentId);
 
-        var isOwner = assignment.CreatedByUserId == actorUserId;
+        var isOwner = WorkAssignmentCurrentAuthority.IsReviewer(assignment, actorUserId);
         var isAssignee = false;
 
         var binding = await _ctx.WorkTemplateAssignees
@@ -386,7 +388,7 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
             .FirstOrDefaultAsync(ct)
             ?? throw ReportAssignmentNotFound(report.WorkAssignmentId);
 
-        var isOwner = assignment.CreatedByUserId == actorUserId;
+        var isOwner = WorkAssignmentCurrentAuthority.IsReviewer(assignment, actorUserId);
         var isAssignee = !string.IsNullOrWhiteSpace(report.AssigneeUserId) && report.AssigneeUserId == actorUserId;
 
         if (!isAssignee)
@@ -634,7 +636,8 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
                 await TryReconcileCommittedLifecycleProjectionAsync(existed.Id);
                 await _docRoleReadModelProjection.RebuildReportPeriodAsync(period.Id, actorUserId, ct);
                 await _docRoleReadModelFreshness.EnsureReportPeriodFreshAsync(period, existed, actorUserId, ct);
-                return await MapToResponseAsync(existed, period, actorUserId, ct);
+                // Reconciliation updates persisted outbox state, not the previously loaded object.
+                return await MapPayloadCommandReplayResponseAsync(existed.Id, actorUserId, ct);
             }
         }
 
@@ -656,7 +659,8 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
         await TryReconcileCommittedLifecycleProjectionAsync(created.Id);
         await _docRoleReadModelFreshness.EnsureReportPeriodFreshAsync(period, created, actorUserId, ct);
 
-        return await MapToResponseAsync(created, period, actorUserId, ct);
+        // Return the committed projection state rather than the pre-reconciliation draft.
+        return await MapPayloadCommandReplayResponseAsync(created.Id, actorUserId, ct);
     }
 
     public async Task<WorkAssignmentReportResponse> InitDraftAsync(
@@ -816,6 +820,9 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
             actorUserId,
             IsDynamicFlowReportAfterSubmit(entity),
             ct);
+        if (dynamicFlowPermissions is not null && templateSection?.NativeTablesJson is not null)
+            throw AppExceptionFactory.BadRequest(AppErrorCode.WORK_ASSIGNMENT_REPORT_VALUES_INVALID,
+                new { reportId = id, sectionId = section.SectionId, reason = "NATIVE_SECTION_FLOW_CONTRACT_REQUIRED" });
         var readablePayload = dynamicFlowPermissions is null
             ? new DynamicFlowReportReadablePayload(null, section.FieldValuesJson, section.TableValuesJson)
             : DynamicFlowReportPermissionEnforcer.ApplyReadRestrictions(
@@ -833,6 +840,7 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
             SectionOrder = section.SectionOrder,
             FieldCount = section.FieldCount,
             BlockCount = section.BlockCount,
+            NativeTableCount = section.NativeTableCount,
             HasData = section.HasData,
             LastUpdatedAtUtc = section.LastUpdatedAtUtc,
             LastUpdatedByUserId = section.LastUpdatedByUserId,
@@ -859,6 +867,8 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
             DynamicFormSchemaHash = section.DynamicFormSchemaHash,
             FieldsJson = templateSection?.FieldsJson ?? "[]",
             BlocksJson = templateSection?.BlocksJson ?? "[]",
+            NativeTablesVersion = templateSection?.NativeTablesJson is null ? null : 1,
+            NativeTablesJson = templateSection?.NativeTablesJson,
             FieldValuesJson = readablePayload.FieldValuesJson,
             TableValuesJson = readablePayload.TableValuesJson
         };
@@ -895,6 +905,7 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
             SectionOrder = section.SectionOrder,
             FieldCount = section.FieldCount,
             BlockCount = section.BlockCount,
+            NativeTableCount = section.NativeTableCount,
             HasData = section.HasData,
             LastUpdatedAtUtc = section.LastUpdatedAtUtc,
             LastUpdatedByUserId = section.LastUpdatedByUserId,
@@ -999,7 +1010,7 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
             .FirstOrDefaultAsync(ct)
             ?? throw ReportAssignmentNotFound(workAssignmentId);
 
-        var isOwner = assignment.CreatedByUserId == actorUserId;
+        var isOwner = WorkAssignmentCurrentAuthority.IsReviewer(assignment, actorUserId);
         var isAssignee = await _ctx.WorkTemplateAssignees
             .Find(x =>
                 x.WorkAssignmentId == workAssignmentId &&
@@ -1315,7 +1326,7 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
         var nextAggregateSourceUpdatedAtUtc = nextAggregateSources.IsAggregate
             ? (acceptsReportDataPayload ? now : entity.AggregateSourceUpdatedAtUtc)
             : null;
-        _ = WorkReportPayloadService.PreflightReportPayload(
+        var payloadResult = WorkReportPayloadService.PreflightReportPayload(
             entity,
             values1DJson,
             fieldValuesJson,
@@ -1323,22 +1334,12 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
             nextSummarySourceJson,
             actorUserId,
             now);
-        var reservation = await ReservePayloadMutationCommandAsync(entity, payloadCommand, now, ct);
+        var reservation = await ReservePayloadMutationCommandAsync(entity, payloadCommand, now, ct, deferToTransaction: true);
         if (reservation == PayloadCommandReservationOutcome.CompletedReplay)
         {
             await TryReconcileCommittedLifecycleProjectionAsync(entity.Id);
             return await MapPayloadCommandReplayResponseAsync(entity.Id, actorUserId, CancellationToken.None);
         }
-
-        var payloadResult = await _payloadWriter.SaveReportPayloadAsync(
-            entity,
-            values1DJson,
-            fieldValuesJson,
-            tableValuesJson,
-            nextSummarySourceJson,
-            actorUserId,
-            now,
-            ct);
 
         var headerCommitUpdate = ApplyPayloadCommandCompletion(
                 ApplyPayloadHeaderUpdate(
@@ -1389,10 +1390,18 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
                 MappingBinding:
                     DynamicFlowMappingLifecycleBinding.FromReport(entity)));
 
-        var headerCommit = await _ctx.WorkAssignmentReports.UpdateOneAsync(
+        var headerCommit = await CommitLegacyLifecycleWithDirectSourceFenceAsync(
+            entity,
             BuildPayloadMutationCommitFilter(entity, payloadCommand),
             headerCommitUpdate,
-            cancellationToken: ct);
+            ct, payloadCommandToReserve: payloadCommand,
+            persistPayload: async (session, before, token) =>
+            {
+                await AggregateHostIntegration.GuardPayloadAsync(_ctx, session, before, fieldValuesJson, tableValuesJson, token);
+                var written = await _payloadWriter.SaveReportPayloadAsync(before, values1DJson, fieldValuesJson,
+                    tableValuesJson, nextSummarySourceJson, actorUserId, now, token, session);
+                if (written != payloadResult) throw new AggregatePreviewException("AGG_PAYLOAD_PLAN_STALE");
+            });
 
         if (headerCommit.ModifiedCount != 1)
             return await ResolvePayloadCommandCommitRaceAsync(entity.Id, payloadCommand, actorUserId, ct);
@@ -1482,6 +1491,8 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
         string actorUserId,
         CancellationToken ct = default)
     {
+        // Tạm khóa luồng tổng hợp cũ; giữ nguyên triển khai bên dưới.
+        tdtd_be.Services.WorkAssignments.LegacyAggregateRetirement.Reject();
         EnsureActor(actorUserId);
 
         if (string.IsNullOrWhiteSpace(id))
@@ -1545,6 +1556,8 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
         string actorUserId,
         CancellationToken ct = default)
     {
+        // Tạm khóa luồng tổng hợp cũ; giữ nguyên triển khai bên dưới.
+        tdtd_be.Services.WorkAssignments.LegacyAggregateRetirement.Reject();
         EnsureActor(actorUserId);
 
         if (string.IsNullOrWhiteSpace(id))
@@ -4357,6 +4370,8 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
         string currentUserId,
         CancellationToken ct = default)
     {
+        // Tổng hợp cũ tạm khóa; giữ dữ liệu, không phát sinh refresh.
+        if (tdtd_be.Services.WorkAssignments.LegacyAggregateRetirement.IsDisabled) return;
         EnsureActor(currentUserId);
         if (string.IsNullOrWhiteSpace(sourceReportId))
             throw ReportIdRequired(sourceReportId);
@@ -4714,7 +4729,7 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
         entity.CreatedByUserId = string.IsNullOrWhiteSpace(entity.CreatedByUserId) ? actorUserId : entity.CreatedByUserId;
         entity.UpdatedAtUtc = now;
         entity.UpdatedByUserId = approveWithoutManualReview ? approvalActorUserId : actorUserId;
-        _ = WorkReportPayloadService.PreflightReportPayload(
+        var payloadResult = WorkReportPayloadService.PreflightReportPayload(
             entity,
             entity.Values1DJson,
             entity.FieldValuesJson,
@@ -4723,7 +4738,7 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
             entity.UpdatedByUserId,
             now);
         await lifecycleSeriesLease.RenewAsync(ct);
-        var reservation = await ReservePayloadMutationCommandAsync(entity, payloadCommand, now, ct);
+        var reservation = await ReservePayloadMutationCommandAsync(entity, payloadCommand, now, ct, deferToTransaction: true);
         if (reservation == PayloadCommandReservationOutcome.CompletedReplay)
         {
             var current = await _ctx.WorkAssignmentReports
@@ -4741,17 +4756,6 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
             await TryReconcileCommittedLifecycleProjectionAsync(current.Id);
             return await MapPayloadCommandReplayResponseAsync(current.Id, actorUserId, CancellationToken.None);
         }
-
-        var payloadResult = await _payloadWriter.SaveReportPayloadAsync(
-            entity,
-            entity.Values1DJson,
-            entity.FieldValuesJson,
-            entity.TableValuesJson,
-            entity.SummarySourceJson,
-            entity.UpdatedByUserId,
-            now,
-            ct);
-        ApplyPayloadMetadata(entity, payloadResult, now);
 
         var headerCommitUpdate = WorkReportLifecycleCommandContract.ApplyCompletion(
                 ApplyPayloadCommandCompletion(
@@ -4847,7 +4851,17 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
                 WorkAssignmentReportStatus.Draft,
                 expectedPayloadMutationCommandId: lifecycleCommand.CommandId),
             headerCommitUpdate,
-            ct);
+            ct, lifecycleCommand, entity.Status, actorUserId,
+            persistPayload: async (session, before, token) =>
+            {
+                await AggregateHostIntegration.GuardPayloadAsync(_ctx, session, before, entity.FieldValuesJson, entity.TableValuesJson, token);
+                var written = await _payloadWriter.SaveReportPayloadAsync(before, entity.Values1DJson, entity.FieldValuesJson,
+                    entity.TableValuesJson, entity.SummarySourceJson, entity.UpdatedByUserId, now, token, session);
+                if (written != payloadResult) throw new AggregatePreviewException("AGG_PAYLOAD_PLAN_STALE");
+            },
+            aggregateSessionKey: req.AggregateSessionKey, aggregateConfirmation: req.AggregateConfirmationToken,
+            resultLifecycleRevision: committedLifecycleCommand.ExpectedLifecycleRevision + 1,
+            payloadCommandToReserve: payloadCommand);
 
         if (headerCommit.ModifiedCount != 1)
         {
@@ -5094,7 +5108,7 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
                 lifecycleCommand,
                 WorkAssignmentReportStatus.Submitted),
             reportCommitUpdate,
-            ct);
+            ct, lifecycleCommand, WorkAssignmentReportStatus.Approved, actorUserId);
 
         if (reportCommit.ModifiedCount != 1)
         {
@@ -5245,7 +5259,7 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
                 lifecycleCommand,
                 WorkAssignmentReportStatus.Submitted),
             reportCommitUpdate,
-            ct);
+            ct, lifecycleCommand, WorkAssignmentReportStatus.Draft, actorUserId);
 
         if (reportCommit.ModifiedCount != 1)
         {
@@ -5397,7 +5411,7 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
                 lifecycleCommand,
                 fromStatus),
             reportCommitUpdate,
-            ct);
+            ct, lifecycleCommand, WorkAssignmentReportStatus.Draft, actorUserId);
 
         if (reportCommit.ModifiedCount != 1)
         {
@@ -5439,7 +5453,15 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
         WorkAssignmentReport expectedReport,
         FilterDefinition<WorkAssignmentReport> reportCommitFilter,
         UpdateDefinition<WorkAssignmentReport> reportCommitUpdate,
-        CancellationToken ct)
+        CancellationToken ct,
+        WorkReportLifecycleCommand? lifecycleCommand = null,
+        WorkAssignmentReportStatus? resultStatus = null,
+        string? actorUserId = null,
+        Func<IClientSessionHandle, WorkAssignmentReport, CancellationToken, Task>? persistPayload = null,
+        string? aggregateSessionKey = null, string? aggregateConfirmation = null,
+        int? resultLifecycleRevision = null,
+        PayloadMutationCommand? payloadCommandToReserve = null,
+        WorkAssignmentReportStatus reservationStatus = WorkAssignmentReportStatus.Draft)
     {
         ArgumentNullException.ThrowIfNull(expectedReport);
         ArgumentNullException.ThrowIfNull(reportCommitFilter);
@@ -5463,6 +5485,22 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
         return await _dynamicFlowTransactions.ExecuteAsync(
             async (session, transactionCt) =>
             {
+                if (payloadCommandToReserve is not null)
+                    await ReservePayloadMutationCommandAsync(expectedReport, payloadCommandToReserve, DateTime.UtcNow,
+                        transactionCt, reservationStatus, session: session);
+                var before = await _ctx.WorkAssignmentReports.Find(session, authoritativeCommitFilter).FirstOrDefaultAsync(transactionCt);
+                if (before is null)
+                {
+                    if (payloadCommandToReserve is not null) throw new AggregatePreviewException("AGG_REVISION_CONFLICT");
+                    return new UpdateResult.Acknowledged(0, 0, null);
+                }
+                await AggregateHostIntegration.GuardReportAsync(_ctx, session, before, transactionCt);
+                if (lifecycleCommand is not null && resultStatus.HasValue)
+                    await AggregateHostIntegration.LifecycleAsync(_ctx, session, _dynamicFlowTransactions, before,
+                        lifecycleCommand.Operation, actorUserId!, lifecycleCommand.CommandId, resultStatus.Value,
+                        resultLifecycleRevision ?? lifecycleCommand.ExpectedLifecycleRevision + 1, transactionCt,
+                        _configuration, aggregateSessionKey, aggregateConfirmation);
+                if (persistPayload is not null) await persistPayload(session, before, transactionCt);
                 var reportCommit =
                     await _ctx.WorkAssignmentReports.UpdateOneAsync(
                         session,
@@ -5470,7 +5508,10 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
                         reportCommitUpdate,
                         cancellationToken: transactionCt);
                 if (reportCommit.ModifiedCount != 1)
-                    return reportCommit;
+                    throw new AggregatePreviewException("AGG_REVISION_CONFLICT");
+                await AggregateHostIntegration.InvalidateReportAsync(_ctx, session, before,
+                    lifecycleCommand?.CommandId ?? before.PayloadMutationCommandId ?? "report:" + before.Id + ":" + before.PayloadRevision,
+                    transactionCt);
 
                 var authoritativeReportWorkId =
                     await _ctx.WorkAssignmentReports
@@ -5686,8 +5727,10 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
         var effectiveDueAtUtc = ResolveEffectiveReportDueAtUtc(period.DueAtUtc, assignment);
         var completedDatePolicy = ResolveReportCompletedDatePolicy(assignment, null, period, now);
         var isHistoricalData = period.IsHistoricalData || IsBackfillCompletedDatePolicy(completedDatePolicy);
-        var defaultDataOrigin = DynamicFormDataSourceRuleNormalizer.ResolveDefaultReportDataOrigin(
-            assignment.DynamicFormDataSourceRulesJson);
+        // Cấu hình nguồn cũ chỉ giữ để đọc lịch sử; nháp mới không kế thừa chế độ mapping cũ.
+        var defaultDataOrigin = tdtd_be.Services.WorkAssignments.LegacyAggregateRetirement.IsDisabled
+            ? WorkReportDataOrigin.ManualInput
+            : DynamicFormDataSourceRuleNormalizer.ResolveDefaultReportDataOrigin(assignment.DynamicFormDataSourceRulesJson);
 
         var entity = new WorkAssignmentReport
         {
@@ -5750,15 +5793,14 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
             IsDeleted = false
         };
 
-        var payloadResult = await _payloadWriter.SaveReportPayloadAsync(
+        var payloadResult = WorkReportPayloadService.PreflightReportPayload(
             entity,
             entity.Values1DJson,
             entity.FieldValuesJson,
             entity.TableValuesJson,
             entity.SummarySourceJson,
             actorUserId,
-            now,
-            ct);
+            now);
         ApplyPayloadMetadata(entity, payloadResult, now);
 
         var detailValues1DJson = entity.Values1DJson;
@@ -5782,13 +5824,20 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
                     CreatedAtUtc: now))
         ];
         CompactEmbeddedPayloadHeader(entity);
-        await _ctx.WorkAssignmentReports.InsertOneAsync(entity, cancellationToken: ct);
-        RestoreRuntimePayload(entity, detailValues1DJson, detailFieldValuesJson, detailTableValuesJson, detailSummarySourceJson);
-
         var nextPeriodStatus = ResolveDraftPeriodStatus(period, entity, now);
-
-        await _ctx.WorkReportPeriods.UpdateOneAsync(
-            x => x.Id == period.Id && !x.IsDeleted,
+        await _dynamicFlowTransactions.ExecuteAsync(async (session, token) =>
+        {
+            await AggregateHostIntegration.GuardReportAsync(_ctx, session, entity, token);
+            var written = await _payloadWriter.SaveReportPayloadAsync(
+                new WorkAssignmentReport { Id = entity.Id, PayloadRevision = payloadResult.PayloadRevision - 1 },
+                detailValues1DJson, detailFieldValuesJson, detailTableValuesJson, detailSummarySourceJson, actorUserId, now, token, session);
+            if (written != payloadResult) throw new AggregatePreviewException("AGG_PAYLOAD_PLAN_STALE");
+            await _ctx.WorkAssignmentReports.InsertOneAsync(session, entity, cancellationToken: token);
+            await AggregateHostIntegration.CarryDeclarationAsync(_ctx, session, entity, token);
+            await AggregateHostIntegration.SeedInstanceAsync(_ctx, session, entity, token);
+            var periodCommit = await _ctx.WorkReportPeriods.UpdateOneAsync(session,
+            x => x.Id == period.Id && !x.IsDeleted && x.CurrentReportId == period.CurrentReportId
+                && x.ReportVersionCount == period.ReportVersionCount && x.UpdatedAtUtc == period.UpdatedAtUtc,
             Builders<WorkReportPeriod>.Update
                 .Set(x => x.CurrentReportId, entity.Id)
                 .Set(x => x.PeriodInstanceKey, periodInstanceKey)
@@ -5801,7 +5850,12 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
                 .Set(x => x.LastDraftSavedAtUtc, now)
                 .Set(x => x.UpdatedAtUtc, now)
                 .Set(x => x.UpdatedByUserId, actorUserId),
-            cancellationToken: ct);
+            cancellationToken: token);
+            if (periodCommit.ModifiedCount != 1) throw new AggregatePreviewException("AGG_REVISION_CONFLICT");
+            await AggregateHostIntegration.InvalidateReportAsync(_ctx, session, entity, "init-draft:" + entity.Id, token);
+            await WorkDirectSourceRevisionFence.IncrementAsync(_ctx, session, entity.WorkId, token);
+        }, ct);
+        RestoreRuntimePayload(entity, detailValues1DJson, detailFieldValuesJson, detailTableValuesJson, detailSummarySourceJson);
 
         period.CurrentReportId = entity.Id;
         period.PeriodInstanceKey = periodInstanceKey;
@@ -6039,6 +6093,7 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
                 ExtractRuntimeEnumCatalogIds(report.SpecJson),
                 ct);
             ValidateTopLevelRuntimeValues(report, values1D ?? Array.Empty<object?>(), topLevelOptionSets);
+            DynamicFormNativeTableValues.Validate(null, null, tableValuesJson, validateRequiredFields);
             return fieldValuesJson;
         }
 
@@ -6054,9 +6109,14 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
             report.SpecJson,
             form.FieldsJson,
             form.ExcelBlockJson,
-            form.BlocksJson);
-        await _enumCatalogs.ValidateVisibleActiveCatalogsAsync(enumCatalogIds, ct);
-        var optionSets = await _enumCatalogs.LoadActiveOptionSetsAsync(enumCatalogIds, ct);
+            form.BlocksJson,
+            form.TablesJson);
+        var optionSets = await LoadBoundEnumOptionSetsAsync(enumCatalogIds, ct);
+        var allowedListUnitIds = await LoadNativeListUnitIdsAsync(form, tableValuesJson, ct);
+        DynamicFormNativeTableValues.Validate(form, report.DynamicFormSchemaHash, tableValuesJson,
+            validateRequiredFields, optionSets, enforceListUuidOnWrite: true,
+            previousTableValuesJson: Values1DCompression.ExpandTableValuesJson(report.TableValuesJson, _jsonOptions),
+            allowedSystemUnitIds: allowedListUnitIds);
 
         ValidateTopLevelRuntimeValues(report, values1D ?? Array.Empty<object?>(), optionSets);
         var canonicalFieldValuesJson = await CanonicalizeDynamicFieldRuntimeValuesAsync(
@@ -6191,6 +6251,17 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
         WorkAssignmentReport report,
         JsonElement? parsedSpec = null)
     {
+        // A Form without a top-level Excel has no Values1D slots. Its zero
+        // rectangle is an absent grid, not an Excel range containing cell A1.
+        // Field/native Table payloads are validated against the pinned Form below.
+        if (!string.IsNullOrWhiteSpace(report.DynamicFormTemplateId) &&
+            string.IsNullOrWhiteSpace(report.DynamicExcelTemplateId) &&
+            string.IsNullOrWhiteSpace(report.SpecJson) &&
+            report.W == 0 && report.H == 0 &&
+            report.DataRectR0 == 0 && report.DataRectC0 == 0 &&
+            report.DataRectR1 == 0 && report.DataRectC1 == 0)
+            return new List<RuntimeInputCellRef>();
+
         var dataRect = new RuntimeDataRect(report.DataRectR0, report.DataRectC0, report.DataRectR1, report.DataRectC1);
         return parsedSpec.HasValue
             ? ResolveRuntimeInputCells(parsedSpec.Value, dataRect, report.W, report.H)
@@ -6414,6 +6485,8 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
                 fieldValuesJson,
                 definitions,
                 validateRequiredFields);
+            await ValidateEvidenceReferencesAsync(report, result.CanonicalFieldValuesJson,
+                fields.Where(f => f.FieldType == "evidence").Select(f => f.Id), ct);
             return AttachRuntimeFieldSourceProvenance(
                 result.CanonicalFieldValuesJson,
                 fields,
@@ -6504,6 +6577,12 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
                 .Find(x => ids.Contains(x.Id) && !x.IsDeleted && x.Code != "ROOT")
                 .Project(x => x.Id)
                 .ToListAsync(ct);
+        }
+
+        if (sourceType == LabelValueSourceTypes.SystemLocality)
+        {
+            var allowed = SystemLocalityCatalog.Official.Rows.Select(x => x.Code).ToHashSet(StringComparer.Ordinal);
+            return selectedCodes.Where(allowed.Contains).Distinct(StringComparer.Ordinal).ToArray();
         }
 
         if (sourceType == LabelValueSourceTypes.SystemUser)
@@ -8531,7 +8610,7 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
         if (isBranchAssignee)
             return NormalizeDynamicFlowActorRole(assignment.FlowRole) ?? "ASSIGNEE";
 
-        if (string.Equals(assignment.CreatedByUserId, actorId, StringComparison.Ordinal))
+        if (WorkAssignmentCurrentAuthority.IsReviewer(assignment, actorId))
             return "ISSUER";
 
         if ((assignment.LeaderWatcherUserIds ?? new List<string>()).Contains(actorId, StringComparer.Ordinal) ||
@@ -8692,6 +8771,10 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
                 : WorkReportLifecycleCommitStates.Committed,
             LifecycleProjectionPending = lifecycleProjectionPending,
             CanEditPayload = canMutate && x.Status == WorkAssignmentReportStatus.Draft,
+            AggregateSubmissionPreviewRequired = dynamicFlowPermissions is null && !string.IsNullOrWhiteSpace(x.DynamicFormTemplateId)
+                && await AggregateHostIntegration.RequiresSubmissionPreviewAsync(_ctx, x, ct),
+            AggregateEditHint = dynamicFlowPermissions is null && !string.IsNullOrWhiteSpace(x.DynamicFormTemplateId)
+                ? await AggregateHostIntegration.ReadEditHintAsync(_ctx, x, actorUserId, ct) : null,
             CanSubmit = canMutate && x.Status == WorkAssignmentReportStatus.Draft,
             CanWithdraw = canMutate &&
                           (x.Status == WorkAssignmentReportStatus.Submitted ||
@@ -8862,7 +8945,9 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
         DateTime now,
         CancellationToken ct,
         WorkAssignmentReportStatus expectedStatus = WorkAssignmentReportStatus.Draft,
-        bool expectedIsActive = true)
+        bool expectedIsActive = true,
+        bool deferToTransaction = false,
+        IClientSessionHandle? session = null)
     {
         var fb = Builders<WorkAssignmentReport>.Filter;
         var sameCommand = fb.Eq(x => x.PayloadMutationCommandId, command.CommandId)
@@ -8880,14 +8965,16 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
                      & payloadRevisionFilter
                      & (noCommand | sameCommand);
 
-        var result = await _ctx.WorkAssignmentReports.UpdateOneAsync(
-            filter,
-            Builders<WorkAssignmentReport>.Update
+        var reservationUpdate = Builders<WorkAssignmentReport>.Update
                 .Set(x => x.PayloadMutationCommandId, command.CommandId)
                 .Set(x => x.PayloadMutationCommandHash, command.CommandHash)
                 .Set(x => x.PayloadMutationOperation, command.Operation)
-                .Set(x => x.PayloadMutationStartedAtUtc, now),
-            cancellationToken: ct);
+                .Set(x => x.PayloadMutationStartedAtUtc, now);
+        UpdateResult result = deferToTransaction
+            ? new UpdateResult.Acknowledged(await _ctx.WorkAssignmentReports.Find(filter).AnyAsync(ct) ? 1 : 0, 0, null)
+            : session is null
+                ? await _ctx.WorkAssignmentReports.UpdateOneAsync(filter, reservationUpdate, cancellationToken: ct)
+                : await _ctx.WorkAssignmentReports.UpdateOneAsync(session, filter, reservationUpdate, cancellationToken: ct);
         if (result.MatchedCount == 1)
         {
             report.PayloadMutationCommandId = command.CommandId;
@@ -8896,6 +8983,8 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
             report.PayloadMutationStartedAtUtc = now;
             return PayloadCommandReservationOutcome.Reserved;
         }
+
+        if (session is not null) throw new AggregatePreviewException("AGG_REVISION_CONFLICT");
 
         var current = await _ctx.WorkAssignmentReports
             .Find(x => x.Id == report.Id && !x.IsDeleted)
@@ -9301,6 +9390,8 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
         HashSet<string> visitedReportIds,
         CancellationToken ct)
     {
+        // Tổng hợp cũ tạm khóa; giữ dữ liệu, không phát sinh refresh.
+        if (tdtd_be.Services.WorkAssignments.LegacyAggregateRetirement.IsDisabled) return;
         if (source is null || string.IsNullOrWhiteSpace(source.Id))
             return;
         if (!visitedReportIds.Add(source.Id))
@@ -9369,6 +9460,8 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
         string actorUserId,
         CancellationToken ct)
     {
+        // Tổng hợp cũ tạm khóa; giữ dữ liệu, không phát sinh refresh.
+        if (tdtd_be.Services.WorkAssignments.LegacyAggregateRetirement.IsDisabled) return;
         if (source is null || string.IsNullOrWhiteSpace(source.Id))
             return;
         if (string.IsNullOrWhiteSpace(source.DynamicFormTemplateId))
@@ -9451,6 +9544,7 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
         string actorUserId,
         CancellationToken ct)
     {
+        if (await AggregateHostIntegration.PeriodicOwnedAsync(_ctx, candidate.Id, ct)) return;
         var aggregateRefreshFence =
             await AcquireAggregateRefreshLeaseIfDynamicFlowAsync(
                 candidate.WorkAssignmentId,
@@ -9651,7 +9745,7 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
                 lifecycleCommand,
                 WorkAssignmentReportStatus.Approved),
             reportCommitUpdate,
-            ct);
+            ct, lifecycleCommand, WorkAssignmentReportStatus.Submitted, actorUserId);
 
         if (reportCommit.ModifiedCount != 1)
         {
@@ -9702,16 +9796,18 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
         CancellationToken ct,
         string? refreshError = null)
     {
+        // Tổng hợp cũ tạm khóa; giữ dữ liệu, không phát sinh refresh.
+        if (tdtd_be.Services.WorkAssignments.LegacyAggregateRetirement.IsDisabled) return;
+        if (await AggregateHostIntegration.PeriodicOwnedAsync(_ctx, candidate.Id, ct)) return;
         var now = DateTime.UtcNow;
-        await _ctx.WorkAssignmentReports.UpdateOneAsync(
-            x => x.Id == candidate.Id && !x.IsDeleted,
+        if (!await TryUpdateLegacyAggregateMetadataAsync(candidate,
             Builders<WorkAssignmentReport>.Update
                 .Set(x => x.AggregateSnapshotDirty, true)
                 .Set(x => x.AggregateSnapshotDirtyAtUtc, now)
                 .Set(x => x.AggregateRefreshError, refreshError)
                 .Set(x => x.UpdatedAtUtc, now)
                 .Set(x => x.UpdatedByUserId, actorUserId),
-            cancellationToken: ct);
+            ct)) return;
 
         candidate.AggregateSnapshotDirty = true;
         candidate.AggregateSnapshotDirtyAtUtc = now;
@@ -9770,6 +9866,8 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
         string actorUserId,
         CancellationToken ct)
     {
+        if (tdtd_be.Services.WorkAssignments.LegacyAggregateRetirement.IsDisabled) return report;
+        if (await AggregateHostIntegration.PeriodicOwnedAsync(_ctx, report.Id, ct)) return report;
         if (!report.AggregateSnapshotDirty)
             return report;
 
@@ -9841,13 +9939,12 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
                 report.Id,
                 actorUserId);
 
-            await _ctx.WorkAssignmentReports.UpdateOneAsync(
-                x => x.Id == report.Id && !x.IsDeleted,
+            if (!await TryUpdateLegacyAggregateMetadataAsync(report,
                 Builders<WorkAssignmentReport>.Update
                     .Set(x => x.AggregateRefreshError, error)
                     .Set(x => x.UpdatedAtUtc, now)
                     .Set(x => x.UpdatedByUserId, actorUserId),
-                cancellationToken: ct);
+                ct)) return report;
 
             report.AggregateRefreshError = error;
             report.UpdatedAtUtc = now;
@@ -9855,6 +9952,24 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
             return report;
         }
     }
+
+    private Task<bool> TryUpdateLegacyAggregateMetadataAsync(WorkAssignmentReport observed,
+        UpdateDefinition<WorkAssignmentReport> update, CancellationToken ct)
+        => _dynamicFlowTransactions.ExecuteAsync(async (session, token) =>
+        {
+            var tx = AggregateHostIntegration.Transaction(_ctx, session);
+            var instances = await tx.QueryAsync<AggregateInstanceState>(AggregateCollections.Instances,
+                new(observed.WorkId, observed.Id), token);
+            if (instances.Any(i => i.Value.State != "UNLINKED")) return false;
+            var result = await _ctx.WorkAssignmentReports.UpdateOneAsync(session,
+                x => x.Id == observed.Id && !x.IsDeleted && x.PayloadRevision == observed.PayloadRevision
+                    && x.LifecycleRevision == observed.LifecycleRevision && x.Status == observed.Status,
+                update, cancellationToken: token);
+            if (result.MatchedCount != 1) return false;
+            // Serialize with creating/applying a mapping after the initial legacy skip check.
+            await WorkDirectSourceRevisionFence.IncrementAsync(_ctx, session, observed.WorkId, token);
+            return true;
+        }, ct);
 
     private async Task<bool> AggregateRequestMayIncludeSourceAsync(
         DynamicFormAggregateRequest req,
@@ -9978,6 +10093,7 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
         WorkReportLifecycleSeriesLease? aggregateRefreshLease,
         CancellationToken ct)
     {
+        if (tdtd_be.Services.WorkAssignments.LegacyAggregateRetirement.IsDisabled) return report;
         if (string.IsNullOrWhiteSpace(report.DynamicFormTemplateId))
             return null;
 
@@ -10091,26 +10207,19 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
             payloadCommand,
             now,
             ct,
-            expectedStatus);
+            expectedStatus, deferToTransaction: true);
         if (reservation == PayloadCommandReservationOutcome.CompletedReplay)
             return await LoadCompletedPayloadCommandReportAsync(report.Id, payloadCommand, ct);
 
-        var payloadResult = await _payloadWriter.SaveReportPayloadAsync(
-            report,
-            values1DJson,
-            canonicalFieldValuesJson,
-            tableValuesJson,
-            summarySourceJson,
-            actorUserId,
-            now,
-            ct);
+        var payloadResult = preflight;
 
         if (aggregateRefreshLease is not null)
             await aggregateRefreshLease.RenewAsync(ct);
         var preserveAggregateDirty =
             aggregateRefreshLease is not null &&
             expectedStatus == WorkAssignmentReportStatus.Approved;
-        var headerCommit = await _ctx.WorkAssignmentReports.UpdateOneAsync(
+        var headerCommit = await CommitLegacyLifecycleWithDirectSourceFenceAsync(
+            report,
             BuildPayloadMutationCommitFilter(report, payloadCommand, expectedStatus),
             ApplyPayloadCommandCompletion(
                 ApplyPayloadHeaderUpdate(
@@ -10139,7 +10248,15 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
                 .Set(x => x.UpdatedByUserId, actorUserId),
                 payloadCommand,
                 payloadResult),
-            cancellationToken: ct);
+            ct, payloadCommandToReserve: payloadCommand, reservationStatus: expectedStatus,
+            persistPayload: async (session, before, token) =>
+            {
+                await AggregateHostIntegration.GuardPayloadAsync(_ctx, session, before, canonicalFieldValuesJson, tableValuesJson, token);
+                await AggregateHostIntegration.EnsureLegacyRefreshAsync(_ctx, session, before, token);
+                var written = await _payloadWriter.SaveReportPayloadAsync(before, values1DJson, canonicalFieldValuesJson,
+                    tableValuesJson, summarySourceJson, actorUserId, now, token, session);
+                if (written != payloadResult) throw new AggregatePreviewException("AGG_PAYLOAD_PLAN_STALE");
+            });
 
         if (headerCommit.ModifiedCount != 1)
             return await LoadCompletedPayloadCommandReportAsync(report.Id, payloadCommand, ct);
@@ -10288,26 +10405,19 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
             payloadCommand,
             now,
             ct,
-            expectedStatus);
+            expectedStatus, deferToTransaction: true);
         if (reservation == PayloadCommandReservationOutcome.CompletedReplay)
             return await LoadCompletedPayloadCommandReportAsync(report.Id, payloadCommand, ct);
 
-        var payloadResult = await _payloadWriter.SaveReportPayloadAsync(
-            report,
-            values1DJson,
-            canonicalFieldValuesJson,
-            tableValuesJson,
-            summarySourceJson,
-            actorUserId,
-            now,
-            ct);
+        var payloadResult = preflight;
 
         if (aggregateRefreshLease is not null)
             await aggregateRefreshLease.RenewAsync(ct);
         var preserveAggregateDirty =
             aggregateRefreshLease is not null &&
             expectedStatus == WorkAssignmentReportStatus.Approved;
-        var headerCommit = await _ctx.WorkAssignmentReports.UpdateOneAsync(
+        var headerCommit = await CommitLegacyLifecycleWithDirectSourceFenceAsync(
+            report,
             BuildPayloadMutationCommitFilter(report, payloadCommand, expectedStatus),
             ApplyPayloadCommandCompletion(
                 ApplyPayloadHeaderUpdate(
@@ -10336,7 +10446,15 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
                 .Set(x => x.UpdatedByUserId, actorUserId),
                 payloadCommand,
                 payloadResult),
-            cancellationToken: ct);
+            ct, payloadCommandToReserve: payloadCommand, reservationStatus: expectedStatus,
+            persistPayload: async (session, before, token) =>
+            {
+                await AggregateHostIntegration.GuardPayloadAsync(_ctx, session, before, canonicalFieldValuesJson, tableValuesJson, token);
+                await AggregateHostIntegration.EnsureLegacyRefreshAsync(_ctx, session, before, token);
+                var written = await _payloadWriter.SaveReportPayloadAsync(before, values1DJson, canonicalFieldValuesJson,
+                    tableValuesJson, summarySourceJson, actorUserId, now, token, session);
+                if (written != payloadResult) throw new AggregatePreviewException("AGG_PAYLOAD_PLAN_STALE");
+            });
 
         if (headerCommit.ModifiedCount != 1)
             return await LoadCompletedPayloadCommandReportAsync(report.Id, payloadCommand, ct);
@@ -10875,9 +10993,9 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
     private static string ResolveAutoApproveActorUserId(
         WorkAssignment assignment,
         string fallbackUserId)
-        => string.IsNullOrWhiteSpace(assignment.CreatedByUserId)
+        => string.IsNullOrWhiteSpace(WorkAssignmentCurrentAuthority.ReviewerId(assignment))
             ? fallbackUserId
-            : assignment.CreatedByUserId;
+            : WorkAssignmentCurrentAuthority.ReviewerId(assignment)!;
 
     private async Task EnsurePreviousReportsApprovedAsync(
         WorkReportPeriod? period,
@@ -11089,6 +11207,12 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
             MonthDays = assignment.Schedule?.MonthDays?.ToArray() ?? Array.Empty<int>(),
             QuarterDays = assignment.Schedule?.QuarterDays?.ToArray() ?? Array.Empty<int>(),
             SemiAnnualDays = assignment.Schedule?.SemiAnnualDays?.ToArray() ?? Array.Empty<int>(),
+            QuarterDayRules = assignment.Schedule?.QuarterDayRules?.Select(x =>
+                new tdtd_be.DTOs.WorkAssignments.QuarterDayRuleDto(x.Quarter, (x.Days ?? Array.Empty<int>()).ToList()))
+                .ToArray() ?? Array.Empty<tdtd_be.DTOs.WorkAssignments.QuarterDayRuleDto>(),
+            SemiAnnualDayRules = assignment.Schedule?.SemiAnnualDayRules?.Select(x =>
+                new tdtd_be.DTOs.WorkAssignments.SemiAnnualDayRuleDto(x.Half, (x.Days ?? Array.Empty<int>()).ToList()))
+                .ToArray() ?? Array.Empty<tdtd_be.DTOs.WorkAssignments.SemiAnnualDayRuleDto>(),
             Note = assignment.Schedule?.Note,
             DynamicFormDataSourceRulesJson = assignment.DynamicFormDataSourceRulesJson
         };
@@ -11629,6 +11753,7 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
         string reportId,
         string actorUserId)
     {
+        tdtd_be.Services.WorkAssignments.LegacyAggregateRetirement.RequireUnchangedLegacySummary(requested, current);
         var json = ResolveOptionalJsonOverride(requested, current);
         EnsureJsonObjectOrNull(
             json,

@@ -22,6 +22,20 @@ public sealed class WorkAssignmentReportsController : ControllerBase
         _service = service;
     }
 
+    [HttpGet("work-assignment-reports/{id}/fields/{fieldId}/enum-options")]
+    public async Task<IActionResult> SearchFieldEnumOptions(string id, string fieldId, [FromQuery] string catalogId,
+        [FromQuery] string? q, [FromQuery] int page = 0, [FromQuery] int pageSize = 50, CancellationToken ct = default)
+        => Ok(await _service.SearchFieldEnumOptionsAsync(id, null, fieldId, catalogId, q, page, pageSize, GetActorUserId(), ct));
+
+    [HttpGet("work-assignment-reports/{id}/selected-enum-labels")]
+    public async Task<IActionResult> GetSelectedEnumLabels(string id, CancellationToken ct)
+        => Ok(await _service.GetSelectedEnumLabelsAsync(id, GetActorUserId(), ct));
+
+    [HttpGet("work-assignments/{assignmentId}/report-fields/{fieldId}/enum-options")]
+    public async Task<IActionResult> SearchAssignmentFieldEnumOptions(string assignmentId, string fieldId, [FromQuery] string catalogId,
+        [FromQuery] string? q, [FromQuery] int page = 0, [FromQuery] int pageSize = 50, CancellationToken ct = default)
+        => Ok(await _service.SearchFieldEnumOptionsAsync(null, assignmentId, fieldId, catalogId, q, page, pageSize, GetActorUserId(), ct));
+
     [HttpPost("works/{workId}/my-report-templates/search")]
     public async Task<IActionResult> SearchMyReportTemplates([FromRoute] string workId, [FromBody] MyReportTemplateSearchRequest req, CancellationToken ct)
     {
@@ -128,6 +142,8 @@ public sealed class WorkAssignmentReportsController : ControllerBase
         return rs.LifecycleProjectionPending ? Accepted(rs) : Ok(rs);
     }
 
+    // Luồng tổng hợp cũ tạm khóa; giữ action để đối chiếu.
+    [tdtd_be.Services.WorkAssignments.LegacyAggregateDisabled]
     [HttpPost("work-assignment-reports/{id}/draft/apply-dynamic-form-aggregate")]
     public async Task<IActionResult> ApplyDynamicFormAggregateDraft([FromRoute] string id, [FromBody] ApplyDynamicFormAggregateDraftRequest req, CancellationToken ct)
     {
@@ -137,6 +153,8 @@ public sealed class WorkAssignmentReportsController : ControllerBase
         return Ok(rs);
     }
 
+    // Luồng tổng hợp cũ tạm khóa; giữ action để đối chiếu.
+    [tdtd_be.Services.WorkAssignments.LegacyAggregateDisabled]
     [HttpPost("work-assignment-reports/{id}/draft/preview-dynamic-form-aggregate")]
     public async Task<IActionResult> PreviewDynamicFormAggregateDraft([FromRoute] string id, [FromBody] ApplyDynamicFormAggregateDraftRequest req, CancellationToken ct)
     {
@@ -147,6 +165,7 @@ public sealed class WorkAssignmentReportsController : ControllerBase
     }
 
     [HttpPost("work-assignment-reports/{id}/draft/preview-dynamic-flow-mapping")]
+    [NonAction] // Flow chưa mở trong bản deploy này.
     [ProducesResponseType(typeof(DynamicFlowMappingPreviewResponse), StatusCodes.Status200OK)]
     [ProducesResponseType(typeof(AppErrorResponse), StatusCodes.Status400BadRequest)]
     [ProducesResponseType(typeof(AppErrorResponse), StatusCodes.Status401Unauthorized)]
@@ -165,6 +184,7 @@ public sealed class WorkAssignmentReportsController : ControllerBase
     }
 
     [HttpPost("work-assignment-reports/{id}/draft/apply-dynamic-flow-mapping")]
+    [NonAction] // Flow chưa mở trong bản deploy này.
     [ProducesResponseType(typeof(WorkAssignmentReportResponse), StatusCodes.Status200OK)]
     [ProducesResponseType(typeof(AppErrorResponse), StatusCodes.Status400BadRequest)]
     [ProducesResponseType(typeof(AppErrorResponse), StatusCodes.Status401Unauthorized)]
@@ -186,6 +206,7 @@ public sealed class WorkAssignmentReportsController : ControllerBase
     public async Task<IActionResult> Submit([FromRoute] string id, [FromBody] SubmitWorkAssignmentReportRequest req, CancellationToken ct)
     {
         var actorUserId = GetActorUserId();
+        req.AggregateSessionKey = User.FindFirstValue("sid") ?? User.FindFirstValue("jti");
         var rs = await _service.SubmitAsync(id, req, actorUserId, ct);
         return rs.LifecycleProjectionPending ? Accepted(rs) : Ok(rs);
     }

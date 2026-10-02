@@ -11,7 +11,7 @@ internal static class WorkAssignmentReviewPermissionHelper
         if (string.IsNullOrWhiteSpace(currentUserId))
             throw AppExceptionFactory.Unauthorized(AppErrorCode.WORK_ASSIGNMENT_REVIEWER_MISSING);
 
-        if (!string.Equals(node.CreatedByUserId, currentUserId, StringComparison.Ordinal))
+        if (!WorkAssignmentCurrentAuthority.IsReviewer(node, currentUserId))
             throw AppExceptionFactory.Forbidden(
                 AppErrorCode.WORK_ASSIGNMENT_REVIEW_FORBIDDEN,
                 new { assignmentId = node.Id });

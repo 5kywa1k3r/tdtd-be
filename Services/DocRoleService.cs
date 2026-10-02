@@ -122,13 +122,14 @@ namespace tdtd_be.Services.Common
 
             var desired = new List<DocRole>();
 
-            if (!string.IsNullOrWhiteSpace(assignment.CreatedByUserId))
+            var reviewerUserId = tdtd_be.Services.WorkAssignments.Internal.WorkAssignmentCurrentAuthority.ReviewerId(assignment);
+            if (!string.IsNullOrWhiteSpace(reviewerUserId))
             {
                 desired.Add(new DocRole
                 {
                     DocType = DocType.WORK_ASSIGNMENT,
                     DocId = assignment.Id!,
-                    UserId = assignment.CreatedByUserId,
+                    UserId = reviewerUserId,
                     Role = DocRoleType.ASSIGNER,
                     User = null,
                     IsDeleted = false,

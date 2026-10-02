@@ -2,6 +2,13 @@ namespace tdtd_be.Services.WorkAssignments.Lookups;
 
 public interface IWorkAssignmentTemplateResolver
 {
+    Task<WorkAssignmentTemplateResolution> ResolveForChildAsync(
+        string? dynamicFormTemplateId,
+        string actorUserId,
+        string workId,
+        string parentAssignmentId,
+        CancellationToken ct = default);
+
     Task<WorkAssignmentTemplateResolution> ResolveAsync(
         string? dynamicFormTemplateId,
         string actorUserId,

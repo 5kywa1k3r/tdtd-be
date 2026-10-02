@@ -384,6 +384,10 @@ public sealed class WorkReportStatisticRebuildJob : BaseEntity
     [BsonElement("directStoreDigests")]
     public List<WorkReportDirectStoreDigest> DirectStoreDigests { get; set; } = [];
 
+    [BsonElement("nativeStatisticPublication")]
+    [BsonIgnoreIfNull]
+    public WorkReportNativeStatisticPublication? NativeStatisticPublication { get; set; }
+
     [BsonElement("publishedAtUtc")]
     [BsonDateTimeOptions(Kind = DateTimeKind.Utc)]
     public DateTime? PublishedAtUtc { get; set; }

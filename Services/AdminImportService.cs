@@ -67,23 +67,32 @@ public sealed class AdminImportService : IAdminImportService
     public async Task<ImportTemplateFile> BuildUnitTemplateAsync(string? format, CancellationToken ct)
     {
         var me = _me.RequireMe();
-        RoleGuard.RequireAdminOrSystemAdmin(me);
+        var scope = await UnitManagementScope.ResolveAsync(_ctx, me, ct);
 
         var fmt = NormalizeFormat(format);
-        if (fmt == "csv")
-            return BuildCsvTemplate("unit-import-template.csv", UnitHeaders, new[]
-            {
-                new[] { "U001", "", "ROOT", "1", "", "Công an tỉnh", "CAT", "CAT", "CAT", "false", "" },
+        var managedType = scope is null ? null
+            : await _ctx.Units.Find(x => x.Code == scope && !x.IsDeleted).Project(x => x.PrimaryUnitTypeCode).FirstOrDefaultAsync(ct);
+        var exampleType = managedType == "PHONG" ? "DOI" : managedType == "TINH" ? "PHONG" : "TO";
+        var exampleName = exampleType == "DOI" ? "Đội mới" : exampleType == "PHONG" ? "Phòng mới" : "Tổ mới";
+        var exampleRows = scope is null
+            ? new[] {
+                new[] { "U001", "", "ROOT", "1", "", "Công an tỉnh", "CAT", "CAT", "TINH", "false", "" },
                 new[] { "U002", "U001", "", "1", "", "Phòng Tham mưu", "PV01", "PV01", "PHONG", "false", "" }
-            });
+            }
+            : AccountAdministrationRules.ChildUnitTypeAllowed(managedType, exampleType)
+                ? new[] { new[] { "U001", "", scope, "1", "", exampleName, "", "", exampleType, "false", "" } }
+                : Array.Empty<string[]>();
+        if (fmt == "csv")
+            return BuildCsvTemplate("unit-import-template.csv", UnitHeaders, exampleRows);
 
         var unitTypes = await _ctx.UnitTypes.Find(x => !x.IsDeleted).SortBy(x => x.Code).ToListAsync(ct);
-        var units = await _ctx.Units.Find(x => !x.IsDeleted).SortBy(x => x.Code).Limit(500).ToListAsync(ct);
+        if (scope is not null)
+            unitTypes = unitTypes.Where(x => AccountAdministrationRules.ChildUnitTypeAllowed(managedType, x.Code)).ToList();
+        var units = await _ctx.Units.Find(x => !x.IsDeleted && (scope == null || (x.Code != null && x.Code.StartsWith(scope)))).SortBy(x => x.Code).Limit(500).ToListAsync(ct);
         using var wb = new XLWorkbook();
         var ws = wb.AddWorksheet("Units");
         WriteHeader(ws, UnitHeaders);
-        WriteRow(ws, 2, new[] { "U001", "", "ROOT", "1", "", "Công an tỉnh", "CAT", "CAT", "CAT", "false", "" });
-        WriteRow(ws, 3, new[] { "U002", "U001", "", "1", "", "Phòng Tham mưu", "PV01", "PV01", "PHONG", "false", "" });
+        for (var i = 0; i < exampleRows.Length; i++) WriteRow(ws, i + 2, exampleRows[i]);
         ws.Columns().AdjustToContents();
 
         var typeWs = wb.AddWorksheet("UnitTypes");
@@ -108,6 +117,9 @@ public sealed class AdminImportService : IAdminImportService
         var me = _me.RequireMe();
         RequireUserManagementRole(me);
 
+        var userScope = RoleGuard.TryGetManagerUnit(me, out _)
+            ? await UnitManagementScope.ResolveAsync(_ctx, me, ct) : null;
+
         var fmt = NormalizeFormat(format);
         if (fmt == "csv")
             return BuildCsvTemplate("user-import-template.csv", UserHeaders, new[]
@@ -116,7 +128,8 @@ public sealed class AdminImportService : IAdminImportService
             });
 
         var positions = await _ctx.Positions.Find(x => !x.IsDeleted).SortBy(x => x.Order).ThenBy(x => x.Code).ToListAsync(ct);
-        var units = await _ctx.Units.Find(x => !x.IsDeleted && !x.IsVirtual).SortBy(x => x.Code).Limit(500).ToListAsync(ct);
+        var units = await _ctx.Units.Find(x => !x.IsDeleted && !x.IsVirtual &&
+            (userScope == null || (x.Code != null && x.Code.StartsWith(userScope)))).SortBy(x => x.Code).Limit(500).ToListAsync(ct);
 
         using var wb = new XLWorkbook();
         var ws = wb.AddWorksheet("Users");
@@ -144,7 +157,7 @@ public sealed class AdminImportService : IAdminImportService
     public async Task<ImportResult> ImportUnitsAsync(IFormFile file, bool dryRun, CancellationToken ct)
     {
         var me = _me.RequireMe();
-        RoleGuard.RequireAdminOrSystemAdmin(me);
+        var scope = await UnitManagementScope.ResolveAsync(_ctx, me, ct);
 
         var rows = await ReadRowsAsync(file, UnitHeaders, ct);
         var errors = new List<ImportRowError>();
@@ -200,6 +213,27 @@ public sealed class AdminImportService : IAdminImportService
         AddCycleErrors(parsed, errors);
 
         var importPlan = await BuildUnitImportPlanAsync(parsed, errors, ct);
+        if (scope is not null)
+        {
+            foreach (var row in importPlan.Rows)
+                if (!UnitManagementScope.Contains(scope, row.ParentCode))
+                    errors.Add(new(row.RowNumber, "parentUnitCode", "UNIT_SCOPE_FORBIDDEN",
+                        "Chỉ được nhập đơn vị con trong phạm vi đơn vị quản lý."));
+            RoleGuard.TryGetManagerUnit(me, out var managedUnitId);
+            var managedUnit = await _ctx.Units.Find(x => x.Id == managedUnitId && !x.IsDeleted).FirstOrDefaultAsync(ct);
+            foreach (var row in parsed)
+            {
+                var plannedRow = importPlan.Rows.FirstOrDefault(x => x.RowNumber == row.RowNumber);
+                var parentType = !string.IsNullOrWhiteSpace(row.ParentExternalKey)
+                    ? parsed.FirstOrDefault(x => x.ExternalKey == row.ParentExternalKey)?.PrimaryUnitTypeCode
+                    : !string.IsNullOrWhiteSpace(plannedRow?.ParentCode) && importPlan.ExistingByCode.TryGetValue(plannedRow.ParentCode, out var parent)
+                        ? parent.PrimaryUnitTypeCode : null;
+                if (!AccountAdministrationRules.ChildUnitTypeAllowed(managedUnit?.PrimaryUnitTypeCode, row.PrimaryUnitTypeCode)
+                    || !AccountAdministrationRules.ChildUnitTypeAllowed(parentType, row.PrimaryUnitTypeCode))
+                    errors.Add(new(row.RowNumber, "primaryUnitTypeCode", "UNIT_SCOPE_FORBIDDEN",
+                        "Loại đơn vị không thuộc cấp dưới được phép tạo của tài khoản quản trị hoặc đơn vị cha."));
+            }
+        }
 
         var typeCodes = parsed.Select(x => x.PrimaryUnitTypeCode).Where(x => !string.IsNullOrWhiteSpace(x)).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
         var existingTypes = await _ctx.UnitTypes.Find(x => typeCodes.Contains(x.Code) && !x.IsDeleted).Project(x => x.Code).ToListAsync(ct);
@@ -257,6 +291,8 @@ public sealed class AdminImportService : IAdminImportService
     {
         var me = _me.RequireMe();
         RequireUserManagementRole(me);
+        var userScope = RoleGuard.TryGetManagerUnit(me, out _)
+            ? await UnitManagementScope.ResolveAsync(_ctx, me, ct) : null;
 
         var rows = await ReadRowsAsync(file, UserHeaders, ct);
         var errors = new List<ImportRowError>();
@@ -306,6 +342,11 @@ public sealed class AdminImportService : IAdminImportService
 
         foreach (var row in parsed)
         {
+            if (userScope is not null && !UnitManagementScope.Contains(userScope, row.UnitCode))
+            {
+                errors.Add(new(row.RowNumber, "unitCode", "UNIT_SCOPE_FORBIDDEN", "Đơn vị nằm ngoài phạm vi quản lý."));
+                continue;
+            }
             if (!unitByCode.TryGetValue(row.UnitCode, out var unit))
             {
                 errors.Add(new(row.RowNumber, "unitCode", "UNIT_NOT_FOUND", "Unit code does not exist or is deleted."));
@@ -324,9 +365,10 @@ public sealed class AdminImportService : IAdminImportService
                 continue;
             }
 
-            var positionValid = await _ctx.Positions
-                .Find(x => x.Code == row.PositionCode && !x.IsDeleted && x.UnitTypeCodes.Contains(unit.PrimaryUnitTypeCode))
-                .AnyAsync(ct);
+            var position = await _ctx.Positions.Find(x => x.Code == row.PositionCode && !x.IsDeleted).FirstOrDefaultAsync(ct);
+            var unitType = await _ctx.UnitTypes.Find(x => x.Code == unit.PrimaryUnitTypeCode && !x.IsDeleted).FirstOrDefaultAsync(ct);
+            var positionValid = position is not null && unitType is not null
+                && AccountAdministrationRules.PositionAllowed(position, unitType, unit);
 
             if (!positionValid)
                 errors.Add(new(row.RowNumber, "positionCode", "POSITION_INVALID", "Position is invalid for target unit type."));
