@@ -53,6 +53,7 @@ public sealed partial class WorkAssignmentService : IWorkAssignmentService
     private readonly WorkAssignmentTargetScopePolicy _targetScopePolicy;
     private readonly MeAccessor _me;
     private readonly ILogger<WorkAssignmentService> _log;
+    private readonly IConfiguration? _aggregateConfiguration;
 
     public WorkAssignmentService(
         MongoDbContext ctx,
@@ -75,7 +76,8 @@ public sealed partial class WorkAssignmentService : IWorkAssignmentService
         IWorkReportLifecycleSeriesLockService lifecycleSeriesLock,
         WorkAssignmentTargetScopePolicy targetScopePolicy,
         MeAccessor me,
-        ILogger<WorkAssignmentService> log)
+        ILogger<WorkAssignmentService> log,
+        IConfiguration? aggregateConfiguration = null)
     {
         _ctx = ctx;
         _docRole = docRole;
@@ -98,6 +100,7 @@ public sealed partial class WorkAssignmentService : IWorkAssignmentService
         _targetScopePolicy = targetScopePolicy;
         _me = me;
         _log = log;
+        _aggregateConfiguration = aggregateConfiguration;
     }
 
     public async Task<List<WorkAssignmentListResponse>> GetByWorkIdAsync(
@@ -399,7 +402,7 @@ public sealed partial class WorkAssignmentService : IWorkAssignmentService
         if (unitManagerUserIds.Count > 0)
         {
             normalizedReq.AssigneeUserIds = normalizedReq.AssigneeUserIds
-                .Concat(unitManagerUserIds.Where(id => !string.Equals(id, actorUserId, StringComparison.Ordinal)))
+                .Concat(unitManagerUserIds)
                 .Distinct(StringComparer.Ordinal)
                 .ToList();
         }
@@ -895,6 +898,10 @@ public sealed partial class WorkAssignmentService : IWorkAssignmentService
         if (entity is null)
             return null;
 
+        if (string.IsNullOrWhiteSpace(entity.FlowInstanceId))
+            throw AppExceptionFactory.BadRequest(AppErrorCode.COMMON_VALIDATION_FAILED,
+                message: "Gửi đề nghị kết thúc để cấp giao việc duyệt qua luồng Kết thúc phần việc.");
+
         if (!CanConfigureDataSourceRules(entity, actorUserId))
             throw AppExceptionFactory.Forbidden(
                 AppErrorCode.WORK_ASSIGNMENT_COMPLETION_FORBIDDEN,
@@ -1225,9 +1232,10 @@ public sealed partial class WorkAssignmentService : IWorkAssignmentService
     public async Task<bool> DeactivateAsync(
         string id,
         string actorUserId,
-        CancellationToken ct = default)
+        CancellationToken ct = default, string? reason = null)
     {
         EnsureActor(actorUserId);
+        reason = RequireEffectivenessReason(reason);
 
         var entity = await _ctx.WorkAssignments
             .Find(x =>
@@ -1256,7 +1264,7 @@ public sealed partial class WorkAssignmentService : IWorkAssignmentService
         if (!entity.IsActive)
             return true;
 
-        await EnsureAssignmentMutationScopeOpenAsync(entity, actorUserId, ct);
+        await EnsureEffectivenessWorkExistsAsync(entity, ct);
 
         var now = DateTime.UtcNow;
 
@@ -1333,10 +1341,10 @@ public sealed partial class WorkAssignmentService : IWorkAssignmentService
                     entity.WorkId,
                     transactionCt);
 
-                await tdtd_be.Services.AggregateMapping.Persistence.AggregateHostIntegration.RelationshipAsync(
-                    _ctx, session, entity.WorkId, [entity.Id!], "assignment-inactive:" + entity.Id + ":" + now.Ticks,
-                    transactionCt, preserveIdentity: true);
+                await tdtd_be.Services.AggregateMapping.Persistence.AggregateHostIntegration.EffectivenessAsync(
+                    _ctx, session, entity.WorkId, entity.Id!, "assignment-inactive:" + entity.Id + ":" + now.Ticks, transactionCt);
 
+                await AppendEffectivenessHistoryAsync(session, entity, actorUserId, false, reason, now, transactionCt);
                 return (true, periodIds);
             },
             ct);
@@ -1353,17 +1361,51 @@ public sealed partial class WorkAssignmentService : IWorkAssignmentService
 
             await _statusRepair.RebuildWorkTreeAsync(entity.WorkId, ct);
             await RebuildManualEvaluationTreeAsync(entity.WorkId, actorUserId, ct);
+            await DispatchAggregateEffectivenessAsync(entity.WorkId, ct);
         }
 
         return true;
     }
 
+    private static string RequireEffectivenessReason(string? reason) =>
+        string.IsNullOrWhiteSpace(reason) || reason.Trim().Length > 4000
+            ? throw AppExceptionFactory.BadRequest(AppErrorCode.COMMON_VALIDATION_FAILED,
+                message: "Nhập lý do thay đổi hiệu lực (tối đa 4.000 ký tự).")
+            : reason.Trim();
+
+    private async Task DispatchAggregateEffectivenessAsync(string workId, CancellationToken ct)
+    {
+        if (_aggregateConfiguration == null) return;
+        try
+        {
+            await tdtd_be.Services.AggregateMapping.Persistence.AggregateHostIntegration.DispatchAsync(
+                _ctx, _dynamicFlowTransactions, _aggregateConfiguration, 100, ct, workId);
+        }
+        catch (Exception ex)
+        {
+            // The membership transaction already committed a durable intent. The existing
+            // lifecycle dispatcher retries delivery; queue failure must not undo the decision.
+            _log.LogWarning(ex, "Aggregate effectiveness dispatch pending for Work {WorkId}", workId);
+        }
+    }
+
+    private Task AppendEffectivenessHistoryAsync(IClientSessionHandle session, WorkAssignment a, string actor,
+        bool active, string reason, DateTime now, CancellationToken ct) =>
+        _ctx.WorkHistories.InsertOneAsync(session, new WorkHistory {
+            Id = ObjectId.GenerateNewId().ToString(), WorkId = a.WorkId, Type = WorkHistoryType.UPDATED,
+            AtUtc = now, ByUserId = actor, CreatedAtUtc = now, UpdatedAtUtc = now,
+            CreatedByUserId = actor, UpdatedByUserId = actor,
+            Data = new() { ["action"] = active ? "ASSIGNMENT_ACTIVATED" : "ASSIGNMENT_DEACTIVATED",
+                ["assignmentId"] = a.Id, ["assignmentName"] = a.Name ?? "", ["reason"] = reason }
+        }, cancellationToken: ct);
+
     public async Task<bool> ActivateAsync(
         string id,
         string actorUserId,
-        CancellationToken ct = default)
+        CancellationToken ct = default, string? reason = null)
     {
         EnsureActor(actorUserId);
+        reason = RequireEffectivenessReason(reason);
 
         var entity = await _ctx.WorkAssignments
             .Find(x =>
@@ -1392,7 +1434,7 @@ public sealed partial class WorkAssignmentService : IWorkAssignmentService
         if (entity.IsActive)
             return true;
 
-        await EnsureAssignmentMutationScopeOpenAsync(entity, actorUserId, ct);
+        await EnsureEffectivenessWorkExistsAsync(entity, ct);
 
         var assigneeUserIds = (entity.Assignees ?? Enumerable.Empty<UserRef>())
             .Select(x => x.UserId)
@@ -1481,10 +1523,10 @@ public sealed partial class WorkAssignmentService : IWorkAssignmentService
                     entity.WorkId,
                     transactionCt);
 
-                await tdtd_be.Services.AggregateMapping.Persistence.AggregateHostIntegration.RelationshipAsync(
-                    _ctx, session, entity.WorkId, [entity.Id!], "assignment-active:" + entity.Id + ":" + now.Ticks,
-                    transactionCt, preserveIdentity: true);
+                await tdtd_be.Services.AggregateMapping.Persistence.AggregateHostIntegration.EffectivenessAsync(
+                    _ctx, session, entity.WorkId, entity.Id!, "assignment-active:" + entity.Id + ":" + now.Ticks, transactionCt);
 
+                await AppendEffectivenessHistoryAsync(session, entity, actorUserId, true, reason, now, transactionCt);
                 return (true, periodIds);
             },
             ct);
@@ -1512,6 +1554,7 @@ public sealed partial class WorkAssignmentService : IWorkAssignmentService
             await _statusRepair.RebuildWorkTreeAsync(entity.WorkId, ct);
             await RebuildManualEvaluationTreeAsync(entity.WorkId, actorUserId, ct);
             await _notifications.NotifyAssignmentAssignedAsync(entity, actorUserId, ct);
+            await DispatchAggregateEffectivenessAsync(entity.WorkId, ct);
         }
 
         return true;
@@ -1520,7 +1563,8 @@ public sealed partial class WorkAssignmentService : IWorkAssignmentService
     private async Task EnsureAssignmentTargetsAllowedAsync(
         string actorUserId,
         List<UserRef> assignees,
-        CancellationToken ct)
+        CancellationToken ct,
+        bool rejectOverlap = true)
     {
         var assigneeUserIds = (assignees ?? new List<UserRef>())
             .Select(x => x.UserId)
@@ -1561,9 +1605,6 @@ public sealed partial class WorkAssignmentService : IWorkAssignmentService
                 AppErrorCode.WORK_ASSIGNMENT_ASSIGNEE_USER_NOT_FOUND,
                 new { userIds = missingAssigneeUserIds });
 
-        if (!WorkAssignmentTargetScopeValidator.IsUnitManager(actorUser))
-            return;
-
         var unitIds = users
             .Select(x => x.UnitId)
             .Where(x => !string.IsNullOrWhiteSpace(x))
@@ -1590,8 +1631,7 @@ public sealed partial class WorkAssignmentService : IWorkAssignmentService
             ? resolvedActorUnit
             : null;
 
-        var actorUnitHasAssignableDescendants = actorUnit is not null &&
-                                                await HasAssignableDescendantUnitAsync(actorUnit, ct);
+        var actorUnitHasAssignableDescendants = false; // No leaf-only personal-recipient rule.
 
         var targetUsers = assigneeUserIds
             .Select(id => userById[id])
@@ -1603,7 +1643,7 @@ public sealed partial class WorkAssignmentService : IWorkAssignmentService
             targetUsers,
             unitById,
             actorUnitHasAssignableDescendants,
-            _targetScopePolicy);
+            _targetScopePolicy, rejectOverlap);
     }
 
     private async Task<(string IssuedByUnitId, List<string> TargetUnitIds)> ResolveAssignmentTenantPinsAsync(
@@ -1893,6 +1933,14 @@ public sealed partial class WorkAssignmentService : IWorkAssignmentService
         await EnsureNoCompletedAncestorAsync(assignment, actorUserId, ct);
     }
 
+    // Effectiveness is independent of completion. Preserve the completion decision;
+    // frozen source dependencies are checked inside the effectiveness transaction.
+    private async Task EnsureEffectivenessWorkExistsAsync(WorkAssignment assignment, CancellationToken ct)
+    {
+        if (!await _ctx.Works.Find(w => w.Id == assignment.WorkId && !w.IsDeleted).AnyAsync(ct))
+            throw AppExceptionFactory.NotFound(AppErrorCode.WORK_ASSIGNMENT_WORK_NOT_FOUND);
+    }
+
     private async Task EnsureNoCompletedAncestorAsync(
         WorkAssignment assignment,
         string actorUserId,
@@ -1948,7 +1996,9 @@ public sealed partial class WorkAssignmentService : IWorkAssignmentService
     }
 
     private static DateTime? NormalizeDueDateUtc(DateTime? value)
-        => value.HasValue ? AppTimeRangeHelper.EndOfUtcDate(value.Value) : null;
+        // DueAtUtc is already an instant. Date-only inputs are converted at the
+        // picker boundary; truncating here moved a Vietnam deadline to next day.
+        => AppTimeRangeHelper.ToUtc(value);
 
     private static DateTime? NormalizeDate(DateTime? value)
         => value?.Date;

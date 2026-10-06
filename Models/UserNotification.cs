@@ -87,6 +87,9 @@ public sealed class UserNotification : BaseEntity
     [BsonElement("workName")]
     public string? WorkName { get; set; }
 
+    [BsonElement("assignmentName")]
+    public string? AssignmentName { get; set; }
+
     [BsonElement("workAssignmentId")]
     [BsonRepresentation(BsonType.ObjectId)]
     public string? WorkAssignmentId { get; set; }

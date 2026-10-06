@@ -12,12 +12,15 @@ public sealed class NotificationRowDto
     public string? WorkId { get; set; }
     public WorkType? WorkType { get; set; }
     public string? WorkName { get; set; }
+    public string? AssignmentName { get; set; }
     public string? WorkAssignmentId { get; set; }
     public string? AssignmentCode { get; set; }
     public string? WorkReportPeriodId { get; set; }
     public string? WorkAssignmentReportId { get; set; }
     public string? Category { get; set; }
     public bool RequiresAction { get; set; }
+    public string? ProcessingState { get; set; }
+    public int? ProcessingPriority { get; set; }
     public string? ActionState { get; set; }
     public string? SourceEntityType { get; set; }
     public string? SourceEntityId { get; set; }
@@ -39,9 +42,12 @@ public sealed class NotificationSearchRequest
     public DateTime? CursorOccurredAtUtc { get; set; }
     public string? CursorId { get; set; }
     public int PageSize { get; set; } = 20;
+    public int? PageNumber { get; set; }
     public string? WorkId { get; set; }
     public string? WorkAssignmentId { get; set; }
     public bool? UnreadOnly { get; set; }
+    public DateTime? OccurredFromUtc { get; set; }
+    public DateTime? OccurredBeforeUtc { get; set; }
     public List<string>? Types { get; set; }
     public string? Category { get; set; }
     public bool? RequiresAction { get; set; }

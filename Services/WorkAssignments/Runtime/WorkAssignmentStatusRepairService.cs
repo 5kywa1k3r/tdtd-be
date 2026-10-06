@@ -41,22 +41,13 @@ public sealed class WorkAssignmentStatusRepairService : IWorkAssignmentStatusRep
             workId,
             all.Count);
 
-        foreach (var leafOrNode in all.OrderByDescending(x => x.Level))
-        {
-            await _progress.RecomputeSingleAsync(leafOrNode.Id, ct);
-            await _docRoleReadModelProjection.RebuildAssignmentAsync(leafOrNode.Id, "system", ct);
-        }
-
         var roots = all
             .Where(x => x.ParentAssignmentId == null && x.IsActive)
             .Select(x => x.Id)
             .Distinct(StringComparer.Ordinal)
             .ToList();
 
-        foreach (var rootId in roots)
-        {
-            await _sync.SyncFromAssignmentAsync(rootId, ct);
-        }
+        await _sync.RebuildWorkSnapshotsAsync(workId, ct);
 
         _log.LogInformation(
             "WorkAssignment status repair completed. workId={workId} assignmentCount={assignmentCount} rootCount={rootCount}",

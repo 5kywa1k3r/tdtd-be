@@ -107,6 +107,8 @@ var facts = new AggregateAuthorityFacts(
     IsAssignmentAssignee: true, OwnerScopeMatches: true, DelegationValid: true);
 bool Allowed(AggregateAction action, AggregateAuthorityFacts f) => AggregateMappingPolicy.Decide(action, f).Allowed;
 Check(Allowed(AggregateAction.EditConfig, facts), "B edits own assignment config");
+Check(Allowed(AggregateAction.EditMapping, facts with { ConfigMutationScopeOpen = false }), "exact reopened period can edit its mapping");
+Check(!Allowed(AggregateAction.EditConfig, facts with { ConfigMutationScopeOpen = false }), "exact reopened period cannot edit config shared by closed periods");
 Check(!Allowed(AggregateAction.EditConfig, facts with { IsAssignmentAssignee = false }), "assigner/form owner alone cannot edit B config");
 Check(!Allowed(AggregateAction.EditConfig, facts with { OwnerScopeMatches = false }), "another assignee scope denied");
 Check(!Allowed(AggregateAction.ReadSource, facts with { WholeSourceReadable = false }), "form rights never grant report rights");

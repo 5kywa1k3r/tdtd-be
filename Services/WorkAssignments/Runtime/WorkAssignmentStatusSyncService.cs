@@ -193,6 +193,14 @@ public sealed class WorkAssignmentStatusSyncService : IWorkAssignmentStatusSyncS
         }
     }
 
+    public async Task RebuildWorkSnapshotsAsync(string workId, CancellationToken ct = default)
+    {
+        var nodes = await _ctx.WorkAssignments.Find(x => x.WorkId == workId && !x.IsDeleted)
+            .SortByDescending(x => x.Level).ToListAsync(ct);
+        foreach (var node in nodes) await RebuildParentAggregateAsync(node.Id, ct);
+        await RebuildWorkAggregateAsync(workId, ct); // Including zero active roots.
+    }
+
     private async Task RebuildParentAggregateAsync(string parentAssignmentId, CancellationToken ct)
     {
         var children = await _ctx.WorkAssignments
@@ -219,9 +227,6 @@ public sealed class WorkAssignmentStatusSyncService : IWorkAssignmentStatusSyncS
                 .Set(x => x.ActiveChildCount, children.Count)
                 .Set(x => x.ChildProgressCounts, snapshot)
                 .Set(x => x.WorstChildProgressStatus, worstChildProgress)
-                .Set(x => x.WorstPeriodStatus, worstChild?.WorstPeriodStatus)
-                .Set(x => x.WorstOverdueReasonCode, worstChild?.WorstOverdueReasonCode)
-                .Set(x => x.WorstOverdueReasonLabel, worstChild?.WorstOverdueReasonLabel)
                 .Set(x => x.UpdatedAtUtc, DateTime.UtcNow)
                 .Set(x => x.UpdatedByUserId, (string?)null),
             cancellationToken: ct);
@@ -232,6 +237,11 @@ public sealed class WorkAssignmentStatusSyncService : IWorkAssignmentStatusSyncS
 
     private async Task<WorkStatus> RebuildWorkAggregateAsync(string workId, CancellationToken ct)
     {
+        for (var attempt = 0; attempt < 5; attempt++)
+        {
+        // Read the fence before roots. Child lifecycle/relationship transactions advance it.
+        var work = await _ctx.Works.Find(x => x.Id == workId && !x.IsDeleted).FirstOrDefaultAsync(ct);
+        if (work is null) return WorkStatus.S1;
         var roots = await _ctx.WorkAssignments
             .Find(x => x.WorkId == workId &&
                        x.ParentAssignmentId == null &&
@@ -245,27 +255,37 @@ public sealed class WorkAssignmentStatusSyncService : IWorkAssignmentStatusSyncS
             snapshot.Add((WorkAssignmentProgressStatus)root.ProgressStatus);
         }
 
-        var work = await _ctx.Works
-            .Find(x => x.Id == workId && !x.IsDeleted)
-            .FirstOrDefaultAsync(ct);
-
-        var mappedWorkStatus = work is not null &&
-                               (work.CompletedAtUtc.HasValue || work.Status == WorkStatus.S3)
+        var firstApproval = work.FirstApprovedAtUtc ?? roots.Where(x => x.FirstApprovedAtUtc.HasValue)
+            .Select(x => x.FirstApprovedAtUtc).Min();
+        var mappedWorkStatus = (work.CompletedAtUtc.HasValue || work.Status == WorkStatus.S3)
             ? WorkStatus.S3
-            : MapToWorkStatus(snapshot);
+            : string.IsNullOrWhiteSpace(work.DynamicFlowRuntimeInstanceId)
+                ? (firstApproval.HasValue ? WorkStatus.S2 : WorkStatus.S1)
+                : MapToWorkStatus(snapshot);
 
-        await _ctx.Works.UpdateOneAsync(
-            x => x.Id == workId && !x.IsDeleted,
+        var filter = Builders<Work>.Filter;
+        var sourceFence = work.DirectSourceRevision == 0
+            ? filter.Eq(x => x.DirectSourceRevision, 0) | filter.Exists(x => x.DirectSourceRevision, false)
+            : filter.Eq(x => x.DirectSourceRevision, work.DirectSourceRevision);
+        var result = await _ctx.Works.UpdateOneAsync(
+            filter.Eq(x => x.Id, workId) & filter.Eq(x => x.IsDeleted, false) &
+            filter.Eq(x => x.UpdatedAtUtc, work.UpdatedAtUtc) &
+            filter.Eq(x => x.CompletedAtUtc, work.CompletedAtUtc) & sourceFence,
             Builders<Work>.Update
                 .Set(x => x.ActiveRootAssignmentCount, roots.Count)
                 .Set(x => x.RootAssignmentProgressCounts, snapshot)
                 .Set(x => x.Status, mappedWorkStatus)
+                .Set(x => x.FirstApprovedAtUtc, firstApproval)
                 .Set(x => x.UpdatedAtUtc, DateTime.UtcNow)
                 .Set(x => x.UpdatedByUserId, (string?)null),
             cancellationToken: ct);
 
+        if (result.MatchedCount == 0) continue;
+
         await _docRoleReadModelProjection.RebuildWorkAsync(workId, "system", ct);
         return mappedWorkStatus;
+        }
+        throw new InvalidOperationException("WORK_PROGRESS_SNAPSHOT_CONFLICT");
     }
 
     private async Task WriteStatusLogAsync(

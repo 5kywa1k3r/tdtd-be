@@ -51,7 +51,7 @@ var tests = new (string Name, Action Run)[]
     ("unit manager can assign descendant unit manager", AllowsUnitManagerDescendantUnitManagerAssignment),
     ("configured PHONG unit manager can assign PHUONG_XA unit manager", AllowsConfiguredPhongToPhuongXaUnitManagerAssignment),
     ("configured PHONG to PHUONG_XA rule does not allow normal user by default", BlocksConfiguredPhongToPhuongXaNormalUserAssignment),
-    ("unit manager cannot assign normal user before final unit", BlocksUnitManagerNormalUserBeforeFinalUnit),
+    ("unit manager can assign personnel in own non-leaf unit", AllowsUnitManagerNormalUserBeforeFinalUnit),
     ("final unit manager can assign normal user in own unit", AllowsFinalUnitManagerOwnUnitNormalUserAssignment),
     ("unit manager cannot assign normal user outside own final unit", BlocksUnitManagerNormalUserOutsideOwnUnit),
     ("blank actor is rejected before scope evaluation", BlocksBlankActor),
@@ -470,21 +470,13 @@ static void BlocksConfiguredPhongToPhuongXaNormalUserAssignment()
             ConfiguredPhongToPhuongXaPolicy()));
 }
 
-static void BlocksUnitManagerNormalUserBeforeFinalUnit()
+static void AllowsUnitManagerNormalUserBeforeFinalUnit()
 {
     var actorUnit = TestUnit(6, "003", 1, parentUnitId: null);
     var actor = TestUser(5, "mu_actor", ManagementAccountKind.UnitManager, actorUnit.Id);
     var staff = TestUser(6, "staff", ManagementAccountKind.NormalUser, actorUnit.Id);
-    var units = UnitMap(actorUnit);
-
-    AssertThrows(
-        AppErrorCode.WORK_ASSIGNMENT_ASSIGNEE_SCOPE_INVALID,
-        () => WorkAssignmentTargetScopeValidator.EnsureCanAssignTargets(
-            actor,
-            actorUnit,
-            new[] { staff },
-            units,
-            actorUnitHasAssignableDescendants: true));
+    WorkAssignmentTargetScopeValidator.EnsureCanAssignTargets(actor, actorUnit,
+        new[] { staff }, UnitMap(actorUnit), actorUnitHasAssignableDescendants: true);
 }
 
 static void AllowsFinalUnitManagerOwnUnitNormalUserAssignment()
@@ -5512,6 +5504,19 @@ static DynamicFormTemplate TestDynamicFormSectionSnapshotTemplate(
 static void ValidatesDynamicFormFieldDisplayName()
 {
     var serviceType = typeof(DynamicFormService);
+    foreach (var name in new[] { "Số", "Ngày", "Nội dung", "number 1", "Tình hình xử lý hồ sơ: số lượng, kết quả (đợt 1) / năm 2026?", "<b>Nội dung</b>" })
+    {
+        var fields = JsonSerializer.Serialize(new[] {
+            new { id = "f1", sectionId = "s1", key = "first", type = "number", name },
+            new { id = "f2", sectionId = "s1", key = "second", type = "number", name }
+        });
+        InvokePrivateStatic<object?>(serviceType, "EnsureFieldDisplayNames", fields);
+        var stored = InvokePrivateStatic<string?>(serviceType, "NormalizeFieldPayload", fields, fields);
+        using var readback = JsonDocument.Parse(stored!);
+        AssertEqual(name, readback.RootElement[0].GetProperty("name").GetString(), "display name is retained");
+        AssertEqual("f1", readback.RootElement[0].GetProperty("id").GetString(), "first identity is retained");
+        AssertEqual("second", readback.RootElement[1].GetProperty("key").GetString(), "duplicate name keeps distinct keys");
+    }
 
     InvokePrivateStatic<object?>(
         serviceType,
@@ -5574,7 +5579,7 @@ static void ValidatesDynamicFormFieldDisplayName()
             "EnsureFieldDisplayNames",
             """
             [
-              { "id": "f2", "sectionId": "s1", "key": "number_1", "type": "number", "name": "number 1", "label": "number 1", "isStatistic": true, "statisticLabelCodes": ["revenue"] }
+              { "id": "f2", "sectionId": "s1", "key": "number_1", "type": "number", "name": "   ", "label": "   ", "isStatistic": true, "statisticLabelCodes": ["revenue"] }
             ]
             """));
 

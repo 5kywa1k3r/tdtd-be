@@ -40,7 +40,7 @@ internal static class AggregateTargetPayload
                         ? await new AggregateListStore(db).Load(targetId, stored.Deserialize<AggregateListReference>(AggregateCanonical.Json)!, ct)
                         : AggregateListWire.Decode(stored);
                 }
-                var records = AggregateNativePayloadAdapter.ListRecords(definition, list, row => AggregateListWire.OutputId(write.Instance.Id, member, row.Origin));
+                var records = AggregateNativePayloadAdapter.ListRecords(definition, list, row => AggregateListWire.OutputId(write.Instance.Id, member, row));
                 var targetTables = tables["nativeTables"]?["tables"]?.AsArray() ?? throw new AggregatePreviewException("AGG_NATIVE_TABLE_ENVELOPE_REQUIRED");
                 var targetIndex = targetTables.ToList().FindIndex(t => t!["tableId"]!.GetValue<string>() == member);
                 if (targetIndex < 0) throw new AggregatePreviewException("AGG_NATIVE_TABLE_ENVELOPE_REQUIRED");
@@ -50,6 +50,13 @@ internal static class AggregateTargetPayload
             {
                 var definition = definitions.Single(f => f.Id == member);
                 var proposed = new JsonObject { [member] = result.State == "NO_RESULT" ? null : Scalar(port.ValueType, result.Value) };
+                if (definition.Type == "richText" && proposed[member] != null)
+                    proposed[member] = AggregateTextProjection.RichDestination(proposed[member]!.GetValue<string>());
+                if (definition.Type == "stringList" && proposed[member] != null)
+                    // One aggregate result is one whole block in the native string[].
+                    // Duplicate source contributions remain inside it; the existing
+                    // Form writer still validates the array (no unique-rule bypass).
+                    proposed[member] = new JsonArray(JsonValue.Create(proposed[member]!.GetValue<string>()));
                 IReadOnlyList<string>? choiceCodes = null;
                 if (port.ValueType is "CHOICE_ONE" or "CHOICE_MANY")
                 {

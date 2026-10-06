@@ -40,6 +40,12 @@ public sealed class DashboardController : ControllerBase
         return Ok(result);
     }
 
+    // Read-only, with the same authority and predicates as the leadership charts.
+    [HttpPost("overview/items/search")]
+    public async Task<ActionResult<DashboardLeadershipItemsDto>> SearchLeadershipItems(
+        [FromBody] DashboardLeadershipItemsRequest req, CancellationToken ct)
+        => Ok(await _overview.SearchLeadershipItemsAsync(req, ct));
+
     [HttpGet("report-assignment-options")]
     public async Task<ActionResult<List<DashboardReportAssignmentOptionDto>>> GetReportAssignmentOptions(
         [FromQuery] DateTime? fromUtc,

@@ -51,9 +51,13 @@ WorkReportPeriod Period(WorkAssignment a, string user, int status = 0) => new() 
   PeriodKey = "20261002", PeriodInstanceKey = Id(), IsActive = true, Status = (WorkReportPeriodStatus)status,
   ReportTitle = "Báo cáo thử", DueAtUtc = now.AddDays(-100), LastSubmittedAtUtc = now };
 var mine = Assignment(actor, "Mine"); var theirs = Assignment(other, "Theirs"); var direct = Assignment(actor, "Direct", false);
-var completed = Assignment(actor, "Completed", false); completed.CompletedDate = now;
+mine.CreatedByUserId = actor;
+mine.Assignees.Add(new UserRef { UserId = other, FullName = "Người xin sao chép" });
+var completed = Assignment(actor, "Completed", false); completed.CompletedDate = now; completed.ProgressStatus = 2;
 var flow = Assignment(actor, "Flow"); flow.FlowInstanceId = Id();
 await ctx.WorkAssignments.InsertManyAsync(new[] { mine, theirs, direct, completed, flow });
+// A pending copy request is actionable only while the pinned source still exists.
+await ctx.DynamicFormTemplates.InsertOneAsync(new DynamicFormTemplate { Id = mine.DynamicFormTemplateId!, Code = "INBOX-FIXTURE", Name = "Fixture source", CreatedByUserId = actor });
 var pending = Period(mine, actor); var submitted = Period(theirs, other, 6); var mineSubmitted = Period(mine, actor, 2); var hiddenFlow = Period(flow, actor);
 pending.ReportTitle = "";
 var submittedReport = new WorkAssignmentReport { Id = Id(), WorkId = work.Id, WorkAssignmentId = theirs.Id, WorkReportPeriodId = submitted.Id,
@@ -100,7 +104,7 @@ Check((await inbox.SearchAsync(new(), actor, default)).Items.Count == 2, "approv
 Check((await inbox.HistoryAsync(new(), actor, default)).Items.Count == 1, "history retained after completion");
 await ctx.DynamicFormCloneRequests.UpdateOneAsync(x => x.Id == clone.Id, Builders<DynamicFormCloneRequest>.Update.Set(x => x.Status, "APPROVED"));
 Check((await inbox.ItemAsync("clone:" + clone.Id, other, default)) is { RequiresAction: false }, "requester can read approved clone context without acquiring approver action");
-Check((await inbox.ItemAsync("assignment:" + completed.Id, actor, default)) is { RequiresAction: false }, "completedDate resolves direct assignment despite lagging progress status");
+Check((await inbox.ItemAsync("assignment:" + completed.Id, actor, default)) is { RequiresAction: false }, "completion requires a decision or completed status together with its day");
 await notifications.CreateManyAsync(Enumerable.Range(0, 25).Select(i => new NotificationCommand { RecipientUserId = actor, Type = "ASSIGNMENT_ASSIGNED", Title = "Assigned", WorkId = work.Id, WorkAssignmentId = direct.Id, EventKey = "assigned:" + i, OccurredAtUtc = now.AddMinutes(i) }));
 var recent = await inbox.RecentAsync(actor, default);
 Check(recent.Items.Count == 20 && recent.RecentUnreadCount == 20 && !recent.Items.Any(x => x.Notification.Id == notification.Id), "bell only latest 20 and matching unread badge");
@@ -169,6 +173,49 @@ Check((await inbox.SearchAsync(new() { Function = "REVIEW" }, actor, default)).I
 Check(!(await inbox.SearchAsync(new() { Function = "REPORT" }, actor, default)).Items.Any(x => x.Target.PeriodId == selfPeriod.Id),
   "submitted self-review period is not a writing obligation");
 Console.WriteLine($"PASS {checks} checks; isolated Mongo + HTTP/JWT fixture; no acceptance data or product browser UAT claim.");
+
+// Actual Mongo aggregation, including exact reopened period under completed Work/ancestors.
+var handledReview = await inbox.ItemAsync("review:" + submitted.Id, reviewer, default);
+Check(handledReview is { RequiresAction: false, Target.ReadOnly: false }, "handled review retains lifecycle entry; transaction authority remains separate");
+var ancestor = Assignment(actor, "Completed ancestor", false); ancestor.CompletedAtUtc = now;
+await ctx.WorkAssignments.InsertOneAsync(ancestor);
+await ctx.WorkAssignments.UpdateOneAsync(x => x.Id == mine.Id, Builders<WorkAssignment>.Update
+    .Set(x => x.Assignees, mine.Assignees).Set(x => x.ParentAssignmentId, ancestor.Id)
+    .Set(x => x.CompletionReopenedAtUtc, now).Set(x => x.CompletionReviewPeriodId, dueSoon.Id));
+await ctx.Works.UpdateOneAsync(x => x.Id == work.Id, Builders<Work>.Update.Set(x => x.Status, WorkStatus.S3));
+var reopenedQueue = await inbox.SearchAsync(new() { Function = "REPORT" }, actor, default);
+Check(reopenedQueue.Items.Count == 1 && reopenedQueue.Items[0].Target.PeriodId == dueSoon.Id, "only reopened period returns to queue below completed Work and ancestor");
+await ctx.Works.UpdateOneAsync(x => x.Id == work.Id, Builders<Work>.Update.Set(x => x.CompletedAtUtc, now.AddSeconds(1)));
+Check(!(await inbox.SearchAsync(new() { Function = "REPORT" }, actor, default)).Items.Any(), "new Work closure invalidates stale reopen in real Mongo Inbox");
+await ctx.Works.UpdateOneAsync(x => x.Id == work.Id, Builders<Work>.Update.Set(x => x.CompletedAtUtc, now.AddSeconds(-1)));
+await ctx.WorkAssignments.UpdateOneAsync(x => x.Id == ancestor.Id, Builders<WorkAssignment>.Update.Set(x => x.CompletedAtUtc, now.AddSeconds(1)));
+Check(!(await inbox.SearchAsync(new() { Function = "REPORT" }, actor, default)).Items.Any(), "new ancestor closure invalidates stale reopen in real Mongo Inbox");
+await ctx.WorkAssignments.UpdateOneAsync(x => x.Id == ancestor.Id, Builders<WorkAssignment>.Update.Set(x => x.CompletedAtUtc, now));
+using (var approvalSession = await ctx.Db.Client.StartSessionAsync())
+{
+    approvalSession.StartTransaction();
+    await tdtd_be.Services.WorkAssignments.Progress.WorkExecutionScopeGuard.RecordFirstApprovalAsync(
+        ctx, approvalSession, mine.Id, now.AddSeconds(2), default, dueSoon.Id, WorkAssignmentReportStatus.Approved);
+    await approvalSession.CommitTransactionAsync();
+}
+Check((await inbox.SearchAsync(new() { Function = "REPORT" }, actor, default)).Items.Count == 1, "reactivation does not settle reopen in Mongo");
+using (var approvalSession = await ctx.Db.Client.StartSessionAsync())
+{
+    approvalSession.StartTransaction();
+    await tdtd_be.Services.WorkAssignments.Progress.WorkExecutionScopeGuard.RecordFirstApprovalAsync(
+        ctx, approvalSession, mine.Id, now.AddSeconds(2), default, dueSoon.Id, WorkAssignmentReportStatus.Submitted);
+    await approvalSession.CommitTransactionAsync();
+}
+var settledAssignment = await ctx.WorkAssignments.Find(x => x.Id == mine.Id).SingleAsync();
+Check(settledAssignment.CompletionReviewPeriodId == null && settledAssignment.CompletionProjectionPending && settledAssignment.CompletionRevision == 1,
+    "fresh approval atomically expires reopen and marks projection pending in Mongo");
+Check(!(await inbox.SearchAsync(new() { Function = "REPORT" }, actor, default)).Items.Any(), "settled correction no longer bypasses completed Work in Inbox");
+await ctx.WorkAssignments.UpdateOneAsync(x => x.Id == mine.Id, Builders<WorkAssignment>.Update.Set(x => x.CompletionReviewPeriodId, dueSoon.Id));
+await ctx.WorkAssignments.UpdateOneAsync(x => x.Id == ancestor.Id, Builders<WorkAssignment>.Update.Set(x => x.IsActive, false));
+Check(!(await inbox.SearchAsync(new() { Function = "REPORT" }, actor, default)).Items.Any(), "inactive ancestor blocks reopened queue");
+await ctx.WorkAssignments.UpdateOneAsync(x => x.Id == ancestor.Id, Builders<WorkAssignment>.Update.Set(x => x.IsActive, true).Set(x => x.ParentAssignmentId, mine.Id));
+Check(!(await inbox.SearchAsync(new() { Function = "REPORT" }, actor, default)).Items.Any(), "cyclic ancestor chain fails closed in Mongo pipeline");
+Console.WriteLine($"PASS {checks} total checks including reopened queue and handled review actions; own fixture only.");
 
 public class Stub : DispatchProxy {
   public static T For<T>() where T : class => Create<T, Stub>();

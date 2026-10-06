@@ -16,9 +16,9 @@ internal static class WorkAssignmentHistoricalMutationPolicy
         WorkAssignmentReport report,
         WorkReportPeriod? period,
         MeResponse actor,
-        DateTime now)
+        DateTime now, bool useUpdatedAt = true)
     {
-        var sourceDate = ResolveMutationSourceDate(report, period);
+        var sourceDate = useUpdatedAt ? ResolveMutationSourceDate(report, period) : ResolveLegacySourceDate(report, period);
         var today = now.Date;
         var recentCutoff = today.AddMonths(-RecentWindowMonths);
         var managementCutoff = today.AddMonths(-ManagementWindowMonths);
@@ -66,12 +66,12 @@ internal static class WorkAssignmentHistoricalMutationPolicy
         WorkReportPeriod? period,
         MeResponse actor,
         string operation,
-        DateTime now)
+        DateTime now, bool useUpdatedAt = true)
     {
         if (report.Status != WorkAssignmentReportStatus.Approved)
             return;
 
-        var decision = EvaluateApprovedMutation(report, period, actor, now);
+        var decision = EvaluateApprovedMutation(report, period, actor, now, useUpdatedAt);
         if (decision.IsAllowed)
             return;
 
@@ -99,6 +99,11 @@ internal static class WorkAssignmentHistoricalMutationPolicy
     internal static DateTime? ResolveMutationSourceDate(
         WorkAssignmentReport report,
         WorkReportPeriod? period)
+        // Age of the saved report before this command, not the historical business day,
+        // period key or background payload/materialization timestamp.
+        => report.UpdatedAtUtc == default ? null : NormalizeDate(report.UpdatedAtUtc);
+
+    private static DateTime? ResolveLegacySourceDate(WorkAssignmentReport report, WorkReportPeriod? period)
     {
         var completedDate = NormalizeDate(report.CompletedDate ?? period?.CompletedDate);
         if (completedDate.HasValue)

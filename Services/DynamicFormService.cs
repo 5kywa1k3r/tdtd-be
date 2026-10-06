@@ -65,33 +65,6 @@ public sealed partial class DynamicFormService : IDynamicFormService
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private static readonly Regex LabelCodeRegex = new("^[a-z0-9][a-z0-9_.-]{0,63}$", RegexOptions.Compiled);
     private static readonly Regex MetricKeyRegex = new("^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$", RegexOptions.Compiled);
-    private static readonly Regex GenericFieldDisplayNameRegex = new(
-        "^(field|truong|number|date|full\\s*date|fulldate|short\\s*text|shorttext|long\\s*text|longtext|boolean|single\\s*select|singleselect|multi\\s*select|multiselect|so|ngay|ngay\\s*day\\s*du|van\\s*ban\\s*ngan|van\\s*ban\\s*dai|chon\\s*mot|chon\\s*nhieu|co\\s*khong)[\\s_-]*\\d*$",
-        RegexOptions.Compiled | RegexOptions.IgnoreCase);
-    private static readonly HashSet<string> GenericFieldDisplayNames = new(StringComparer.Ordinal)
-    {
-        "shorttext",
-        "longtext",
-        "number",
-        "date",
-        "fulldate",
-        "singleselect",
-        "multiselect",
-        "boolean",
-        "short text",
-        "long text",
-        "single select",
-        "multi select",
-        "van ban ngan",
-        "van ban dai",
-        "so",
-        "ngay",
-        "ngay day du",
-        "chon mot",
-        "chon nhieu",
-        "co/khong",
-        "co khong"
-    };
     private const int MaxFieldsPerForm = 200;
     private const int MaxOptionsPerSelectField = 100;
     private const int MaxTableBlocksPerForm = 30;
@@ -3378,13 +3351,15 @@ public sealed partial class DynamicFormService : IDynamicFormService
                               ?? ReadOptionalString(item, "displayName")
                               ?? ReadOptionalString(item, "label");
 
-            if (string.IsNullOrWhiteSpace(displayName) || IsGenericFieldDisplayName(type, displayName))
+            if (string.IsNullOrWhiteSpace(displayName))
                 throw DynamicFormValidation(
                     AppErrorCode.DYNAMIC_FORM_FIELD_NAME_INVALID,
-                    "Ten hien thi cua field phai la ten/cau hoi rieng cho nguoi nhap, khong duoc dung ten kieu du lieu.",
+                    "Tên hiển thị của trường dữ liệu không được để trống.",
                     new
                     {
                         fieldName = "FieldsJson",
+                        path = $"FieldsJson[{index}].name",
+                        fieldId = ReadOptionalString(item, "id"),
                         index,
                         key,
                         type,
@@ -3581,29 +3556,6 @@ public sealed partial class DynamicFormService : IDynamicFormService
             normalized = $"field_{normalized}";
 
         return normalized.Length <= 96 ? normalized : normalized[..96].TrimEnd('_', '.', '-');
-    }
-
-    private static bool IsGenericFieldDisplayName(string? fieldType, string displayName)
-    {
-        var normalized = NormalizeForComparison(displayName);
-        if (string.IsNullOrWhiteSpace(normalized))
-            return true;
-
-        var normalizedType = NormalizeForComparison(fieldType ?? string.Empty);
-        return string.Equals(normalized, normalizedType, StringComparison.Ordinal)
-               || GenericFieldDisplayNames.Contains(normalized)
-               || GenericFieldDisplayNameRegex.IsMatch(normalized);
-    }
-
-    private static string NormalizeForComparison(string value)
-    {
-        var formD = value.Normalize(System.Text.NormalizationForm.FormD);
-        var chars = formD
-            .Where(ch => CharUnicodeInfo.GetUnicodeCategory(ch) != UnicodeCategory.NonSpacingMark)
-            .ToArray();
-
-        var withoutMarks = new string(chars).Normalize(System.Text.NormalizationForm.FormC);
-        return Regex.Replace(withoutMarks.Trim().ToLowerInvariant(), "\\s+", " ");
     }
 
     private static void EnsureStatisticConfigOnlyChange(string? currentJson, string? nextJson, string fieldName)

@@ -19,6 +19,7 @@ internal sealed class LeafProgressFacts
 
 public class ProgressComputeResult
 {
+    public DateTime? FirstApprovedAtUtc { get; set; }
     public int ProgressStatus { get; set; }
     public bool HasAnyDuePeriod { get; set; }
     public bool HasOverduePeriod { get; set; }

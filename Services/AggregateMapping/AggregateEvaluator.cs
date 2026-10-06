@@ -12,6 +12,25 @@ internal sealed class AggregateEvaluator(AggregateBudget budget, IReadOnlyList<s
     internal async Task<AggregateChannel> EvaluateWithListsAsync(AggregateExpressionDto expression,
         IReadOnlyDictionary<string, AggregateChannel> inputs, IAggregateListSink store, AggregateReadContext context, CancellationToken ct)
     {
+        if (expression.Kind == "LIST_MERGE") return await AggregateListMerge.EvaluateAsync(expression.ListMerge!, inputs, budget, ListTrace, ListSelections, store, context, ct);
+        if (expression.Kind == "CALL" && expression.Name == "REPORT_COUNT")
+        {
+            var source = await EvaluateWithListsAsync(expression.Arguments![0], inputs, store, context, ct);
+            if (source.Type != "LIST") return AggregateExtendedFunctions.Evaluate("REPORT_COUNT", source, expression.Options, budget);
+            var reports = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var observation in source.Items)
+            {
+                if (observation.Value.State != "VALUE") throw new AggregatePreviewException("AGG_LIST_SOURCE_UNAVAILABLE");
+                if (expression.Options!.Basis == "ELIGIBLE_SOURCES") continue;
+                if (observation.Value.List is { } list) foreach (var row in list.Records) Add(row);
+                else if (observation.Value.ListReference is { } reference) await foreach (var row in store.ReadRowsAsync(context, reference, ct)) Add(row);
+                else throw new AggregatePreviewException("AGG_LIST_SOURCE_UNAVAILABLE");
+            }
+            var eligible = source.EligibleSources;
+            var ids = expression.Options!.Basis == "ELIGIBLE_SOURCES" ? eligible.Select(t => t.ReportId).Distinct(StringComparer.Ordinal).LongCount() : reports.Count;
+            return Single(AggregateValue.Numeric(AggregateNumber.From(ids)), eligible.Where(t => expression.Options.Basis == "ELIGIBLE_SOURCES" || reports.Contains(t.ReportId)).ToArray()) with { EligibleSources = eligible };
+            void Add(AggregateListRow row) { budget.Spend(); foreach (var trace in row.Cells.Values.SelectMany(c => c.Trace)) reports.Add(trace.ReportId); }
+        }
         if (expression.Kind == "CALL" && expression.Name == "IF")
         {
             var condition = Scalar(await EvaluateWithListsAsync(expression.Arguments![0], inputs, store, context, ct));
@@ -23,12 +42,13 @@ internal sealed class AggregateEvaluator(AggregateBudget budget, IReadOnlyList<s
         var prepared = inputs.ToDictionary(p => p.Key, p => p.Value, StringComparer.Ordinal);
         async Task<AggregateExpressionDto> Prepare(AggregateExpressionDto e)
         {
-            if (e.Kind == "LIST_PIPELINE" || e.Kind == "CALL" && e.Name == "IF")
+            if (e.Kind is "LIST_PIPELINE" or "LIST_MERGE" || e.Kind == "CALL" && e.Name is "IF" or "REPORT_COUNT")
             {
                 var key = "__list_" + Guid.NewGuid().ToString("N");
                 prepared[key] = e.Kind == "LIST_PIPELINE"
                     ? await AggregateListPipeline.EvaluateAsync(e.ListPipeline!, prepared[e.Ref!], budget, ListTrace, ListSelections, store, context, ct)
                     : await EvaluateWithListsAsync(e, prepared, store, context, ct);
+                if (e.Kind == "LIST_PIPELINE") prepared[key] = prepared[key] with { EligibleSources = prepared[e.Ref!].EligibleSources };
                 return new() { Kind = "INPUT", Ref = key };
             }
             if (e.Arguments == null) return e;
@@ -41,6 +61,7 @@ internal sealed class AggregateEvaluator(AggregateBudget budget, IReadOnlyList<s
     internal AggregateExpressionType Infer(AggregateExpressionDto e, IReadOnlyDictionary<string, AggregateExpressionType> inputs)
     {
         budget.Spend();
+        if (e.Kind == "LIST_MERGE") return AggregateListMerge.Infer(e.ListMerge!, inputs);
         if (e.Kind == "LIST_PIPELINE")
         {
             if (!inputs.TryGetValue(e.Ref!, out var listType)) throw new AggregatePreviewException("AGG_EXPRESSION_REF");
@@ -55,6 +76,8 @@ internal sealed class AggregateEvaluator(AggregateBudget budget, IReadOnlyList<s
             return e.Kind != "INPUT" ? new("TABLE", type.Shape, true) : type;
         }
         var args = e.Arguments!.Select(a => Infer(a, inputs)).ToArray();
+        if (e.Kind == "CALL" && AggregateExtendedFunctions.Names.Contains(e.Name ?? ""))
+            return AggregateExtendedFunctions.Infer(e.Name!, args[0]);
         if (args.Any(a => a.Type == "LIST")) throw new AggregatePreviewException("AGG_LIST_OPERATOR_REQUIRED");
         var tableOrigin = args.Any(a => a.TableOrigin);
         if (e.Kind == "BINARY")
@@ -104,7 +127,16 @@ internal sealed class AggregateEvaluator(AggregateBudget budget, IReadOnlyList<s
 
     internal AggregateChannel Evaluate(AggregateExpressionDto e, IReadOnlyDictionary<string, AggregateChannel> inputs)
     {
+        var answer = EvaluateCore(e, inputs);
+        IEnumerable<string> Refs(AggregateExpressionDto x) => x.Kind == "LIST_MERGE" ? x.ListMerge!.Inputs.Select(i => i.Ref) : x.Kind is "INPUT" or "LIST_PIPELINE" ? [x.Ref!]
+            : (x.Arguments ?? []).SelectMany(Refs);
+        return answer with { EligibleSources = Refs(e).Distinct(StringComparer.Ordinal)
+            .Where(inputs.ContainsKey).SelectMany(r => inputs[r].EligibleSources).Distinct().ToArray() };
+    }
+    private AggregateChannel EvaluateCore(AggregateExpressionDto e, IReadOnlyDictionary<string, AggregateChannel> inputs)
+    {
         budget.Spend();
+        if (e.Kind == "LIST_MERGE") return AggregateListMerge.EvaluateAsync(e.ListMerge!, inputs, budget, ListTrace, ListSelections).GetAwaiter().GetResult();
         if (e.Kind == "LIST_PIPELINE") return AggregateListPipeline.Evaluate(e.ListPipeline!, inputs[e.Ref!], budget, ListTrace, ListSelections);
         if (e.Kind == "INPUT") return inputs[e.Ref!];
         if (e.Kind == "TABLE_RANGE") return AggregateTableAdapter.Select(inputs[e.Ref!], e.Area!, budget);
@@ -118,6 +150,11 @@ internal sealed class AggregateEvaluator(AggregateBudget budget, IReadOnlyList<s
                 _ => new(e.Kind, "VALUE", Text: e.Value)
             }, []);
         var a = Evaluate(e.Arguments![0], inputs);
+        if (e.Name is "TEXT_CONTAINS" or "TEXT_STARTS" or "TEXT_ENDS" or "TEXT_EQUALS" or "COUNT_DISTINCT"
+            || e.Name == "COUNT" && e.Options?.Basis == "VALUES")
+            AggregateTextPolicy.CheckValueOperation(e.Name!, a);
+        if (e.Kind == "CALL" && AggregateExtendedFunctions.Names.Contains(e.Name ?? ""))
+            return AggregateExtendedFunctions.Evaluate(e.Name!, a, e.Options, budget);
         if (e.Name is "IS_BLANK" or "IS_PRESENT")
         {
             var item = Scalar(a);
@@ -128,13 +165,14 @@ internal sealed class AggregateEvaluator(AggregateBudget budget, IReadOnlyList<s
             var left = Scalar(a); var right = Scalar(Evaluate(e.Arguments[1], inputs));
             var traces = left.Trace.Concat(right.Trace).ToArray();
             if (left.Value.State != "VALUE" || right.Value.State != "VALUE") return Single(AggregateValue.NoResult("BOOLEAN"), traces, a.TableOrigin);
-            var needle = right.Value.Text!;
+            var needle = e.Name == "HAS_CHOICE" ? right.Value.Text! : AggregateTextProjection.VisibleText(right.Value);
+            var text = e.Name == "HAS_CHOICE" ? "" : AggregateTextProjection.VisibleText(left.Value);
             var matches = e.Name switch {
                 "HAS_CHOICE" => left.Value.Type == "CHOICE_ONE" ? left.Value.Text == needle : left.Value.Choices!.Contains(needle, StringComparer.Ordinal),
-                "TEXT_CONTAINS" => left.Value.Text!.Contains(needle, StringComparison.OrdinalIgnoreCase),
-                "TEXT_STARTS" => left.Value.Text!.StartsWith(needle, StringComparison.OrdinalIgnoreCase),
-                "TEXT_EQUALS" => string.Equals(left.Value.Text, needle, StringComparison.OrdinalIgnoreCase),
-                _ => left.Value.Text!.EndsWith(needle, StringComparison.OrdinalIgnoreCase)
+                "TEXT_CONTAINS" => text.Contains(needle, StringComparison.OrdinalIgnoreCase),
+                "TEXT_STARTS" => text.StartsWith(needle, StringComparison.OrdinalIgnoreCase),
+                "TEXT_EQUALS" => string.Equals(text, needle, StringComparison.OrdinalIgnoreCase),
+                _ => text.EndsWith(needle, StringComparison.OrdinalIgnoreCase)
             };
             return Single(new("BOOLEAN", "VALUE", Boolean: matches), traces, a.TableOrigin);
         }
@@ -154,6 +192,8 @@ internal sealed class AggregateEvaluator(AggregateBudget budget, IReadOnlyList<s
         if (e.Kind == "BINARY")
         {
             var b = Evaluate(e.Arguments[1], inputs); var left = Scalar(a); var right = Scalar(b);
+            AggregateTextPolicy.CheckValueOperation(e.Name!, a);
+            AggregateTextPolicy.CheckValueOperation(e.Name!, b);
             var trace = left.Trace.Concat(right.Trace).ToArray();
             var numeric = e.Name is "+" or "-" or "*" or "/";
             if (left.Value.State != "VALUE" || right.Value.State != "VALUE") return Single(AggregateValue.NoResult(numeric ? "NUMBER" : "BOOLEAN"), trace, a.TableOrigin || b.TableOrigin);
@@ -170,6 +210,7 @@ internal sealed class AggregateEvaluator(AggregateBudget budget, IReadOnlyList<s
                 "DATE_PARTIAL" => AggregatePartialDate.Compare(left.Value.Text!, right.Value.Text!),
                 "INSTANT" => DateTimeOffset.Parse(left.Value.Text!, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal)
                     .CompareTo(DateTimeOffset.Parse(right.Value.Text!, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal)),
+                "TEXT" => string.CompareOrdinal(AggregateTextProjection.VisibleText(left.Value), AggregateTextProjection.VisibleText(right.Value)),
                 _ => string.CompareOrdinal(left.Value.Text, right.Value.Text)
             };
             var result = e.Name switch
@@ -232,10 +273,23 @@ internal sealed class AggregateEvaluator(AggregateBudget budget, IReadOnlyList<s
             var ordered = present.OrderBy(i => options.Order == "UNIT_THEN_PERIOD" ? First(i).UnitId : First(i).OccurrenceKey, StringComparer.Ordinal)
                 .ThenBy(i => options.Order == "UNIT_THEN_PERIOD" ? First(i).OccurrenceKey : First(i).UnitId, StringComparer.Ordinal)
                 .ThenBy(i => First(i).ReportId, StringComparer.Ordinal);
-            var parts = ordered.Select(i => options.Trim == true ? i.Value.Text!.Trim() : i.Value.Text!).Where(s => s.Length > 0).ToArray();
-            var length = parts.Sum(p => (long)p.Length) + Math.Max(0, parts.Length - 1) * (long)options.Separator!.Length;
+            var projected = ordered.Select(i => AggregateTextProjection.VisibleText(i.Value));
+            // A string-list report contributes one complete block. Its internal lines
+            // and report boundaries belong to the system, never to string dedup.
+            var blocks = present.Any(i => i.Value.TextFormat == AggregateTextPolicy.StringListBlock);
+            var separator = blocks ? AggregateTextPolicy.BlockSeparator : options.Separator!;
+            var parts = projected.Select(text => !blocks && options.Trim == true ? text.Trim() : text).Where(s => s.Length > 0).ToArray();
+            var length = parts.Sum(p => (long)p.Length) + Math.Max(0, parts.Length - 1) * (long)separator.Length;
             budget.Spend(bytes: length * 4);
-            return Single(parts.Length == 0 ? AggregateValue.NoResult("TEXT") : new("TEXT", "VALUE", Text: string.Join(options.Separator, parts)), allTrace, a.TableOrigin);
+            var result = parts.Length == 0 ? AggregateValue.NoResult("TEXT") : new("TEXT", "VALUE", Text: string.Join(separator, parts)) {
+                TextFormat = blocks ? AggregateTextPolicy.StringListBlock : null };
+            if (parts.Length > 0 && present.Any(i => i.Value.TextFormat == "RICH_HTML" || i.Value.LengthText != null))
+            {
+                var plain = ordered.Select(i => options.Trim == true ? AggregateExtendedFunctions.PlainText(i.Value).Trim() : AggregateExtendedFunctions.PlainText(i.Value)).Where(s => s.Length > 0);
+                result = result with { LengthText = string.Join(separator, plain) };
+                budget.Spend(bytes: result.LengthText.Length * 2L);
+            }
+            return Single(result, allTrace, a.TableOrigin);
         }
         if (present.Length == 0 && (e.Name != "AVG" || a.Items.Count == 0)) return Single(AggregateValue.NoResult("NUMBER"), allTrace, a.TableOrigin);
         var sum = AggregateNumber.From(0);
@@ -254,6 +308,7 @@ internal sealed class AggregateEvaluator(AggregateBudget budget, IReadOnlyList<s
 
     internal IReadOnlyDictionary<string, AggregateChannel> Filter(AggregateNodeDto node, IReadOnlyDictionary<string, AggregateChannel> inputs)
     {
+        if (node.Predicate?.Kind == "LIST_PIPELINE") return AggregateListFilter.EvaluateAsync(node, inputs, budget).GetAwaiter().GetResult();
         var declared = inputs.ToDictionary(p => p.Key, p => new AggregateExpressionType(p.Value.Type, "SINGLE", p.Value.TableOrigin, p.Value.ListSchema));
         if (Infer(node.Predicate!, declared).Type != "BOOLEAN") throw new AggregatePreviewException("AGG_FILTER_TYPE");
         var allSet = inputs.Values.All(c => c.Shape == "SET");
@@ -278,8 +333,12 @@ internal sealed class AggregateEvaluator(AggregateBudget budget, IReadOnlyList<s
             }
         }
         return node.Outputs.ToDictionary(p => p.Id, p => new AggregateChannel(p.ValueType, p.Shape, output[p.Id],
-            inputs[node.Inputs[node.Outputs.IndexOf(p)].Id].TableOrigin, inputs[node.Inputs[node.Outputs.IndexOf(p)].Id].ListSchema));
+            inputs[node.Inputs[node.Outputs.IndexOf(p)].Id].TableOrigin, inputs[node.Inputs[node.Outputs.IndexOf(p)].Id].ListSchema)
+            { EligibleSources = inputs[node.Inputs[node.Outputs.IndexOf(p)].Id].EligibleSources });
     }
+    internal Task<IReadOnlyDictionary<string, AggregateChannel>> FilterAsync(AggregateNodeDto node, IReadOnlyDictionary<string, AggregateChannel> inputs,
+        IAggregateListSink? store, AggregateReadContext context, CancellationToken ct)
+        => node.Predicate?.Kind == "LIST_PIPELINE" ? AggregateListFilter.EvaluateAsync(node, inputs, budget, store, context, ct) : Task.FromResult(Filter(node, inputs));
     internal static AggregateChannel Single(AggregateValue value, IReadOnlyList<AggregateTrace> trace, bool tableOrigin = false)
         => new(value.Type, "SINGLE", [new(value, trace)], tableOrigin);
     internal static AggregateObservation Scalar(AggregateChannel channel)

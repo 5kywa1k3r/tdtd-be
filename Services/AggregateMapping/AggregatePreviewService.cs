@@ -14,21 +14,23 @@ internal sealed record AggregatePreviewEnvelope(AggregatePreviewResponseDto Prev
     // submissions can explain their old result after a child is returned and edited later.
     public IReadOnlyList<AggregateSourceValueEvidence> SourceValues { get; init; } = [];
     public IReadOnlyList<AggregateListPipelineTrace> ListOperations { get; init; } = [];
+    public AggregateFormulaProbe? FormulaProbe { get; init; }
 }
 internal sealed record AggregateSourceValueEvidence(string NodeId, string PortId, AggregateFormPinDto Form,
     JsonElement Value, IReadOnlyList<AggregateTrace> Trace);
 internal sealed record AggregatePreviewProgress(string SourceNodeId, int SourceNumber, int SourceCount, int Processed, int Total,
     IReadOnlyList<AggregateTargetResultDto> Results);
-internal sealed class AggregatePreviewService(IAggregatePreviewReader reader, IAggregateContentSink? contentSink = null, IAggregateListSink? listSink = null)
+internal sealed partial class AggregatePreviewService(IAggregatePreviewReader reader, IAggregateContentSink? contentSink = null, IAggregateListSink? listSink = null)
 {
     internal async Task<AggregatePreviewEnvelope> PreviewAsync(AggregatePreviewRequestDto request, string actor, CancellationToken ct,
-        Func<AggregatePreviewProgress, Task>? progress = null)
+        Func<AggregatePreviewProgress, Task>? progress = null, string? formulaProbeNode = null)
     {
         var budget = new AggregateBudget(ct, duration: progress == null ? null : TimeSpan.FromMinutes(5));
         var raw = JsonSerializer.Serialize(request.Recipe, new JsonSerializerOptions(JsonSerializerDefaults.Web));
-        var parsed = AggregateMappingValidator.Parse(raw);
+        var parsed = AggregateMappingValidator.Parse(raw, formulaProbeNode);
         if (!parsed.StructurallyValid) throw new AggregatePreviewException(parsed.Issues[0].Code, parsed.Issues[0].Path);
         var recipe = parsed.Recipe!;
+        if (formulaProbeNode != null) ValidateProbeSelection(request);
         var context = await reader.ReadContextAsync(request.Context, actor, ct);
         var contextIssue = AggregatePeriodContextContract.Compare(request.Context, context.Context);
         if (contextIssue != null) throw new AggregatePreviewException(contextIssue.Code);
@@ -48,20 +50,25 @@ internal sealed class AggregatePreviewService(IAggregatePreviewReader reader, IA
         var resolved = new List<AggregateResolvedSource>();
         foreach (var node in sourceNodes)
         {
-            var result = await new AggregateSourceResolver(reader, contentSink, listSink).ResolveAsync(node, recipe,
-                request.Selection.Sources.Single(s => s.SourceNodeId == node.Id), context, actor, budget, ct,
-                progress == null ? null : async (capture, processed, total) => {
-                    var interim = await EvaluateAsync(request, recipe, context, [.. resolved, capture], actor,
-                        new AggregateBudget(ct), ct, partial: true);
-                    await progress(new(node.Id, resolved.Count + 1, sourceNodes.Length, processed, total, interim.Preview.Results));
-                });
-            resolved.Add(result);
+            try
+            {
+                var result = await new AggregateSourceResolver(reader, contentSink, listSink).ResolveAsync(node, recipe,
+                    request.Selection.Sources.Single(s => s.SourceNodeId == node.Id), context, actor, budget, ct,
+                    progress == null ? null : async (capture, processed, total) => {
+                        var interim = await EvaluateAsync(request, recipe, context, [.. resolved, capture], actor,
+                            new AggregateBudget(ct), ct, partial: true);
+                        await progress(new(node.Id, resolved.Count + 1, sourceNodes.Length, processed, total, interim.Preview.Results));
+                    });
+                resolved.Add(result);
+            }
+            catch (AggregatePreviewException ex) when (ex.Path == "$" && ex.Location == null)
+            { throw new AggregatePreviewException(ex.Code, $"$.nodes[{node.Id}]", ex) { Location = new(node.Id) }; }
         }
-        return await EvaluateAsync(request, recipe, context, resolved, actor, budget, ct);
+        return await EvaluateAsync(request, recipe, context, resolved, actor, budget, ct, formulaProbeNode: formulaProbeNode);
     }
     private async Task<AggregatePreviewEnvelope> EvaluateAsync(AggregatePreviewRequestDto request, AggregateRecipeDto recipe,
         AggregateReadContext context, IReadOnlyList<AggregateResolvedSource> resolved, string actor, AggregateBudget budget,
-        CancellationToken ct, bool partial = false)
+        CancellationToken ct, bool partial = false, string? formulaProbeNode = null)
     {
         var channels = new Dictionary<(string, string), AggregateChannel>();
         var waiting = new HashSet<(string, string)>();
@@ -87,19 +94,25 @@ internal sealed class AggregatePreviewService(IAggregatePreviewReader reader, IA
                 ?? throw new AggregatePreviewException("AGG_GRAPH_CYCLE");
             var inputs = recipe.Edges.Where(e => e.To.NodeId == node.Id).ToDictionary(e => e.To.PortId, e => channels[(e.From.NodeId, e.From.PortId)]);
             var inputWaiting = partial && recipe.Edges.Where(e => e.To.NodeId == node.Id).Any(e => waiting.Contains((e.From.NodeId, e.From.PortId)));
-            if (node.Kind == "FILTER")
+            var failurePath = node.Kind == "FILTER" ? $"$.nodes[{node.Id}].predicate" : $"$.nodes[{node.Id}]";
+            string? failurePort = null;
+            try
             {
-                if (inputWaiting)
+                if (node.Kind == "FILTER")
                 {
-                    foreach (var port in node.Outputs) { channels[(node.Id, port.Id)] = new(port.ValueType, port.Shape, [], port.ValueType == "TABLE"); waiting.Add((node.Id, port.Id)); }
+                    if (inputWaiting)
+                    {
+                        foreach (var port in node.Outputs) { channels[(node.Id, port.Id)] = new(port.ValueType, port.Shape, [], port.ValueType == "TABLE"); waiting.Add((node.Id, port.Id)); }
                 }
                 else
-                foreach (var port in evaluator.Filter(node, inputs)) channels[(node.Id, port.Key)] = port.Value;
+                foreach (var port in await evaluator.FilterAsync(node, inputs, listSink, context, ct)) channels[(node.Id, port.Key)] = port.Value;
             }
             else if (node.Kind == "CALCULATION")
             {
                 foreach (var output in node.Outputs)
                 {
+                    failurePort = output.Id;
+                    failurePath = $"$.nodes[{node.Id}].expressions[{output.Id}].expression";
                     AggregateChannel result;
                     var expression = node.Expressions!.SingleOrDefault(e => e.PortId == output.Id);
                     if (partial && (inputWaiting || expression == null || RequiresComplete(expression.Expression)))
@@ -124,6 +137,7 @@ internal sealed class AggregatePreviewService(IAggregatePreviewReader reader, IA
                     }
                     else
                     {
+                        failurePath = $"$.nodes[{node.Id}].tableAssignments[{output.Id}]";
                         var targetPort = ResolveTarget(node.Id, output.Id);
                         if (!context.TargetSchema.Members.TryGetValue(targetPort.MemberId!, out var member) || member.Table == null)
                             throw new AggregatePreviewException("AGG_TABLE_TARGET_REQUIRED");
@@ -136,6 +150,8 @@ internal sealed class AggregatePreviewService(IAggregatePreviewReader reader, IA
             {
                 foreach (var port in node.Inputs)
                 {
+                    failurePort = port.Id;
+                    failurePath = $"$.nodes[{node.Id}].inputs[{port.Id}]";
                     var edge = recipe.Edges.Single(e => e.To.NodeId == node.Id && e.To.PortId == port.Id);
                     if (partial && waiting.Contains((edge.From.NodeId, edge.From.PortId)))
                     { targetResults.Add(new(node.Id, port.Id, port.ValueType, "WAITING", null, null, null, "", null)); continue; }
@@ -149,6 +165,8 @@ internal sealed class AggregatePreviewService(IAggregatePreviewReader reader, IA
                         var codes = member.Type == "CHOICE_ONE" ? new[] { value.Value.Text! } : value.Value.Choices!;
                         if (member.AllowedChoiceCodes == null || codes.Any(c => !member.AllowedChoiceCodes.Contains(c, StringComparer.Ordinal)))
                             throw new AggregatePreviewException("AGG_TARGET_CHOICE_UNAVAILABLE");
+                        if (recipe.SchemaVersion == 3 && member.Type == "CHOICE_MANY")
+                            value = value with { Value = value.Value with { Choices = member.AllowedChoiceCodes.Where(c => codes.Contains(c, StringComparer.Ordinal)).ToArray() } };
                     }
                     if (value.Value.Table is { } table) ValidateTargetTable(table, member.Table!);
                     if (value.Value.List is { } list)
@@ -176,6 +194,11 @@ internal sealed class AggregatePreviewService(IAggregatePreviewReader reader, IA
                         value.Value.Number?.Denominator.ToString(System.Globalization.CultureInfo.InvariantCulture), reference, previousRef));
                 }
             }
+            }
+            catch (AggregatePreviewException ex) when (ex.Path == "$" && ex.Location == null)
+            {
+                throw new AggregatePreviewException(ex.Code, failurePath, ex) { Location = new(node.Id, failurePort) };
+            }
             pending.Remove(node);
         }
         var linked = resolved.SelectMany(r => r.Linked).GroupBy(p => p.ReportId).Select(g =>
@@ -191,7 +214,7 @@ internal sealed class AggregatePreviewService(IAggregatePreviewReader reader, IA
         var complete = resolved.All(r => r.Complete) && !(missing && recipe.Nodes.Any(n => n.Outputs.Any(p => p.ValueType == "LIST")));
         var digest = AggregateDigest.Of(new { actor, context.AuthorizationFingerprint, context.Context, context.Revisions,
             recipe, request.Selection, linked, membership, windows = resolved.SelectMany(r => r.Windows).ToArray(), numeric = "EXACT_RATIONAL_6_TO_EVEN",
-            dateFilters = AggregatePartialDate.FilterSemantics });
+            dateFilters = AggregatePartialDate.FilterSemantics, textPolicy = AggregateTextPolicy.Semantics });
         if (!complete)
         {
             targetResults = targetResults.Select(r => r with { State = partial ? "WAITING" : "UNAVAILABLE", Value = null, Numerator = null, Denominator = null }).ToList();
@@ -201,6 +224,8 @@ internal sealed class AggregatePreviewService(IAggregatePreviewReader reader, IA
         var issues = resolved.SelectMany(r => r.Issues).ToList();
         foreach (var operation in evaluator.ListTrace.Where(t => t.Omitted > 0))
             issues.Add(new("AGG_LIST_TOP_N_TRUNCATED", "$.listOperations", $"Có {operation.Matched} phần tử phù hợp; đã lấy {operation.Selected}, còn {operation.Omitted}. Có thể tăng N để lấy thêm."));
+        foreach (var input in evaluator.ListTrace.SelectMany(t => t.MergeInputs ?? []).Where(i => i.MissingRows > 0))
+            issues.Add(new("AGG_LIST_MERGE_MISSING_ROWS", "$.listOperations", $"Biến {input.InputId} có {input.Rows} dòng; {input.MissingRows} dòng thiếu đối ứng được để trống khi nối ngang."));
         if (!complete) issues.Add(new("AGG_COVERAGE_UNKNOWN", "$.coverage", "Coverage cannot be established from declared data windows."));
         AggregateCapabilityDto Capability(AggregateAction action) => AggregateMappingPolicy.Decide(action, context.Authority);
         var capabilities = new AggregateCapabilitiesDto(Capability(AggregateAction.ReadConfig), Capability(AggregateAction.EditConfig),
@@ -212,7 +237,7 @@ internal sealed class AggregatePreviewService(IAggregatePreviewReader reader, IA
             new(linked.Select(p => p.ReportId).ToList(), coverage.Where(c => c.State == "MISSING").Select(c => c.SlotKey).Distinct().ToList(), complete ? "RESOLVED" : "UNKNOWN"),
             capabilities, null, null);
         var sourceEvidence = new List<AggregateSourceValueEvidence>();
-        if (complete && !partial) foreach (var source in resolved) foreach (var port in source.Outputs)
+        if (complete && !partial && formulaProbeNode == null) foreach (var source in resolved) foreach (var port in source.Outputs)
         {
             var contentCall = recipe.Edges.Where(e => e.From.NodeId == source.Node.Id && e.From.PortId == port.Key)
                 .SelectMany(e => recipe.Nodes.Where(n => n.Id == e.To.NodeId).SelectMany(n => n.Expressions ?? []))
@@ -242,7 +267,8 @@ internal sealed class AggregatePreviewService(IAggregatePreviewReader reader, IA
                 evaluator.ListTrace[i] = evaluator.ListTrace[i] with { Selection = await listSink.CaptureAsync(context, evaluator.ListSelections[i], ct) };
         return new(response, lineage, valueDiffs, evaluator.FunctionTrace, resolved.SelectMany(r => r.UnitIds).Distinct(StringComparer.Ordinal).ToArray())
         {
-            SourceValues = sourceEvidence, ListOperations = evaluator.ListTrace
+            SourceValues = sourceEvidence, ListOperations = evaluator.ListTrace,
+            FormulaProbe = formulaProbeNode == null || !complete || partial ? null : await CaptureFormulaProbe(formulaProbeNode, recipe, channels, context, resolved, ct)
         };
 
         AggregatePortDto ResolveTarget(string nodeId, string portId)
@@ -273,6 +299,7 @@ internal sealed class AggregatePreviewService(IAggregatePreviewReader reader, IA
             "LIST" => AggregateListWire.Encode(value.List!),
             "TABLE" => new { columns = value.Table!.Schema.Columns, rows = value.Table.Rows.Select((row, r) =>
                 new { unitId = value.Table.Units[r], note = value.Table.ContentRows?[r], cells = row.Select(cell => new { type = cell.Value.Type, state = cell.Value.State, value = ToWire(cell.Value), lineage = cell.Trace }) }) },
+            "TEXT" => AggregateTextProjection.VisibleText(value),
             _ => value.Text
         };
         return JsonSerializer.SerializeToElement(wire, new JsonSerializerOptions(JsonSerializerDefaults.Web));

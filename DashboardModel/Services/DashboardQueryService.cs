@@ -31,6 +31,7 @@ public sealed class DashboardQueryService : IDashboardQueryService
     private readonly MongoDbContext _ctx;
     private readonly MeAccessor _me;
     private readonly RedisDashboardCache _dashboardCache;
+    private DashboardUnitReadScope? _unitScope;
 
     public DashboardQueryService(
         MongoDbContext ctx,
@@ -47,6 +48,7 @@ public sealed class DashboardQueryService : IDashboardQueryService
         CancellationToken ct = default)
     {
         var me = _me.RequireMe();
+        _unitScope = await DashboardUnitReadScope.ResolveAsync(_ctx, me, ct);
         req ??= new MyWorksDashboardRequest();
 
         var range = DashboardTimeRangeHelper.NormalizeMonthRange(req.FromUtc, req.ToUtc);
@@ -59,7 +61,7 @@ public sealed class DashboardQueryService : IDashboardQueryService
             range.FromUtc,
             range.ToUtc,
             keyword,
-            unitHash);
+            unitHash) + (_unitScope is null ? "" : ":unit-v1:" + _unitScope.CacheScope);
 
         return await _dashboardCache.GetOrCreateAsync(
             cacheKey,
@@ -99,11 +101,16 @@ public sealed class DashboardQueryService : IDashboardQueryService
             throw AppExceptionFactory.BadRequest(AppErrorCode.DASHBOARD_WORK_ID_REQUIRED, new { field = "workId", value = workId });
 
         var me = _me.RequireMe();
+        _unitScope = await DashboardUnitReadScope.ResolveAsync(_ctx, me, ct);
         req ??= new WorkDashboardDetailRequest();
 
         var range = DashboardTimeRangeHelper.NormalizeMonthRange(req.FromUtc, req.ToUtc);
         var unitIds = NormalizeIds(req.UnitIds);
         var unitHash = BuildStableHash(unitIds);
+
+        var authorizedWork = await _ctx.Works.Find(x => x.Id == workId && !x.IsDeleted).FirstOrDefaultAsync(ct);
+        if (authorizedWork is null || !(_unitScope?.WorkIds.Contains(workId) ?? (authorizedWork.CreatedByUserId == me.Id)))
+            throw AppExceptionFactory.NotFound(AppErrorCode.DASHBOARD_WORK_NOT_FOUND, new { workId });
 
         var cacheKey = CacheKeys.DashboardWorkDetail(
             me.Id,
@@ -112,24 +119,19 @@ public sealed class DashboardQueryService : IDashboardQueryService
             range.ToUtc,
             unitHash,
             req.IncludeRootAssignments,
-            req.IncludeReportSummary);
+            req.IncludeReportSummary) + (_unitScope is null ? "" : ":unit-v1:" + _unitScope.CacheScope);
 
         return await _dashboardCache.GetOrCreateAsync(
             cacheKey,
             async innerCt =>
             {
-                var work = await _ctx.Works
-                    .Find(x => x.Id == workId && x.CreatedByUserId == me.Id && !x.IsDeleted)
-                    .FirstOrDefaultAsync(innerCt);
-
-                if (work is null)
-                    throw AppExceptionFactory.NotFound(AppErrorCode.DASHBOARD_WORK_NOT_FOUND, new { workId });
+                var work = authorizedWork;
 
                 var roots = await LoadRootAssignmentsForSingleWorkAsync(me.Id, workId, unitIds, innerCt);
 
                 var result = new WorkDashboardDetailDto
                 {
-                    Work = unitIds.Count == 0
+                    Work = unitIds.Count == 0 && _unitScope is null
                         ? MapMyWorkRow(work)
                         : MapMyWorkRow(work, roots)
                 };
@@ -200,7 +202,7 @@ public sealed class DashboardQueryService : IDashboardQueryService
             return new List<MyWorkSummaryRowDto>();
 
         var unitIds = NormalizeIds(req.UnitIds);
-        if (unitIds.Count == 0)
+        if (unitIds.Count == 0 && _unitScope is null)
         {
             return works
                 .Select(MapMyWorkRow)
@@ -210,7 +212,7 @@ public sealed class DashboardQueryService : IDashboardQueryService
         var workIds = works.Select(x => x.Id).Distinct(StringComparer.Ordinal).ToList();
 
         var roots = await LoadRootAssignmentsForWorksAsync(actorUserId, workIds, unitIds, ct);
-        if (roots.Count == 0)
+        if (roots.Count == 0 && unitIds.Count > 0)
             return new List<MyWorkSummaryRowDto>();
 
         var rootsByWorkId = roots
@@ -218,8 +220,8 @@ public sealed class DashboardQueryService : IDashboardQueryService
             .ToDictionary(g => g.Key, g => g.ToList(), StringComparer.Ordinal);
 
         return works
-            .Where(w => rootsByWorkId.ContainsKey(w.Id))
-            .Select(w => MapMyWorkRow(w, rootsByWorkId[w.Id]))
+            .Where(w => unitIds.Count == 0 || rootsByWorkId.ContainsKey(w.Id))
+            .Select(w => MapMyWorkRow(w, rootsByWorkId.GetValueOrDefault(w.Id) ?? new()))
             .ToList();
     }
 
@@ -230,7 +232,8 @@ public sealed class DashboardQueryService : IDashboardQueryService
         CancellationToken ct)
     {
         var f = Builders<Work>.Filter.Eq(x => x.IsDeleted, false)
-              & Builders<Work>.Filter.Eq(x => x.CreatedByUserId, actorUserId)
+              & (_unitScope is null ? Builders<Work>.Filter.Eq(x => x.CreatedByUserId, actorUserId)
+                  : Builders<Work>.Filter.In(x => x.Id, _unitScope.WorkIds))
               & BuildWorkTimeFilter(range);
 
         if (!string.IsNullOrWhiteSpace(keyword))
@@ -258,6 +261,10 @@ public sealed class DashboardQueryService : IDashboardQueryService
     {
         if (workIds.Count == 0)
             return new List<WorkAssignment>();
+
+        if (_unitScope is not null)
+            return workIds.SelectMany(_unitScope.Entries)
+                .Where(x => unitIds.Count == 0 || x.Assignees.Any(a => unitIds.Contains(a.UnitId!))).ToList();
 
         var f = Builders<WorkAssignment>.Filter.In(x => x.WorkId, workIds)
               & Builders<WorkAssignment>.Filter.Eq(x => x.CreatedByUserId, actorUserId)
@@ -298,6 +305,10 @@ public sealed class DashboardQueryService : IDashboardQueryService
     {
         if (rootIds.Count == 0)
             return new Dictionary<string, List<string>>(StringComparer.Ordinal);
+
+        if (_unitScope is not null)
+            return _unitScope.Entries(workId).Where(x => rootIds.Contains(x.Id)).ToDictionary(x => x.Id,
+                x => _unitScope.Assignments.Where(node => DashboardUnitReadScope.InBranch(node, x)).Select(node => node.Id).ToList());
 
         var items = await _ctx.WorkAssignments
             .Find(x =>
@@ -341,6 +352,8 @@ public sealed class DashboardQueryService : IDashboardQueryService
         {
             f &= Builders<WorkReportPeriod>.Filter.In(x => x.AssigneeUnitId, unitIds);
         }
+
+        if (_unitScope is not null) f &= _unitScope.PeriodFilter();
 
         return await _ctx.WorkReportPeriods
             .Find(f)

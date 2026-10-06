@@ -429,6 +429,8 @@ builder.Services.AddSingleton<
 builder.Services.AddScoped<IWorkReportLifecycleSeriesLockService, WorkReportLifecycleSeriesLockService>();
 
 builder.Services.AddScoped<IWorkAssignmentProgressService, WorkAssignmentProgressService>();
+builder.Services.AddScoped<WorkCompletionWorkflowService>();
+builder.Services.AddScoped<WorkExecutionReconcileJob>();
 builder.Services.AddScoped<IWorkAssignmentReviewService, WorkAssignmentReviewService>();
 builder.Services.AddScoped<IAggregateTableService, AggregateTableService>();
 builder.Services.AddScoped<IWorkAssignmentBasicSummaryService, WorkAssignmentBasicSummaryService>();
@@ -705,6 +707,7 @@ using (var scope = app.Services.CreateScope())
         await MongoIndexInitializer.EnsureAsync(
             ctx.Db,
             mongoOpt);
+        await WorkCompletionIndexes.EnsureAsync(ctx.Db);
     }
 
     if (hangfireRecurringRegistrationEnabled)

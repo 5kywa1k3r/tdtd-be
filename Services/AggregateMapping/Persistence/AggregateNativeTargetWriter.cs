@@ -32,8 +32,14 @@ internal sealed class AggregateNativeTargetWriter(MongoDbContext db, IClientSess
         if (schema.Pin != authority.Read.TargetSchema.Pin || !form.IsPublished) throw new AggregatePreviewException("AGG_SCHEMA_INCOMPATIBLE");
         var payload = await reader.LoadReportPayloadAsync(report, ct);
         WorkReportPayloadConsistency.EnsureSnapshotFreshForStatisticProjection(report, payload);
+        // Build every native definition from the pinned Form only on first
+        // Apply. The authoritative validator/writer still validates the whole
+        // envelope; unrelated matrix rows remain present with unentered cells.
+        var targetTables = AggregateNativePayloadAdapter.IsUninitializedTarget(payload)
+            && DynamicFormNativeTableDefinition.IsNative(form)
+            ? AggregateViewPayload.EmptyTables(form).ToJsonString() : payload.TableValuesJson;
         var (fieldJson, tableJson) = await AggregateTargetPayload.ValidateAsync(db, session, form, report.Id, write,
-            payload.FieldValuesJson, payload.TableValuesJson, async (member, reference) => {
+            payload.FieldValuesJson, targetTables, async (member, reference) => {
                 var tx = new AggregateMongoTransaction(db, session, reader, writer);
                 var key = AggregateCanonical.Key(report.Id, member);
                 var existing = await tx.GetAsync<AggregateNativeContentBinding>(AggregateCollections.NativeContent, key, ct);

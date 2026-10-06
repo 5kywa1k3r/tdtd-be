@@ -19,14 +19,26 @@ internal sealed class AggregateSourceResolver(IAggregatePreviewReader reader, IA
             if (!schema.Members.TryGetValue(port.MemberId!, out var member) || member.Type != port.ValueType)
                 throw new AggregatePreviewException("AGG_SCHEMA_INCOMPATIBLE", "$.nodes[" + node.Id + "]");
         var rules = node.Outputs.ToDictionary(p => p.Id, p => recipe.TimeRules.Single(r => r.Id == p.TimeRuleId));
-        var windows = rules.ToDictionary(p => p.Key, p => AggregateTimeResolver.Resolve(p.Value, context));
-        var listing = await reader.ListSourcesAsync(context, schema.Pin, actor, ct);
+        var reportSetMode = rules.Values.All(r => r.Mode == AggregateReportSetFilter.Mode);
+        var windows = rules.Where(p => p.Value.Mode != AggregateReportSetFilter.Mode).ToDictionary(p => p.Key, p => AggregateTimeResolver.Resolve(p.Value, context));
+        var listing = reportSetMode
+            ? await reader.ListReportSetSourcesAsync(context, schema.Pin, actor, ct)
+            : await reader.ListSourcesAsync(context, schema.Pin, actor, ct);
         if (!listing.Complete) throw new AggregatePreviewException("AGG_SOURCE_ENUMERATION_INCOMPLETE");
         if (listing.Headers.Count > 10_000 || listing.Slots.Count > 20_000) throw new AggregatePreviewException("AGG_BUDGET_EXCEEDED");
         var candidates = listing.Headers.Where(h => h.Form == schema.Pin && h.Pin.IsCurrent && !h.Deleted).ToArray();
         if (candidates.GroupBy(h => (h.Pin.BindingId, h.OccurrenceKey)).Any(g => g.Count() > 1))
             throw new AggregatePreviewException("AGG_CURRENT_REPORT_AMBIGUOUS");
         var available = candidates.Select(h => h.Pin.ReportId).ToHashSet(StringComparer.Ordinal);
+        var missingIds = selection.ReportIds.Concat(selection.ExcludedReportIds).Where(id => !available.Contains(id)).Distinct().ToArray();
+        var inactive = missingIds.Length == 0 ? [] : await reader.ReadInactiveSourcesAsync(context, schema.Pin, missingIds, actor, ct);
+        foreach (var header in inactive)
+        {
+            if (!header.WholeReportReadable || header.Active || header.Deleted || header.Pin.IsCurrent || header.Form != schema.Pin
+                || header.ParentAssignmentId != AggregateTargetIdentity.Parent(context.Context) || header.Pin.WorkId != context.Context.WorkId)
+                throw new AggregatePreviewException("AGG_SOURCE_UNAVAILABLE");
+            available.Add(header.Pin.ReportId);
+        }
         if (selection.ReportIds.Concat(selection.ExcludedReportIds).Any(id => !available.Contains(id)))
             throw new AggregatePreviewException("AGG_SOURCE_UNAVAILABLE");
         var outputs = node.Outputs.ToDictionary(p => p.Id, _ => new List<AggregateObservation>());
@@ -48,6 +60,7 @@ internal sealed class AggregateSourceResolver(IAggregatePreviewReader reader, IA
             var edges = recipe.Edges.Where(e => e.From.NodeId == node.Id && e.From.PortId == port.Id).ToArray();
             return edges.Length > 0 && edges.All(edge => {
                 var calculation = recipe.Nodes.Single(n => n.Id == edge.To.NodeId);
+                if (calculation.Kind == "FILTER" && calculation.Predicate?.Kind == "LIST_PIPELINE") return true;
                 bool Safe(AggregateExpressionDto e) => !(e.Kind == "INPUT" && e.Ref == edge.To.PortId)
                     && (e.Arguments?.All(Safe) ?? true) && (e.Predicate == null || Safe(e.Predicate));
                 return calculation.Kind == "CALCULATION" && calculation.TableAssignments is not { Count: > 0 }
@@ -58,12 +71,16 @@ internal sealed class AggregateSourceResolver(IAggregatePreviewReader reader, IA
         var linked = new Dictionary<string, AggregateSourcePinDto>();
         var eligible = new Dictionary<string, AggregateSourcePinDto>();
         var issues = new List<AggregateIssueDto>();
+        if (inactive.Any(h => selection.ReportIds.Contains(h.Pin.ReportId)))
+            issues.Add(new("AGG_SOURCE_INACTIVE", "$.nodes[" + node.Id + "]", "Selected hidden reports are retained in the configuration but do not contribute."));
         var ordered = candidates.OrderBy(h => h.UnitId, StringComparer.Ordinal).ThenBy(h => h.OccurrenceKey, StringComparer.Ordinal).ThenBy(h => h.Pin.ReportId, StringComparer.Ordinal).ToArray();
         var positions = ordered.Select((h, i) => (h.Pin.ReportId, i)).ToDictionary(p => p.ReportId, p => p.i, StringComparer.Ordinal);
         var preparedThrough = -1;
-        var coverage = node.Outputs.SelectMany(p => AggregateCoverageResolver.Resolve(listing, schema.Pin, [windows[p.Id]], budget, rules[p.Id].ReportFilter))
+        var coverage = node.Outputs.Where(p => windows.ContainsKey(p.Id)).SelectMany(p => AggregateCoverageResolver.Resolve(listing, schema.Pin, [windows[p.Id]], budget, rules[p.Id].ReportFilter))
             .GroupBy(c => c.SlotKey).Select(g => g.FirstOrDefault(c => c.State == "UNKNOWN") ?? g.First()).ToArray();
-        AggregateResolvedSource Capture() => new(node, schema, node.Outputs.ToDictionary(p => p.Id, p => new AggregateChannel(p.ValueType, p.Shape, outputs[p.Id].ToArray(), p.ValueType == "TABLE", schema.Members[p.MemberId!].List)),
+        AggregateChannel Channel(AggregatePortDto p) => new(p.ValueType, p.Shape, outputs[p.Id].ToArray(), p.ValueType == "TABLE", schema.Members[p.MemberId!].List)
+            { EligibleSources = outputs[p.Id].SelectMany(o => o.Trace).Distinct().ToArray() };
+        AggregateResolvedSource Capture() => new(node, schema, node.Outputs.ToDictionary(p => p.Id, Channel),
             linked.Values.ToArray(), eligible.Values.ToArray(), coverage, windows.Values.Distinct().ToArray(), issues.ToArray(),
             listing.MembershipRevision, listing.CurrentUnitIds, !coverage.Any(c => c.State == "UNKNOWN"));
         if (progress != null) await progress(Capture(), 0, ordered.Length);
@@ -77,16 +94,29 @@ internal sealed class AggregateSourceResolver(IAggregatePreviewReader reader, IA
             if (selection.ExcludedReportIds.Contains(header.Pin.ReportId) || (selection.Mode == "EXPLICIT_REPORTS" && !selection.ReportIds.Contains(header.Pin.ReportId))) continue;
             if (!header.WholeReportReadable || header.ParentAssignmentId != AggregateTargetIdentity.Parent(context.Context) || header.Pin.WorkId != context.Context.WorkId)
                 throw new AggregatePreviewException("AGG_SOURCE_UNAVAILABLE");
-            var metadataMatching = node.Outputs.Where(p => AggregateReportMetadataFilter.Matches(rules[p.Id].ReportFilter, header)).ToArray();
+            if (reportSetMode && (header.Pin.Status != "Approved" || !header.Active))
+            {
+                // Explicitly linked current reports retain their existing lock identity,
+                // even while awaiting approval. They never contribute or load a payload.
+                if (header.Active && selection.Mode == "EXPLICIT_REPORTS") linked.TryAdd(header.Pin.ReportId, header.Pin);
+                continue;
+            }
+            var metadataMatching = node.Outputs.Where(p => {
+                if (rules[p.Id].Mode != AggregateReportSetFilter.Mode)
+                    return AggregateReportMetadataFilter.Matches(rules[p.Id].ReportFilter, header);
+                var match = AggregateReportSetFilter.Matches(rules[p.Id].ReportSet!, header, context);
+                if (match == null) throw new AggregatePreviewException("AGG_METADATA_DATE_UNAVAILABLE", "$.timeRules[" + rules[p.Id].Id + "]");
+                return match.Value;
+            }).ToArray();
             if (metadataMatching.Length == 0)
             {
                 if (selection.Mode == "EXPLICIT_REPORTS") linked.TryAdd(header.Pin.ReportId, header.Pin);
                 continue;
             }
             AggregatePayload? payload = null;
-            if (metadataMatching.Any(p => rules[p.Id].SourceDateBasis != "DECLARED_DATA_WINDOW"))
+            if (metadataMatching.Any(p => rules[p.Id].Mode != AggregateReportSetFilter.Mode && rules[p.Id].SourceDateBasis != "DECLARED_DATA_WINDOW"))
                 payload = await Read(header);
-            var matching = metadataMatching.Where(p => AggregateTimeResolver.MatchesSource(rules[p.Id], windows[p.Id], header, payload)).ToArray();
+            var matching = metadataMatching.Where(p => rules[p.Id].Mode == AggregateReportSetFilter.Mode || AggregateTimeResolver.MatchesSource(rules[p.Id], windows[p.Id], header, payload)).ToArray();
             if (matching.Length == 0 && selection.Mode != "EXPLICIT_REPORTS") continue;
             linked.TryAdd(header.Pin.ReportId, header.Pin);
             if (header.Pin.Status != "Approved" || !header.Active || matching.Length == 0) continue;
@@ -112,9 +142,10 @@ internal sealed class AggregateSourceResolver(IAggregatePreviewReader reader, IA
                     SourceSlot: port.ValueType == "LIST" ? AggregateDigest.Of(new { NodeId = node.Id, PortId = port.Id }) : null)])
                 {
                     SourceNote = new("", AggregateDigest.Of(new { header.Pin.BindingId, header.OccurrenceKey, port.MemberId }),
-                        header.Pin.ReportId, header.UnitId, header.UnitName ?? header.UnitId, header.ReportTitle,
+                        header.Pin.ReportId, header.UnitId, header.UnitName ?? "", header.ReportTitle,
                         header.OccurrenceKey, port.MemberId!, header.IsHistoricalData ? header.CompletedDate?.ToString("yyyy-MM-dd") : null,
-                        header.IsHistoricalData ? null : header.SubmittedAtUtc?.ToString("O"))
+                        header.IsHistoricalData ? null : header.SubmittedAtUtc?.ToString("O")) {
+                            UnitFullName = header.UnitName, UnitShortName = header.UnitShortName, UnitSymbol = header.UnitSymbol }
                 };
                 if(spooled.Contains(port.Id))
                 {
@@ -148,7 +179,7 @@ internal sealed class AggregateSourceResolver(IAggregatePreviewReader reader, IA
             if (port.Shape == "SINGLE" && outputs[port.Id].Count > 1) throw new AggregatePreviewException("AGG_SOURCE_CARDINALITY");
         if (windows.Values.Any(w => w.Match == "OVERLAPS_WHOLE_REPORT"))
             issues.Add(new("AGG_OVERLAP_WHOLE_REPORT", "$.nodes[" + node.Id + "]", "Whole reports can contribute to adjacent target periods; no proration is performed."));
-        return new(node, schema, node.Outputs.ToDictionary(p => p.Id, p => new AggregateChannel(p.ValueType, p.Shape, outputs[p.Id], p.ValueType == "TABLE", schema.Members[p.MemberId!].List)),
+        return new(node, schema, node.Outputs.ToDictionary(p => p.Id, Channel),
             linked.Values.ToArray(), eligible.Values.ToArray(), coverage, windows.Values.Distinct().ToArray(), issues,
             listing.MembershipRevision, listing.CurrentUnitIds, !coverage.Any(c => c.State == "UNKNOWN"));
 

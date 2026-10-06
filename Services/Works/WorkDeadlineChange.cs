@@ -103,6 +103,12 @@ internal static class WorkDeadlineChange
                 Builders<WorkTemplateAssignee>.Update.Set(a => a.DueDate, impact.NewDueDate)
                     .Set(a => a.UpdatedAtUtc, now).Set(a => a.UpdatedByUserId, actor), cancellationToken: ct);
         }
-        // Deliberately no period/report/queue mutation or rematerialize call here.
+        // Report-set filters may use Work dates. Recompute draft aggregates using the
+        // existing durable queue; retained report periods and submitted results stay intact.
+        if (current.StartDate != observed.StartDate || current.EndDate != observed.EndDate)
+            await tdtd_be.Services.AggregateMapping.Persistence.AggregateHostIntegration.RelationshipAsync(
+                ctx, session, observed.Id, assignments.Select(a => a.Id).ToArray(),
+                "WORK_FILTER_DATES:" + observed.Id + ":" + now.Ticks, ct, preserveIdentity: true);
+        // Deliberately no period/report rematerialization here.
     }
 }

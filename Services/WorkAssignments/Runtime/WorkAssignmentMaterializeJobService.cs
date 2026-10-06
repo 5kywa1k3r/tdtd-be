@@ -115,7 +115,7 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
         await EnqueueOrTouchAsync(assignment, actorUserId, ct);
     }
 
-    public async Task DisableByAssignmentIdAsync(string workAssignmentId, string actorUserId, CancellationToken ct = default)
+    public async Task DisableByAssignmentIdAsync(string workAssignmentId, string? actorUserId, CancellationToken ct = default)
     {
         var now = DateTime.UtcNow;
 
@@ -321,7 +321,7 @@ public sealed class WorkAssignmentMaterializeJobService : IWorkAssignmentMateria
                 throw InvalidPeriodKey(item.PeriodKey, assignment.Id);
             }
 
-            periodDate = periodDate.Date;
+            periodDate = ReportCivilDate.Encode(periodDate);
 
             var actualDueAtUtc = isOnceAssignment
                 ? ResolveOnceDueAtUtc(assignment, work, parent)

@@ -29,7 +29,17 @@ internal sealed record AggregateSourceHeader(AggregateSourcePinDto Pin, string P
     public DateTime? DueAtUtc { get; init; }
     public string? PeriodKey { get; init; }
     public string? UnitName { get; init; }
+    public string? UnitShortName { get; init; }
+    public string? UnitSymbol { get; init; }
     public string? ReportTitle { get; init; }
+    public DateTime? AssignedAtUtc { get; init; }
+    public DateTime? AssignmentStartDate { get; init; }
+    public DateTime? AssignmentCompletedDate { get; init; }
+    public DateTime? StartedDate { get; init; }
+    public DateTime? PeriodStart { get; init; }
+    public DateTime? PeriodEnd { get; init; }
+    public DateTime? WorkStartDate { get; init; }
+    public DateTime? WorkEndDate { get; init; }
 }
 internal sealed record AggregateSlot(string Key, string BindingId, string ScheduleRevision, string OccurrenceKey,
     string? PeriodId, string? CurrentReportId, AggregateFormPinDto Form, bool Readable,
@@ -52,6 +62,11 @@ internal interface IAggregatePreviewReader
     Task<AggregateReadContext> ReadContextAsync(AggregatePeriodContextDto selector, string actor, CancellationToken ct);
     Task<AggregateSchema> ReadSchemaAsync(AggregateFormPinDto pin, AggregateReadContext context, string actor, CancellationToken ct);
     Task<AggregateSourceListing> ListSourcesAsync(AggregateReadContext context, AggregateFormPinDto form, string actor, CancellationToken ct);
+    Task<AggregateSourceListing> ListReportSetSourcesAsync(AggregateReadContext context, AggregateFormPinDto form, string actor, CancellationToken ct)
+        => ListSourcesAsync(context, form, actor, ct);
+    // Only explicitly selected/excluded IDs. Inactive metadata is not a payload or a contributor.
+    Task<IReadOnlyList<AggregateSourceHeader>> ReadInactiveSourcesAsync(AggregateReadContext context, AggregateFormPinDto form,
+        IReadOnlyList<string> ids, string actor, CancellationToken ct) => Task.FromResult<IReadOnlyList<AggregateSourceHeader>>([]);
     Task<AggregatePayload> ReadPayloadAsync(AggregateReadContext context, AggregateSourceHeader header, AggregateSchema schema, string actor, CancellationToken ct);
     Task<bool> IsCurrentAsync(AggregateReadContext context, IReadOnlyList<AggregateSourcePinDto> pins,
         string membershipRevision, string actor, CancellationToken ct);
@@ -65,10 +80,12 @@ internal interface IAggregateBatchPreviewReader
         string actor, CancellationToken ct);
 }
 
-internal sealed class AggregatePreviewException(string code, string path = "$") : Exception(code)
+internal sealed record AggregateErrorLocation(string NodeId, string? PortId = null);
+internal sealed class AggregatePreviewException(string code, string path = "$", Exception? inner = null) : Exception(code, inner)
 {
     internal string Code { get; } = code;
     internal string Path { get; } = path;
+    internal AggregateErrorLocation? Location { get; init; }
 }
 internal sealed class AggregateBudget(CancellationToken cancellation, int maxOperations = 500_000, long maxBytes = 16_777_216, TimeSpan? duration = null)
 {
@@ -105,7 +122,12 @@ internal interface IAggregateContentSink
     Task<AggregateContentReference> CaptureAsync(AggregateReadContext context, AggregateTable table, CancellationToken ct);
 }
 internal sealed record AggregateContentRowNote(string RowKey, string SourceKey, string ReportId, string UnitId,
-    string UnitName, string? ReportTitle, string OccurrenceKey, string MemberId, string? CompletedDate, string? SubmittedAtUtc);
+    string UnitName, string? ReportTitle, string OccurrenceKey, string MemberId, string? CompletedDate, string? SubmittedAtUtc)
+{
+    public string? UnitFullName { get; init; }
+    public string? UnitShortName { get; init; }
+    public string? UnitSymbol { get; init; }
+}
 internal sealed record AggregateValue(string Type, string State, string? Text = null, bool? Boolean = null,
     AggregateNumber? Number = null, AggregateTable? Table = null, IReadOnlyList<string>? Choices = null)
 {
@@ -113,6 +135,10 @@ internal sealed record AggregateValue(string Type, string State, string? Text = 
     public AggregateContentReference? ContentReference { get; init; }
     public AggregateListValue? List { get; init; }
     public AggregateListReference? ListReference { get; init; }
+    [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+    public string? TextFormat { get; init; }
+    [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+    public string? LengthText { get; init; }
     internal static AggregateValue Blank(string type) => new(type, "BLANK");
     internal static AggregateValue NoResult(string type) => new(type, "NO_RESULT");
     internal static AggregateValue Numeric(AggregateNumber number) => new("NUMBER", "VALUE", Number: number);
@@ -122,7 +148,10 @@ internal sealed record AggregateObservation(AggregateValue Value, IReadOnlyList<
     public AggregateContentRowNote? SourceNote { get; init; }
 }
 internal sealed record AggregateChannel(string Type, string Shape, IReadOnlyList<AggregateObservation> Items,
-    bool TableOrigin = false, AggregateListSchema? ListSchema = null);
+    bool TableOrigin = false, AggregateListSchema? ListSchema = null)
+{
+    internal IReadOnlyList<AggregateTrace> EligibleSources { get; init; } = [];
+}
 internal sealed record AggregateResolvedSource(AggregateNodeDto Node, AggregateSchema Schema,
     IReadOnlyDictionary<string, AggregateChannel> Outputs, IReadOnlyList<AggregateSourcePinDto> Linked,
     IReadOnlyList<AggregateSourcePinDto> Eligible, IReadOnlyList<AggregateCoverageSlotDto> Coverage,

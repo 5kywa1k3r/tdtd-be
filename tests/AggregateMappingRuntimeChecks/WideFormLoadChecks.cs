@@ -22,7 +22,8 @@ internal static class WideFormLoadChecks
 {
     internal static async Task Run(MongoDbContext db, AggregateMongoStore store,
         IDynamicFlowDefinitionTransactionRunner runner, IConfiguration configuration, string run,
-        Func<string, object, string?, HttpStatusCode, Task<JsonElement>> post, CancellationToken ct, bool mixedContent = false)
+        Func<string, object, string?, HttpStatusCode, Task<JsonElement>> post, CancellationToken ct, bool mixedContent = false,
+        Func<DynamicFormTemplate, CancellationToken, Task<DynamicFormTemplate>>? publishForm = null, bool asyncCompute = false)
     {
         const int sources = 166, scalarCount = 40, rowCount = 16, columnCount = 10;
         var textCount = mixedContent ? 4 : 0;
@@ -49,7 +50,7 @@ internal static class WideFormLoadChecks
                     new { id = "text" + i, key = "text" + i, name = "Nội dung " + i, label = "Nội dung " + i, sectionId = "main", type = "longText", required = false, order = numberCount + i - 1 })));
             form.NativeTablesVersion = 1; form.TablesJson = JsonSerializer.Serialize(new[] { table }
                 .Concat(Enumerable.Range(1, target ? textCount : 0).Select(WideContentChecks.Table)), AggregateCanonical.Json);
-        });
+        }, publishForm: publishForm);
         await FixtureProvenanceChecks.Migration(db, "wide after seed", ct);
         Task<JsonElement> Call(string path, object body) => post("aggregate-v2/" + path, body, f.Actor, HttpStatusCode.OK);
         var window = new AggregateDataWindowDeclarationDto("2026-09-01", "2026-09-30", "USER_DECLARED", run, 1);
@@ -148,6 +149,10 @@ internal static class WideFormLoadChecks
             return AggregateDigest.Of(rows);
         }
         var before = await Snapshot();
+        if (asyncCompute) {
+            await WideAsyncComputationChecks.Run(db,runner,configuration,f,run,instanceId,context,change,Call,Check,ct);
+            return;
+        }
         watch.Restart();
         JsonElement preview = default;
         // Mixed long-content UX uses the approved job path. Start it cold, without
@@ -227,9 +232,43 @@ internal static class WideFormLoadChecks
                 && c.GetProperty("numerator").GetString() == c.GetProperty("value").GetString()
                 && c.GetProperty("lineage").GetArrayLength() == 1)), "source evidence retains exact numbers and per-cell lineage without duplicate cell tree");
         Verify(finished.GetProperty("result").GetProperty("preview"));
+        if (mixedContent)
+        {
+            foreach (var field in Enumerable.Range(1, textCount))
+            {
+                var reference = finished.GetProperty("result").GetProperty("preview").GetProperty("preview").GetProperty("results")
+                    .EnumerateArray().Single(r => r.GetProperty("portId").GetString() == "content" + field).GetProperty("value");
+                var contentRequest = new tdtd_be.Controllers.AggregateContentReadRequest(f.Report.Id, null, null, jobId, reference, Limit: 10);
+                var page = await Call("content/page", contentRequest);
+                Check(page.GetProperty("total").GetInt32() == sources && page.GetProperty("rows").GetArrayLength() == 10
+                    && page.GetProperty("rows").EnumerateArray().All(row => row.GetProperty("sample").GetString()!.Length <= 240),
+                    "preview content page keeps ten bounded samples " + field);
+                Console.WriteLine($"MEASURE wide previewContentPage field={field} bytes={System.Text.Encoding.UTF8.GetByteCount(page.GetRawText())}");
+                var row = page.GetProperty("rows").EnumerateArray().First(row => row.GetProperty("characterCount").GetInt32() > 0);
+                int? part = 0; var full = new System.Text.StringBuilder();
+                while (part != null)
+                {
+                    var chunk = await Call("content/part", contentRequest with { RowKey = row.GetProperty("rowKey").GetString(), Part = part.Value });
+                    full.Append(chunk.GetProperty("text").GetString());
+                    part = chunk.GetProperty("nextPart").ValueKind == JsonValueKind.Null ? null : chunk.GetProperty("nextPart").GetInt32();
+                }
+                var text = full.ToString(); var ordinal = int.Parse(text.Substring("Nguồn ".Length, 3));
+                Check(text == WideContentChecks.Text(ordinal, field), "preview parts restore complete long Unicode text " + field);
+            }
+        }
         Check(before == await Snapshot(), "sync/job preview leaves target payload and aggregate business records unchanged");
         watch.Restart();
-        await Call($"instances/{instanceId}/apply", new AggregateMappingApplyCommandDto(run + "-wide-apply", context, change, finished.GetProperty("result").GetProperty("token").GetString()!));
+        try
+        {
+            await Call($"instances/{instanceId}/apply", new AggregateMappingApplyCommandDto(run + "-wide-apply", context, change, finished.GetProperty("result").GetProperty("token").GetString()!));
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"LIMIT wide applyMs={watch.ElapsedMilliseconds} {ex.Message}");
+            Check(before == await Snapshot(), "failed Apply preserves target payload and aggregate business records");
+            await FixtureProvenanceChecks.Migration(db, "wide after failed Apply", ct);
+            throw;
+        }
         Console.WriteLine($"MEASURE wide applyMs={watch.ElapsedMilliseconds}");
         var current = await db.WorkAssignmentReports.Find(x => x.Id == f.Report.Id).SingleAsync(ct);
         var savedPayload = await payload.LoadReportPayloadAsync(current, ct);

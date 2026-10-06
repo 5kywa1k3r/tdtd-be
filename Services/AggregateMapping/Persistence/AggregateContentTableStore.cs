@@ -82,7 +82,7 @@ internal sealed class AggregateContentTableStore(MongoDbContext db) : IAggregate
                 }
             }
             var note = table.ContentRows[i]; var cells = table.Rows[i];
-            if (string.IsNullOrWhiteSpace(note.UnitName) || !keys.Add(note.RowKey) || cells.Count != 2 || cells.Any(c => c.Value.Type != "TEXT")
+            if (!keys.Add(note.RowKey) || cells.Count != 2 || cells.Any(c => c.Value.Type != "TEXT")
                 || cells[1].Value.State is not ("VALUE" or "BLANK")) throw new AggregatePreviewException("AGG_CONTENT_TABLE_INVALID");
             var text = cells[1].Value.Text ?? ""; var partIds = new List<string>();
             var contentHash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(text)));
@@ -153,12 +153,8 @@ internal sealed class AggregateContentTableStore(MongoDbContext db) : IAggregate
     internal async Task<AggregateContentTextPart> TextPart(string scope, AggregateContentReference reference,
         string rowKey, int part, CancellationToken ct)
     {
-        if (part < 0 || string.IsNullOrWhiteSpace(rowKey)) throw new AggregatePreviewException("AGG_CONTENT_PAGE_INVALID");
-        var manifest = await Manifest(scope, reference, ct);
-        // Membership comes from the sealed manifest, not just the guessed row key.
-        var row = await Collection(Rows).Find(new BsonDocument { ["scope"] = scope, ["rowKey"] = rowKey,
-            ["_id"] = new BsonDocument("$in", manifest["rowIds"]) }).FirstOrDefaultAsync(ct)
-            ?? throw new AggregatePreviewException("AGG_CONTENT_UNAVAILABLE");
+        if (part < 0) throw new AggregatePreviewException("AGG_CONTENT_PAGE_INVALID");
+        var row = await ReadRow(scope, reference, rowKey, ct);
         var parts = row["parts"].AsBsonArray;
         if (part == 0 && parts.Count == 0) return new("", null, row["characters"].AsInt32);
         if (part >= parts.Count) throw new AggregatePreviewException("AGG_CONTENT_PAGE_INVALID");
@@ -168,6 +164,23 @@ internal sealed class AggregateContentTableStore(MongoDbContext db) : IAggregate
         var text = value["text"].AsString;
         if (Digest(scope, text) != id) throw new AggregatePreviewException("AGG_CONTENT_INTEGRITY");
         return new(text, part + 1 < parts.Count ? part + 1 : null, row["characters"].AsInt32);
+    }
+
+    internal async Task<AggregateContentRowNote> SourceNote(string scope, AggregateContentReference reference,
+        string rowKey, CancellationToken ct) => Note(await ReadRow(scope, reference, rowKey, ct));
+
+    private async Task<BsonDocument> ReadRow(string scope, AggregateContentReference reference, string rowKey, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(rowKey)) throw new AggregatePreviewException("AGG_CONTENT_PAGE_INVALID");
+        var manifest = await Manifest(scope, reference, ct);
+        // Membership comes from the sealed manifest, not just the guessed row key.
+        var row = await Collection(Rows).Find(new BsonDocument { ["scope"] = scope, ["rowKey"] = rowKey,
+            ["_id"] = new BsonDocument("$in", manifest["rowIds"]) }).FirstOrDefaultAsync(ct)
+            ?? throw new AggregatePreviewException("AGG_CONTENT_UNAVAILABLE");
+        var note = Note(row); var state = row["state"].AsString; var contentHash = row["contentHash"].AsString;
+        if (note.RowKey != rowKey || Digest(scope, JsonSerializer.Serialize(new { note, state, contentHash }, AggregateCanonical.Json)) != row["_id"].AsString)
+            throw new AggregatePreviewException("AGG_CONTENT_INTEGRITY");
+        return row;
     }
 
     internal async Task<IReadOnlyList<string>> FindSourceRows(string scope, string sourceKey, CancellationToken ct)

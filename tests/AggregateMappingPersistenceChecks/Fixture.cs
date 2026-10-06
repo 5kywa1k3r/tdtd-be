@@ -10,16 +10,26 @@ internal sealed class TestStore : IAggregateTransactionStore
     internal Dictionary<(string Collection, string Id), TestRow> Rows = [];
     internal Dictionary<string, TestReport> Reports = [];
     internal int FailAtWrite, WriteCount;
+    internal int TransactionDepth;
+    internal Exception? AfterTargetWriteFailure, AfterTargetCommitFailure;
     internal T? Value<T>(string collection, string id) => Rows.TryGetValue((collection, id), out var row) ? JsonSerializer.Deserialize<T>(row.Body, AggregateCanonical.Json) : default;
     public async Task<T> ExecuteAsync<T>(Func<IAggregateTransaction, CancellationToken, Task<T>> action, CancellationToken ct)
     {
-        var tx = new Transaction(this); var result = await action(tx, ct);
-        Rows = tx.Rows; Reports = tx.Reports; return result;
+        TransactionDepth++;
+        try
+        {
+            var tx = new Transaction(this); var result = await action(tx, ct);
+            Rows = tx.Rows; Reports = tx.Reports;
+            if(tx.TargetWritten&&AfterTargetCommitFailure is {} commitFailure){AfterTargetCommitFailure=null;throw commitFailure;}
+            return result;
+        }
+        finally { TransactionDepth--; }
     }
     internal sealed class Transaction(TestStore owner) : IAggregateTransaction
     {
         internal Dictionary<(string Collection, string Id), TestRow> Rows = new(owner.Rows);
         internal Dictionary<string, TestReport> Reports = new(owner.Reports);
+        internal bool TargetWritten;
         public Task<AggregateStored<T>?> GetAsync<T>(string collection, string id, CancellationToken ct)
             => Task.FromResult(Rows.TryGetValue((collection, id), out var row)
                 ? new AggregateStored<T>(row.Version, JsonSerializer.Deserialize<T>(row.Body, AggregateCanonical.Json)!) : null);
@@ -51,6 +61,8 @@ internal sealed class TestStore : IAggregateTransactionStore
             Touch(); var id = authority.Read.Context.ReportId!; var report = Reports[id];
             if (report.Status != "Draft" || report.Payload != authority.Read.Revisions.PayloadRevision) throw new AggregatePreviewException("AGG_REVISION_CONFLICT");
             Reports[id] = report with { Payload = report.Payload + 1, Value = write.Preview.Preview.Results.Single().Value?.GetString() };
+            TargetWritten=true;
+            if(owner.AfterTargetWriteFailure is {} failure)throw failure;
             return Task.FromResult((long)Reports[id].Payload);
         }
         private void Touch()
@@ -64,6 +76,11 @@ internal sealed class TestReader(TestStore store) : IAggregateCommandReader
     internal int SourceRevision = 1;
     internal long SourceValue = 30;
     internal bool Missing;
+    internal bool RejectPreviewInTransaction;
+    internal int PreviewCalls;
+    internal Func<Task>? AfterPreview;
+    public Task<string> InputStampAsync(AggregateInstanceState instance, AggregateRecipeDto recipe, AggregateCommitAuthority authority, CancellationToken ct)
+        => Task.FromResult(AggregateCanonical.Hash(new { recipe, instance.Selection, SourceRevision, SourceValue, Authorized, Fresh, Missing }));
     internal static AggregateFormPinDto SourceForm = new("formC", "familyC", 1, "hashC"), TargetForm = new("formB", "familyB", 1, "hashB");
     internal static AggregatePeriodContextDto Context(string id = "reportB") => new("PERIODIC", "work", "B", "binding" + id, id, "period" + id, "pi" + id, "20260930", "2026-09-01", "2026-09-30", null, "schedule");
     internal static AggregateExpressionDto Input() => new() { Kind = "INPUT", Ref = "in" };
@@ -88,11 +105,16 @@ internal sealed class TestReader(TestStore store) : IAggregateCommandReader
             new(report.Payload, report.Lifecycle, 0, 0, "hashB", ""), "authorityB", new("2026-09-01", "2026-09-30", "USER_DECLARED", "owned", 1), values);
         return Task.FromResult(new AggregateCommitAuthority(actor, sessionKey, read, []));
     }
-    public Task<AggregatePreviewEnvelope> PreviewAsync(AggregateInstanceState instance, AggregateRecipeDto recipe, AggregateCommitAuthority authority, CancellationToken ct)
+    public async Task<AggregatePreviewEnvelope> PreviewAsync(AggregateInstanceState instance, AggregateRecipeDto recipe, AggregateCommitAuthority authority, CancellationToken ct)
     {
+        if (RejectPreviewInTransaction && store.TransactionDepth != 0) throw new InvalidOperationException("PREVIEW_INSIDE_PUBLICATION_TRANSACTION");
+        PreviewCalls++;
         var expected = authority.Read.Revisions with { InstanceRevision = instance.Revision, ConfigRevision = instance.ConfigRevision };
         var read = authority.Read with { Revisions = expected };
-        return new AggregatePreviewService(new SourceReader(this, read)).PreviewAsync(new(read.Context, instance.Id, instance.ConfigId, expected, recipe, instance.Selection), authority.Actor, ct);
+        var result = await new AggregatePreviewService(new SourceReader(this, read)).PreviewAsync(new(read.Context, instance.Id, instance.ConfigId, expected, recipe, instance.Selection), authority.Actor, ct);
+        var after = AfterPreview; AfterPreview = null;
+        if (after != null) await after();
+        return result;
     }
     private sealed class SourceReader(TestReader owner, AggregateReadContext read) : IAggregatePreviewReader
     {

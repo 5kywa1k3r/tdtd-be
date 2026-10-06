@@ -39,6 +39,19 @@ public sealed class AggregateMappingPreviewController(MongoDbContext db, IWorkRe
                 readConfig = AggregateMappingPolicy.Decide(AggregateAction.ReadConfig, read.Authority),
                 editConfig = AggregateMappingPolicy.Decide(AggregateAction.EditConfig, read.Authority),
                 editMapping = AggregateMappingPolicy.Decide(AggregateAction.EditMapping, read.Authority),
+                asyncCompute = new { supported = V2Enabled, version = 1, semanticProfile = "DURABLE_COMPUTATION_V1" },
+                reportSetFilter = new { supported = V2Enabled, version = 1, maxConditions = 32 },
+                formulaProbe = new { supported = V2Enabled && AggregateMappingPolicy.Decide(AggregateAction.ReadLineage, read.Authority).Allowed, version = 1, maxReports = 3 },
+                textPolicy = new { supported = true, semanticProfile = AggregateTextPolicy.Semantics,
+                    shortTextLimit = AggregateTextPolicy.ShortTextLimit, lengthBasis = "VISIBLE_GRAPHEMES",
+                    longTextOperations = new[] { "CONCAT", "REPORT_TEXT_TABLE" }, richTextDistinct = false,
+                    stringListWholeBlock = true, unitDisplays = new[] { "FULL_NAME", "SHORT_NAME", "SYMBOL", "NONE" } },
+                extendedOperators = new { supported = true, recipeVersion = 3, semanticProfile = "REPORT_MAPPING_EXTENDED_V1",
+                    scalar = AggregateExtendedFunctions.Names.Order(StringComparer.Ordinal).ToArray(),
+                    list = new[] { "AVG_PRESENT", "WEIGHTED_AVG", "COUNT_DISTINCT_FIELD", "LIST_MERGE_VERTICAL", "LIST_MERGE_HORIZONTAL", "REPORT_COUNT" },
+                    listFilter = true, maxMergeInputs = 8, maxTargetRecords = 200, maxTopN = 200,
+                    maxScannedRecords = 40_000, maxRetainedSelectionBytes = 16_777_216, maxPageSize = 50,
+                    signatures = AggregateExtendedFunctions.Signatures },
                 listPipeline = new { supported = true, version = 1, recipeVersion = 2, semanticProfile = "REPORT_MAPPING_LIST_V1",
                     maxTopN = 200, maxPageSize = 50, maxScannedRecords = 40_000, maxRetainedSelectionBytes = 16_777_216,
                     maxTargetRecords = 200, directListSnapshotScan = true, sortChoiceBy = new[] { "CODE" },
@@ -112,7 +125,8 @@ public sealed class AggregateMappingPreviewController(MongoDbContext db, IWorkRe
             if (offset > visible.Length) throw new AggregatePreviewException("AGG_CURSOR_STALE");
             var items = visible.Skip(offset).Take(request.PageSize).Select(h => h.Pin).ToList();
             var next = offset + items.Count;
-            return new AggregateSourceSearchResponseDto(items, next < visible.Length ? fingerprint + ":" + next : null, "NOT_RESOLVED", []);
+            return new AggregateSourceSearchResponseDto(items, next < visible.Length ? fingerprint + ":" + next : null, "NOT_RESOLVED", [])
+            { Labels = visible.Skip(offset).Take(request.PageSize).ToDictionary(h=>h.Pin.ReportId,h=>new AggregateSourceLabelDto(h.UnitId,h.UnitName??"",h.ReportTitle,h.PeriodKey)) };
         }, ct);
 
     [HttpPost("contexts/resolve")]

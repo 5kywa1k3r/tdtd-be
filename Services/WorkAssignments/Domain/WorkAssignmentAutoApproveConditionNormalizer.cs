@@ -25,16 +25,23 @@ public static class WorkAssignmentAutoApproveConditionNormalizer
             if (root.ValueKind != JsonValueKind.Object)
                 throw InvalidCondition("Điều kiện tự duyệt phải là JSON object.", new { field = "autoApproveConditionJson" });
 
-            if (root.TryGetProperty("enabled", out var enabledElement) &&
+            if (TryGetPropertyCaseInsensitive(root, "enabled", out var enabledElement) &&
                 enabledElement.ValueKind is JsonValueKind.False)
             {
                 return null;
             }
 
+            if (enabledElement.ValueKind != JsonValueKind.True || !HasValidFieldReferences(root))
+                throw InvalidCondition("Cấu hình tự duyệt không hợp lệ.", new { field = "autoApproveConditionJson" });
+
             var fieldId = ReadString(root, "fieldId");
             var fieldKey = ReadString(root, "fieldKey");
             if (IsNoFieldCondition(fieldId, fieldKey))
+            {
+                if (!IsExplicitAlwaysCondition(root))
+                    throw InvalidCondition("Điều kiện tự duyệt thiếu trường dữ liệu.", new { fieldId, fieldKey });
                 return SerializeAlwaysCondition();
+            }
 
             var field = ResolveField(fieldsJson, fieldId, fieldKey)
                         ?? throw InvalidCondition(
@@ -47,6 +54,10 @@ public static class WorkAssignmentAutoApproveConditionNormalizer
                     "Điều kiện tự duyệt chỉ hỗ trợ field số, chọn một hoặc chọn nhiều.",
                     new { fieldId = field.Id, fieldKey = field.Key, fieldType = field.Type });
             }
+
+            var requestedFieldType = ReadString(root, "fieldType");
+            if (!string.IsNullOrWhiteSpace(requestedFieldType) && requestedFieldType != field.Type)
+                throw InvalidCondition("Kiểu trường của điều kiện tự duyệt đã thay đổi.", new { fieldId, fieldKey });
 
             var op = NormalizeOperator(ReadString(root, "operator"));
             EnsureOperatorAllowed(field.Type, op);
@@ -96,8 +107,8 @@ public static class WorkAssignmentAutoApproveConditionNormalizer
             if (condition.ValueKind != JsonValueKind.Object)
                 return false;
 
-            if (condition.TryGetProperty("enabled", out var enabledElement) &&
-                enabledElement.ValueKind is JsonValueKind.False)
+            if (!TryGetPropertyCaseInsensitive(condition, "enabled", out var enabledElement) ||
+                enabledElement.ValueKind != JsonValueKind.True || !HasValidFieldReferences(condition))
             {
                 return false;
             }
@@ -105,7 +116,7 @@ public static class WorkAssignmentAutoApproveConditionNormalizer
             var fieldId = ReadString(condition, "fieldId");
             var fieldKey = ReadString(condition, "fieldKey");
             if (IsNoFieldCondition(fieldId, fieldKey))
-                return true;
+                return IsExplicitAlwaysCondition(condition);
 
             if (string.IsNullOrWhiteSpace(fieldValuesJson))
                 return false;
@@ -117,7 +128,12 @@ public static class WorkAssignmentAutoApproveConditionNormalizer
             if (!IsSupportedFieldType(fieldType))
                 return false;
 
+            EnsureOperatorAllowed(fieldType, op);
+
             if (!TryGetReportValue(valuesDocument.RootElement, fieldId, fieldKey, out var reportValue))
+                return false;
+
+            if (!IsValidReportValue(fieldType, reportValue))
                 return false;
 
             if (op == "notEmpty")
@@ -136,7 +152,33 @@ public static class WorkAssignmentAutoApproveConditionNormalizer
         {
             return false;
         }
+        catch (AppException)
+        {
+            return false;
+        }
     }
+
+    private static bool HasValidFieldReferences(JsonElement condition)
+        => new[] { "fieldId", "fieldKey" }.All(name =>
+            !TryGetPropertyCaseInsensitive(condition, name, out var value) ||
+            value.ValueKind is JsonValueKind.Null or JsonValueKind.String);
+
+    private static bool IsExplicitAlwaysCondition(JsonElement condition)
+    {
+        // Preserve the established legacy { enabled: true } contract, but not a broken field rule.
+        if (!TryGetPropertyCaseInsensitive(condition, "operator", out var op)) return true;
+        return op.ValueKind == JsonValueKind.String && NormalizeOperator(op.GetString()) == AlwaysOperator;
+    }
+
+    private static bool IsValidReportValue(string fieldType, JsonElement value)
+        => fieldType switch
+        {
+            "number" => ToNullableDecimal(value).HasValue,
+            "singleSelect" => value.ValueKind == JsonValueKind.String,
+            "multiSelect" => value.ValueKind == JsonValueKind.String ||
+                (value.ValueKind == JsonValueKind.Array && value.EnumerateArray().All(item => item.ValueKind == JsonValueKind.String)),
+            _ => false
+        };
 
     private static object NormalizeConditionValue(string fieldType, JsonElement value)
     {
@@ -281,6 +323,11 @@ public static class WorkAssignmentAutoApproveConditionNormalizer
 
     private static AutoApproveField? ResolveField(string? fieldsJson, string? fieldId, string? fieldKey)
     {
+        if (!string.IsNullOrWhiteSpace(fieldId))
+        {
+            var byId = ReadFields(fieldsJson).FirstOrDefault(field => field.Id == fieldId.Trim());
+            return byId is not null && (string.IsNullOrWhiteSpace(fieldKey) || byId.Key == fieldKey.Trim()) ? byId : null;
+        }
         foreach (var field in ReadFields(fieldsJson))
         {
             if (!string.IsNullOrWhiteSpace(fieldId) &&

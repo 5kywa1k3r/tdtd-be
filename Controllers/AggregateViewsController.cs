@@ -61,9 +61,10 @@ public sealed class AggregateViewsController(MongoDbContext db, IDynamicFlowDefi
         var expiry = DateTimeOffset.UtcNow.AddMinutes(5);
         var token = Tokens().Issue(Confirmation(request, actor, session, prepared.Evidence, expiry));
         return new { ConfirmationToken = token, ExpiresAtUtc = expiry, Previous = prepared.Previous?.Current.Form,
-            Next = prepared.Pin, RetainedPreviousVersions = Math.Min(3, (prepared.Previous?.History.Count ?? -1) + 1),
-            Discarded = prepared.Previous?.History.Count >= 3 ? prepared.Previous.History[0].Form : null,
-            Warning = "Đổi biểu mẫu sẽ mở cấu hình tổng hợp mới. Kết quả cũ được giữ trong lịch sử, tối đa ba bản cũ; bản cũ nhất vượt giới hạn sẽ bị bỏ. Báo cáo đã nộp và biểu mẫu gốc không bị sửa." };
+            Next = prepared.Pin, RetainedPreviousVersions = AggregateViewRetention.HistoryAfterBind(prepared.Previous).Length,
+            Discarded = AggregateViewRetention.DiscardedAfterBind(prepared.Previous).FirstOrDefault()?.Form,
+            DiscardedVersions = AggregateViewRetention.DiscardedAfterBind(prepared.Previous).Select(g => g.Form).ToArray(),
+            Warning = "Đổi biểu mẫu sẽ mở cấu hình tổng hợp mới. Giữ tối đa ba bản tổng cộng, gồm bản hiện tại và hai bản lịch sử gần nhất; bản cũ hơn vượt giới hạn sẽ bị bỏ. Báo cáo đã nộp và biểu mẫu gốc không bị sửa." };
     }, ct);
 
     [HttpPost("binding/apply")]
@@ -74,7 +75,7 @@ public sealed class AggregateViewsController(MongoDbContext db, IDynamicFlowDefi
         var id = Id(request.Owner);
         var next = new AggregateViewState(id, request.Owner.WorkId, request.Owner.OwnerKind, request.Owner.OwnerId,
             new(Guid.NewGuid().ToString("N"), prepared.Pin, null, DateTimeOffset.UtcNow),
-            prepared.Previous == null ? [] : prepared.Previous.History.Concat([prepared.Previous.Current]).TakeLast(3).ToArray(),
+            AggregateViewRetention.HistoryAfterBind(prepared.Previous),
             checked((prepared.Previous?.PayloadRevision ?? 0) + 1));
         await Store().ExecuteAsync(async (tx, token) =>
         {

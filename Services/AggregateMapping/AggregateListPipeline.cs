@@ -7,14 +7,17 @@ internal static class AggregateListPipeline
 {
     internal static void Validate(AggregateListPipelineDto p)
     {
-        if (p.Version != 1 || p.Sort == null || p.Project == null || p.Sort.Count > 8
+        if (p.Version is not (1 or 2) || p.Sort == null || p.Project == null || p.Sort.Count > 8
             || p.Project.Count is < 1 or > 200 || p.Project.Any(x => x == null || !Id(x.FieldId) || !Id(x.OutputFieldId))
             || p.Project.Select(x => x.OutputFieldId).Distinct(StringComparer.Ordinal).Count() != p.Project.Count
             || p.Scope is not ("PER_REPORT" or "ALL_SOURCES") || p.Take is not ("ALL" or "TOP_N")
             || (p.Take == "ALL" ? p.TopN != null : p.TopN is not (> 0 and <= 200) || p.Sort.Count == 0)
             || p.Sort.Any(x => x == null || !Id(x.FieldId) || x.Direction is not ("ASC" or "DESC") || x.Nulls != "LAST")
             || p.Sort.Select(x => x.FieldId).Distinct(StringComparer.Ordinal).Count() != p.Sort.Count
-            || p.Operation is not ("COLLECT" or "COUNT_RECORDS" or "COUNT_VALUES" or "SUM" or "AVG" or "MIN" or "MAX" or "ONLY_ITEM")
+            || !(p.Operation is "COLLECT" or "COUNT_RECORDS" or "COUNT_VALUES" or "SUM" or "AVG" or "MIN" or "MAX" or "ONLY_ITEM"
+                || p.Version == 2 && p.Operation is "AVG_PRESENT" or "WEIGHTED_AVG" or "COUNT_DISTINCT_FIELD")
+            || (p.Operation == "WEIGHTED_AVG" ? !Id(p.WeightFieldId) : p.WeightFieldId != null)
+            || (p.Operation != "COUNT_DISTINCT_FIELD" && (p.Trim != null || p.CaseSensitive != null))
             || (p.Operation is "COLLECT" or "COUNT_RECORDS" ? p.ValueFieldId != null : !Id(p.ValueFieldId)))
             throw new AggregatePreviewException("AGG_LIST_PIPELINE_SCHEMA");
         var count = 0;
@@ -63,7 +66,14 @@ internal static class AggregateListPipeline
         if (p.Operation == "COLLECT") return new("LIST", "SINGLE", ListSchema: projected);
         var scalarType = p.ValueFieldId == null ? null : projected.Fields.SingleOrDefault(f => f.Id == p.ValueFieldId)?.Type
             ?? (p.ValueFieldId == null ? null : throw new AggregatePreviewException("AGG_LIST_FIELD_REF"));
-        if (p.Operation is "SUM" or "AVG" or "MIN" or "MAX" && scalarType != "NUMBER") throw new AggregatePreviewException("AGG_LIST_NUMERIC_FIELD_REQUIRED");
+        if (p.Operation is "SUM" or "AVG" or "MIN" or "MAX" or "AVG_PRESENT" or "WEIGHTED_AVG" && scalarType != "NUMBER") throw new AggregatePreviewException("AGG_LIST_NUMERIC_FIELD_REQUIRED");
+        if (p.Operation == "WEIGHTED_AVG" && projected.Fields.SingleOrDefault(f => f.Id == p.WeightFieldId)?.Type != "NUMBER")
+            throw new AggregatePreviewException("AGG_LIST_NUMERIC_FIELD_REQUIRED");
+        if (p.Operation == "COUNT_DISTINCT_FIELD")
+        {
+            if (scalarType is "LIST" or "TABLE" or "CHOICE_MANY" or "UNSUPPORTED") throw new AggregatePreviewException("AGG_EXPRESSION_TYPE");
+            CheckTextOptions(scalarType!, p.Trim, p.CaseSensitive);
+        }
         return new(p.Operation == "ONLY_ITEM" ? scalarType! : "NUMBER", "SINGLE");
 
         void CheckPredicate(AggregateListPredicateDto predicate)
@@ -177,6 +187,8 @@ internal static class AggregateListPipeline
                     c => c.Value with { Value = AggregateListChoicePolicy.Normalize(c.Value.Value) }, StringComparer.Ordinal) };
             var origin = (row.Origin.Pin?.ReportId, row.Origin.SourceSlot);
             counts.TryGetValue(origin, out var count); counts[origin] = (count.Read + 1, count.Matched);
+            if (p.Where != null) CheckTextPredicate(p.Where, row);
+            foreach (var sort in p.Sort) AggregateTextPolicy.CheckValueOperation("SORT", row.Cells[sort.FieldId].Value);
             if (p.Where != null && !Match(p.Where, row, budget)) return;
             matched++; counts[origin] = (count.Read + 1, count.Matched + 1);
             row = row with { Cells = row.Cells.Where(c => retainedFields.Contains(c.Key)).ToDictionary(c => c.Key, c => c.Value, StringComparer.Ordinal) };
@@ -218,7 +230,7 @@ internal static class AggregateListPipeline
         if (p.Operation == "COLLECT")
         {
             var value = new AggregateValue("LIST", "VALUE") { List = new(inferred.ListSchema!, projected) };
-            return AggregateEvaluator.Single(value, allTrace) with { ListSchema = inferred.ListSchema };
+            return AggregateEvaluator.Single(value, allTrace) with { ListSchema = inferred.ListSchema, EligibleSources = input.EligibleSources };
         }
         if (p.Operation == "COUNT_RECORDS") return AggregateEvaluator.Single(AggregateValue.Numeric(AggregateNumber.From(projected.Length)), allTrace);
         if (p.Operation == "ONLY_ITEM")
@@ -232,19 +244,54 @@ internal static class AggregateListPipeline
         var present = values.Where(v => v.Value.State == "VALUE").ToArray();
         var trace = values.SelectMany(v => v.Trace).ToArray();
         traces[^1] = traces[^1] with { BlankCount = values.Length - present.Length };
+        if (p.Operation == "COUNT_DISTINCT_FIELD")
+        {
+            foreach (var cell in values) AggregateTextPolicy.CheckValueOperation("COUNT_DISTINCT", cell.Value);
+            var keys = values.Where(c => c.Value.State != "NO_RESULT").Select(c => c.Value.State == "BLANK" ? "BLANK" : c.Value.Type + ":" + (c.Value.Type switch {
+                "NUMBER" => c.Value.Number!.ExactKey, "BOOLEAN" => c.Value.Boolean!.Value.ToString(),
+                "TEXT" => Normalize(c.Value.Text!, p.Trim, p.CaseSensitive), _ => c.Value.Text! })).Distinct(StringComparer.Ordinal).LongCount();
+            return AggregateEvaluator.Single(AggregateValue.Numeric(AggregateNumber.From(keys)), trace);
+        }
+        if (p.Operation == "WEIGHTED_AVG")
+        {
+            var numerator = AggregateNumber.From(0); var denominator = AggregateNumber.From(0);
+            var weightedTrace = new List<AggregateTrace>();
+            foreach (var row in projected)
+            {
+                budget.Spend();
+                var weight = row.Cells[p.WeightFieldId!]; var score = row.Cells[p.ValueFieldId!];
+                weightedTrace.AddRange(weight.Trace); weightedTrace.AddRange(score.Trace);
+                if (weight.Value.State != "VALUE" || weight.Value.Number!.Compare(AggregateNumber.From(0)) < 0)
+                    throw new AggregatePreviewException("AGG_LIST_WEIGHT_INVALID");
+                if (weight.Value.Number.Compare(AggregateNumber.From(0)) == 0) continue;
+                if (score.Value.State != "VALUE") throw new AggregatePreviewException("AGG_LIST_SCORE_MISSING");
+                numerator = numerator.Add(score.Value.Number!.Multiply(weight.Value.Number));
+                denominator = denominator.Add(weight.Value.Number);
+            }
+            traces[^1] = traces[^1] with { ExactTotal = numerator.ExactKey };
+            return AggregateEvaluator.Single(denominator.Compare(AggregateNumber.From(0)) == 0 ? AggregateValue.NoResult("NUMBER")
+                : AggregateValue.Numeric(numerator.Divide(denominator)), weightedTrace);
+        }
         if (p.Operation == "COUNT_VALUES") return AggregateEvaluator.Single(AggregateValue.Numeric(AggregateNumber.From(present.Length)), trace);
         if (values.Length == 0 || (present.Length == 0 && p.Operation != "AVG"))
             return AggregateEvaluator.Single(AggregateValue.NoResult("NUMBER"), trace);
         var sum = present.Aggregate(AggregateNumber.From(0), (n, c) => n.Add(c.Value.Number!));
         traces[^1] = traces[^1] with { ExactTotal = sum.ExactKey };
         var number = p.Operation switch {
-            "SUM" => sum, "AVG" => sum.Divide(AggregateNumber.From(values.Length)),
+            "SUM" => sum, "AVG" => sum.Divide(AggregateNumber.From(values.Length)), "AVG_PRESENT" => sum.Divide(AggregateNumber.From(present.Length)),
             "MIN" => present.Select(v => v.Value.Number!).Aggregate((a, b) => a.Compare(b) <= 0 ? a : b),
             "MAX" => present.Select(v => v.Value.Number!).Aggregate((a, b) => a.Compare(b) >= 0 ? a : b),
             _ => throw new AggregatePreviewException("AGG_LIST_PIPELINE_SCHEMA") };
         return AggregateEvaluator.Single(AggregateValue.Numeric(number), trace);
         }
     }
+    private static void CheckTextPredicate(AggregateListPredicateDto p, AggregateListRow row)
+    {
+        if (p.Children != null) { foreach (var child in p.Children) CheckTextPredicate(child, row); return; }
+        if (p.Operator is not ("IS_BLANK" or "IS_PRESENT")) AggregateTextPolicy.CheckValueOperation(p.Operator, row.Cells[p.FieldId!].Value);
+    }
+    internal static bool Matches(AggregateListPredicateDto p, AggregateListRow row, AggregateBudget budget)
+    { CheckTextPredicate(p, row); return Match(p, row, budget); }
     private static bool Match(AggregateListPredicateDto p, AggregateListRow row, AggregateBudget budget)
     {
         budget.Spend();
@@ -273,7 +320,7 @@ internal static class AggregateListPipeline
         if (p.Operator == "IS_FALSE") return value.Boolean == false;
         if (value.Type == "TEXT")
         {
-            var text = Normalize(value.Text!, p.Trim, p.CaseSensitive);
+            var text = Normalize(AggregateTextProjection.VisibleText(value), p.Trim, p.CaseSensitive);
             var needle = Normalize(operands[0], p.Trim, p.CaseSensitive);
             return p.Operator switch { "EQ" => text == needle, "NE" => text != needle,
                 "CONTAINS" => text.Contains(needle, StringComparison.Ordinal), "NOT_CONTAINS" => !text.Contains(needle, StringComparison.Ordinal),

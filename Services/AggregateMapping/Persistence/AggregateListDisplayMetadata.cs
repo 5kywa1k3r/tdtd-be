@@ -48,14 +48,30 @@ internal sealed class AggregateListDisplayMetadata(MongoDbContext db)
             {
                 var cell=pair.Value!.AsObject();
                 var fields=info["fields"]?[pair.Key]?.Deserialize<string[]>(AggregateCanonical.Json)??[];
-                var fieldId=fields.Length==1?fields[0]:origin.Pin==null?pair.Key:null;
-                var field=table?.Fields?.SingleOrDefault(f=>f.Id==fieldId);
+                var cellSources=info["cellSources"]?[pair.Key]?.Deserialize<AggregateListCellSource[]>(AggregateCanonical.Json)??[];
+                var cellOrigin=cellSources.Length==1?cellSources[0].Origin:origin;
+                var cellTable=table;
+                if(cellSources.Length==1&&cellOrigin.Form is {} cellPin&&cellOrigin!=origin)
+                {
+                    if(!templates.TryGetValue(cellPin,out var cellTemplate))
+                    {
+                        cellTemplate=await db.DynamicFormTemplates.Find(f=>f.Id==cellPin.FormId&&!f.IsDeleted).FirstOrDefaultAsync(ct)
+                            ??throw new AggregatePreviewException("AGG_SCHEMA_PIN_UNAVAILABLE");
+                        if(cellTemplate.FamilyId!=cellPin.FamilyId||cellTemplate.VersionNo!=cellPin.VersionNo||cellTemplate.PublishedSchemaHash!=cellPin.SchemaHash)
+                            throw new AggregatePreviewException("AGG_SCHEMA_PIN_UNAVAILABLE");
+                        DynamicFormPublishedSchemaSnapshotBuilder.ValidateAgainstTemplate(cellTemplate);templates[cellPin]=cellTemplate;
+                    }
+                    cellTable=DynamicFormNativeTableDefinition.ReadStored(cellTemplate.NativeTablesVersion,cellTemplate.TablesJson)?
+                        .SingleOrDefault(t=>t.Id==cellOrigin.ListId&&t.Presentation?.Kind=="LIST");
+                }
+                var fieldId=cellSources.Length==1?cellSources[0].FieldId:fields.Length==1?fields[0]:cellOrigin.Pin==null?pair.Key:null;
+                var field=cellTable?.Fields?.SingleOrDefault(f=>f.Id==fieldId);
                 cell["fieldLabel"]=field?.Name;
                 if(cell["type"]?.GetValue<string>() is not ("CHOICE_ONE" or "CHOICE_MANY") || cell["state"]?.GetValue<string>()!="VALUE")continue;
                 var codes=cell["value"] is JsonArray array ? array.Select(c=>c!.GetValue<string>()).ToArray()
                     : new[] {cell["value"]!.GetValue<string>()};
                 if(field==null){Unavailable(cell,codes);continue;}
-                var spec=DynamicFormNativeTableDefinition.CompileCellTypes(table!)(field.Id!,null);
+                var spec=DynamicFormNativeTableDefinition.CompileCellTypes(cellTable!)(field.Id!,null);
                 if(spec.Type is not ("singleSelect" or "multiSelect")){Unavailable(cell,codes);continue;}
                 bindings.Add(new(cell,field.Name??field.Id!,spec.ValueSource?.SourceType=="ENUM_CATALOG"?spec.ValueSource.CatalogId:null,
                     (spec.Options??[]).ToDictionary(o=>o.Code!,o=>o.Label??o.Code!,StringComparer.Ordinal),codes));
@@ -67,6 +83,27 @@ internal sealed class AggregateListDisplayMetadata(MongoDbContext db)
                 response["origin"]!["unitName"]=name;
                 response["origin"]!["unitNameState"]=string.IsNullOrWhiteSpace(name)?"UNAVAILABLE":"AVAILABLE";
                 response["origin"]!["listName"]=table?.Name;
+                if(response["contributors"] is JsonArray contributors)
+                    foreach(var contributor in contributors)
+                    {
+                        var source=contributor!["origin"]!;var unitId=source["unitId"]?.GetValue<string>();
+                        var unitName=string.IsNullOrEmpty(unitId)?null:await db.Units.Find(u=>u.Id==unitId&&!u.IsDeleted).Project(u=>u.FullName).FirstOrDefaultAsync(ct);
+                        source["unitName"]=unitName;source["unitNameState"]=string.IsNullOrWhiteSpace(unitName)?"UNAVAILABLE":"AVAILABLE";
+                        var sourceOrigin=source.Deserialize<AggregateListOrigin>(AggregateCanonical.Json)!;
+                        if(sourceOrigin.Form is {} sourcePin)
+                        {
+                            if(!templates.TryGetValue(sourcePin,out var sourceTemplate))
+                            {
+                                sourceTemplate=await db.DynamicFormTemplates.Find(f=>f.Id==sourcePin.FormId&&!f.IsDeleted).FirstOrDefaultAsync(ct)
+                                    ??throw new AggregatePreviewException("AGG_SCHEMA_PIN_UNAVAILABLE");
+                                if(sourceTemplate.FamilyId!=sourcePin.FamilyId||sourceTemplate.VersionNo!=sourcePin.VersionNo||sourceTemplate.PublishedSchemaHash!=sourcePin.SchemaHash)
+                                    throw new AggregatePreviewException("AGG_SCHEMA_PIN_UNAVAILABLE");
+                                DynamicFormPublishedSchemaSnapshotBuilder.ValidateAgainstTemplate(sourceTemplate);templates[sourcePin]=sourceTemplate;
+                            }
+                            source["listName"]=DynamicFormNativeTableDefinition.ReadStored(sourceTemplate.NativeTablesVersion,sourceTemplate.TablesJson)?
+                                .SingleOrDefault(t=>t.Id==sourceOrigin.ListId&&t.Presentation?.Kind=="LIST")?.Name;
+                        }
+                    }
             }
         }
         // One bounded projection per bound catalog, containing only codes occurring
@@ -88,6 +125,7 @@ internal sealed class AggregateListDisplayMetadata(MongoDbContext db)
         }
         // The compact index is internal, including when includeLineage=false.
         response.AsObject().Remove("metadata");
+        if(!lineage)response.AsObject().Remove("contributors");
     }
     private static void Unavailable(JsonObject cell,string[] codes)
     {

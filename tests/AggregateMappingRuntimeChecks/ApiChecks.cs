@@ -34,7 +34,7 @@ using tdtd_be.Services.WorkAssignmentReports.Payloads;
 internal static class ApiChecks
 {
     static void Check(bool value, string name) { if (!value) throw new InvalidOperationException(name); Console.WriteLine("PASS " + name); }
-    internal static async Task Run(MongoDbContext db, string run, CancellationToken ct, bool loadOnly = false, bool wideLoadOnly = false, bool contentOnly = false, bool mixedLoadOnly = false, bool contentRetry = false, bool listOnly = false, bool listL4FixtureOnly = false, bool listL4Periodic = false, bool listL4Paging = false)
+    internal static async Task Run(MongoDbContext db, string run, CancellationToken ct, bool loadOnly = false, bool wideLoadOnly = false, bool contentOnly = false, bool mixedLoadOnly = false, bool contentRetry = false, bool listOnly = false, bool listL4FixtureOnly = false, bool listL4Periodic = false, bool listL4Paging = false, bool operatorsV3 = false)
     {
         var fixture = await RuntimeFixture.Seed(db, run, ct);
         var builder = WebApplication.CreateBuilder(new WebApplicationOptions { Args = [], EnvironmentName = "P05" });
@@ -128,7 +128,7 @@ internal static class ApiChecks
         var runner = app.Services.GetRequiredService<IDynamicFlowDefinitionTransactionRunner>();
         var store = new AggregateMongoStore(db, runner, payload, payload);
         if (listOnly || listL4FixtureOnly) {
-            await ListRuntimeChecks.Run(db, runner, builder.Configuration, run, Post, ct, browserFixture: listL4FixtureOnly, browserPeriodic:listL4Periodic, browserPaging:listL4Paging);
+            await ListRuntimeChecks.Run(db, runner, builder.Configuration, run, Post, ct, browserFixture: listL4FixtureOnly, browserPeriodic:listL4Periodic, browserPaging:listL4Paging, operatorsV3:operatorsV3);
             if(listOnly) await TableChecks.Run(db, runner, run + "-table-regression", Post, ct);
             await app.StopAsync(ct); return;
         }

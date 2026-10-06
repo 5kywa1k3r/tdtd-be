@@ -42,6 +42,8 @@ public sealed record AggregateExpressionDto
     public required string Kind { get; init; }
     [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
     public AggregateListPipelineDto? ListPipeline { get; init; }
+    [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+    public AggregateListMergeDto? ListMerge { get; init; }
     public string? Value { get; init; }
     public string? Ref { get; init; }
     public string? Name { get; init; }
@@ -59,11 +61,14 @@ public sealed record AggregateFunctionOptionsDto
     public bool? CaseSensitive { get; init; }
     public string? Separator { get; init; }
     public string? Order { get; init; }
+    [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+    public string? UnitDisplay { get; init; }
     public int? ColumnIndex { get; init; }
 }
 
 public sealed record AggregateTimeRuleDto
 {
+    public AggregateReportSetDto? ReportSet { get; init; }
     public AggregateReportFilterDto? ReportFilter { get; init; }
     public required string Id { get; init; }
     public required string Mode { get; init; }
@@ -73,6 +78,10 @@ public sealed record AggregateTimeRuleDto
     public string? EndDate { get; init; }
     public string? SourceDateMemberId { get; init; }
 }
+
+public sealed record AggregateReportSetDto(int Version, string Junction, List<AggregateReportConditionDto> Conditions);
+public sealed record AggregateReportConditionDto(string Field, string Operator, List<string> Values,
+    string? Mode = null);
 
 // Excel-like 1-based coordinates within a pinned table schema (tracker section 49).
 // Schema migration must preview reference changes; row identities are not business keys.
@@ -199,7 +208,11 @@ public sealed record AggregateConfigImpactResponseDto(
     List<AggregateMigrationConflictDto> Conflicts, List<AggregateIssueDto> Issues,
     string? PreviewToken, string? ExpiresAtUtc);
 public sealed record AggregateSourceSearchResponseDto(
-    List<AggregateSourcePinDto> Items, string? NextCursor, string CoverageState, List<AggregateIssueDto> Issues);
+    List<AggregateSourcePinDto> Items, string? NextCursor, string CoverageState, List<AggregateIssueDto> Issues)
+{
+    public IReadOnlyDictionary<string, AggregateSourceLabelDto>? Labels { get; init; }
+}
+public sealed record AggregateSourceLabelDto(string UnitId, string UnitName, string? ReportTitle, string? PeriodKey);
 public sealed record AggregateOverridePreviewRequestDto(
     AggregateExpectedRevisionsDto Expected, AggregateInstanceOverrideDto? Overrides,
     AggregateInstanceSelectionDto Selection, string ResetMode);

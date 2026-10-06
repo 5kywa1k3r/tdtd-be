@@ -33,7 +33,7 @@ internal interface IAggregateBatchDataWindowReader : IAggregateDataWindowReader
 
 // Read-only repository adapter. Never call report.GetById, projection refresh or a writer.
 internal sealed partial class AggregateMongoPreviewReader(MongoDbContext db, IWorkReportPayloadReader payloadReader,
-    IAggregateDataWindowReader dates, bool v2Enabled = false) : IAggregatePreviewReader, IAggregateBatchPreviewReader, IAggregateListTargetValidator
+    IAggregateDataWindowReader dates, bool v2Enabled = false, bool metadataOnly = false) : IAggregatePreviewReader, IAggregateBatchPreviewReader, IAggregateListTargetValidator
 {
     public async Task ValidateListResultAsync(AggregateReadContext context, string memberId, AggregateListValue value, CancellationToken ct)
     {
@@ -54,7 +54,7 @@ internal sealed partial class AggregateMongoPreviewReader(MongoDbContext db, IWo
         var index = items.ToList().FindIndex(t => t!["tableId"]!.GetValue<string>() == memberId);
         if (index < 0) throw new AggregatePreviewException("AGG_LIST_TARGET_SCHEMA");
         items[index] = new System.Text.Json.Nodes.JsonObject { ["tableId"] = memberId,
-            ["records"] = AggregateNativePayloadAdapter.ListRecords(definition, value, row => AggregateListWire.OutputId("preview", memberId, row.Origin)) };
+            ["records"] = AggregateNativePayloadAdapter.ListRecords(definition, value, row => AggregateListWire.OutputId("preview", memberId, row)) };
         tdtd_be.Services.WorkAssignmentReports.Runtime.DynamicFormNativeTableValues.Validate(template, context.TargetSchema.Pin.SchemaHash,
             tables.ToJsonString(), submitting: false, optionSets: _listOptions);
     }
@@ -64,12 +64,16 @@ internal sealed partial class AggregateMongoPreviewReader(MongoDbContext db, IWo
     private readonly Dictionary<string, string> _captures = new(StringComparer.Ordinal);
     private readonly Dictionary<string, string> _listingCaptures = new(StringComparer.Ordinal);
     private readonly Dictionary<string, AggregateFormPinDto> _forms = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, string> _pickerListingCaptures = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, AggregateFormPinDto> _pickerForms = new(StringComparer.Ordinal);
     private readonly Dictionary<string, string> _catalogFingerprints = new(StringComparer.Ordinal);
     private readonly Dictionary<string, RuntimeEnumOptionSet> _listOptions = new(StringComparer.Ordinal);
     private readonly Dictionary<string, DynamicFormTemplate> _templates = new(StringComparer.Ordinal);
     private readonly Dictionary<string, (AggregateSourceHeader Header, WorkAssignmentReport Report, DynamicFormTemplate Template, AggregateSchema Schema)> _payloadBatch = new(StringComparer.Ordinal);
     private string? _payloadBatchScope;
     private readonly Dictionary<string, string> _unitNames = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, Unit> _unitLabels = new(StringComparer.Ordinal);
+    private Work? _reportFilterWork;
 
     private async Task<IReadOnlyDictionary<string, AggregateDataWindowDeclarationDto?>> Windows(string kind, IReadOnlyList<string> ids, CancellationToken ct)
     {
@@ -276,23 +280,18 @@ internal sealed partial class AggregateMongoPreviewReader(MongoDbContext db, IWo
             choices = schema.Members.Values.Where(m => m.AllowedChoiceCodes != null).OrderBy(m => m.Id).Select(m => new { m.Id, m.AllowedChoiceCodes }) });
         var work = await db.Works.Find(w => w.Id == selector.WorkId && !w.IsDeleted).FirstOrDefaultAsync(ct)
             ?? throw new AggregatePreviewException("AGG_CONTEXT_UNAVAILABLE");
-        var mutationOpen = !work.CompletedAtUtc.HasValue && work.Status != WorkStatus.S3 && !assignment.CompletedAtUtc.HasValue;
-        var ancestorId = assignment.ParentAssignmentId;
-        var visitedAncestors = new HashSet<string>();
-        while (!string.IsNullOrEmpty(ancestorId))
-        {
-            if (!visitedAncestors.Add(ancestorId)) throw new AggregatePreviewException("AGG_CONTEXT_UNAVAILABLE");
-            var ancestor = await db.WorkAssignments.Find(a => a.Id == ancestorId && a.WorkId == work.Id && !a.IsDeleted).FirstOrDefaultAsync(ct)
-                ?? throw new AggregatePreviewException("AGG_CONTEXT_UNAVAILABLE");
-            mutationOpen &= !ancestor.CompletedAtUtc.HasValue && ancestor.IsActive;
-            ancestorId = ancestor.ParentAssignmentId;
-        }
+        var ancestors = await tdtd_be.Services.WorkAssignments.Progress.WorkExecutionScopeGuard.ReadAncestorsAsync(db, assignment, ct);
+        var mutationOpen = tdtd_be.Services.WorkAssignments.Progress.WorkExecutionScopeGuard.IsOpen(assignment, work, ancestors, period?.Id);
         var facts = new AggregateAuthorityFacts(true, true, true, true, true, false,
             binding.AssigneeUserId == actor, binding.AssigneeUserId == actor, tdtd_be.Services.WorkAssignments.Internal.WorkAssignmentCurrentAuthority.IsReviewer(assignment, actor),
             true, mutationOpen && (v2Enabled || !StatConfigPhaseBarrier.IsBlocked(StatConfigPhaseBarrierEntries.P9Run)), assignment.IsActive && report.IsActive && binding.IsActive,
-            report.Status.ToString(), false, true, true, true, true);
+            report.Status.ToString(), false, true, true, true, true) {
+                ConfigMutationScopeOpen = tdtd_be.Services.WorkAssignments.Progress.WorkExecutionScopeGuard.IsOpen(assignment, work, ancestors, null)
+                    && (v2Enabled || !StatConfigPhaseBarrier.IsBlocked(StatConfigPhaseBarrierEntries.P9Run)) };
         if (!WorkReportPayloadConsistency.IsReadyForStatisticProjection(report))
             throw new AggregatePreviewException("AGG_TARGET_PAYLOAD_UNAVAILABLE");
+        if (metadataOnly) return new(context, schema, facts, new(report.PayloadRevision, report.LifecycleRevision, 0, 0, pin.SchemaHash, ""),
+            auth, declaration, new Dictionary<string, AggregateValue>());
         var payload = await payloadReader.LoadReportPayloadAsync(report, ct);
         WorkReportPayloadConsistency.EnsureSnapshotFreshForStatisticProjection(report, payload);
         var previous = AggregateNativePayloadAdapter.Read(template, payload, schema, null, listOptions: _listOptions);
@@ -310,6 +309,8 @@ internal sealed partial class AggregateMongoPreviewReader(MongoDbContext db, IWo
     public Task<AggregateSourceListing> ListSourcesAsync(AggregateReadContext context, AggregateFormPinDto form, string actor, CancellationToken ct)
         => ListSourcesCoreAsync(context, form, actor, true, ct);
     internal Task<AggregateSourceListing> ListPickerSourcesAsync(AggregateReadContext context, AggregateFormPinDto form, string actor, CancellationToken ct)
+        => ListSourcesCoreAsync(context, form, actor, false, ct);
+    public Task<AggregateSourceListing> ListReportSetSourcesAsync(AggregateReadContext context, AggregateFormPinDto form, string actor, CancellationToken ct)
         => ListSourcesCoreAsync(context, form, actor, false, ct);
     internal async Task<IReadOnlyList<AggregateEditorSourceFormDto>> ListSourceFormsAsync(AggregateReadContext context, string actor, CancellationToken ct)
     {
@@ -356,7 +357,13 @@ internal sealed partial class AggregateMongoPreviewReader(MongoDbContext db, IWo
         foreach (var group in bindings.Select(b => b.AssigneeUnitId).Where(id => !string.IsNullOrEmpty(id)).Distinct().Chunk(256))
         {
             var names = await db.Units.Find(u => group.Contains(u.Id) && !u.IsDeleted).ToListAsync(ct);
-            foreach (var id in group) _unitNames[id!] = names.FirstOrDefault(u => u.Id == id)?.FullName ?? id!;
+            foreach (var id in group)
+            {
+                var unit = names.FirstOrDefault(u => u.Id == id);
+                _unitNames[id!] = unit?.FullName ?? "";
+                _unitLabels.Remove(id!);
+                if (unit != null) _unitLabels[id!] = unit;
+            }
         }
         var headers = new List<AggregateSourceHeader>(); var slots = new List<AggregateSlot>();
         foreach (var report in reports)
@@ -405,7 +412,11 @@ internal sealed partial class AggregateMongoPreviewReader(MongoDbContext db, IWo
                 if (occurrence != "ONCE" && !DateOnly.TryParseExact(occurrence, "yyyyMMdd", System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.None, out day))
                     throw new AggregatePreviewException("AGG_OCCURRENCE_UNRESOLVED");
                 var key = binding.Id + ":" + occurrence;
-                slots.Add(new(key, binding.Id, scheduleRevision, occurrence, period?.Id, period?.CurrentReportId, form, true,
+                // Lifecycle report flags are authoritative while the period projection catches up.
+                var currentReports = headers.Where(h => h.Pin.BindingId == binding.Id && h.OccurrenceKey == occurrence).ToArray();
+                if (currentReports.Length > 1) throw new AggregatePreviewException("AGG_CURRENT_REPORT_AMBIGUOUS");
+                slots.Add(new(key, binding.Id, scheduleRevision, occurrence, period?.Id, currentReports.SingleOrDefault()?.Pin.ReportId, form,
+                    child.IsActive && binding.IsActive && (period?.IsActive ?? true),
                     DateOnly.FromDateTime(effectiveStart.Value), effectiveEnd.HasValue ? DateOnly.FromDateTime(effectiveEnd.Value) : null, day, null));
             }
         }
@@ -417,8 +428,13 @@ internal sealed partial class AggregateMongoPreviewReader(MongoDbContext db, IWo
             bindings = bindings.OrderBy(b => b.Id).Select(b => new { b.Id, b.Schedule, b.StartDate, b.DueDate, b.AssigneeUserId, b.UpdatedAtUtc }),
             periods = periods.OrderBy(p => p.Id).Select(p => new { p.Id, p.CurrentReportId, p.PeriodInstanceKey, p.PeriodKey, p.UpdatedAtUtc }),
             headers = headers.OrderBy(h => h.Pin.ReportId), slots = slots.OrderBy(s => s.Key) });
-        if (_listingCaptures.TryGetValue(form.FormId, out var prior) && prior != membership) throw new AggregatePreviewException("AGG_INPUT_STALE");
-        _forms[form.FormId] = form; _listingCaptures[form.FormId] = membership;
+        // Picker listings omit expected coverage slots. They cannot share a
+        // membership capture with a full source listing from the same request
+        // (for example a saved View's source check then its schema picker).
+        var captures = includeCoverage ? _listingCaptures : _pickerListingCaptures;
+        var forms = includeCoverage ? _forms : _pickerForms;
+        if (captures.TryGetValue(form.FormId, out var prior) && prior != membership) throw new AggregatePreviewException("AGG_INPUT_STALE");
+        forms[form.FormId] = form; captures[form.FormId] = membership;
         return new(headers, slots, true, membership, children.Where(c => c.IsActive).SelectMany(c => c.Assignees).Select(a => a.UnitId)
             .Where(id => !string.IsNullOrWhiteSpace(id)).Select(id => id!).Distinct(StringComparer.Ordinal).OrderBy(id => id, StringComparer.Ordinal).ToArray());
     }
@@ -506,6 +522,7 @@ internal sealed partial class AggregateMongoPreviewReader(MongoDbContext db, IWo
     }
     public async Task<bool> IsCurrentAsync(AggregateReadContext context, IReadOnlyList<AggregateSourcePinDto> pins, string membershipRevision, string actor, CancellationToken ct)
     {
+        _reportFilterWork = null;
         _payloadBatch.Clear(); _payloadBatchScope = null;
         // A cached Form is immutable only while its full structure still agrees;
         // check fresh documents, including same-hash corruption, before exposing results.
@@ -523,16 +540,24 @@ internal sealed partial class AggregateMongoPreviewReader(MongoDbContext db, IWo
         if (fresh.Context != context.Context || fresh.Revisions != context.Revisions || fresh.DataWindow != context.DataWindow
             || fresh.AuthorizationFingerprint != context.AuthorizationFingerprint) return false;
         var before = _listingCaptures.ToDictionary(p => p.Key, p => p.Value);
+        var pickerBefore = _pickerListingCaptures.ToDictionary(p => p.Key, p => p.Value);
         var captures = _captures.ToDictionary(p => p.Key, p => p.Value);
+        foreach (var capture in _inactiveCaptures.Values.ToArray())
+            await ReadInactiveSourcesAsync(context, capture.Form, capture.Ids, actor, ct);
         foreach (var form in _forms.Values.ToArray())
         {
             var listing = await ListSourcesAsync(context, form, actor, ct);
             if (listing.MembershipRevision != before[form.FormId]) return false;
         }
+        foreach (var form in _pickerForms.Values.ToArray())
+        {
+            var listing = await ListPickerSourcesAsync(context, form, actor, ct);
+            if (listing.MembershipRevision != pickerBefore[form.FormId]) return false;
+        }
         return pins.All(pin => captures.TryGetValue(pin.ReportId, out var value) && _captures.TryGetValue(pin.ReportId, out var current) && value == current);
     }
     private async Task<AggregateSourceHeader> Header(WorkAssignmentReport report, WorkAssignment child, WorkTemplateAssignee binding, string actor, CancellationToken ct, WorkReportPeriod? period = null,
-        AggregateDataWindowDeclarationDto? capturedWindow = null, bool windowCaptured = false)
+        AggregateDataWindowDeclarationDto? capturedWindow = null, bool windowCaptured = false, bool inactiveMetadata = false)
     {
         if (report.WorkId != child.WorkId || report.WorkAssignmentId != child.Id || binding.WorkId != child.WorkId
             || binding.WorkAssignmentId != child.Id || binding.AssigneeUserId != report.AssigneeUserId
@@ -545,25 +570,42 @@ internal sealed partial class AggregateMongoPreviewReader(MongoDbContext db, IWo
             period ??= await db.WorkReportPeriods.Find(p => p.Id == report.WorkReportPeriodId && p.WorkId == child.WorkId
                 && p.WorkAssignmentId == child.Id && p.WorkTemplateAssigneeId == binding.Id && !p.IsDeleted).FirstOrDefaultAsync(ct);
             if (period == null || period.Id != report.WorkReportPeriodId || period.WorkId != child.WorkId || period.WorkAssignmentId != child.Id
-                || period.WorkTemplateAssigneeId != binding.Id || period.CurrentReportId != report.Id)
+                || period.WorkTemplateAssigneeId != binding.Id)
                 throw new AggregatePreviewException("AGG_INPUT_STALE");
+            if (!inactiveMetadata && period.CurrentReportId != report.Id)
+            {
+                var currentIds = await db.WorkAssignmentReports.Find(r => r.WorkReportPeriodId == period.Id && r.WorkId == child.WorkId
+                    && r.IsCurrent && !r.IsDeleted).Project(r => r.Id).Limit(2).ToListAsync(ct);
+                if (currentIds.Count != 1 || currentIds[0] != report.Id) throw new AggregatePreviewException("AGG_INPUT_STALE");
+            }
         }
         // Same classification policy as the report editor. These schedule bounds identify
         // backfill only; they are never substituted for a declared aggregation data window.
-        var reportDate = (report.ReportDate ?? period?.ReportDate)?.Date;
-        var start = (report.PeriodStart ?? period?.PeriodStart ?? reportDate)?.Date;
-        var end = (report.PeriodEnd ?? period?.PeriodEnd ?? reportDate ?? start)?.Date;
-        var anchor = (report.DueAtUtc ?? period?.DueAtUtc ?? reportDate)?.Date;
+        var reportDate = ReportCivilDate.ReadPeriodDay(report.ReportDate ?? period?.ReportDate);
+        var start = ReportCivilDate.ReadPeriodDay(report.PeriodStart ?? period?.PeriodStart ?? reportDate);
+        var end = ReportCivilDate.ReadPeriodDay(report.PeriodEnd ?? period?.PeriodEnd ?? reportDate ?? start);
+        var dueInstant = report.DueAtUtc ?? period?.DueAtUtc;
+        var anchor = dueInstant.HasValue ? ReportCivilDate.FromInstant(dueInstant.Value) : reportDate;
         var historical = report.IsHistoricalData || period?.IsHistoricalData == true ||
             tdtd_be.Services.WorkAssignments.Internal.WorkAssignmentBackfillPeriodPolicy.IsBackfillHistoricalPeriod(child, start, end, anchor, DateTime.UtcNow);
         var pin = new AggregateSourcePinDto(report.WorkId, report.WorkAssignmentId, binding.Id, report.WorkReportPeriodId, report.PeriodInstanceKey,
             report.Id, report.VersionNo, report.PayloadRevision, report.LifecycleRevision, report.PayloadHash ?? "", report.DynamicFormSchemaHash ?? "",
             report.Status.ToString(), report.IsCurrent, relationship, auth);
-        return new(pin, child.ParentAssignmentId!, Pin(report), binding.AssigneeUnitId ?? "", binding.AssignmentType == "ONCE" ? "ONCE" : report.PeriodKey, true, report.IsActive, report.IsDeleted,
+        _reportFilterWork ??= await db.Works.Find(w => w.Id == report.WorkId && !w.IsDeleted).FirstOrDefaultAsync(ct)
+            ?? throw new AggregatePreviewException("AGG_CONTEXT_UNAVAILABLE");
+        return new(pin, child.ParentAssignmentId!, Pin(report), binding.AssigneeUnitId ?? "", binding.AssignmentType == "ONCE" ? "ONCE" : report.PeriodKey, true,
+            report.IsActive && child.IsActive && binding.IsActive && (period?.IsActive ?? true), report.IsDeleted,
             windowCaptured ? capturedWindow : await dates.ReadAsync("REPORT", report.Id, ct)) { IsHistoricalData = historical,
                 CompletedDate = report.CompletedDate ?? period?.CompletedDate, SubmittedAtUtc = report.SubmittedAtUtc,
+                AssignedAtUtc = child.CreatedAtUtc, AssignmentStartDate = child.StartDate,
+                AssignmentCompletedDate = tdtd_be.Common.Time.WorkCompletionDate.Read(child.CompletedDate, child.CompletedAtUtc, child.CompletionMode),
+                StartedDate = report.StartedDate ?? period?.StartedDate,
+                PeriodStart = report.PeriodStart ?? period?.PeriodStart, PeriodEnd = report.PeriodEnd ?? period?.PeriodEnd,
+                WorkStartDate = _reportFilterWork.StartDate, WorkEndDate = _reportFilterWork.EndDate,
                 DueAtUtc = report.DueAtUtc ?? period?.DueAtUtc, PeriodKey = report.PeriodKey,
-                UnitName = _unitNames.GetValueOrDefault(binding.AssigneeUnitId ?? "") ?? binding.AssigneeUnitId,
+                UnitName = _unitNames.GetValueOrDefault(binding.AssigneeUnitId ?? "") ?? "",
+                UnitShortName = _unitLabels.GetValueOrDefault(binding.AssigneeUnitId ?? "")?.ShortName,
+                UnitSymbol = _unitLabels.GetValueOrDefault(binding.AssigneeUnitId ?? "")?.Symbol,
                 ReportTitle = report.ReportTitle };
     }
     private async Task<List<WorkAssignment>> Children(AggregateReadContext context, string actor, CancellationToken ct)
@@ -576,7 +618,7 @@ internal sealed partial class AggregateMongoPreviewReader(MongoDbContext db, IWo
             if (DynamicFlowBranchVisibility.IsFlowAssignment(child) || (!tdtd_be.Services.WorkAssignments.Internal.WorkAssignmentCurrentAuthority.IsReviewer(child, actor)
                 && !await WorkAssignmentReadAccessHelper.CanReadAssignmentOrAncestorAsync(db, child, actor, ct)))
                 throw new AggregatePreviewException("AGG_SOURCE_UNAVAILABLE");
-        return children; // Do not drop historical approved sources because the assignment is inactive.
+        return children; // Retain identities for dependency/lock checks; inactive sources cannot contribute.
     }
     private async Task<bool> CanRead(WorkAssignment assignment, WorkAssignmentReport report, string actor, CancellationToken ct)
     {

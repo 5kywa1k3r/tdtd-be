@@ -33,7 +33,7 @@ internal static class AggregateMappingValidator
     private static readonly HashSet<string> Binary = new(StringComparer.Ordinal)
         { "+", "-", "*", "/", "=", "<>", "<", "<=", ">", ">=", "AND", "OR" };
 
-    internal static AggregateContractValidation Parse(string? raw)
+    internal static AggregateContractValidation Parse(string? raw, string? formulaProbeNode = null)
     {
         var issues = new List<AggregateIssueDto>();
         void Add(string code, string path, string reason) => issues.Add(new(code, path, reason));
@@ -61,9 +61,13 @@ internal static class AggregateMappingValidator
             Add("AGG_RECIPE_REQUIRED", "$", "Recipe and collections must be non-null.");
             return new(recipe, issues);
         }
-        var listProfile = recipe.SchemaVersion == 2 && recipe.SemanticProfile == "REPORT_MAPPING_LIST_V1";
+        var extended = recipe.SchemaVersion == 3 && recipe.SemanticProfile == "REPORT_MAPPING_EXTENDED_V1";
+        var listProfile = extended || recipe.SchemaVersion == 2 && recipe.SemanticProfile == "REPORT_MAPPING_LIST_V1";
         if (!listProfile && (recipe.SchemaVersion != 1 || recipe.SemanticProfile != "REPORT_MAPPING_V1"))
             Add("AGG_RECIPE_VERSION", "$", "Unsupported schemaVersion or semanticProfile; preserve raw draft.");
+        if (!extended && recipe.Nodes.Any(n => n != null && ((n.Expressions?.Any(e => HasExtended(e?.Expression)) ?? false)
+            || HasExtended(n.Predicate) || (n.TableAssignments?.Any(a => HasExtended(a.Expression)) ?? false))))
+            Add("AGG_EXTENDED_PROFILE_REQUIRED", "$", "New operators require recipe 3 / REPORT_MAPPING_EXTENDED_V1.");
         if (!listProfile && recipe.Nodes.Any(n => n != null &&
             ((n.Inputs?.Concat(n.Outputs ?? []).Any(p => p?.ValueType == "LIST") ?? false)
                 || (n.Expressions?.Any(e => HasList(e?.Expression)) ?? false) || HasList(n.Predicate))))
@@ -116,8 +120,12 @@ internal static class AggregateMappingValidator
                         Add("AGG_SOURCE_CARDINALITY", path, "Each source port must carry the declared source cardinality.");
                     if (node.Origin == "DIRECT_CHILD_REPORTS" && node.Outputs.Any(p => p != null && p.TimeRuleId == null))
                         Add("AGG_TIME_RULE_REQUIRED", path, "Choose a data window for each report source port; no implicit all-time scope.");
+                    var sourceRuleIds = node.Outputs.Where(p => p != null).Select(p => p.TimeRuleId).Distinct().ToArray();
+                    if (recipe.TimeRules.Any(r => r != null && sourceRuleIds.Contains(r.Id) && r.Mode == AggregateReportSetFilter.Mode)
+                        && sourceRuleIds.Length != 1)
+                        Add("AGG_REPORT_SET_INVALID", path, "All fields of a report-set source must share one metadata filter.");
                 }
-                else if (node.Outputs.Count != 0 || node.Inputs.Count == 0 || node.Origin != null || node.SourceCardinality != null
+                else if (node.Outputs.Count != 0 || (formulaProbeNode == null ? node.Inputs.Count == 0 : node.Inputs.Count != 0) || node.Origin != null || node.SourceCardinality != null
                     || node.Inputs.Any(p => p != null && p.Shape != "SINGLE"))
                     Add("AGG_TARGET_SCHEMA", path, "Target ports must be SINGLE inputs with no source metadata.");
             }
@@ -181,6 +189,9 @@ internal static class AggregateMappingValidator
         if (issues.Count > 0) return new(recipe, issues);
         if (nodes.Values.Count(n => n.Kind == "TARGET") != 1 || !nodes.Values.Any(n => n.Kind == "SOURCE"))
             Add("AGG_GRAPH_ENDPOINTS", "$.nodes", "Exactly one target and at least one source are required.");
+        if (formulaProbeNode != null && (!nodes.TryGetValue(formulaProbeNode, out var probe) || probe.Kind != "CALCULATION"
+            || probe.TableAssignments?.Count > 0 || recipe.Edges.Any(e => e?.From?.NodeId == formulaProbeNode)))
+            Add("AGG_FORMULA_PROBE_INVALID", "$.nodes", "A read-only formula probe must terminate at its calculation node.");
         var edgeIds = new HashSet<string>(StringComparer.Ordinal);
         var writers = new HashSet<(string, string)>();
         var graph = nodes.Keys.ToDictionary(id => id, _ => new List<string>(), StringComparer.Ordinal);
@@ -231,6 +242,16 @@ internal static class AggregateMappingValidator
         if (expression == null || depth > 16)
         { add("AGG_EXPRESSION_DEPTH", path, "Expression is null or too deeply nested."); return; }
         var e = expression;
+        if (e.Kind == "LIST_MERGE")
+        {
+            if (e.ListMerge == null || e.ListPipeline != null || e.Ref != null || e.Value != null || e.Name != null || e.Arguments != null
+                || e.Options != null || e.Area != null || e.ColumnIndex != null || e.Predicate != null)
+                add("AGG_LIST_MERGE_SCHEMA", path, "Merge requires its explicit local List inputs and projections.");
+            else try { AggregateListMerge.Validate(e.ListMerge, inputs); }
+                catch (AggregatePreviewException ex) { add(ex.Code, path, "Invalid List merge."); }
+            return;
+        }
+        if (e.ListMerge != null && e.Kind != "LIST_MERGE") add("AGG_EXPRESSION_SCHEMA", path, "Merge plan belongs only to LIST_MERGE.");
         if (e.Kind == "LIST_PIPELINE")
         {
             if (e.ListPipeline == null || e.Ref == null || !inputs.Contains(e.Ref) || e.Value != null || e.Name != null
@@ -281,10 +302,12 @@ internal static class AggregateMappingValidator
         }
         if (e.Value != null || e.Ref != null || e.Area != null || e.Arguments == null || e.Arguments.Count > 128
             || (e.Kind == "BINARY" ? !Binary.Contains(e.Name ?? "") || e.Arguments.Count != 2 || e.Options != null
-                : e.Kind != "CALL" || !Calls.Contains(e.Name ?? "") || e.Arguments.Count != (e.Name == "IF" ? 3 : e.Name is "HAS_CHOICE" or "TEXT_CONTAINS" or "TEXT_STARTS" or "TEXT_ENDS" or "TEXT_EQUALS" ? 2 : 1)))
+                : e.Kind != "CALL" || !(Calls.Contains(e.Name ?? "") || AggregateExtendedFunctions.Names.Contains(e.Name ?? "")) || e.Arguments.Count != (e.Name == "IF" ? 3 : e.Name is "HAS_CHOICE" or "TEXT_CONTAINS" or "TEXT_STARTS" or "TEXT_ENDS" or "TEXT_EQUALS" ? 2 : 1)))
         { add("AGG_EXPRESSION_SCHEMA", path, "Unknown expression/function or invalid arity."); return; }
         if (e.Name == "COUNT" && e.Options?.Basis is not ("VALUES" or "REPORTS" or "UNITS" or "ROWS" or "PRESENT_ROWS"))
             add("AGG_COUNT_BASIS", path, "COUNT requires explicit basis.");
+        if (e.Name == "REPORT_COUNT" && e.Options?.Basis is not ("ELIGIBLE_SOURCES" or "SELECTED_ELEMENTS"))
+            add("AGG_COUNT_BASIS", path, "REPORT_COUNT requires an explicit source or selected-element basis.");
         if (e.Name == "COUNT_DISTINCT" && (e.Options?.Trim == null || e.Options.CaseSensitive == null))
             add("AGG_DISTINCT_OPTIONS", path, "DISTINCT requires explicit text normalization settings.");
         if (e.Name == "CONCAT" && (e.Options?.Separator == null || e.Options.Trim == null || e.Options.Order is not ("UNIT_THEN_PERIOD" or "PERIOD_THEN_UNIT")))
@@ -293,7 +316,9 @@ internal static class AggregateMappingValidator
             add("AGG_CONTENT_TABLE_ORDER", path, "Content table requires an explicit deterministic order.");
         if (e.Options?.Basis == "PRESENT_ROWS" && e.Options.ColumnIndex is not > 0)
             add("AGG_COUNT_COLUMN", path, "PRESENT_ROWS requires a positive column coordinate.");
-        if (e.Options != null && ((e.Options.Basis != null && e.Name != "COUNT")
+        if (e.Options?.UnitDisplay != null && (e.Name != "REPORT_TEXT_TABLE" || e.Options.UnitDisplay is not ("FULL_NAME" or "SHORT_NAME" or "SYMBOL" or "NONE")))
+            add("AGG_CONTENT_UNIT_DISPLAY", path, "Choose the reporting-unit display.");
+        if (e.Options != null && ((e.Options.Basis != null && e.Name is not ("COUNT" or "REPORT_COUNT"))
             || (e.Options.Trim != null && e.Name is not ("COUNT_DISTINCT" or "CONCAT"))
             || (e.Options.CaseSensitive != null && e.Name != "COUNT_DISTINCT")
             || (e.Options.Separator != null && e.Name != "CONCAT")
@@ -306,6 +331,15 @@ internal static class AggregateMappingValidator
     private static void ValidateTimeRule(AggregateTimeRuleDto rule, Action<string, string, string> add)
     {
         var path = "$.timeRules[" + rule.Id + "]";
+        if (rule.Mode == AggregateReportSetFilter.Mode)
+        {
+            AggregateReportSetFilter.Validate(rule.ReportSet, path, add);
+            if (rule.SourceDateBasis != "REPORT_METADATA" || rule.Match != "REPORTS" || rule.StartDate != null
+                || rule.EndDate != null || rule.SourceDateMemberId != null || rule.ReportFilter != null)
+                add("AGG_REPORT_SET_INVALID", path, "Report-set filters do not imply a declared data window.");
+            return;
+        }
+        if (rule.ReportSet != null) add("AGG_REPORT_SET_INVALID", path, "Report-set conditions require REPORT_SET mode.");
             if (rule.ReportFilter is { } metadata)
             {
 
@@ -362,8 +396,10 @@ internal static class AggregateMappingValidator
     }
 
     private static bool Identifier(string? value) => !string.IsNullOrWhiteSpace(value) && value.Length <= 256;
-    private static bool HasList(AggregateExpressionDto? e) => e != null && (e.Kind == "LIST_PIPELINE"
+    private static bool HasList(AggregateExpressionDto? e) => e != null && (e.Kind is "LIST_PIPELINE" or "LIST_MERGE"
         || e.ListPipeline != null || (e.Arguments?.Any(HasList) ?? false) || HasList(e.Predicate));
+    private static bool HasExtended(AggregateExpressionDto? e) => e != null && (AggregateExtendedFunctions.Names.Contains(e.Name ?? "")
+        || e.ListMerge != null || e.ListPipeline?.Version == 2 || (e.Arguments?.Any(HasExtended) ?? false) || HasExtended(e.Predicate));
     private static bool PartialDate(string? value)
     {
         if (DateOnly.TryParseExact(value, ["dd/MM/yyyy", "yyyy-MM-dd"], CultureInfo.InvariantCulture, DateTimeStyles.None, out _)) return true;

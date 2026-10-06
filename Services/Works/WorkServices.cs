@@ -524,8 +524,21 @@ namespace tdtd_be.Services.Works
                 var now = DateTime.UtcNow;
                 var completedDate = (req?.CompletedDate ?? now).Date;
 
+                if (doc.CompletedAtUtc.HasValue || doc.Status == WorkStatus.S3)
+                {
+                    await _docRoleReadModelProjection.RebuildWorkAsync(id, me.Id, ct);
+                    return ToResponse(doc);
+                }
+                if (string.IsNullOrWhiteSpace(req?.Note))
+                    throw AppExceptionFactory.BadRequest(AppErrorCode.COMMON_VALIDATION_FAILED,
+                        message: "Nhập lý do kết thúc công việc.");
+
                 var update = Builders<Work>.Update
                     .Set(x => x.Status, WorkStatus.S3)
+                    .Set(x => x.CompletionMode, "WORK_OWNER")
+                    .Set(x => x.CompletionReason, req!.Note!.Trim())
+                    .Inc(x => x.CompletionRevision, 1)
+                    .Inc(x => x.DirectSourceRevision, 1)
                     .Set(x => x.CompletedDate, completedDate)
                     .Set(x => x.CompletedAtUtc, now)
                     .Set(x => x.CompletedByUserId, me.Id)
@@ -541,15 +554,38 @@ namespace tdtd_be.Services.Works
                         x => x.AssignmentTopologyOwner,
                         WorkAssignmentTopologyOwners.P5FlowRuntime) |
                     workFilter.Exists(x => x.AssignmentTopologyOwner, false);
-                var completionResult = await _ctx.Works.UpdateOneAsync(
-                    workFilter.Eq(x => x.Id, id) &
-                    workFilter.Eq(x => x.IsDeleted, false) &
-                    noRuntimeOwner &
-                    nonFlowTopology,
-                    update,
-                    cancellationToken: ct);
+                var completionResult = await _transactions.ExecuteAsync(async (session, token) =>
+                {
+                    var result = await _ctx.Works.UpdateOneAsync(
+                        session,
+                        workFilter.Eq(x => x.Id, id) &
+                        workFilter.Eq(x => x.IsDeleted, false) &
+                        workFilter.Eq(x => x.CompletedAtUtc, null) &
+                        workFilter.Eq(x => x.UpdatedAtUtc, doc.UpdatedAtUtc) &
+                        noRuntimeOwner &
+                        nonFlowTopology,
+                        update,
+                        cancellationToken: token);
+                    if (result.ModifiedCount == 1)
+                        await _ctx.WorkHistories.InsertOneAsync(session, new WorkHistory {
+                            Id = MongoDB.Bson.ObjectId.GenerateNewId().ToString(), WorkId = id,
+                            Type = WorkHistoryType.UPDATED, AtUtc = now, ByUserId = me.Id,
+                            CreatedAtUtc = now, UpdatedAtUtc = now, CreatedByUserId = me.Id, UpdatedByUserId = me.Id,
+                            Data = new() { ["action"] = "WORK_COMPLETED", ["completedDate"] = completedDate, ["note"] = req!.Note!.Trim() }
+                        }, cancellationToken: token);
+                    return result;
+                }, ct);
                 if (completionResult.MatchedCount != 1)
                 {
+                    var latest = await _ctx.Works.Find(x => x.Id == id && !x.IsDeleted).FirstOrDefaultAsync(ct);
+                    if (latest?.CompletedAtUtc != null)
+                    {
+                        await _docRoleReadModelProjection.RebuildWorkAsync(id, me.Id, ct);
+                        return ToResponse(latest);
+                    }
+                    if (latest != null && string.IsNullOrEmpty(latest.DynamicFlowRuntimeInstanceId))
+                        throw AppExceptionFactory.Create(AppErrorCode.WORK_ASSIGNMENT_REPORT_LIFECYCLE_REVISION_CONFLICT,
+                            new { workId = id, reason = "WORK_COMPLETION_STALE" }, "Công việc vừa thay đổi. Vui lòng tải lại để đối chiếu.");
                     throw AppExceptionFactory.Create(
                         AppErrorCode.DYNAMIC_FLOW_EXECUTION_BLOCKED_UNTIL_TARGET_PHASE,
                         new
@@ -570,18 +606,6 @@ namespace tdtd_be.Services.Works
 
                 await DisableRuntimeForCompletedWorkAsync(id, me.Id, now, ct);
                 await _docRoleReadModelProjection.RebuildWorkAsync(id, me.Id, ct);
-
-                await _history.AppendAsync(
-                    workId: id,
-                    byUserId: me.Id,
-                    type: WorkHistoryType.UPDATED,
-                    data: new Dictionary<string, object?>
-                    {
-                        { "action", "WORK_COMPLETED" },
-                        { "completedDate", completedDate },
-                        { "note", req?.Note }
-                    },
-                    ct: ct);
 
                 return ToResponse(doc);
             }

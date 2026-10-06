@@ -92,6 +92,34 @@ end";
             if (_db is null)
                 return await factory(ct);
 
+            var generationKey = $"{cacheKey}:refresh-generation";
+            var lifetimeMs = Math.Max(1, (long)(ttl ?? DefaultTtl).TotalMilliseconds);
+            if (forceRefresh)
+            {
+                // Retire the old value and fence already running writers in one Redis operation.
+                await _db.ScriptEvaluateAsync(@"
+redis.call('set', KEYS[1], ARGV[1], 'PX', ARGV[2])
+return redis.call('del', KEYS[2])",
+                    new RedisKey[] { generationKey, cacheKey },
+                    new RedisValue[] { Guid.NewGuid().ToString("N"), lifetimeMs });
+            }
+            var generation = await _db.StringGetAsync(generationKey);
+            async Task<T> CreateAndStoreAsync()
+            {
+                var created = await factory(ct);
+                ct.ThrowIfCancellationRequested();
+                // An earlier computation must not overwrite a later explicit refresh.
+                await _db.ScriptEvaluateAsync(@"
+local current = redis.call('get', KEYS[1]) or ''
+if current == ARGV[1] then
+    return redis.call('set', KEYS[2], ARGV[2], 'PX', ARGV[3])
+end
+return 0",
+                    new RedisKey[] { generationKey, cacheKey },
+                    new RedisValue[] { generation.IsNull ? "" : generation, JsonSerializer.Serialize(created, JsonOpts), lifetimeMs });
+                return created;
+            }
+
             if (!forceRefresh)
             {
                 var cached = await GetAsync<T>(cacheKey, ct);
@@ -113,9 +141,7 @@ end";
                             return cachedAgain;
                     }
 
-                    var created = await factory(ct);
-                    await SetAsync(cacheKey, created, ttl, ct);
-                    return created;
+                    return await CreateAndStoreAsync();
                 }
                 finally
                 {
@@ -128,12 +154,23 @@ end";
                 ct.ThrowIfCancellationRequested();
                 await Task.Delay(WaitDelayMs, ct);
 
+                // A refresh must not return the pre-existing value held behind another writer's lock.
+                if (forceRefresh)
+                {
+                    if (!await TryAcquireLockAsync(cacheKey, lockToken)) continue;
+                    try
+                    {
+                        return await CreateAndStoreAsync();
+                    }
+                    finally { await ReleaseLockAsync(cacheKey, lockToken); }
+                }
+
                 var waited = await GetAsync<T>(cacheKey, ct);
                 if (waited is not null)
                     return waited;
             }
 
-            return await factory(ct);
+            return await CreateAndStoreAsync();
         }
     }
 }

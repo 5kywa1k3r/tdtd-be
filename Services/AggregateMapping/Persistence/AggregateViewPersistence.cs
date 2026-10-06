@@ -28,7 +28,7 @@ internal sealed partial class AggregateMongoCommandReader
 {
     private async Task<AggregateCommitAuthority> AuthorizeViewAsync(AggregatePeriodContextDto context, string actor, string sessionKey, CancellationToken ct)
     {
-        var adapter = new AggregateMongoPreviewReader(db, payloads, new AggregateMongoDataWindows(db), v2Enabled);
+        var adapter = new AggregateMongoPreviewReader(db, payloads, new AggregateMongoDataWindows(db), v2Enabled, metadataOnly);
         var read = await adapter.ReadViewContextAsync(context, actor, ct);
         var scope = await adapter.ViewOwnerAsync(context.WorkId, context.View!.Kind, context.View.Id, actor, ct);
         var pins = new List<AggregateAuthorityPin>();

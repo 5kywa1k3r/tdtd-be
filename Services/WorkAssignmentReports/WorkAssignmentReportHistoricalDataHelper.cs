@@ -1,4 +1,5 @@
 using tdtd_be.Models;
+using tdtd_be.Common.Time;
 using tdtd_be.Models.Enums;
 using tdtd_be.Services.Common;
 
@@ -77,10 +78,10 @@ internal static class WorkAssignmentReportHistoricalDataHelper
     }
 
     public static DateTime? NormalizeDate(DateTime? value)
-        => value?.Date;
+        => value.HasValue ? ReportCivilDate.Encode(value.Value) : null;
 
     private static bool IsHistoricalCompletedAfterDue(DateTime? completedDate, DateTime? dueAtUtc)
         => completedDate.HasValue &&
            dueAtUtc.HasValue &&
-           completedDate.Value.Date > dueAtUtc.Value.Date;
+           completedDate.Value.Date > ReportCivilDate.FromInstant(dueAtUtc.Value);
 }

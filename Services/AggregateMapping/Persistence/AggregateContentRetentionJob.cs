@@ -19,7 +19,7 @@ public sealed class AggregateContentRetentionJob(MongoDbContext db, IMinioClient
     internal static async Task PlanOnSave(MongoDbContext db, IClientSessionHandle session, string target, string workId, CancellationToken ct)
     {
         var snapshots = await db.Db.GetCollection<BsonDocument>(AggregateCollections.ContentSnapshots)
-            .Find(session, new BsonDocument("target", target)).Project(new BsonDocument("body", 1)).Limit(10001).ToListAsync(ct);
+            .Find(session, new BsonDocument("target", target)).Project(new BsonDocument { ["version"] = 1, ["body"] = 1 }).Limit(10001).ToListAsync(ct);
         if (snapshots.Count > 10000) throw new AggregatePreviewException("AGG_BUDGET_EXCEEDED");
         var excess = snapshots.Select(r => AggregateMongoTransaction.Read<AggregateContentSnapshotIntent>(r).Value)
             .GroupBy(r => r.TableId).Sum(g => Math.Max(0, g.Count() - KeepVersions));

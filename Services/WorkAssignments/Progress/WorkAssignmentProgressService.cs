@@ -27,6 +27,8 @@ public sealed class WorkAssignmentProgressService : IWorkAssignmentProgressServi
         WorkAssignment assignment,
         CancellationToken ct)
     {
+        if (string.IsNullOrWhiteSpace(assignment.FlowInstanceId))
+            return await ComputeOwnExecutionAsync(assignment, ct);
         var children = await _ctx.WorkAssignments
             .Find(x => x.ParentAssignmentId == assignment.Id && x.IsActive && !x.IsDeleted)
             .ToListAsync(ct);
@@ -52,6 +54,7 @@ public sealed class WorkAssignmentProgressService : IWorkAssignmentProgressServi
         var worstFacts = await ComputeWorstFactsAsync(assignment, ct);
         return new ProgressProjectionResult
         {
+            FirstApprovedAtUtc = computed.FirstApprovedAtUtc,
             ProgressStatus = computed.ProgressStatus,
             HasAnyDuePeriod = computed.HasAnyDuePeriod,
             HasOverduePeriod = computed.HasOverduePeriod,
@@ -67,12 +70,31 @@ public sealed class WorkAssignmentProgressService : IWorkAssignmentProgressServi
         WorkAssignment assignment,
         CancellationToken ct)
     {
+        if (string.IsNullOrWhiteSpace(assignment.FlowInstanceId))
+            return await ComputeOwnExecutionAsync(assignment, ct);
         var work = await _ctx.Works
             .Find(x => x.Id == assignment.WorkId && !x.IsDeleted)
             .FirstOrDefaultAsync(ct)
             ?? throw AssignmentWorkNotFound(assignment);
 
         return await ComputeLeafProgressAsync(assignment, work, ct);
+    }
+
+    private async Task<ProgressComputeResult> ComputeOwnExecutionAsync(WorkAssignment assignment, CancellationToken ct)
+    {
+        var work = await _ctx.Works.Find(x => x.Id == assignment.WorkId && !x.IsDeleted).FirstOrDefaultAsync(ct)
+            ?? throw AssignmentWorkNotFound(assignment);
+        var facts = await WorkExecutionReader.ReadAsync(_ctx, assignment, work, DateTime.UtcNow, ct);
+        var completed = WorkExecutionProgressPolicy.IsCompleted(assignment);
+        return new ProgressComputeResult
+        {
+            FirstApprovedAtUtc = facts.FirstApprovedAtUtc,
+            ProgressStatus = facts.ExecutionStatus(completed),
+            HasAnyDuePeriod = facts.DeadlineUtc <= DateTime.UtcNow,
+            HasOverduePeriod = !completed && !facts.AllReportsApproved && (facts.SubmissionOverdue || facts.ReviewOverdue),
+            LatestDueAtUtc = facts.DeadlineUtc,
+            LatestPeriodKey = assignment.LatestPeriodKey
+        };
     }
 
     private async Task<ProgressComputeResult> ComputeLeafProgressAsync(
@@ -145,6 +167,8 @@ public sealed class WorkAssignmentProgressService : IWorkAssignmentProgressServi
         List<WorkAssignment> directChildren,
         CancellationToken ct)
     {
+        if (string.IsNullOrWhiteSpace(parent.FlowInstanceId))
+            return ComputeOwnExecutionAsync(parent, ct);
         if (IsManuallyCompleted(parent))
         {
             return Task.FromResult(new ProgressComputeResult
@@ -228,6 +252,7 @@ public sealed class WorkAssignmentProgressService : IWorkAssignmentProgressServi
             var computed = await ComputeProgressAsync(current, ct);
             var worstFacts = await ComputeWorstFactsAsync(current, ct);
             var changed =
+                (!current.FirstApprovedAtUtc.HasValue && computed.FirstApprovedAtUtc.HasValue) ||
                 current.ProgressStatus != computed.ProgressStatus ||
                 current.HasAnyDuePeriod != computed.HasAnyDuePeriod ||
                 current.HasOverduePeriod != computed.HasOverduePeriod ||
@@ -242,6 +267,7 @@ public sealed class WorkAssignmentProgressService : IWorkAssignmentProgressServi
 
             var now = DateTime.UtcNow;
             var update = Builders<WorkAssignment>.Update
+                .Set(x => x.FirstApprovedAtUtc, current.FirstApprovedAtUtc ?? computed.FirstApprovedAtUtc)
                 .Set(x => x.ProgressStatus, computed.ProgressStatus)
                 .Set(x => x.ProgressStatusUpdatedAtUtc, now)
                 .Set(x => x.HasAnyDuePeriod, computed.HasAnyDuePeriod)
@@ -284,6 +310,7 @@ public sealed class WorkAssignmentProgressService : IWorkAssignmentProgressServi
             }
 
             current.ProgressStatus = computed.ProgressStatus;
+            current.FirstApprovedAtUtc ??= computed.FirstApprovedAtUtc;
             current.ProgressStatusUpdatedAtUtc = now;
             current.HasAnyDuePeriod = computed.HasAnyDuePeriod;
             current.HasOverduePeriod = computed.HasOverduePeriod;
@@ -342,12 +369,15 @@ public sealed class WorkAssignmentProgressService : IWorkAssignmentProgressServi
                 if (!workMap.TryGetValue(child.WorkId, out var work))
                     throw AssignmentWorkNotFound(child);
 
-                computed = await ComputeLeafProgressAsync(child, work, ct);
+                computed = string.IsNullOrWhiteSpace(child.FlowInstanceId)
+                    ? await ComputeOwnExecutionAsync(child, ct)
+                    : await ComputeLeafProgressAsync(child, work, ct);
             }
 
             var worstFacts = await ComputeWorstFactsAsync(child, ct);
 
             var changed =
+                (!child.FirstApprovedAtUtc.HasValue && computed.FirstApprovedAtUtc.HasValue) ||
                 child.ProgressStatus != computed.ProgressStatus ||
                 child.HasAnyDuePeriod != computed.HasAnyDuePeriod ||
                 child.HasOverduePeriod != computed.HasOverduePeriod ||
@@ -362,6 +392,7 @@ public sealed class WorkAssignmentProgressService : IWorkAssignmentProgressServi
                 var now = DateTime.UtcNow;
 
                 var update = Builders<WorkAssignment>.Update
+                    .Set(x => x.FirstApprovedAtUtc, child.FirstApprovedAtUtc ?? computed.FirstApprovedAtUtc)
                     .Set(x => x.ProgressStatus, computed.ProgressStatus)
                     .Set(x => x.ProgressStatusUpdatedAtUtc, now)
                     .Set(x => x.HasAnyDuePeriod, computed.HasAnyDuePeriod)
@@ -396,6 +427,7 @@ public sealed class WorkAssignmentProgressService : IWorkAssignmentProgressServi
                     continue;
                 }
 
+                child.FirstApprovedAtUtc ??= computed.FirstApprovedAtUtc;
                 child.ProgressStatus = computed.ProgressStatus;
                 child.ProgressStatusUpdatedAtUtc = now;
                 child.HasAnyDuePeriod = computed.HasAnyDuePeriod;
@@ -493,7 +525,7 @@ public sealed class WorkAssignmentProgressService : IWorkAssignmentProgressServi
             ? BuildOnceDueItemsInRange(assignment, workStartDate, rangeTo)
             : AssignmentScheduleDueHelper.GetDueItemsInRange(
                 assignment.Schedule,
-                workStartDate,
+                ResolveAssignmentStartDay(assignment, nowUtc),
                 rangeTo);
 
         if (dueItems.Count == 0)
@@ -581,22 +613,33 @@ public sealed class WorkAssignmentProgressService : IWorkAssignmentProgressServi
         };
     }
 
-    private static DateTime ResolveAssignmentStartUtc(WorkAssignment assignment, DateTime nowUtc)
+    private static readonly TimeZoneInfo BusinessTimeZone = AppTimeService.ResolveApplicationTimeZone();
+
+    private static DateTime ResolveAssignmentStartDay(WorkAssignment assignment, DateTime nowUtc)
     {
-        var start = WorkAssignmentDatePolicy.ResolveEffectiveStartDate(assignment, nowUtc);
+        // Stored calendar fields retain their day token. Only comparisons with
+        // the clock convert that day to an instant; schedule keys still use days.
+        var today = TimeZoneInfo.ConvertTimeFromUtc(DateTime.SpecifyKind(nowUtc, DateTimeKind.Utc), BusinessTimeZone).Date;
+        var start = WorkAssignmentDatePolicy.ResolveEffectiveStartDate(assignment, today);
         if (assignment.Schedule?.StartDate is { } scheduleStart && scheduleStart.Date > start)
             start = scheduleStart.Date;
 
         return start;
     }
 
+    private static DateTime ResolveAssignmentStartUtc(WorkAssignment assignment, DateTime nowUtc)
+        => TimeZoneInfo.ConvertTimeToUtc(DateTime.SpecifyKind(ResolveAssignmentStartDay(assignment, nowUtc), DateTimeKind.Unspecified), BusinessTimeZone);
+
     private static DateTime? ResolveAssignmentEndUtc(
         WorkAssignment assignment,
         Work work,
         WorkAssignment? parent)
     {
-        return WorkAssignmentDatePolicy.ResolveEffectiveCompletedDate(assignment, work, parent)
-               ?? (IsOnceAssignment(assignment) ? assignment.DueAtUtc : null);
+        var endDay = WorkAssignmentDatePolicy.ResolveEffectiveCompletedDate(assignment, work, parent);
+        if (endDay.HasValue)
+            return TimeZoneInfo.ConvertTimeToUtc(DateTime.SpecifyKind(endDay.Value.Date.AddDays(1), DateTimeKind.Unspecified), BusinessTimeZone).AddTicks(-1);
+        // DueAtUtc is already an instant; never convert it a second time.
+        return IsOnceAssignment(assignment) ? assignment.DueAtUtc : null;
     }
 
     private async Task<WorkAssignment?> LoadParentAssignmentAsync(WorkAssignment assignment, CancellationToken ct)
@@ -628,11 +671,24 @@ public sealed class WorkAssignmentProgressService : IWorkAssignmentProgressServi
 
     private async Task<WorstFacts> ComputeWorstFactsAsync(WorkAssignment assignment, CancellationToken ct)
     {
+        if (string.IsNullOrWhiteSpace(assignment.FlowInstanceId))
+        {
+            var work = await _ctx.Works.Find(w => w.Id == assignment.WorkId && !w.IsDeleted).FirstOrDefaultAsync(ct)
+                ?? throw AssignmentWorkNotFound(assignment);
+            var facts = await WorkExecutionReader.ReadAsync(_ctx, assignment, work, DateTime.UtcNow, ct);
+            // Late submission remains in report history, not an active completion warning.
+            if (WorkExecutionProgressPolicy.IsCompleted(assignment) || facts.AllReportsApproved)
+                return new WorstFacts();
+            return new WorstFacts {
+                WorstOverdueReasonCode = facts.ReviewOverdue ? "OVERDUE_SUBMITTED_WAITING_REVIEW" : facts.SubmissionOverdue ? "OVERDUE_NOT_SUBMITTED" : null,
+                WorstOverdueReasonLabel = facts.ReviewOverdue ? "Quá hạn duyệt" : facts.SubmissionOverdue ? "Quá hạn nộp" : null
+            };
+        }
         var children = await _ctx.WorkAssignments
             .Find(x => x.ParentAssignmentId == assignment.Id && x.IsActive && !x.IsDeleted)
             .ToListAsync(ct);
 
-        if (children.Count > 0)
+        if (children.Count > 0 && !string.IsNullOrWhiteSpace(assignment.FlowInstanceId))
         {
             var worstChild = children
                 .OrderByDescending(GetWorstPeriodRank)
@@ -741,6 +797,10 @@ public sealed class WorkAssignmentProgressService : IWorkAssignmentProgressServi
         return filter.Eq(x => x.Id, assignment.Id) &
                filter.Eq(x => x.IsDeleted, false) &
                filter.Eq(x => x.IsActive, assignment.IsActive) &
+               filter.Eq(x => x.FirstApprovedAtUtc, assignment.FirstApprovedAtUtc) &
+               (assignment.CompletionRevision == 0
+                   ? filter.Eq(x => x.CompletionRevision, 0) | filter.Exists(x => x.CompletionRevision, false)
+                   : filter.Eq(x => x.CompletionRevision, assignment.CompletionRevision)) &
                filter.Eq(x => x.CompletedAtUtc, expectedCompletedAtUtc) &
                filter.Eq(
                    x => x.ProgressStatusUpdatedAtUtc,

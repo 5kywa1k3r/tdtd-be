@@ -56,7 +56,12 @@ internal sealed record WorkReportNativeStatisticInput(
 
         var definitions = DynamicFormNativeTableDefinition.ReadStored(template.NativeTablesVersion, template.TablesJson)!;
         using var document = JsonDocument.Parse(payload.TableValuesJson!);
-        if(document.RootElement.GetProperty("nativeTables").GetProperty("tables").EnumerateArray().Any(table=>table.TryGetProperty("contentRef",out _)))
+        // An empty trusted plan still validates the complete pinned envelope,
+        // but has no cells to consume. Keep paged content opaque in that case.
+        var hasNativeTargets = configuration.NativeTargets.Count != 0
+            || configuration.NativePlan?.Targets.Count > 0;
+        if (hasNativeTargets && document.RootElement.GetProperty("nativeTables").GetProperty("tables")
+            .EnumerateArray().Any(table => table.TryGetProperty("contentRef", out _)))
             throw new InvalidOperationException("CONTENT_TABLE_REQUIRES_PAGED_READER");
         var requiresTimestamp = configuration.NativeTargets.Any(target => target.Statistic.AggregateOps?.Contains("LATEST", StringComparer.Ordinal) == true)
             || configuration.NativePlan?.Targets.Any(target => target.Configuration.Order?.Reports == "sourceUpdatedAtAsc") == true;

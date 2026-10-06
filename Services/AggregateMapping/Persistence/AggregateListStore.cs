@@ -41,10 +41,10 @@ internal sealed class AggregateListStore(MongoDbContext db) : IAggregateListSink
         {
             var body = JsonSerializer.Serialize(AggregateListWire.EncodeRow(record), AggregateCanonical.Json);
             var id = AggregateCanonical.Hash(new { scope, body }); ids.Add(id);
-            var preview = JsonNode.Parse(body)!.AsObject(); preview.Remove("origin");
+            var preview = JsonNode.Parse(body)!.AsObject(); preview.Remove("origin"); preview.Remove("contributors");
             foreach (var cell in preview["cells"]!.AsObject().Select(p => p.Value!.AsObject()))
             {
-                cell.Remove("lineage"); cell.Remove("exact");
+                cell.Remove("lineage"); cell.Remove("exact"); cell.Remove("textFormat"); cell.Remove("lengthText");
                 if (cell["type"]!.GetValue<string>() == "TEXT" && cell["value"] is JsonValue textNode)
                 {
                     var text = textNode.GetValue<string>(); var length = text.Length;
@@ -67,12 +67,12 @@ internal sealed class AggregateListStore(MongoDbContext db) : IAggregateListSink
         var manifest = new BsonDocument { ["_id"] = snapshotId, ["scope"] = scope, ["hash"] = hash,
             ["schema"] = JsonSerializer.Serialize(value.Schema, AggregateCanonical.Json), ["rowIds"] = new BsonArray(ids), ["keys"] = new BsonArray(keys), ["count"] = ids.Count };
         await Collection(Manifests).UpdateOneAsync(new BsonDocument("_id", snapshotId), new BsonDocument("$setOnInsert", manifest), new UpdateOptions { IsUpsert = true }, ct);
-        return new(AggregateListWire.Kind, snapshotId, hash, ids.Count, value.Schema);
+        return new(AggregateListWire.KindFor(value), snapshotId, hash, ids.Count, value.Schema);
     }
     internal async Task<AggregateListValue> Load(string reportId, AggregateListReference reference, CancellationToken ct)
     {
         var manifest = await Manifest(reportId, reference.Id, reference.Hash, ct);
-        if (reference.Kind != AggregateListWire.Kind || reference.Count != manifest["count"].AsInt32
+        if (!AggregateListWire.Supported(reference.Kind) || reference.Count != manifest["count"].AsInt32
             || AggregateCanonical.Hash(reference.Schema) != AggregateCanonical.Hash(JsonSerializer.Deserialize<AggregateListSchema>(manifest["schema"].AsString, AggregateCanonical.Json)))
             throw new AggregatePreviewException("AGG_LIST_SNAPSHOT_INVALID");
         var rows = new List<AggregateListRow>();
@@ -133,12 +133,24 @@ internal sealed class AggregateListStore(MongoDbContext db) : IAggregateListSink
         using var doc = JsonDocument.Parse(body);
         if (!doc.RootElement.GetProperty("cells").TryGetProperty(fieldId, out var cell)) throw new AggregatePreviewException("AGG_LIST_FIELD_REF");
         return new { SnapshotId = id, SnapshotHash = hash, RowKey = rowKey, FieldId = fieldId,
-            Origin = doc.RootElement.GetProperty("origin").Clone(), Cell = cell.Clone(), Metadata = Metadata(doc.RootElement) };
+            Origin = doc.RootElement.GetProperty("origin").Clone(),
+            Contributors = doc.RootElement.TryGetProperty("contributors", out var contributors) ? (JsonElement?)contributors.Clone() : null,
+            Cell = cell.Clone(), Metadata = Metadata(doc.RootElement) };
     }
-    private static JsonElement Metadata(JsonElement row) => JsonSerializer.SerializeToElement(new {
-        Origin = row.GetProperty("origin").Clone(), Fields = row.GetProperty("cells").EnumerateObject().ToDictionary(c => c.Name,
+    private static JsonElement Metadata(JsonElement row)
+    {
+        var contributors=row.TryGetProperty("contributors",out var origins)?origins.Deserialize<AggregateListContributor[]>(AggregateCanonical.Json):null;
+        var sourceOrigins=contributors?.Select(o=>o.Origin).ToArray()??[row.GetProperty("origin").Deserialize<AggregateListOrigin>(AggregateCanonical.Json)!];
+        return JsonSerializer.SerializeToElement(new {
+        Origin = row.GetProperty("origin").Clone(),
+        Contributors = row.TryGetProperty("contributors", out var contributorJson) ? (JsonElement?)contributorJson.Clone() : null,
+        CellSources = row.GetProperty("cells").EnumerateObject().ToDictionary(c => c.Name, c => c.Value.GetProperty("lineage").Deserialize<AggregateTrace[]>(AggregateCanonical.Json)!
+            .SelectMany(t => sourceOrigins
+                .Where(o => o.Pin?.ReportId == t.ReportId && o.SourceSlot == t.SourceSlot).Select(o => new AggregateListCellSource(o, t.FieldId))).Distinct().ToArray()),
+        Fields = row.GetProperty("cells").EnumerateObject().ToDictionary(c => c.Name,
             c => c.Value.GetProperty("lineage").EnumerateArray().Select(t => t.TryGetProperty("fieldId", out var id) ? id.GetString() : null)
                 .Where(id => id != null).Distinct().ToArray()) }, AggregateCanonical.Json);
+    }
     private async Task<BsonDocument> Manifest(string reportId, string id, string hash, CancellationToken ct)
     {
         var row = await Collection(Manifests).Find(new BsonDocument { ["_id"] = id, ["scope"] = reportId, ["hash"] = hash }).FirstOrDefaultAsync(ct)

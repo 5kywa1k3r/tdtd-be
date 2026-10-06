@@ -60,6 +60,7 @@ public sealed class NotificationService : INotificationService
                         .SetOnInsert(x => x.WorkId, NullIfWhiteSpace(command.WorkId))
                         .SetOnInsert(x => x.WorkType, command.WorkType)
                         .SetOnInsert(x => x.WorkName, command.WorkName)
+                        .SetOnInsert(x => x.AssignmentName, command.AssignmentName)
                         .SetOnInsert(x => x.WorkAssignmentId, NullIfWhiteSpace(command.WorkAssignmentId))
                         .SetOnInsert(x => x.AssignmentCode, command.AssignmentCode)
                         .SetOnInsert(x => x.WorkReportPeriodId, NullIfWhiteSpace(command.WorkReportPeriodId))
@@ -138,6 +139,13 @@ public sealed class NotificationService : INotificationService
 
         if (request.UnreadOnly == true)
             filter &= fb.Eq(x => x.ReadAtUtc, null);
+        else if (request.UnreadOnly == false)
+            filter &= fb.Ne(x => x.ReadAtUtc, null);
+
+        if (request.OccurredFromUtc.HasValue)
+            filter &= fb.Gte(x => x.OccurredAtUtc, request.OccurredFromUtc.Value);
+        if (request.OccurredBeforeUtc.HasValue)
+            filter &= fb.Lt(x => x.OccurredAtUtc, request.OccurredBeforeUtc.Value);
 
         var types = (request.Types ?? new List<string>())
             .Select(x => (x ?? string.Empty).Trim().ToUpperInvariant())
@@ -170,13 +178,13 @@ public sealed class NotificationService : INotificationService
                     fb.Lt(x => x.Id, cursorId)));
         }
 
-        var rows = await _ctx.Notifications
+        var query = _ctx.Notifications
             .Find(filter)
             .Sort(Builders<UserNotification>.Sort
                 .Descending(x => x.OccurredAtUtc)
-                .Descending(x => x.Id))
-            .Limit(pageSize + 1)
-            .ToListAsync(ct);
+                .Descending(x => x.Id));
+        if (request.PageNumber.HasValue) query = query.Skip(checked((request.PageNumber.Value - 1) * pageSize));
+        var rows = await query.Limit(pageSize + 1).ToListAsync(ct);
 
         var hasMore = rows.Count > pageSize;
         var pageRows = rows.Take(pageSize).ToList();
@@ -327,6 +335,7 @@ public sealed class NotificationService : INotificationService
             WorkId = assignment.WorkId,
             WorkAssignmentId = assignment.Id,
             AssignmentCode = assignment.Code,
+            AssignmentName = assignment.Name,
             Category = UserNotificationCategories.General,
             RequiresAction = true,
             ActionState = UserNotificationActionStates.Open,
@@ -370,6 +379,7 @@ public sealed class NotificationService : INotificationService
                 WorkId = assignment.WorkId,
                 WorkAssignmentId = assignment.Id,
                 AssignmentCode = assignment.Code,
+                AssignmentName = assignment.Name,
                 Category = UserNotificationCategories.Handover,
                 RequiresAction = true,
                 ActionState = UserNotificationActionStates.Open,
@@ -392,6 +402,7 @@ public sealed class NotificationService : INotificationService
                 WorkId = assignment.WorkId,
                 WorkAssignmentId = assignment.Id,
                 AssignmentCode = assignment.Code,
+                AssignmentName = assignment.Name,
                 Category = UserNotificationCategories.Handover,
                 RequiresAction = false,
                 ActionState = UserNotificationActionStates.Resolved,
@@ -452,7 +463,7 @@ public sealed class NotificationService : INotificationService
         }
     }
 
-    private static NotificationRowDto ToDto(UserNotification x) => new()
+    internal static NotificationRowDto ToDto(UserNotification x) => new()
     {
         Id = x.Id,
         Type = x.Type,
@@ -462,6 +473,7 @@ public sealed class NotificationService : INotificationService
         WorkId = x.WorkId,
         WorkType = x.WorkType,
         WorkName = x.WorkName,
+        AssignmentName = x.AssignmentName,
         WorkAssignmentId = x.WorkAssignmentId,
         AssignmentCode = x.AssignmentCode,
         WorkReportPeriodId = x.WorkReportPeriodId,

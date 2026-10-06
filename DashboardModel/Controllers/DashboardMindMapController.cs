@@ -53,6 +53,15 @@ public sealed class DashboardMindMapController : ControllerBase
         return Ok(result);
     }
 
+    [HttpGet("works/{workId}/assignments/{assignmentId}/focus-path")]
+    public async Task<ActionResult<List<DashboardTreeNodeDto>>> GetAssignmentFocusPath(string workId, string assignmentId, CancellationToken ct)
+        => Ok(await _service.GetAssignmentFocusPathAsync(workId, assignmentId, ct));
+
+    [HttpPost("works/{workId}/card-summaries")]
+    public async Task<ActionResult<DashboardMindMapCardSummariesResponse>> GetCardSummaries(
+        string workId, [FromBody] DashboardMindMapCardSummariesRequest? req, CancellationToken ct)
+        => Ok(await _service.GetCardSummariesAsync(workId, req, ct));
+
     [HttpGet("works/{workId}/root-assignments")]
     public async Task<ActionResult<DashboardMindMapCursorResult<DashboardTreeNodeDto>>> GetRootAssignments(
         [FromRoute] string workId,

@@ -33,6 +33,43 @@ public sealed class AggregateMappingCommandsController(MongoDbContext db, IDynam
     [HttpPost("instances")]
     public Task<IActionResult> CreateInstance(AggregateInstanceCreateCommandDto request, CancellationToken ct)
         => Run(request.CommandId, "CREATE_INSTANCE", AggregateTargetIdentity.Id(request.Context)!, (s, c) => s.CreateInstanceAsync(c, request.Context, request.ConfigId, ct), ct);
+    [HttpPost("instances/{id}/mapping/queue-preview")]
+    public Task<IActionResult> QueuePreview(string id, AggregateMappingPreviewCommandDto request, CancellationToken ct)
+        => Run("preview", "QUEUE_MAPPING", id, (s, c) => s.PreviewQueuedMappingAsync(c, request.Context, id, Change(request.Change), ct), ct);
+    [HttpPost("instances/{id}/mapping/queue")]
+    public async Task<IActionResult> QueueMapping(string id, AggregateMappingApplyCommandDto request, CancellationToken ct)
+    {
+        var result = await Run(request.CommandId, "QUEUE_MAPPING", id, (s, c) => s.SaveQueuedMappingAsync(c, request.Context, id, Change(request.Change), request.ConfirmationToken, ct), ct);
+        if (result is OkObjectResult) await DispatchQueued(request.Context.WorkId, ct);
+        return result;
+    }
+    [HttpPost("configs/{id}/queue-preview")]
+    public Task<IActionResult> QueueConfigPreview(string id, AggregateConfigImpactCommandDto request, CancellationToken ct)
+        => Run("preview", "QUEUE_CONFIG", id, (s, c) => s.PreviewQueuedConfigAsync(c, request.Context, id, request.Impact, ct), ct);
+    [HttpPost("configs/{id}/queue")]
+    public async Task<IActionResult> QueueConfig(string id, AggregateConfigRevisionCommandDto request, CancellationToken ct)
+    {
+        var result = await Run(request.CommandId, "QUEUE_CONFIG", id, (s, c) => s.SaveQueuedConfigAsync(c, request.Context, id, request.Impact, request.ConfirmationToken, ct), ct);
+        if (result is OkObjectResult) await DispatchQueued(request.Context.WorkId, ct);
+        return result;
+    }
+    [HttpPost("instances/{id}/computation/cancel")]
+    public Task<IActionResult> CancelComputation(string id, AggregateUnlinkPreviewCommandDto request, CancellationToken ct)
+        => Run("cancel", "CANCEL_COMPUTATION", id, (s, c) => s.ChangeComputationAsync(c, request.Context, id, request.ExpectedRevision, false, ct), ct);
+    [HttpPost("instances/{id}/computation/retry")]
+    public async Task<IActionResult> RetryComputation(string id, AggregateUnlinkPreviewCommandDto request, CancellationToken ct)
+    {
+        var result = await Run("retry", "RETRY_COMPUTATION", id, (s, c) => s.ChangeComputationAsync(c, request.Context, id, request.ExpectedRevision, true, ct), ct);
+        if (result is OkObjectResult) await DispatchQueued(request.Context.WorkId, ct);
+        return result;
+    }
+    private async Task DispatchQueued(string workId, CancellationToken ct)
+    {
+        try { await AggregateMaterializationDispatch.Schedule(db, transactions,
+            HttpContext.RequestServices.GetService<Hangfire.IBackgroundJobClient>(), 100, ct, workId); }
+        catch (Exception ex) { HttpContext.RequestServices.GetRequiredService<ILogger<AggregateMappingCommandsController>>()
+            .LogWarning(ex, "Aggregate computation remains durable after dispatch failure"); }
+    }
     [HttpPost("instances/{id}/mapping/preview")]
     public Task<IActionResult> Preview(string id, AggregateMappingPreviewCommandDto request, CancellationToken ct)
         => Run("preview", "APPLY", id, (s, c) => s.PreviewChangeAsync(c, request.Context, id, Change(request.Change), ct), ct);
@@ -68,6 +105,10 @@ public sealed class AggregateMappingCommandsController(MongoDbContext db, IDynam
     [HttpPost("instances/{id}/read")]
     public Task<IActionResult> Read(string id, AggregateInstanceReadCommandDto request, CancellationToken ct)
         => Run("read", "READ", id, (s, c) => s.ReadInstanceAsync(c, request.Context, id, ct), ct);
+
+    [HttpPost("instances/{id}/computation/status")]
+    public Task<IActionResult> ComputationStatus(string id, AggregateInstanceReadCommandDto request, CancellationToken ct)
+        => Run("read-status", "READ", id, (s, c) => s.ReadComputationStatusAsync(c, request.Context, id, ct), ct);
     [HttpPost("configs/{id}/read")]
     public Task<IActionResult> ReadConfig(string id, AggregateConfigReadCommandDto request, CancellationToken ct)
         => Run("read", "READ", id, (s, c) => s.ReadConfigAsync(c, request.Context, id, ct, request.Revision), ct);

@@ -31,7 +31,7 @@ public sealed class ScopedPickerController : ControllerBase
     {
         if (request.Context is null || request.Context.Purpose is null
             || !System.Enum.IsDefined(typeof(PickerPurpose), request.Context.Purpose.Value)
-            || request.Operation is not ("children" or "units" or "users" or "lookup" or "restoreUsers" or "restoreUnits" or "expandUnits")
+            || request.Operation is not ("children" or "units" or "directory" or "users" or "lookup" or "restoreUsers" or "restoreUnits" or "expandUnits")
             || (request.Ids?.Count ?? 0) > 2000)
             return BadRequest("Ngữ cảnh bộ chọn không hợp lệ.");
         var context = request.Context;
@@ -43,6 +43,7 @@ public sealed class ScopedPickerController : ControllerBase
         List<Unit> units;
         List<AppUser> users;
         var selectableUnits = new HashSet<string>(StringComparer.Ordinal);
+        AssignmentPickerScope? assignmentScope = null;
         if (context.Purpose == PickerPurpose.WorkLeaders)
         {
             if (!ValidOptionalId(context.WorkId) || !string.IsNullOrWhiteSpace(context.ParentAssignmentId)
@@ -70,7 +71,8 @@ public sealed class ScopedPickerController : ControllerBase
         }
         else
         {
-            var scope = await _assignments.GetPickerScopeAsync(context, ct);
+            var scope = await _assignments.GetPickerScopeAsync(context, ct, request);
+            assignmentScope = scope;
             (units, users, selectableUnits) = (scope.Units, scope.Users, scope.SelectableUnitIds);
         }
 
@@ -85,12 +87,19 @@ public sealed class ScopedPickerController : ControllerBase
             else if (request.Operation == "lookup") matches = matches.Where(x => string.Equals(x.Username, q, StringComparison.OrdinalIgnoreCase));
             else if (q.Length > 0) matches = matches.Where(x => Contains(x.Username, q) || Contains(x.FullName, q));
             var found = matches.OrderBy(x => x.Username, StringComparer.Ordinal).ToList();
-            var slice = request.Operation == "restoreUsers" ? found : found.Skip((int)Math.Min((long)page * size, int.MaxValue)).Take(size);
+            var slice = request.Operation == "restoreUsers" || assignmentScope?.UserTotalRows is not null
+                ? found : found.Skip((int)Math.Min((long)page * size, int.MaxValue)).Take(size);
             var unitMap = units.ToDictionary(x => x.Id);
             return Ok(new { rows = slice.Select(x => new UserPickRow {
                 Id = x.Id, Username = x.Username, FullName = x.FullName, UnitId = x.UnitId, PositionCode = x.PositionCode,
-                UnitSymbol = x.UnitId != null && unitMap.TryGetValue(x.UnitId, out var u) ? u.Symbol : null
-            }), totalRows = found.Count, page, pageSize = size });
+                UnitSymbol = x.UnitId != null && unitMap.TryGetValue(x.UnitId, out var u) ? u.Symbol : null,
+                UnitCode = x.UnitId != null && unitMap.TryGetValue(x.UnitId, out var codeUnit) ? codeUnit.Code : null,
+                UnitShortName = x.UnitId != null && unitMap.TryGetValue(x.UnitId, out var nameUnit) ? nameUnit.ShortName ?? nameUnit.FullName : null,
+                PositionName = Positions.GetName(x.PositionCode),
+                Selectable = assignmentScope?.UserConflicts.ContainsKey(x.Id) != true,
+                ConflictUnitId = assignmentScope?.UserConflicts.GetValueOrDefault(x.Id)?.Id,
+                ConflictUnitName = assignmentScope?.UserConflicts.GetValueOrDefault(x.Id) is { } covering ? covering.ShortName ?? covering.FullName : null
+            }), totalRows = assignmentScope?.UserTotalRows ?? found.Count, page, pageSize = size });
         }
 
         // Navigation ancestors are visible but only selectableUnits can become unit recipients.
@@ -117,7 +126,7 @@ public sealed class ScopedPickerController : ControllerBase
             var selected = units.Where(x => ids.Contains(x.Id)).ToList();
             unitMatches = navigable.Where(x => !x.IsVirtual && selectableUnits.Contains(x.Id)
                 && selected.Any(s => s.IsVirtual
-                      ? !string.IsNullOrWhiteSpace(s.Code) && x.Code != null && x.Code.StartsWith(s.Code.Trim(), StringComparison.Ordinal)
+                      ? UnitManagementScope.Contains(s.Code, x.Code, false)
                     : s.Id == x.Id));
         }
         else if (request.Operation == "children")

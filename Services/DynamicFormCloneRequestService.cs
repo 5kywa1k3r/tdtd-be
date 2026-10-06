@@ -84,6 +84,20 @@ public sealed class DynamicFormCloneRequestService : IDynamicFormCloneRequestSer
                 AppErrorCode.DYNAMIC_FORM_CLONE_REQUEST_ASSIGNEE_FORBIDDEN,
                 new { assignmentId, actorUserId });
 
+        var source = await _ctx.DynamicFormTemplates.Find(x => x.Id == assignment.DynamicFormTemplateId && !x.IsDeleted)
+            .Project(x => new { x.Id, x.CreatedByUserId }).FirstOrDefaultAsync(ct)
+            ?? throw AppExceptionFactory.BadRequest(AppErrorCode.DYNAMIC_FORM_CLONE_REQUEST_TEMPLATE_MISSING, new { assignmentId });
+        var actor = await _ctx.Users.Find(x => x.Id == actorUserId && !x.IsDeleted)
+            .Project(x => new { x.AccountKind, x.Roles }).FirstOrDefaultAsync(ct);
+        var alreadyGranted = source.CreatedByUserId == actorUserId
+            || string.Equals(actor?.AccountKind, "SYSTEM_ADMIN", StringComparison.OrdinalIgnoreCase)
+            || actor?.Roles.Any(x => string.Equals(x, "SYSTEM_ADMIN", StringComparison.OrdinalIgnoreCase)) == true
+            || await _ctx.DynamicFormCloneRequests.Find(x => x.DynamicFormTemplateId == source.Id
+                && x.RequesterUserId == actorUserId && x.Status == DynamicFormCloneRequestStatus.Approved && !x.IsDeleted).Limit(1).AnyAsync(ct);
+        if (alreadyGranted)
+            throw AppExceptionFactory.BadRequest(AppErrorCode.DYNAMIC_FORM_CLONE_REQUEST_STATUS_INVALID,
+                new { assignmentId, reason = "clone-permission-already-granted" });
+
         var ownerUserId = NullIfWhiteSpace(assignment.CreatedByUserId);
         if (ownerUserId is null)
             throw AppExceptionFactory.Forbidden(
@@ -145,7 +159,11 @@ public sealed class DynamicFormCloneRequestService : IDynamicFormCloneRequestSer
             IsDeleted = false
         };
 
-        await _ctx.DynamicFormCloneRequests.InsertOneAsync(doc, cancellationToken: ct);
+        try { await _ctx.DynamicFormCloneRequests.InsertOneAsync(doc, cancellationToken: ct); }
+        catch (MongoWriteException ex) when (ex.WriteError.Category == ServerErrorCategory.DuplicateKey)
+        {
+            throw AppExceptionFactory.Create(AppErrorCode.DYNAMIC_FORM_CLONE_REQUEST_DUPLICATE, new { assignmentId });
+        }
         await NotifyCloneRequestedAsync(doc, assignment.WorkType, actorUserId, ct);
         return ToRow(doc);
     }
@@ -215,6 +233,15 @@ public sealed class DynamicFormCloneRequestService : IDynamicFormCloneRequestSer
             throw AppExceptionFactory.BadRequest(
                 AppErrorCode.DYNAMIC_FORM_CLONE_REQUEST_STATUS_INVALID,
                 new { requestId, doc.Status });
+
+        // A pending request must still refer to the same active assignment, pinned source and recipient.
+        var currentAssignment = await _ctx.WorkAssignments.Find(x => x.Id == doc.WorkAssignmentId && !x.IsDeleted && x.IsActive)
+            .FirstOrDefaultAsync(ct);
+        var sourceExists = await _ctx.DynamicFormTemplates.Find(x => x.Id == doc.DynamicFormTemplateId && !x.IsDeleted).Limit(1).AnyAsync(ct);
+        if (currentAssignment is null || currentAssignment.DynamicFormTemplateId != doc.DynamicFormTemplateId
+            || !currentAssignment.Assignees.Any(x => x.UserId == doc.RequesterUserId) || !sourceExists)
+            throw AppExceptionFactory.BadRequest(AppErrorCode.DYNAMIC_FORM_CLONE_REQUEST_STATUS_INVALID,
+                new { requestId, reason = "source-or-assignment-no-longer-valid" });
 
         var now = DateTime.UtcNow;
         var update = Builders<DynamicFormCloneRequest>.Update

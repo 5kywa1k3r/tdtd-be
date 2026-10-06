@@ -1,4 +1,4 @@
-﻿namespace tdtd_be.DTOs.Pickers;
+namespace tdtd_be.DTOs.Pickers;
 
 public sealed class UnitPickRow
 {
@@ -16,6 +16,10 @@ public sealed class UnitPickRow
 
 public sealed class UserPickRow
 {
+    public bool Selectable { get; set; } = true;
+    public string? ConflictUnitId { get; set; }
+    public string? ConflictUnitName { get; set; }
+    public string? PositionName { get; set; }
     public string Id { get; set; } = default!;
     public string Username { get; set; } = default!;
     public string FullName { get; set; } = default!;

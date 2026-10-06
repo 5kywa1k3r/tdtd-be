@@ -44,6 +44,10 @@ public static class HangfireRecurringJobRegistrar
     {
         Volatile.Write(ref _recurringRegistrationReady, 0);
         var tz = time.ApplicationTimeZone;
+        RecurringJob.AddOrUpdate<tdtd_be.Services.WorkAssignments.Progress.WorkExecutionReconcileJob>(
+            "work:execution-progress-reconcile",
+            job => job.RunAsync(CancellationToken.None),
+            "*/5 * * * *", new RecurringJobOptions { TimeZone = tz });
         var hour = Math.Clamp(cfg.GetValue<int?>("UploadCleanup:LocalHour") ?? 21, 0, 23);
         var minute = Math.Clamp(cfg.GetValue<int?>("UploadCleanup:LocalMinute") ?? 0, 0, 59);
 

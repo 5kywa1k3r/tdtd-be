@@ -17,6 +17,7 @@ namespace tdtd_be.DashboardModel.Services;
 
 public interface IDashboardOverviewService
 {
+    Task<DashboardLeadershipItemsDto> SearchLeadershipItemsAsync(DashboardLeadershipItemsRequest req, CancellationToken ct = default);
     Task<DashboardOverviewResponse> GetOverviewAsync(
         DashboardOverviewRequest? req,
         CancellationToken ct = default);
@@ -26,11 +27,12 @@ public interface IDashboardOverviewService
         CancellationToken ct = default);
 }
 
-public sealed class DashboardOverviewService : IDashboardOverviewService
+public sealed partial class DashboardOverviewService : IDashboardOverviewService
 {
     private readonly MongoDbContext _ctx;
     private readonly MeAccessor _me;
     private readonly RedisDashboardCache _cache;
+    private DashboardUnitReadScope? _unitScope;
 
     public DashboardOverviewService(
         MongoDbContext ctx,
@@ -48,7 +50,10 @@ public sealed class DashboardOverviewService : IDashboardOverviewService
     {
         var me = _me.RequireMe();
         req ??= new DashboardOverviewRequest();
+        if (string.Equals(req.View, "LEADERSHIP", StringComparison.OrdinalIgnoreCase))
+            return await GetLeadershipOverviewAsync(req, ct);
         var hasGlobalReadAccess = DashboardAccessPolicy.HasGlobalReadAccess(me);
+        _unitScope = await DashboardUnitReadScope.ResolveAsync(_ctx, me, ct);
 
         var mode = NormalizeMode(req.Mode);
         var range = DashboardTimeRangeHelper.NormalizeMonthRange(req.FromUtc, req.ToUtc);
@@ -63,7 +68,7 @@ public sealed class DashboardOverviewService : IDashboardOverviewService
             range,
             unitIds,
             assignmentId,
-            topUnitCount);
+            topUnitCount) + (_unitScope is null ? "" : ":unit-v1:" + _unitScope.CacheScope);
 
         return await _cache.GetOrCreateAsync(
             cacheKey,
@@ -88,6 +93,7 @@ public sealed class DashboardOverviewService : IDashboardOverviewService
         var me = _me.RequireMe();
         req ??= new DashboardReportAssignmentOptionsRequest();
         var hasGlobalReadAccess = DashboardAccessPolicy.HasGlobalReadAccess(me);
+        _unitScope = await DashboardUnitReadScope.ResolveAsync(_ctx, me, ct);
 
         var unitIds = NormalizeIds(req.UnitIds);
         var range = DashboardTimeRangeHelper.NormalizeMonthRange(req.FromUtc, req.ToUtc);
@@ -152,7 +158,7 @@ public sealed class DashboardOverviewService : IDashboardOverviewService
         int topUnitCount,
         CancellationToken ct)
     {
-        return mode switch
+        var result = mode switch
         {
             "WORK_TASK" => await BuildWorkOverviewAsync(actorUserId, hasGlobalReadAccess, mode, range, unitIds, topUnitCount, ct),
             "WORK_TARGET" => await BuildWorkOverviewAsync(actorUserId, hasGlobalReadAccess, mode, range, unitIds, topUnitCount, ct),
@@ -161,6 +167,9 @@ public sealed class DashboardOverviewService : IDashboardOverviewService
             "REPORT" => await BuildReportOverviewAsync(actorUserId, hasGlobalReadAccess, range, unitIds, assignmentId, topUnitCount, ct),
             _ => await BuildWorkOverviewAsync(actorUserId, hasGlobalReadAccess, "WORK_TASK", range, unitIds, topUnitCount, ct)
         };
+        result.ScopeLabel = _unitScope?.Label ?? (hasGlobalReadAccess ? "Toàn tỉnh" : "Công việc của bạn");
+        result.GeneratedAtUtc = DateTime.UtcNow;
+        return result;
     }
 
     private async Task<DashboardOverviewResponse> BuildWorkOverviewAsync(
@@ -175,7 +184,9 @@ public sealed class DashboardOverviewService : IDashboardOverviewService
         var workFilter = Builders<Work>.Filter.Eq(x => x.IsDeleted, false)
             & BuildWorkTimeFilter(range);
         if (!hasGlobalReadAccess)
-            workFilter &= Builders<Work>.Filter.Eq(x => x.CreatedByUserId, actorUserId);
+            workFilter &= _unitScope is null
+                ? Builders<Work>.Filter.Eq(x => x.CreatedByUserId, actorUserId)
+                : Builders<Work>.Filter.In(x => x.Id, _unitScope.WorkIds);
 
         var works = await _ctx.Works
             .Find(workFilter)
@@ -746,6 +757,17 @@ public sealed class DashboardOverviewService : IDashboardOverviewService
         return result;
     }
 
+    private async Task<List<WorkAssignment>> LoadUnitAssignmentScopeAsync(
+        List<WorkAssignment> candidates, List<string> unitIds, DashboardNormalizedRange range,
+        CancellationToken ct, bool applyTimeFilter)
+    {
+        var filter = Builders<WorkAssignment>.Filter.In(x => x.Id, candidates.Select(x => x.Id))
+            & BuildAssignmentUnitFilter(unitIds);
+        if (applyTimeFilter) filter &= BuildAssignmentTimeFilter(range);
+        var items = await _ctx.WorkAssignments.Find(filter).ToListAsync(ct);
+        return items.Select(x => _unitScope!.Mask(x)).ToList();
+    }
+
     private async Task<List<WorkAssignment>> LoadOwnedAssignmentBranchAsync(
         string actorUserId,
         List<string> unitIds,
@@ -753,6 +775,8 @@ public sealed class DashboardOverviewService : IDashboardOverviewService
         CancellationToken ct,
         bool applyTimeFilter = true)
     {
+        if (_unitScope is not null)
+            return await LoadUnitAssignmentScopeAsync(_unitScope.CreatedAssignments, unitIds, range, ct, applyTimeFilter);
         var seeds = await LoadOwnedAssignmentSeedsAsync(actorUserId, ct);
         return await LoadBranchAssignmentsBySeedsAsync(seeds, unitIds, range, ct, applyTimeFilter);
     }
@@ -764,6 +788,8 @@ public sealed class DashboardOverviewService : IDashboardOverviewService
         CancellationToken ct,
         bool applyTimeFilter = true)
     {
+        if (_unitScope is not null)
+            return await LoadUnitAssignmentScopeAsync(_unitScope.ReceivedAssignments, unitIds, range, ct, applyTimeFilter);
         var seeds = await LoadReceivedAssignmentSeedsAsync(actorUserId, ct);
         return await LoadBranchAssignmentsBySeedsAsync(seeds, unitIds, range, ct, applyTimeFilter);
     }
@@ -778,6 +804,9 @@ public sealed class DashboardOverviewService : IDashboardOverviewService
     {
         if (hasGlobalReadAccess)
             return await LoadAllAssignmentScopeAsync(unitIds, range, ct, applyTimeFilter);
+
+        if (_unitScope is not null)
+            return await LoadUnitAssignmentScopeAsync(_unitScope.Assignments, unitIds, range, ct, applyTimeFilter);
 
         var ownedSeedsTask = LoadOwnedAssignmentSeedsAsync(actorUserId, ct);
         var receivedSeedsTask = LoadReceivedAssignmentSeedsAsync(actorUserId, ct);
@@ -930,6 +959,9 @@ public sealed class DashboardOverviewService : IDashboardOverviewService
         if (workIds.Count == 0)
             return new List<WorkAssignment>();
 
+        if (_unitScope is not null)
+            return workIds.SelectMany(_unitScope.Entries).Where(x => unitIds.Count == 0 || x.Assignees.Any(a => unitIds.Contains(a.UnitId!))).ToList();
+
         return await _ctx.WorkAssignments
             .Find(Builders<WorkAssignment>.Filter.In(x => x.WorkId, workIds)
                 & Builders<WorkAssignment>.Filter.Eq(x => x.ParentAssignmentId, null as string)
@@ -955,6 +987,8 @@ public sealed class DashboardOverviewService : IDashboardOverviewService
 
         if (unitIds.Count > 0)
             filter &= Builders<WorkReportPeriod>.Filter.In(x => x.AssigneeUnitId, unitIds);
+
+        if (_unitScope is not null) filter &= _unitScope.PeriodFilter();
 
         return await _ctx.WorkReportPeriods
             .Find(filter)
@@ -1535,7 +1569,7 @@ public sealed class DashboardOverviewService : IDashboardOverviewService
     {
         var raw = string.Join("|", new[]
         {
-            "dashboard-overview-v2",
+            "dashboard-overview-v3",
             actorUserId,
             hasGlobalReadAccess ? "global" : "scoped",
             mode,
@@ -1567,7 +1601,7 @@ public sealed class DashboardOverviewService : IDashboardOverviewService
             return normalized is "TASK" or "NHIEM_VU";
 
         if (mode == "WORK_TARGET")
-            return normalized is "TARGET" or "CHI_TIEU";
+            return normalized is "INDICATOR" or "TARGET" or "CHI_TIEU";
 
         return false;
     }

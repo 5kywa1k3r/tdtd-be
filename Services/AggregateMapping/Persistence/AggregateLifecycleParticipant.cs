@@ -142,7 +142,25 @@ internal sealed class AggregateLifecycleParticipant(IAggregateTransactionStore s
             var instance = stored.Value; AggregateCommandService.Draft(instance, authority, instance.Revision);
             var version = (await AggregateCommandService.Required<AggregateConfigVersion>(tx, AggregateCollections.Versions,
                 AggregateCommandService.VersionKey(instance.ConfigId, instance.ConfigRevision), ct)).Value;
-            var preview = await reader.PreviewAsync(instance, AggregateOverlay.Effective(version, instance), authority, ct);
+            var intent = await tx.GetAsync<AggregateRefreshIntent>(AggregateCollections.Refresh, AggregateRefreshService.IntentKey(instance.Id, instance.Generation), ct);
+            if (intent?.Value.State is "PENDING" or "RUNNING" or "FAILED" or "CANCELLED")
+                throw new AggregatePreviewException("AGG_COMPUTATION_REQUIRED");
+            var effective = AggregateOverlay.Effective(version, instance);
+            AggregatePreviewEnvelope preview;
+            if (instance.AppliedInputStamp != null)
+            {
+                if (instance.Applied == null || instance.AppliedGeneration != instance.Generation)
+                    throw new AggregatePreviewException("AGG_COMPUTATION_REQUIRED");
+                if (instance.AppliedInputStamp != await reader.InputStampAsync(instance, effective, authority, ct))
+                    throw new AggregatePreviewException("AGG_INPUT_STALE");
+                // Materialization is authoritative. Submit checks headers/pins/ACL and
+                // freezes the saved result; no evaluator or source payload scan here.
+                preview = instance.Applied with { Preview = instance.Applied.Preview with {
+                    Context = authority.Read.Context,
+                    Revisions = authority.Read.Revisions with { InstanceRevision = instance.Revision, ConfigRevision = instance.ConfigRevision }
+                } };
+            }
+            else preview = await reader.PreviewAsync(instance, effective, authority, ct); // legacy persisted results remain compatible
             AggregateCommandService.ValidPreview(preview); result.Add((stored, preview));
         }
         return result;

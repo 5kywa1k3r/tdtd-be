@@ -11,7 +11,7 @@ namespace tdtd_be.Services.AggregateMapping.Persistence;
 
 public sealed record AggregatePreviewJobRequest(string Kind, AggregatePeriodContextDto Context,
     AggregatePreviewRequestDto? Recipe, string? InstanceId, AggregateMappingChangeDto? Change,
-    string? ConfigId = null, AggregateConfigImpactRequestDto? Impact = null);
+    string? ConfigId = null, AggregateConfigImpactRequestDto? Impact = null, string? FormulaNodeId = null);
 
 // A derived preview artifact, separate from report data and immutable submission snapshots.
 // No bearer token, admin identity, native payload writes or second evaluator.
@@ -31,7 +31,7 @@ internal sealed class AggregatePreviewJobs(MongoDbContext db, IWorkReportPayload
         var id = AggregateCanonical.Hash(new { scope, request, stamp });
         var row = new BsonDocument { ["_id"] = id, ["scope"] = scope, ["actor"] = actor, ["session"] = session,
             ["workId"] = request.Context.WorkId, ["target"] = AggregateTargetIdentity.Id(request.Context)!, ["stamp"] = stamp,
-            ["request"] = JsonSerializer.Serialize(request, AggregateCanonical.Json), ["state"] = "QUEUED",
+            ["request"] = JsonSerializer.Serialize(request, AggregateCanonical.Json), ["kind"] = request.Kind, ["state"] = "QUEUED",
             ["createdAt"] = DateTime.UtcNow, ["updatedAt"] = DateTime.UtcNow, ["attempt"] = 0 };
         try { await Rows.InsertOneAsync(row, cancellationToken: ct); }
         catch (MongoWriteException ex) when (ex.WriteError.Category == ServerErrorCategory.DuplicateKey)
@@ -40,7 +40,7 @@ internal sealed class AggregatePreviewJobs(MongoDbContext db, IWorkReportPayload
                 new BsonDocument("state", new BsonDocument("$in", new BsonArray { "FAILED", "CANCELLED" })),
                 new BsonDocument { ["state"] = "COMPLETED", ["updatedAt"] = new BsonDocument("$lt", DateTime.UtcNow.AddMinutes(-3)) } } },
                 new BsonDocument { ["$set"] = new BsonDocument { ["state"] = "QUEUED", ["updatedAt"] = DateTime.UtcNow },
-                    ["$unset"] = new BsonDocument { ["progress"] = "", ["result"] = "", ["error"] = "", ["dispatchUntil"] = "" } },
+                    ["$unset"] = new BsonDocument { ["progress"] = "", ["result"] = "", ["error"] = "", ["errorPath"] = "", ["errorLocation"] = "", ["dispatchUntil"] = "" } },
                 new FindOneAndUpdateOptions<BsonDocument> { ReturnDocument = ReturnDocument.Before }, ct);
             if (previous != null && previous["state"] == "COMPLETED")
             {
@@ -64,6 +64,9 @@ internal sealed class AggregatePreviewJobs(MongoDbContext db, IWorkReportPayload
         return new { Id = id, Kind = request.Kind, Context = request.Context, State = row["state"].AsString, Attempt = row["attempt"].AsInt32,
             Progress = row["state"] == "RUNNING" ? Decode("progress") : null, Result = row["state"] == "COMPLETED" ? Decode("result") : null,
             ErrorCode = row.GetValue("error", BsonNull.Value).IsString ? row["error"].AsString : null,
+            ErrorPath = row["state"] == "FAILED" && row.GetValue("errorPath", BsonNull.Value).IsString ? row["errorPath"].AsString : null,
+            ErrorLocation = row["state"] == "FAILED" && row.GetValue("errorLocation", BsonNull.Value).IsString
+                ? JsonSerializer.Deserialize<AggregateErrorLocation>(row["errorLocation"].AsString, AggregateCanonical.Json) : null,
             UpdatedAtUtc = row["updatedAt"].ToUniversalTime().ToString("O") };
     }
     internal async Task AuthorizeContent(string id, string reportId, AggregateContentReference reference,
@@ -104,7 +107,7 @@ internal sealed class AggregatePreviewJobs(MongoDbContext db, IWorkReportPayload
         {
             if (node.ValueKind == JsonValueKind.Array) return node.EnumerateArray().Any(Contains);
             if (node.ValueKind != JsonValueKind.Object) return false;
-            if (node.TryGetProperty("kind", out var kind) && kind.GetString() == AggregateListWire.Kind)
+            if (node.TryGetProperty("kind", out var kind) && AggregateListWire.Supported(kind.GetString()))
                 return node.GetProperty("id").GetString() == snapshotId && node.GetProperty("hash").GetString() == snapshotHash;
             return node.EnumerateObject().Any(p => Contains(p.Value));
         }
@@ -119,14 +122,15 @@ internal sealed class AggregatePreviewJobs(MongoDbContext db, IWorkReportPayload
         await Stamp(Request(row), actor, session, ct);
         await Rows.UpdateOneAsync(new BsonDocument { ["_id"] = id, ["state"] = new BsonDocument("$in", new BsonArray { "QUEUED", "RUNNING" }) },
             new BsonDocument { ["$set"] = new BsonDocument { ["state"] = "CANCELLED", ["updatedAt"] = DateTime.UtcNow },
-                ["$unset"] = new BsonDocument { ["progress"] = "", ["result"] = "", ["lease"] = "" } }, cancellationToken: ct);
+                ["$unset"] = new BsonDocument { ["progress"] = "", ["result"] = "", ["errorPath"] = "", ["errorLocation"] = "", ["lease"] = "" } }, cancellationToken: ct);
     }
     internal async Task<string?> Current(AggregatePeriodContextDto context, string actor, string session, CancellationToken ct, bool completedOnly = false)
     {
         var authority = await new AggregateMongoCommandReader(db, payloads, true).AuthorizeAsync(context, actor, session, ct);
         AggregateCommandService.Allow(AggregateAction.EditMapping, authority);
         var filter = new BsonDocument { ["actor"] = actor, ["session"] = session, ["target"] = AggregateTargetIdentity.Id(context)!,
-            ["state"] = completedOnly ? new BsonString("COMPLETED") : new BsonDocument("$in", new BsonArray { "QUEUED", "RUNNING", "COMPLETED" }) };
+            ["kind"] = new BsonDocument("$ne", "FORMULA"),
+            ["state"] = completedOnly ? new BsonString("COMPLETED") : new BsonDocument("$in", new BsonArray { "QUEUED", "RUNNING", "COMPLETED", "FAILED" }) };
         if (!completedOnly) filter["archived"] = new BsonDocument("$ne", true);
         var rows = await Rows.Find(filter).Sort(new BsonDocument(completedOnly ? "updatedAt" : "createdAt", -1)).Limit(completedOnly ? 20 : 1).ToListAsync(ct);
         foreach (var row in rows)
@@ -155,7 +159,7 @@ internal sealed class AggregatePreviewJobs(MongoDbContext db, IWorkReportPayload
                 new BsonDocument("state", "QUEUED"), new BsonDocument { ["state"] = "RUNNING", ["leaseUntil"] = new BsonDocument("$lt", DateTime.UtcNow) } } },
             new BsonDocument { ["$set"] = new BsonDocument { ["state"] = "RUNNING", ["lease"] = lease,
                     ["leaseUntil"] = DateTime.UtcNow.AddMinutes(6), ["updatedAt"] = DateTime.UtcNow }, ["$inc"] = new BsonDocument("attempt", 1),
-                ["$unset"] = new BsonDocument { ["progress"] = "", ["result"] = "", ["error"] = "" } },
+                ["$unset"] = new BsonDocument { ["progress"] = "", ["result"] = "", ["error"] = "", ["errorPath"] = "", ["errorLocation"] = "" } },
             new FindOneAndUpdateOptions<BsonDocument> { ReturnDocument = ReturnDocument.After }, cancellation);
         if (row == null) return;
         var actor = row["actor"].AsString; var session = row["session"].AsString; var request = Request(row);
@@ -191,9 +195,18 @@ internal sealed class AggregatePreviewJobs(MongoDbContext db, IWorkReportPayload
         {
             if (row["stamp"].AsString != await Stamp(request, actor, session, ct)) throw new AggregatePreviewException("AGG_INPUT_STALE");
             object result;
-            if (request.Kind == "RECIPE")
+            if (request.Kind == "FORMULA")
+            {
+                var reader = new AggregateMongoPreviewReader(db, payloads, new AggregateMongoDataWindows(db), true);
+                var captured = await reader.ReadContextAsync(request.Context, actor, ct);
+                // Stamp has checked persisted config/instance revisions; native context owns payload/lifecycle pins.
+                captured = captured with { Revisions = captured.Revisions with { InstanceRevision = request.Recipe!.Expected.InstanceRevision, ConfigRevision = request.Recipe.Expected.ConfigRevision } };
+                result = await new AggregatePreviewService(new AggregateMongoCommandReader.PinnedReader(reader,captured), new AggregateContentTableStore(db), new AggregateListStore(db))
+                    .PreviewAsync(request.Recipe!, actor, ct, Progress, request.FormulaNodeId);
+            }
+            else if (request.Kind == "RECIPE")
                 result = await new AggregatePreviewService(new AggregateMongoPreviewReader(db, payloads, new AggregateMongoDataWindows(db), true), new AggregateContentTableStore(db), new AggregateListStore(db))
-                    .PreviewAsync(request.Recipe!, actor, ct, Progress);
+                    .PreviewAsync(request.Recipe!, actor, ct, Progress, request.FormulaNodeId);
             else
             {
                 var key = Convert.FromBase64String(config["AggregateMapping:ConfirmationKeyBase64"] ?? "");
@@ -221,8 +234,11 @@ internal sealed class AggregatePreviewJobs(MongoDbContext db, IWorkReportPayload
         {
             // Do not retain partial values on failure/revocation. Cancellation cannot overwrite a newer lease.
             var code = ex is AggregatePreviewException aggregate ? aggregate.Code : ex is OperationCanceledException ? "AGG_PREVIEW_CANCELLED" : "AGG_PREVIEW_FAILED";
+            var path = ex is AggregatePreviewException located ? located.Path : null;
+            var location = ex is AggregatePreviewException failure ? failure.Location : null;
             await Rows.UpdateOneAsync(owned, new BsonDocument { ["$set"] = new BsonDocument {
-                ["state"] = "FAILED", ["error"] = code, ["updatedAt"] = DateTime.UtcNow },
+                ["state"] = "FAILED", ["error"] = code, ["errorPath"] = path == null ? BsonNull.Value : new BsonString(path),
+                ["errorLocation"] = location == null ? BsonNull.Value : new BsonString(JsonSerializer.Serialize(location, AggregateCanonical.Json)), ["updatedAt"] = DateTime.UtcNow },
                 ["$unset"] = new BsonDocument { ["progress"] = "", ["result"] = "", ["lease"] = "" } }, cancellationToken: CancellationToken.None);
             if (cancellation.IsCancellationRequested) throw;
         }
@@ -237,6 +253,10 @@ internal sealed class AggregatePreviewJobs(MongoDbContext db, IWorkReportPayload
         => JsonSerializer.Deserialize<AggregatePreviewJobRequest>(row["request"].AsString, AggregateCanonical.Json)!;
     private static void Validate(AggregatePreviewJobRequest request)
     {
+        if (request.Kind == "FORMULA" && request.Recipe != null && !string.IsNullOrWhiteSpace(request.FormulaNodeId)
+            && request.Change == null && request.InstanceId == null && request.ConfigId == null && request.Impact == null && request.Recipe.Context == request.Context)
+        { AggregatePreviewService.ValidateProbeSelection(request.Recipe); return; }
+        if (request.FormulaNodeId != null) throw new AggregatePreviewException("AGG_JOB_REQUEST_INVALID");
         if (request.Kind == "RECIPE" && request.Recipe != null && request.Change == null && request.InstanceId == null && request.ConfigId == null && request.Impact == null && request.Recipe.Context == request.Context) return;
         if (request.Kind == "MAPPING" && request.Change != null && request.Recipe == null && request.ConfigId == null && request.Impact == null && !string.IsNullOrEmpty(request.InstanceId)) return;
         if (request.Kind == "CONFIG" && request.Impact != null && request.Recipe == null && request.Change == null && request.InstanceId == null && !string.IsNullOrEmpty(request.ConfigId)
@@ -247,6 +267,7 @@ internal sealed class AggregatePreviewJobs(MongoDbContext db, IWorkReportPayload
     {
         var authority = await new AggregateMongoCommandReader(db, payloads, true).AuthorizeAsync(request.Context, actor, session, ct);
         AggregateCommandService.Allow(AggregateAction.EditMapping, authority);
+        if (request.Kind == "FORMULA") { Validate(request); AggregateCommandService.Allow(AggregateAction.ReadLineage, authority); }
         if (AggregatePeriodContextContract.Compare(request.Context, authority.Read.Context) is { } issue) throw new AggregatePreviewException(issue.Code);
         AggregateRecipeDto recipe; string? instanceStamp = null;
         if (request.Kind == "CONFIG")
@@ -273,6 +294,23 @@ internal sealed class AggregatePreviewJobs(MongoDbContext db, IWorkReportPayload
             }
             instanceStamp = AggregateCanonical.Hash(selected);
         }
+        else if (request.Kind == "FORMULA")
+        {
+            var expected = request.Recipe!.Expected;
+            var instanceRow = await db.Db.GetCollection<BsonDocument>(AggregateCollections.Instances)
+                .Find(new BsonDocument("_id", AggregateCommandService.InstanceKey(authority.Read.Context))).FirstOrDefaultAsync(ct);
+            var headRow = await db.Db.GetCollection<BsonDocument>(AggregateCollections.Configs)
+                .Find(new BsonDocument("_id", AggregateCanonical.Key(request.Context.WorkId,request.Context.AssignmentId,request.Context.BindingId))).FirstOrDefaultAsync(ct);
+            var instance = instanceRow == null ? null : AggregateMongoTransaction.Read<AggregateInstanceState>(instanceRow).Value;
+            var head = headRow == null ? null : AggregateMongoTransaction.Read<AggregateConfigHead>(headRow).Value;
+            if(expected.InstanceRevision != (instance?.Revision ?? 0) || expected.ConfigRevision != (instance?.ConfigRevision ?? head?.HeadRevision ?? 0)
+                || instance != null && request.Recipe.InstanceId != instance.Id || head != null && request.Recipe.ConfigId != head.Id)
+                throw new AggregatePreviewException("AGG_REVISION_CONFLICT");
+            instanceStamp = AggregateCanonical.Hash(new { Instance = instanceRow?.GetValue("body").AsString, Head = headRow?.GetValue("body").AsString });
+            var parsed = AggregateMappingValidator.Parse(JsonSerializer.Serialize(request.Recipe!.Recipe, AggregateCanonical.Json), request.FormulaNodeId);
+            if (!parsed.StructurallyValid) throw new AggregatePreviewException(parsed.Issues[0].Code, parsed.Issues[0].Path);
+            recipe = parsed.Recipe!;
+        }
         else if (request.Kind == "RECIPE") recipe = AggregateOverlay.Validate(request.Recipe!.Recipe);
         else
         {
@@ -289,13 +327,26 @@ internal sealed class AggregatePreviewJobs(MongoDbContext db, IWorkReportPayload
         }
         var reader = new AggregateMongoPreviewReader(db, payloads, new AggregateMongoDataWindows(db), true);
         var sources = new List<object>();
+        var selection = request.Recipe?.Selection ?? request.Change?.Selection;
         foreach (var form in recipe.Nodes.Where(n => n.Kind == "SOURCE").Select(n => n.Form!).Distinct())
         {
             var schema = await reader.ReadSchemaAsync(form, authority.Read, actor, ct);
-            var listing = await reader.ListSourcesAsync(authority.Read, form, actor, ct);
+            var reportSet = recipe.Nodes.Where(n => n.Kind == "SOURCE" && n.Form == form).SelectMany(n => n.Outputs)
+                .All(p => recipe.TimeRules.Single(r => r.Id == p.TimeRuleId).Mode == AggregateReportSetFilter.Mode);
+            var listing = reportSet ? await reader.ListReportSetSourcesAsync(authority.Read, form, actor, ct)
+                : await reader.ListSourcesAsync(authority.Read, form, actor, ct);
+            var nodes = recipe.Nodes.Where(n => n.Kind == "SOURCE" && n.Form == form).Select(n => n.Id).ToHashSet();
+            var currentIds = listing.Headers.Select(h => h.Pin.ReportId).ToHashSet();
+            if (request.Kind == "FORMULA" && selection!.Sources.Where(s=>nodes.Contains(s.SourceNodeId)).SelectMany(s=>s.ReportIds)
+                .Any(id=>!listing.Headers.Any(h=>h.Pin.ReportId==id && h.Active && !h.Deleted && h.Pin.IsCurrent && h.Pin.Status=="Approved" && h.WholeReportReadable)))
+                throw new AggregatePreviewException("AGG_SOURCE_UNAVAILABLE");
+            var absent = selection?.Sources.Where(s => nodes.Contains(s.SourceNodeId)).SelectMany(s => s.ReportIds.Concat(s.ExcludedReportIds))
+                .Where(id => !currentIds.Contains(id)).Distinct().ToArray() ?? [];
+            var inactive = absent.Length == 0 ? [] : await reader.ReadInactiveSourcesAsync(authority.Read, form, absent, actor, ct);
+            if (absent.Any(id => !inactive.Any(h => h.Pin.ReportId == id))) throw new AggregatePreviewException("AGG_SOURCE_UNAVAILABLE");
             if (!listing.Complete || listing.Headers.Any(h => !h.WholeReportReadable) || listing.Slots.Any(s => !s.Readable))
                 throw new AggregatePreviewException("AGG_SOURCE_UNAVAILABLE");
-            sources.Add(new { schema, listing.MembershipRevision });
+            sources.Add(new { schema, listing.MembershipRevision, inactive });
         }
         return AggregateCanonical.Hash(new { authority.Read.Context, authority.Read.Revisions, authority.Read.AuthorizationFingerprint,
             authority.Pins, instanceStamp, sources, dateFilters = AggregatePartialDate.FilterSemantics });

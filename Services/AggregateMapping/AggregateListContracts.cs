@@ -17,7 +17,13 @@ internal sealed record AggregateListOrigin(AggregateSourcePinDto? Pin, string Un
     public string? SourcePortId { get; init; }
 }
 internal sealed record AggregateListRow(string Key, AggregateListOrigin Origin,
-    IReadOnlyDictionary<string, AggregateCell> Cells);
+    IReadOnlyDictionary<string, AggregateCell> Cells)
+{
+    [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+    public IReadOnlyList<AggregateListContributor>? Contributors { get; init; }
+}
+internal sealed record AggregateListContributor(string InputId, AggregateListOrigin Origin);
+internal sealed record AggregateListCellSource(AggregateListOrigin Origin, string? FieldId);
 internal sealed record AggregateListValue(AggregateListSchema Schema, IReadOnlyList<AggregateListRow> Records);
 internal sealed record AggregateListReference(string Kind, string Id, string Hash, int Count, AggregateListSchema Schema);
 internal sealed record AggregateListReportCount(string? ReportId, string SourceSlot, int Read, int Matched, int Selected);
@@ -26,7 +32,10 @@ internal sealed record AggregateListPipelineTrace(string Scope, int Read, int Ma
 {
     public AggregateListReference? Selection { get; init; }
     public IReadOnlyList<AggregateListReportCount> Reports { get; init; } = [];
+    [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+    public IReadOnlyList<AggregateListMergeInputCount>? MergeInputs { get; init; }
 }
+internal sealed record AggregateListMergeInputCount(string InputId, int Rows, int MissingRows);
 internal interface IAggregateListSink
 {
     Task<AggregateListReference> CaptureAsync(AggregateReadContext context, AggregateListValue value, CancellationToken ct);

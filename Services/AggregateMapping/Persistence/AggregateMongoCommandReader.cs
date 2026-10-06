@@ -35,14 +35,16 @@ internal sealed class AggregateMongoDataWindows(MongoDbContext db) : IAggregateB
 }
 
 internal sealed partial class AggregateMongoCommandReader(MongoDbContext db, IWorkReportPayloadReader payloads, bool v2Enabled = false,
-    Func<AggregatePreviewProgress, Task>? progress = null) : IAggregateCommandReader
+    Func<AggregatePreviewProgress, Task>? progress = null, bool metadataOnly = false) : IAggregateCommandReader
 {
+    public Task<AggregateCommitAuthority> AuthorizeStatusAsync(AggregatePeriodContextDto context, string actor, string sessionKey, CancellationToken ct)
+        => new AggregateMongoCommandReader(db, payloads, v2Enabled, metadataOnly: true).AuthorizeAsync(context, actor, sessionKey, ct);
     public async Task<AggregateCommitAuthority> AuthorizeAsync(AggregatePeriodContextDto context, string actor, string sessionKey, CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(sessionKey)) throw new AggregatePreviewException("AGG_AUTH_REQUIRED");
         if (context.View != null) return await AuthorizeViewAsync(context, actor, sessionKey, ct);
         if (context.ReportId == null) return await AuthorizeSlotAsync(context, actor, sessionKey, ct);
-        var read = await new AggregateMongoPreviewReader(db, payloads, new AggregateMongoDataWindows(db), v2Enabled).ReadContextAsync(context, actor, ct);
+        var read = await new AggregateMongoPreviewReader(db, payloads, new AggregateMongoDataWindows(db), v2Enabled, metadataOnly).ReadContextAsync(context, actor, ct);
         var lockRow = await db.Db.GetCollection<BsonDocument>(AggregateCollections.Locks).Find(new BsonDocument("_id", "REPORT:" + context.ReportId)).FirstOrDefaultAsync(ct);
         var locked = lockRow != null && AggregateMongoTransaction.Read<AggregateLockState>(lockRow).Value.Owners.Count > 0;
         read = read with { Authority = read.Authority with { TargetLockedByConsumer = locked } };
@@ -50,6 +52,10 @@ internal sealed partial class AggregateMongoCommandReader(MongoDbContext db, IWo
         await Pin(pins, db.Users.CollectionNamespace.CollectionName, actor, ct);
         await Pin(pins, db.Works.CollectionNamespace.CollectionName, context.WorkId, ct);
         await Pin(pins, db.WorkAssignments.CollectionNamespace.CollectionName, context.AssignmentId, ct);
+        var scopeAssignment = await db.WorkAssignments.Find(a => a.Id == context.AssignmentId).FirstOrDefaultAsync(ct)
+            ?? throw new AggregatePreviewException("AGG_CONTEXT_UNAVAILABLE");
+        foreach (var ancestor in await tdtd_be.Services.WorkAssignments.Progress.WorkExecutionScopeGuard.ReadAncestorsAsync(db, scopeAssignment, ct))
+            await Pin(pins, db.WorkAssignments.CollectionNamespace.CollectionName, ancestor.Id, ct);
         await Pin(pins, db.WorkTemplateAssignees.CollectionNamespace.CollectionName, context.BindingId, ct);
         await Pin(pins, db.WorkAssignmentReports.CollectionNamespace.CollectionName, context.ReportId!, ct);
         await Pin(pins, db.DynamicFormTemplates.CollectionNamespace.CollectionName, read.TargetSchema.Pin.FormId, ct);
@@ -67,24 +73,34 @@ internal sealed partial class AggregateMongoCommandReader(MongoDbContext db, IWo
         var preview = await new AggregatePreviewService(new PinnedReader(inner, read), new AggregateContentTableStore(db), new AggregateListStore(db)).PreviewAsync(
             new(read.Context, instance.Id, instance.ConfigId, expected, recipe, instance.Selection), authority.Actor, ct, progress);
         if (authority.Pins is not List<AggregateAuthorityPin> pins) throw new InvalidOperationException("AGG_AUTHORITY_CAPTURE_REQUIRED");
+        var requested = new List<(string Collection, string Id)>();
         foreach (var source in preview.Preview.LinkedSources)
         {
-            await Pin(pins, db.WorkAssignments.CollectionNamespace.CollectionName, source.AssignmentId, ct);
-            await Pin(pins, db.WorkTemplateAssignees.CollectionNamespace.CollectionName, source.BindingId, ct);
-            await Pin(pins, db.WorkAssignmentReports.CollectionNamespace.CollectionName, source.ReportId, ct);
-            if (source.WorkReportPeriodId != null) await Pin(pins, db.WorkReportPeriods.CollectionNamespace.CollectionName, source.WorkReportPeriodId, ct);
-            await PinDeclaration(pins, "REPORT:" + source.ReportId, ct);
+            requested.Add((db.WorkAssignments.CollectionNamespace.CollectionName, source.AssignmentId));
+            requested.Add((db.WorkTemplateAssignees.CollectionNamespace.CollectionName, source.BindingId));
+            requested.Add((db.WorkAssignmentReports.CollectionNamespace.CollectionName, source.ReportId));
+            if (source.WorkReportPeriodId != null) requested.Add((db.WorkReportPeriods.CollectionNamespace.CollectionName, source.WorkReportPeriodId));
+            requested.Add((AggregateCollections.Declarations, "REPORT:" + source.ReportId));
         }
         foreach (var source in recipe.Nodes.Where(n => n.Kind == "SOURCE"))
         {
-            await Pin(pins, db.DynamicFormTemplates.CollectionNamespace.CollectionName, source.Form!.FormId, ct);
+            var selection = instance.Selection.Sources.Single(s => s.SourceNodeId == source.Id);
+            var explicitIds = selection.ReportIds.Concat(selection.ExcludedReportIds).ToArray();
+            foreach (var hidden in inner.CapturedInactiveSources.Where(h => explicitIds.Contains(h.Pin.ReportId)))
+            {
+                requested.Add((db.WorkAssignments.CollectionNamespace.CollectionName, hidden.Pin.AssignmentId));
+                requested.Add((db.WorkTemplateAssignees.CollectionNamespace.CollectionName, hidden.Pin.BindingId));
+                requested.Add((db.WorkAssignmentReports.CollectionNamespace.CollectionName, hidden.Pin.ReportId));
+            }
+            requested.Add((db.DynamicFormTemplates.CollectionNamespace.CollectionName, source.Form!.FormId));
             await PinBoundCatalogs(pins, source.Form.FormId, ct);
         }
         foreach (var slot in preview.Preview.Coverage)
         {
-            await Pin(pins, db.WorkTemplateAssignees.CollectionNamespace.CollectionName, slot.BindingId, ct);
-            await PinDeclaration(pins, "SLOT:" + slot.SlotKey, ct);
+            requested.Add((db.WorkTemplateAssignees.CollectionNamespace.CollectionName, slot.BindingId));
+            requested.Add((AggregateCollections.Declarations, "SLOT:" + slot.SlotKey));
         }
+        await PinMany(pins, requested, ct);
         if (!await inner.IsCurrentAsync(authority.Read, preview.Preview.LinkedSources, "", authority.Actor, ct))
             throw new AggregatePreviewException("AGG_INPUT_STALE");
         return preview;
@@ -127,7 +143,7 @@ internal sealed partial class AggregateMongoCommandReader(MongoDbContext db, IWo
         using var json = JsonDocument.Parse(copy.ToJson(new MongoDB.Bson.IO.JsonWriterSettings { OutputMode = MongoDB.Bson.IO.JsonOutputMode.CanonicalExtendedJson }));
         return AggregateCanonical.Hash(json.RootElement);
     }
-    private sealed class PinnedReader(AggregateMongoPreviewReader inner, AggregateReadContext captured) : IAggregatePreviewReader, IAggregateBatchPreviewReader, IAggregateListTargetValidator
+    internal sealed class PinnedReader(AggregateMongoPreviewReader inner, AggregateReadContext captured) : IAggregatePreviewReader, IAggregateBatchPreviewReader, IAggregateListTargetValidator
     {
         public Task ValidateListResultAsync(AggregateReadContext context, string memberId, AggregateListValue value, CancellationToken ct)
             => inner.ValidateListResultAsync(context, memberId, value, ct);
@@ -136,6 +152,9 @@ internal sealed partial class AggregateMongoCommandReader(MongoDbContext db, IWo
         public Task<AggregateReadContext> ReadContextAsync(AggregatePeriodContextDto selector, string actor, CancellationToken ct) => Task.FromResult(captured);
         public Task<AggregateSchema> ReadSchemaAsync(AggregateFormPinDto pin, AggregateReadContext context, string actor, CancellationToken ct) => inner.ReadSchemaAsync(pin, context, actor, ct);
         public Task<AggregateSourceListing> ListSourcesAsync(AggregateReadContext context, AggregateFormPinDto form, string actor, CancellationToken ct) => inner.ListSourcesAsync(context, form, actor, ct);
+        public Task<AggregateSourceListing> ListReportSetSourcesAsync(AggregateReadContext context, AggregateFormPinDto form, string actor, CancellationToken ct) => inner.ListReportSetSourcesAsync(context, form, actor, ct);
+        public Task<IReadOnlyList<AggregateSourceHeader>> ReadInactiveSourcesAsync(AggregateReadContext context, AggregateFormPinDto form,
+            IReadOnlyList<string> ids, string actor, CancellationToken ct) => inner.ReadInactiveSourcesAsync(context, form, ids, actor, ct);
         public Task<AggregatePayload> ReadPayloadAsync(AggregateReadContext context, AggregateSourceHeader header, AggregateSchema schema, string actor, CancellationToken ct) => inner.ReadPayloadAsync(context, header, schema, actor, ct);
         public Task<bool> IsCurrentAsync(AggregateReadContext context, IReadOnlyList<AggregateSourcePinDto> pins, string membershipRevision, string actor, CancellationToken ct)
             => inner.IsCurrentAsync(context with { Revisions = context.Revisions with { InstanceRevision = 0, ConfigRevision = 0 } }, pins, membershipRevision, actor, ct);

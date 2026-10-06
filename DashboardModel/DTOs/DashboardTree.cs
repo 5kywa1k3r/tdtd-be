@@ -11,6 +11,11 @@
         public string Id { get; set; } = string.Empty;
         public string Code { get; set; } = string.Empty;
         public string Name { get; set; } = string.Empty;
+        public DateTime? StartDate { get; set; }
+        public DateTime? EndDate { get; set; }
+        public DateTime? DueDate { get; set; }
+        public string? LeaderDirectiveName { get; set; }
+        public string? OwnerUnitName { get; set; }
 
         // FE tự map label theo rule động của work
         public int Status { get; set; }
@@ -40,6 +45,8 @@
         public string DynamicExcelName { get; set; } = string.Empty;
         public string? Description { get; set; }
         public string SummaryText { get; set; } = string.Empty;
+        public DateTime? StartDate { get; set; }
+        public DateTime? DueDate { get; set; }
 
         public bool IsActive { get; set; }
 

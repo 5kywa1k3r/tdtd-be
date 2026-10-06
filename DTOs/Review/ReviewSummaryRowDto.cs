@@ -19,6 +19,13 @@ public sealed class ReviewSummaryRowDto
     public string DynamicExcelCode { get; set; } = string.Empty;
     public string DynamicExcelName { get; set; } = string.Empty;
 
+    public string? DynamicFormTemplateId { get; set; }
+    public string? DynamicFormTemplateCode { get; set; }
+    public string? DynamicFormTemplateName { get; set; }
+    public string? DynamicFormFamilyId { get; set; }
+    public int? DynamicFormVersionNo { get; set; }
+    public string? DynamicFormSchemaHash { get; set; }
+
     public List<ReviewSummaryAssigneeDto> Assignees { get; set; } = new();
 
     public int ProgressStatus { get; set; }

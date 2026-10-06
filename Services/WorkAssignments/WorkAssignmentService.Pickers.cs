@@ -1,6 +1,9 @@
+using System.Text.RegularExpressions;
 using MongoDB.Bson;
 using MongoDB.Driver;
+using tdtd_be.Common.Auth;
 using tdtd_be.Common.Errors;
+using tdtd_be.Common.Pickers;
 using tdtd_be.DTOs.Pickers;
 using tdtd_be.Enum;
 using tdtd_be.Models;
@@ -10,114 +13,172 @@ namespace tdtd_be.Services.WorkAssignments;
 
 public sealed partial class WorkAssignmentService
 {
-    public async Task<AssignmentPickerScope> GetPickerScopeAsync(PickerContext context, CancellationToken ct)
+    public async Task<AssignmentPickerScope> GetPickerScopeAsync(PickerContext context, CancellationToken ct,
+        ScopedPickerRequest? query = null)
     {
-        // Identity is exclusively taken from the authenticated session, never the request.
         var actorId = _me.RequireMe().Id;
         if (context.Purpose is not (PickerPurpose.AssignmentRecipients or PickerPurpose.AssignmentWatchers)
             || !ObjectId.TryParse(context.WorkId, out _))
             throw AppExceptionFactory.BadRequest(AppErrorCode.WORK_ASSIGNMENT_WORK_NOT_FOUND);
-
         var work = await _lookup.LoadWorkAsync(context.WorkId!, ct);
         if (!string.IsNullOrWhiteSpace(context.ParentAssignmentId) && !ObjectId.TryParse(context.ParentAssignmentId, out _))
             throw AppExceptionFactory.BadRequest(AppErrorCode.WORK_ASSIGNMENT_PARENT_NOT_FOUND);
         var parent = await _lookup.LoadParentAsync(context.ParentAssignmentId, work.Id, ct);
-        WorkAssignmentCreateScopeGuard.EnsureCanCreateWithinScope(work, parent, actorId, Array.Empty<string>());
+        WorkAssignmentCreateScopeGuard.EnsureCanCreateWithinScope(work, parent, actorId, []);
         await EnsureCreateScopeOpenAsync(work, parent, actorId, ct);
         if (!string.IsNullOrWhiteSpace(parent?.FlowInstanceId)
             || await _ctx.DynamicFlowInstances.Find(x => x.WorkId == work.Id && !x.IsDeleted).AnyAsync(ct))
             throw AppExceptionFactory.Create(AppErrorCode.DYNAMIC_FLOW_EXECUTION_BLOCKED_UNTIL_TARGET_PHASE);
-
-        var units = await _ctx.Units.Find(x => !x.IsDeleted).ToListAsync(ct);
         var actor = await _ctx.Users.Find(x => x.Id == actorId && !x.IsDeleted).FirstOrDefaultAsync(ct)
             ?? throw AppExceptionFactory.Unauthorized(AppErrorCode.WORK_ASSIGNMENT_ACTOR_REQUIRED);
         if (parent is not null && !WorkAssignmentCurrentAuthority.CanLeadChild(actor))
             throw AppExceptionFactory.Forbidden(AppErrorCode.WORK_ASSIGNMENT_BRANCH_CREATE_FORBIDDEN);
-        var unitMap = units.ToDictionary(x => x.Id, StringComparer.Ordinal);
-        unitMap.TryGetValue(actor.UnitId ?? "", out var actorUnit);
-        if (actorUnit is null || !ObjectId.TryParse(actor.UnitId, out _))
-            throw AppExceptionFactory.Unauthorized(AppErrorCode.WORK_ASSIGNMENT_ACTOR_REQUIRED);
-        var hasDescendants = actorUnit is not null && await HasAssignableDescendantUnitAsync(actorUnit, ct);
-        bool Allowed(AppUser user) => user.Id != actorId && ObjectId.TryParse(user.UnitId, out _)
-            && unitMap.ContainsKey(user.UnitId!) && WorkAssignmentTargetScopeValidator.CanAssignTarget(
-                actor, actorUnit, user, unitMap, hasDescendants, _targetScopePolicy)
-            && (parent is null || WorkAssignmentTargetScopeValidator.IsUnitManager(actor)
-                || WorkAssignmentUnitHierarchy.IsStrictAncestor(actorUnit, unitMap[user.UnitId!], unitMap));
-        // Query only units that can contain a valid target. Prefix/peer/configured-type rules
-        // are evaluated once per unit, not via thousands of thrown user-validation exceptions.
-        // Own-unit eligibility also depends on PositionCode. Include that unit in
-        // the coarse query; Allowed below still checks every actual account.
-        var candidateUnitIds = units.Where(unit => unit.Id == actorUnit.Id || new[] { ManagementAccountKind.UnitManager,
-                ManagementAccountKind.NormalUser, ManagementAccountKind.LevelManager }.Any(kind =>
-                Allowed(new AppUser { Id = "picker-candidate", UnitId = unit.Id, AccountKind = kind })))
-            .Select(unit => unit.Id).ToList();
-        var users = await _ctx.Users.Find(x => !x.IsDeleted && x.UnitId != null && candidateUnitIds.Contains(x.UnitId))
-            .Project(x => new AppUser { Id = x.Id, Username = x.Username, FullName = x.FullName, UnitId = x.UnitId,
-                PositionCode = x.PositionCode, AccountKind = x.AccountKind }).ToListAsync(ct);
-        var allowedUsers = users.Where(Allowed).ToList();
-        var allowedUserIds = allowedUsers.Select(x => x.Id).ToHashSet(StringComparer.Ordinal);
+        var actorUnit = await _ctx.Units.Find(x => x.Id == actor.UnitId && !x.IsDeleted).FirstOrDefaultAsync(ct);
+        if (!WorkAssignmentTargetScopeValidator.ValidUnit(actorUnit))
+            throw AppExceptionFactory.BadRequest(AppErrorCode.WORK_ASSIGNMENT_ASSIGNEE_SCOPE_INVALID,
+                message: "Đơn vị của tài khoản đang đăng nhập không hợp lệ hoặc mã đơn vị sai cấu trúc.");
 
-        // Validate ALL submitted context IDs, including when the operation is only a lookup.
-        var selectedUnitIds = NormalizePickerIds(context.AssigneeUnitIds);
-        var selectedUserIds = NormalizePickerIds(context.AssigneeUserIds);
-        var managers = await _unitSelection.ResolveUnitManagerUserIdsAsync(selectedUnitIds, ct);
-        var recipientIds = selectedUserIds.Concat(managers.Where(x => x != actorId)).Distinct(StringComparer.Ordinal).ToList();
+        var selectedUnits = NormalizePickerIds(context.AssigneeUnitIds);
+        var selectedUsers = NormalizePickerIds(context.AssigneeUserIds);
+        var managers = await _unitSelection.ResolveUnitManagerUserIdsAsync(selectedUnits, ct);
+        var recipientIds = selectedUsers.Concat(managers).Distinct(StringComparer.Ordinal).ToList();
         var recipients = await WorkAssignmentUserHelper.BuildAssigneesAsync(_ctx, recipientIds, ct);
-        await EnsureAssignmentTargetsAllowedAsync(actorId, recipients, ct);
-        if (recipientIds.Any(id => !allowedUserIds.Contains(id)))
-            throw AppExceptionFactory.BadRequest(AppErrorCode.WORK_ASSIGNMENT_ASSIGNEE_SCOPE_INVALID);
+        // A conflicting draft remains readable and removable. The command always rejects it.
+        await EnsureAssignmentTargetsAllowedAsync(actorId, recipients, ct,
+            rejectOverlap: context.Purpose == PickerPurpose.AssignmentWatchers);
+        if (parent is not null) await EnsureChildTargetsBelowActorAsync(actorId, recipients, ct);
+        var selectedAccounts = recipientIds.Count == 0 ? new List<AppUser>()
+            : await _ctx.Users.Find(x => recipientIds.Contains(x.Id) && !x.IsDeleted)
+                .Project(x => new AppUser { Id = x.Id, UnitId = x.UnitId, AccountKind = x.AccountKind, Username = x.Username })
+                .ToListAsync(ct);
+
+        var isUserQuery = query?.Operation is "users" or "lookup" or "restoreUsers";
+        List<Unit> units;
+        if (isUserQuery && context.Purpose == PickerPurpose.AssignmentRecipients)
+        {
+            var f = Builders<Unit>.Filter;
+            // Search only the actor's subtree plus selected unit accounts, never the whole directory per keystroke.
+            var selectedUnitIds = selectedAccounts.Select(x => x.UnitId).ToList();
+            units = await _ctx.Units.Find(f.Eq(x => x.IsDeleted, false) &
+                (f.Regex(x => x.Code, new BsonRegularExpression("^" + actorUnit!.Code)) | f.In(x => x.Id, selectedUnitIds!)))
+                .ToListAsync(ct);
+        }
+        else if (isUserQuery && context.Purpose == PickerPurpose.AssignmentWatchers)
+        {
+            var ids = recipients.Select(x => x.UnitId).Append(actor.UnitId).Distinct().ToList();
+            units = await _ctx.Units.Find(x => !x.IsDeleted && ids.Contains(x.Id)).ToListAsync(ct);
+        }
+        else if (query?.Operation is "restoreUnits" or "expandUnits")
+        {
+            var ids = NormalizePickerIds(query.Ids);
+            var requested = await _ctx.Units.Find(x => !x.IsDeleted && ids.Contains(x.Id)).ToListAsync(ct);
+            var groups = requested.Where(x => x.IsVirtual && UnitManagementScope.Contains(x.Code, x.Code)).ToList();
+            var f = Builders<Unit>.Filter;
+            var descendants = groups.Count == 0 ? new List<Unit>() : await _ctx.Units.Find(
+                f.Eq(x => x.IsDeleted, false) & f.Eq(x => x.IsVirtual, false)
+                & f.Or(groups.Select(g => f.Regex(x => x.Code, new BsonRegularExpression("^" + g.Code)))))
+                .ToListAsync(ct);
+            units = requested.Concat(descendants).DistinctBy(x => x.Id).ToList();
+        }
+        else units = await _ctx.Units.Find(x => !x.IsDeleted).ToListAsync(ct);
+        var unitMap = units.ToDictionary(x => x.Id, StringComparer.Ordinal);
+        bool Allowed(AppUser user) => WorkAssignmentTargetScopeValidator.CanAssignTarget(actor, actorUnit, user,
+            unitMap, false, _targetScopePolicy) && (parent is null || ChildTargetAllowed(actor, actorUnit!, user, unitMap));
 
         if (context.Purpose == PickerPurpose.AssignmentWatchers)
         {
-            var recipientUnits = recipients.Select(x => x.UnitId).Where(x => !string.IsNullOrWhiteSpace(x)).ToHashSet();
-            // Same unit condition as BuildLeaderWatchersAsync, including empty => no candidates.
-            var watchers = await _ctx.Users.Find(x => !x.IsDeleted && recipientUnits.Contains(x.UnitId)
-                    && Positions.KnownCodes.Contains(x.PositionCode!))
-                .Project(x => new AppUser { Id = x.Id, Username = x.Username, FullName = x.FullName,
-                    UnitId = x.UnitId, PositionCode = x.PositionCode }).ToListAsync(ct);
-            return new AssignmentPickerScope(units, watchers, new HashSet<string>());
+            var recipientUnitIds = recipients.Select(x => x.UnitId).Where(x => x != null).ToList();
+            var filter = Builders<AppUser>.Filter.Where(x => !x.IsDeleted && recipientUnitIds.Contains(x.UnitId)
+                && Positions.KnownCodes.Contains(x.PositionCode!));
+            var (watchers, count) = await QueryPickerUsersAsync(filter, query, ct);
+            return new(units, watchers, []) { UserTotalRows = count };
         }
 
-        // Match UnitSelectionService: real units -> UNIT_MANAGER; virtual units -> every
-        // concrete descendant, missing manager => unselectable, auto-expanded self is omitted.
-        var managersByUnit = users.Where(x => x.AccountKind == ManagementAccountKind.UnitManager && x.UnitId != null)
-            .GroupBy(x => x.UnitId!).ToDictionary(x => x.Key, x => x.ToList());
+        var personalUnitIds = units.Where(x => WorkAssignmentTargetScopeValidator.ValidUnit(x)
+            && UnitManagementScope.Contains(actorUnit!.Code, x.Code)).Select(x => x.Id).ToList();
+        var uf = Builders<AppUser>.Filter;
+        // Match explicit NORMAL_USER or the legacy blank kind without manager prefixes.
+        var personalKind = uf.Eq(x => x.AccountKind, ManagementAccountKind.NormalUser)
+            | ((uf.Eq(x => x.AccountKind, null) | uf.Eq(x => x.AccountKind, ""))
+                & uf.Not(uf.Regex(x => x.Username, new BsonRegularExpression("^(mu_|ml_)", "i"))));
+        var personalFilter = uf.Eq(x => x.IsDeleted, false) & uf.Ne(x => x.Id, actorId)
+            & uf.In(x => x.UnitId, personalUnitIds) & personalKind;
+        var (people, total) = isUserQuery ? await QueryPickerUsersAsync(personalFilter, query, ct)
+            : (new List<AppUser>(), (long?)null);
+        var conflicts = WorkAssignmentTargetScopeValidator.FindOverlaps(selectedAccounts.Concat(people), unitMap);
+        if (isUserQuery) return new(units, people, []) { UserConflicts = conflicts, UserTotalRows = total };
+
+        // Only unit account queries are needed to build the directory; do not load all personnel.
+        var managerUnitIds = units.Where(x => WorkAssignmentTargetScopeValidator.ValidUnit(x)).Select(x => x.Id).ToList();
+        var unitAccounts = await _ctx.Users.Find(x => !x.IsDeleted && x.AccountKind == ManagementAccountKind.UnitManager
+            && x.UnitId != null && managerUnitIds.Contains(x.UnitId))
+            .Project(x => new AppUser { Id = x.Id, UnitId = x.UnitId, AccountKind = x.AccountKind, Username = x.Username })
+            .ToListAsync(ct);
+        var byUnit = unitAccounts.Where(x => x.UnitId != null).GroupBy(x => x.UnitId!)
+            .ToDictionary(x => x.Key, x => x.ToList());
         var selectable = new HashSet<string>(StringComparer.Ordinal);
         foreach (var unit in units)
         {
-            var concrete = unit.IsVirtual
-                ? units.Where(x => !x.IsVirtual && !string.IsNullOrWhiteSpace(unit.Code)
-                    && x.Code != null && x.Code.StartsWith(unit.Code.Trim(), StringComparison.Ordinal)).ToList()
-                : new List<Unit> { unit };
-            if (concrete.Count == 0 || concrete.Any(x => !managersByUnit.ContainsKey(x.Id))) continue;
-            var targets = concrete.SelectMany(x => managersByUnit[x.Id]).Where(x => x.Id != actorId).ToList();
-            if (targets.Count > 0 && targets.All(x => allowedUserIds.Contains(x.Id))) selectable.Add(unit.Id);
+            if (!UnitManagementScope.Contains(unit.Code, unit.Code)) continue;
+            if (!WorkAssignmentUnitRecipients.TryExpand([unit], units, out var concrete, out _)) continue;
+            if (concrete.Count == 0 || concrete.Any(x => !byUnit.TryGetValue(x.Id, out var accounts)
+                || accounts.Count != 1 || !Allowed(accounts[0]))) continue;
+            selectable.Add(unit.Id);
         }
-        return new AssignmentPickerScope(units, allowedUsers, selectable);
+        // Synthetic normal users only convey navigable units; they are never returned as user rows.
+        var navigation = personalUnitIds.Select(id => new AppUser { Id = "navigation", UnitId = id }).ToList();
+        return new(units, navigation, selectable);
+    }
+
+    private async Task<(List<AppUser> Users, long? Total)> QueryPickerUsersAsync(FilterDefinition<AppUser> filter,
+        ScopedPickerRequest? query, CancellationToken ct)
+    {
+        var f = Builders<AppUser>.Filter;
+        if (!string.IsNullOrWhiteSpace(query?.UnitId)) filter &= f.Eq(x => x.UnitId, query.UnitId.Trim());
+        var q = query?.Q?.Trim() ?? "";
+        if (query?.Operation == "restoreUsers") filter &= f.In(x => x.Id, NormalizePickerIds(query.Ids));
+        else if (query?.Operation == "lookup") filter &= f.Regex(x => x.Username, new BsonRegularExpression("^" + Regex.Escape(q) + "$", "i"));
+        else if (q.Length > 0) filter &= f.Regex(x => x.Username, new BsonRegularExpression(Regex.Escape(q), "i"))
+            | f.Regex(x => x.FullName, new BsonRegularExpression(Regex.Escape(q), "i"));
+        var total = await _ctx.Users.CountDocumentsAsync(filter, cancellationToken: ct);
+        IFindFluent<AppUser, AppUser> find = _ctx.Users.Find(filter).SortBy(x => x.Username).ThenBy(x => x.Id);
+        if (query?.Operation != "restoreUsers") find = find.Skip((int)Math.Min((long)Math.Max(0, query?.Page ?? 0)
+            * Math.Clamp(query?.PageSize ?? 20, 1, 50), int.MaxValue)).Limit(Math.Clamp(query?.PageSize ?? 20, 1, 50));
+        var users = await find.Project(x => new AppUser { Id = x.Id, Username = x.Username, FullName = x.FullName,
+            UnitId = x.UnitId, PositionCode = x.PositionCode, AccountKind = x.AccountKind }).ToListAsync(ct);
+        return (users, total);
     }
 
     private static List<string> NormalizePickerIds(IEnumerable<string>? values)
     {
-        var ids = (values ?? Array.Empty<string>()).Where(x => !string.IsNullOrWhiteSpace(x))
-            .Select(x => x.Trim()).Distinct(StringComparer.Ordinal).OrderBy(x => x, StringComparer.Ordinal).ToList();
+        var ids = (values ?? []).Where(x => !string.IsNullOrWhiteSpace(x)).Select(x => x.Trim())
+            .Distinct(StringComparer.Ordinal).OrderBy(x => x, StringComparer.Ordinal).ToList();
         if (ids.Count > 2000 || ids.Any(x => !ObjectId.TryParse(x, out _)))
             throw AppExceptionFactory.BadRequest(AppErrorCode.WORK_ASSIGNMENT_ASSIGNEE_SCOPE_INVALID);
         return ids;
     }
 
+    private static bool ChildTargetAllowed(AppUser actor, Unit actorUnit, AppUser target,
+        IReadOnlyDictionary<string, Unit> units) => units.TryGetValue(target.UnitId ?? "", out var unit)
+        && (WorkAssignmentTargetScopeValidator.IsPersonalRecipient(target)
+            ? UnitManagementScope.Contains(actorUnit.Code, unit.Code)
+            : WorkAssignmentTargetScopeValidator.IsUnitManager(actor)
+                || UnitManagementScope.Contains(actorUnit.Code, unit.Code, false));
+
     private async Task EnsureChildTargetsBelowActorAsync(string actorId, IReadOnlyCollection<UserRef> targets, CancellationToken ct)
     {
         var actor = await _ctx.Users.Find(x => x.Id == actorId && !x.IsDeleted).FirstOrDefaultAsync(ct)
             ?? throw AppExceptionFactory.Unauthorized(AppErrorCode.WORK_ASSIGNMENT_ACTOR_REQUIRED);
-        if (WorkAssignmentTargetScopeValidator.IsUnitManager(actor)) return;
         if (!WorkAssignmentCurrentAuthority.CanLeadChild(actor))
             throw AppExceptionFactory.Forbidden(AppErrorCode.WORK_ASSIGNMENT_BRANCH_CREATE_FORBIDDEN);
-        var units = (await _ctx.Units.Find(x => !x.IsDeleted).ToListAsync(ct))
+        var userIds = targets.Select(x => x.UserId).ToList();
+        if (userIds.Count == 0) return;
+        var accounts = await _ctx.Users.Find(x => userIds.Contains(x.Id) && !x.IsDeleted).ToListAsync(ct);
+        var ids = accounts.Select(x => x.UnitId).Append(actor.UnitId).Distinct().ToList();
+        var units = (await _ctx.Units.Find(x => ids.Contains(x.Id) && !x.IsDeleted).ToListAsync(ct))
             .ToDictionary(x => x.Id, StringComparer.Ordinal);
-        if (actor.UnitId is null || !units.TryGetValue(actor.UnitId, out var actorUnit) ||
-            targets.Count == 0 || targets.Any(x => x.UnitId is null ||
-                !units.TryGetValue(x.UnitId, out var targetUnit) ||
-                !WorkAssignmentUnitHierarchy.IsStrictAncestor(actorUnit, targetUnit, units)))
+        if (!units.TryGetValue(actor.UnitId ?? "", out var actorUnit) || accounts.Count != userIds.Count
+            || accounts.Any(x => !ChildTargetAllowed(actor, actorUnit, x, units)))
             throw AppExceptionFactory.BadRequest(AppErrorCode.WORK_ASSIGNMENT_ASSIGNEE_SCOPE_INVALID);
     }
 }

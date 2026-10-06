@@ -302,7 +302,7 @@ var legacyDateFingerprint=AggregateDigest.Of(new {actor="B",fingerprintContext.A
     windows=fingerprintSources.SelectMany(r=>r.Windows).ToArray(),numeric="EXACT_RATIONAL_6_TO_EVEN"});
 var currentDateFingerprint=AggregateDigest.Of(new {actor="B",fingerprintContext.AuthorizationFingerprint,Context=fingerprintContext.Context,
     fingerprintContext.Revisions,recipe=dateRequest.Recipe,Selection=dateRequest.Selection,linked=fingerprintLinked,membership=fingerprintMembership,
-    windows=fingerprintSources.SelectMany(r=>r.Windows).ToArray(),numeric="EXACT_RATIONAL_6_TO_EVEN",dateFilters=AggregatePartialDate.FilterSemantics});
+    windows=fingerprintSources.SelectMany(r=>r.Windows).ToArray(),numeric="EXACT_RATIONAL_6_TO_EVEN",dateFilters=AggregatePartialDate.FilterSemantics,textPolicy=AggregateTextPolicy.Semantics});
 Check(datePreview.Preview.Revisions.InputDigest==currentDateFingerprint&&currentDateFingerprint!=legacyDateFingerprint,
     "date rule revision changes preview input fingerprint before confirmation can be reused");
 dateRequest.Recipe.TimeRules.Add(dateRequest.Recipe.TimeRules[0] with { Id="w2",ReportFilter=new("2026-02-01","2026-02-28") });
@@ -366,9 +366,30 @@ var denominatorResult = await new AggregatePreviewService(denominatorFixture).Pr
 Check(denominatorProgress.Single(p => p.Processed == 64).Results.Single().State == "WAITING"
     && denominatorResult.Preview.Results.Single().Value?.GetString() == "1", "temporary divide by zero waits while final complete input evaluates successfully");
 TraceDictionaryChecks.Run(preview, Check);
+await FormulaProbeChecks.Run(Check);
 ContentTableChecks.Run(Check, Error);
 ListPipelineChecks.Run(Check, Error);
 DateFilterChecks.Run(Check, Error);
+ExtendedOperatorChecks.Run(Check, Error);
+RichTextAggregationChecks.Run(Check, Error);
+await ListMergeChecks.Run(Check, Error);
+await ErrorLocationChecks.Run(Check);
+TextBlockPolicyChecks.Run(Check, Error);
+var hiddenFixture = new Fixture();
+var hiddenHeader = hiddenFixture.Headers[0] with { Active = false, Pin = hiddenFixture.Headers[0].Pin with { IsCurrent = false } };
+hiddenFixture.Headers.RemoveAt(0); hiddenFixture.Hidden.Add(hiddenHeader);
+hiddenFixture.Slots[0] = hiddenFixture.Slots[0] with { CurrentReportId = null };
+var hiddenRequest = hiddenFixture.Request(Call("SUM")) with { Selection = new([new("s", "EXPLICIT_REPORTS", ["r1","r2"], [])]) };
+var hiddenResult = await new AggregatePreviewService(hiddenFixture).PreviewAsync(hiddenRequest,"B",default);
+Check(hiddenResult.Preview.Results.Single().Value!.Value.GetString()=="20" && hiddenFixture.PayloadReads==1,"explicit hidden source retains selection but never reads or contributes payload");
+Check(hiddenResult.Preview.Issues.Any(i=>i.Code=="AGG_SOURCE_INACTIVE") && hiddenResult.Preview.LinkedSources.All(p=>p.ReportId!="r1"),"hidden warning and lock/contribution identities stay separate");
+hiddenRequest = hiddenRequest with { Selection = new([new("s","FORM_SELECTOR",[],["r1"])]) };
+Check((await new AggregatePreviewService(hiddenFixture).PreviewAsync(hiddenRequest,"B",default)).Preview.Results.Single().Value!.Value.GetString()=="20","hidden exclusion does not invalidate configuration");
+hiddenFixture.Hidden[0]=hiddenHeader with {WholeReportReadable=false};
+await PreviewError(hiddenFixture,hiddenRequest,"AGG_SOURCE_UNAVAILABLE");
+hiddenFixture.Hidden.Clear();
+await PreviewError(hiddenFixture,hiddenRequest,"AGG_SOURCE_UNAVAILABLE");
+checks += await ReportSetChecks.Run();
 Console.WriteLine($"PASS: {checks} P02/P04 in-memory preview checks; no API, database or jobs invoked.");
 
 sealed class Fixture : IAggregatePreviewReader
@@ -378,6 +399,7 @@ sealed class Fixture : IAggregatePreviewReader
     internal static readonly AggregateDataWindowDeclarationDto Dates = new("2026-09-01", "2026-09-30", "USER_DECLARED", "declaration", 1);
     internal AggregateAuthorityFacts Authority = new(true, true, true, true, true, false, true, true, false, true, true, true, "Draft", false, true, true, true, true);
     internal readonly List<AggregateSourceHeader> Headers = [];
+    internal readonly List<AggregateSourceHeader> Hidden = [];
     internal readonly List<AggregateSlot> Slots = [];
     internal readonly Dictionary<string, AggregateValue> Values = [];
     internal bool Complete = true, Fresh = true;
@@ -418,6 +440,8 @@ sealed class Fixture : IAggregatePreviewReader
         => Task.FromResult(new AggregateSchema(SourcePin, new Dictionary<string, AggregateMember> { ["n"] = new("n", MemberType) }));
     public Task<AggregateSourceListing> ListSourcesAsync(AggregateReadContext context, AggregateFormPinDto form, string actor, CancellationToken ct)
         => Task.FromResult(new AggregateSourceListing(Headers, Slots, Complete, "membership1", Units));
+    public Task<IReadOnlyList<AggregateSourceHeader>> ReadInactiveSourcesAsync(AggregateReadContext context,AggregateFormPinDto form,IReadOnlyList<string> ids,string actor,CancellationToken ct)
+        => Task.FromResult<IReadOnlyList<AggregateSourceHeader>>(Hidden.Where(h=>ids.Contains(h.Pin.ReportId)).ToArray());
     public Task<AggregatePayload> ReadPayloadAsync(AggregateReadContext context, AggregateSourceHeader header, AggregateSchema schema, string actor, CancellationToken ct)
     {
         PayloadReads++; return Task.FromResult(new AggregatePayload(header.Pin, new Dictionary<string, AggregateValue> { ["n"] = Values[header.Pin.ReportId] }));

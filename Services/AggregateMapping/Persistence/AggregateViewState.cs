@@ -7,3 +7,12 @@ namespace tdtd_be.Services.AggregateMapping.Persistence;
 internal sealed record AggregateViewGeneration(string BindingId, AggregateFormPinDto Form, string? InstanceId, DateTimeOffset CreatedAt);
 internal sealed record AggregateViewState(string Id, string WorkId, string OwnerKind, string OwnerId,
     AggregateViewGeneration Current, IReadOnlyList<AggregateViewGeneration> History, int PayloadRevision);
+
+internal static class AggregateViewRetention
+{
+    internal const int MaxVersions = 3; // Includes the current generation.
+    internal static AggregateViewGeneration[] HistoryAfterBind(AggregateViewState? previous)
+        => previous == null ? [] : previous.History.Append(previous.Current).TakeLast(MaxVersions - 1).ToArray();
+    internal static AggregateViewGeneration[] DiscardedAfterBind(AggregateViewState? previous)
+        => previous == null ? [] : previous.History.Append(previous.Current).Except(HistoryAfterBind(previous)).ToArray();
+}

@@ -78,14 +78,14 @@ internal sealed partial class AggregateMongoPreviewReader
             true, v2Enabled && editable, true, "Draft", false, true, editable, true, true);
         var previous = new Dictionary<string, AggregateValue>();
         string? savedResultReadError = null;
-        if (generation.InstanceId is { } instanceId)
+        if (!metadataOnly && generation.InstanceId is { } instanceId)
         {
             var saved = await db.Db.GetCollection<BsonDocument>(AggregateCollections.Instances).Find(new BsonDocument("_id", instanceId)).FirstOrDefaultAsync(ct);
             var instance = saved == null ? null : AggregateMongoTransaction.Read<AggregateInstanceState>(saved).Value;
             if (instance?.Applied != null)
             {
                 try { await ValidateViewSourcesAsync(instance.Applied, actor, context, schema, facts, ct); }
-                catch (AggregatePreviewException ex) when (ex.Code == "AGG_SOURCE_UNAVAILABLE") { savedResultReadError = ex.Code; }
+                catch (AggregatePreviewException ex) { savedResultReadError = ex.Code; }
                 var versionRow = await db.Db.GetCollection<BsonDocument>(AggregateCollections.Versions).Find(new BsonDocument("_id", AggregateCommandService.VersionKey(instance.ConfigId, instance.ConfigRevision))).FirstOrDefaultAsync(ct)
                     ?? throw new AggregatePreviewException("AGG_CONFIG_UNAVAILABLE");
                 var recipe = AggregateOverlay.Effective(AggregateMongoTransaction.Read<AggregateConfigVersion>(versionRow).Value, instance);
@@ -101,12 +101,23 @@ internal sealed partial class AggregateMongoPreviewReader
         AggregateSchema schema, AggregateAuthorityFacts facts, CancellationToken ct)
     {
         var read = new AggregateReadContext(context, schema, facts, new(0, 0, 0, 0, schema.Pin.SchemaHash, ""), "", null, new Dictionary<string, AggregateValue>());
-        var found = new HashSet<string>();
+        await ValidateSavedSourcesAsync(read, applied, actor, ct);
+    }
+
+    internal async Task ValidateSavedSourcesAsync(AggregateReadContext read, AggregatePreviewEnvelope applied, string actor, CancellationToken ct)
+    {
+        var found = new Dictionary<string, AggregateSourceHeader>();
         foreach (var form in applied.SourceValues.Select(s => s.Form).Distinct())
         {
-            var listing = await ListSourcesAsync(read, form, actor, ct);
-            foreach (var header in listing.Headers.Where(h => h.WholeReportReadable && h.Pin.Status == "Approved" && h.Pin.IsCurrent)) found.Add(header.Pin.ReportId);
+            // Reading a saved result checks current contributors and authority,
+            // not the availability of undeclared future schedule windows.
+            var listing = await ListReportSetSourcesAsync(read, form, actor, ct);
+            foreach (var header in listing.Headers.Where(h => h.WholeReportReadable && h.Pin.IsCurrent && !h.Deleted)) found[header.Pin.ReportId] = header;
         }
-        if (applied.Preview.LinkedSources.Any(p => !found.Contains(p.ReportId))) throw new AggregatePreviewException("AGG_SOURCE_UNAVAILABLE");
+        // Linked pending sources never supplied values. Only contributors must remain Approved.
+        if (applied.Preview.LinkedSources.Any(p => !found.ContainsKey(p.ReportId))) throw new AggregatePreviewException("AGG_SOURCE_UNAVAILABLE");
+        foreach (var pin in applied.Preview.ContributingSources)
+            if (!found.TryGetValue(pin.ReportId, out var header) || !header.Active || header.Pin.Status != "Approved"
+                || header.Pin != pin) throw new AggregatePreviewException("AGG_INPUT_STALE");
     }
 }

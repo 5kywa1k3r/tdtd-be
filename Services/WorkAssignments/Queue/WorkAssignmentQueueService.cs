@@ -14,7 +14,7 @@ public sealed class WorkAssignmentQueueService : IWorkAssignmentQueueService
         _ctx = ctx;
     }
 
-    public async Task UpsertPeriodAsync(WorkReportPeriod period, string actorUserId, CancellationToken ct = default)
+    public async Task UpsertPeriodAsync(WorkReportPeriod period, string? actorUserId, CancellationToken ct = default)
     {
         const int maxAttempts = 5;
         for (var attempt = 1; attempt <= maxAttempts; attempt++)
@@ -39,6 +39,8 @@ public sealed class WorkAssignmentQueueService : IWorkAssignmentQueueService
             var nextScanAt = canonicalPeriod.DueAtUtc ?? now;
             var shouldKeepActive =
                 assignment is { IsActive: true, CompletedAtUtc: null } &&
+                await tdtd_be.Services.WorkAssignments.Progress.WorkExecutionScopeGuard.IsOpenAsync(
+                    _ctx, assignment, canonicalPeriod.Id, ct) &&
                 canonicalPeriod.IsActive &&
                 !canonicalPeriod.IsHistoricalData &&
                 WorkReportPeriodStatusHelper.ShouldKeepQueueActive(
@@ -116,10 +118,11 @@ public sealed class WorkAssignmentQueueService : IWorkAssignmentQueueService
         => expected?.Id == observed?.Id &&
            expected?.IsActive == observed?.IsActive &&
            expected?.CompletedAtUtc == observed?.CompletedAtUtc &&
+           expected?.CompletionRevision == observed?.CompletionRevision &&
            expected?.DynamicFlowMaterializationRevision ==
            observed?.DynamicFlowMaterializationRevision;
 
-    public async Task DisableByPeriodAsync(string workAssignmentId, string assigneeUserId, string periodKey, string actorUserId, CancellationToken ct = default)
+    public async Task DisableByPeriodAsync(string workAssignmentId, string assigneeUserId, string periodKey, string? actorUserId, CancellationToken ct = default)
     {
         var now = DateTime.UtcNow;
         await _ctx.WorkAssignmentQueueItems.UpdateManyAsync(
@@ -134,7 +137,7 @@ public sealed class WorkAssignmentQueueService : IWorkAssignmentQueueService
             cancellationToken: ct);
     }
 
-    public async Task DisableByAssignmentAsync(string workAssignmentId, string actorUserId, CancellationToken ct = default)
+    public async Task DisableByAssignmentAsync(string workAssignmentId, string? actorUserId, CancellationToken ct = default)
     {
         var now = DateTime.UtcNow;
         await _ctx.WorkAssignmentQueueItems.UpdateManyAsync(

@@ -11,7 +11,8 @@ internal sealed record AggregateConfigVersion(string ConfigId, long Revision, Ag
 internal sealed record AggregateInstanceState(string Id, AggregatePeriodContextDto Context, string ConfigId,
     long ConfigRevision, long Revision, long Generation, string State, AggregateInstanceOverrideDto? Overrides,
     AggregateInstanceSelectionDto Selection, IReadOnlyList<string> UnlinkedMembers, AggregateRawDraftDto? RawDraft,
-    AggregatePreviewEnvelope? Applied, string? SubmissionId, string AuthorityUserId);
+    AggregatePreviewEnvelope? Applied, string? SubmissionId, string AuthorityUserId,
+    long AppliedGeneration = 0, string? AppliedInputStamp = null, string? ComputationProfile = null);
 internal sealed record AggregateDependencyState(string InstanceId, string TargetReportId, long Generation,
     IReadOnlyList<string> Keys, IReadOnlyList<AggregateSourcePinDto> Reports, IReadOnlyList<AggregateCoverageSlotDto> Slots);
 internal sealed record AggregateLockState(string Kind, string Identity, IReadOnlyList<AggregateLockOwnerDto> Owners,
@@ -22,7 +23,9 @@ internal sealed record AggregateDeclarationState(string Kind, string Identity, s
     AggregateDataWindowDeclarationDto Declaration);
 internal sealed record AggregateReceipt(string RequestHash, string Actor, string Operation, JsonElement Result);
 internal sealed record AggregateRefreshIntent(string InstanceId, long Generation, string EventId, string AuthorityUserId,
-    string State, string? ErrorCode, string? DiffReference);
+    string State, string? ErrorCode, string? DiffReference, string? Lease = null,
+    DateTimeOffset? LeaseUntil = null, DateTimeOffset? DispatchUntil = null, int Attempt = 0,
+    AggregatePreviewProgress? Progress = null, string? InputStamp = null, DateTimeOffset? RetryNotBefore = null);
 internal sealed record AggregateStored<T>(long Version, T Value);
 internal sealed record AggregateQuery(string WorkId, string? Target = null, string? DependencyKey = null);
 internal sealed record AggregateCommitAuthority(string Actor, string SessionKey, AggregateReadContext Read,
@@ -73,7 +76,14 @@ internal interface IAggregateTransactionStore
 }
 internal interface IAggregateCommandReader
 {
+    Task<AggregateCommitAuthority> AuthorizeStatusAsync(AggregatePeriodContextDto context, string actor, string sessionKey, CancellationToken ct)
+        => AuthorizeAsync(context, actor, sessionKey, ct);
+    Task ValidateSavedResultAsync(AggregateCommitAuthority authority, AggregatePreviewEnvelope applied, CancellationToken ct)
+        => Task.CompletedTask;
     Task<AggregateCommitAuthority> AuthorizeAsync(AggregatePeriodContextDto context, string actor, string sessionKey, CancellationToken ct);
     Task<AggregatePreviewEnvelope> PreviewAsync(AggregateInstanceState instance, AggregateRecipeDto effectiveRecipe,
         AggregateCommitAuthority authority, CancellationToken ct);
+    Task<string> InputStampAsync(AggregateInstanceState instance, AggregateRecipeDto recipe,
+        AggregateCommitAuthority authority, CancellationToken ct)
+        => throw new AggregatePreviewException("AGG_ASYNC_READER_REQUIRED");
 }

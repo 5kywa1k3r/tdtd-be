@@ -22,7 +22,7 @@ internal sealed record RuntimeFixture(string Actor, string Outsider, string Work
         await db.Works.InsertOneAsync(new Work { Id = work, AutoCode = run, Name = run, CreatedByUserId = actor, LeaderDirectiveUserId = actor }, cancellationToken: ct);
         foreach (var pair in new[] { (parent, actor, (string?)null), (child, childActor, (string?)parent) })
             await db.WorkAssignments.InsertOneAsync(new WorkAssignment { Id = pair.Item1, WorkId = work, RootAssignmentId = parent,
-                ParentAssignmentId = pair.Item3, CreatedByUserId = actor, IssuedByUnitId = unit, TargetUnitIds = [unit],
+                ParentAssignmentId = pair.Item3, Level = pair.Item3 == null ? 0 : 1, CreatedByUserId = actor, IssuedByUnitId = unit, TargetUnitIds = [unit],
                 Assignees = [new UserRef { UserId = pair.Item2, UnitId = unit }],
                 Code = run + pair.Item1, Name = run, Path = "/" + parent + "/" + pair.Item1, AssignmentType = "ONCE", IsActive = true }, cancellationToken: ct);
         DynamicFormTemplate Form(string member)

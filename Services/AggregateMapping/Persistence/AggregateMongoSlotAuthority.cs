@@ -49,23 +49,20 @@ internal sealed partial class AggregateMongoCommandReader
         await Pin(pins, db.WorkAssignments.CollectionNamespace.CollectionName, assignment.Id!, ct);
         await Pin(pins, db.WorkTemplateAssignees.CollectionNamespace.CollectionName, binding.Id, ct);
         await Pin(pins, db.DynamicFormTemplates.CollectionNamespace.CollectionName, form.Id, ct);
-        var scopeOpen = !work.CompletedAtUtc.HasValue && work.Status != WorkStatus.S3 && !assignment.CompletedAtUtc.HasValue;
-        var ancestorId = assignment.ParentAssignmentId;
-        var visited = new HashSet<string>();
-        while (!string.IsNullOrEmpty(ancestorId))
+        var ancestors = await tdtd_be.Services.WorkAssignments.Progress.WorkExecutionScopeGuard.ReadAncestorsAsync(db, assignment, ct);
+        var scopeOpen = tdtd_be.Services.WorkAssignments.Progress.WorkExecutionScopeGuard
+            .IsOpen(assignment, work, ancestors, context.WorkReportPeriodId);
+        foreach (var ancestor in ancestors)
         {
-            if (!visited.Add(ancestorId)) throw new AggregatePreviewException("AGG_CONTEXT_UNAVAILABLE");
-            var ancestor = await db.WorkAssignments.Find(a => a.Id == ancestorId && a.WorkId == work.Id && !a.IsDeleted).FirstOrDefaultAsync(ct)
-                ?? throw new AggregatePreviewException("AGG_CONTEXT_UNAVAILABLE");
-            scopeOpen &= !ancestor.CompletedAtUtc.HasValue && ancestor.IsActive;
             await Pin(pins, db.WorkAssignments.CollectionNamespace.CollectionName, ancestor.Id!, ct);
-            ancestorId = ancestor.ParentAssignmentId;
         }
         if (context.WorkReportPeriodId != null) await Pin(pins, db.WorkReportPeriods.CollectionNamespace.CollectionName, context.WorkReportPeriodId, ct);
         await PinDeclaration(pins, "SLOT:" + binding.Id + ":" + occurrence, ct);
         var facts = new AggregateAuthorityFacts(true, true, false, true, false, false, true, false, false, false,
             scopeOpen && (v2Enabled || !StatConfigPhaseBarrier.IsBlocked(StatConfigPhaseBarrierEntries.P9Run)), assignment.IsActive && binding.IsActive,
-            "Draft", false, true, true, true, true);
+            "Draft", false, true, true, true, true) {
+                ConfigMutationScopeOpen = tdtd_be.Services.WorkAssignments.Progress.WorkExecutionScopeGuard.IsOpen(assignment, work, ancestors, null)
+                    && (v2Enabled || !StatConfigPhaseBarrier.IsBlocked(StatConfigPhaseBarrierEntries.P9Run)) };
         return new(actor, sessionKey, new(context, schema, facts, new(0, 0, 0, 0, schema.Pin.SchemaHash, ""),
             AggregateCanonical.Hash(new { actor, assignment.Assignees, binding.AssigneeUserId }), declaration,
             new Dictionary<string, AggregateValue>()), pins);

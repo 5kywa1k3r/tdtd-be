@@ -1,4 +1,5 @@
 using tdtd_be.Models;
+using tdtd_be.Common.Time;
 
 namespace tdtd_be.Services.WorkAssignments.Internal;
 
@@ -36,8 +37,8 @@ internal static class WorkAssignmentBackfillPeriodPolicy
         if (assignment is null)
             return false;
 
-        var sourceStart = (periodStart ?? periodAnchor)?.Date;
-        var sourceEnd = (periodEnd ?? periodStart ?? periodAnchor)?.Date;
+        var sourceStart = ReportCivilDate.ReadPeriodDay(periodStart ?? periodAnchor);
+        var sourceEnd = ReportCivilDate.ReadPeriodDay(periodEnd ?? periodStart ?? periodAnchor);
         var anchorDate = (periodAnchor ?? periodEnd ?? periodStart)?.Date;
         if (!sourceStart.HasValue || !sourceEnd.HasValue)
             return false;
@@ -46,8 +47,8 @@ internal static class WorkAssignmentBackfillPeriodPolicy
             (sourceStart, sourceEnd) = (sourceEnd, sourceStart);
 
         var assignmentCreatedDate = assignment.CreatedAtUtc == default
-            ? nowUtc.Date
-            : assignment.CreatedAtUtc.Date;
+            ? ReportCivilDate.FromInstant(nowUtc)
+            : ReportCivilDate.FromInstant(assignment.CreatedAtUtc);
         var assignmentStartDate = assignment.StartDate?.Date ?? assignmentCreatedDate;
 
         if (assignmentStartDate >= assignmentCreatedDate)
@@ -62,7 +63,7 @@ internal static class WorkAssignmentBackfillPeriodPolicy
         minDate = sourceStart.Value > assignmentStartDate
             ? sourceStart.Value
             : assignmentStartDate;
-        maxDate = nowUtc.Date;
+        maxDate = ReportCivilDate.FromInstant(nowUtc);
 
         return maxDate >= minDate;
     }

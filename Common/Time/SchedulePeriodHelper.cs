@@ -9,7 +9,7 @@ public static class SchedulePeriodHelper
         var type = NormalizeCycleType(cycleType);
         var d = date.Date;
 
-        return type switch
+        var range = type switch
         {
             ReportCycleTypes.Daily => (d, d),
             ReportCycleTypes.Weekly => GetWeekRange(d),
@@ -18,6 +18,7 @@ public static class SchedulePeriodHelper
             ReportCycleTypes.SemiAnnual => GetHalfRange(d),
             _ => (d, d)
         };
+        return (ReportCivilDate.Encode(range.Item1), ReportCivilDate.Encode(range.Item2));
     }
 
     public static int GetQuarter(DateTime date) => ((date.Month - 1) / 3) + 1;

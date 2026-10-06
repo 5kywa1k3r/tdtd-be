@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net8.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable></PropertyGroup>
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <Using Include="Microsoft.AspNetCore.Http" />
+    <Compile Include="../../Services/WorkAssignments/Domain/WorkAssignmentAutoApproveConditionNormalizer.cs" Link="Normalizer.cs" />
+    <Compile Include="../../Common/Errors/AppException.cs" Link="AppException.cs" />
+    <Compile Include="../../Common/Errors/AppExceptionFactory.cs" Link="AppExceptionFactory.cs" />
+    <Compile Include="../../Common/Errors/AppErrorCode.cs" Link="AppErrorCode.cs" />
+    <Compile Include="../../Common/Errors/AppErrorCatalog.cs" Link="AppErrorCatalog.cs" />
+    <Compile Include="../../Common/Errors/AppErrorDescriptor.cs" Link="AppErrorDescriptor.cs" />
+  </ItemGroup>
+</Project>

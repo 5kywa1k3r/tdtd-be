@@ -1,3 +1,4 @@
+using tdtd_be.Common.Auth;
 using tdtd_be.Common.Errors;
 using tdtd_be.Models;
 using tdtd_be.Services;
@@ -6,118 +7,84 @@ namespace tdtd_be.Services.WorkAssignments.Internal;
 
 internal static class WorkAssignmentTargetScopeValidator
 {
-    public static void EnsureCanAssignTargets(
-        AppUser actorUser,
-        Unit? actorUnit,
-        IReadOnlyCollection<AppUser> targetUsers,
-        IReadOnlyDictionary<string, Unit> unitById,
-        bool actorUnitHasAssignableDescendants,
-        WorkAssignmentTargetScopePolicy? targetScopePolicy = null)
+    public static void EnsureCanAssignTargets(AppUser actor, Unit? actorUnit,
+        IReadOnlyCollection<AppUser> targets, IReadOnlyDictionary<string, Unit> units,
+        bool actorUnitHasAssignableDescendants, WorkAssignmentTargetScopePolicy? targetScopePolicy = null, bool rejectOverlap = true)
     {
-        if (!IsUnitManager(actorUser))
-            return;
-
-        if (actorUnit is null)
-            throw InvalidScope("actorUnitMissing", actorUser.Id, null, null);
-
-        foreach (var targetUser in targetUsers)
+        foreach (var target in targets)
         {
-            if (string.Equals(actorUser.Id, targetUser.Id, StringComparison.Ordinal))
-                throw AppExceptionFactory.BadRequest(
-                    AppErrorCode.WORK_ASSIGNMENT_SELF_ASSIGNMENT_NOT_ALLOWED,
-                    new { actorUserId = actorUser.Id });
-
-            var reason = TargetRejectionReason(actorUnit, targetUser, unitById,
-                actorUnitHasAssignableDescendants, targetScopePolicy);
-            if (reason is not null)
-                throw InvalidScope(reason, actorUser.Id, targetUser.Id, ResolveUnit(targetUser, unitById)?.Id);
+            if (actor.Id == target.Id)
+                throw AppExceptionFactory.BadRequest(AppErrorCode.WORK_ASSIGNMENT_SELF_ASSIGNMENT_NOT_ALLOWED);
+            if (!CanAssignTarget(actor, actorUnit, target, units, actorUnitHasAssignableDescendants, targetScopePolicy))
+                throw AppExceptionFactory.BadRequest(AppErrorCode.WORK_ASSIGNMENT_ASSIGNEE_SCOPE_INVALID,
+                    new { reason = "recipientOutsideManagementScope" },
+                    "Tài khoản nhận việc hoặc mã đơn vị không hợp lệ, hoặc người nhận nằm ngoài phạm vi được giao. Hãy kiểm tra lại lựa chọn.");
         }
+        if (!rejectOverlap) return;
+        var conflicts = FindOverlaps(targets, units);
+        if (conflicts.Count == 0) return;
+        var first = conflicts.First();
+        var person = targets.First(x => x.Id == first.Key);
+        throw AppExceptionFactory.BadRequest(AppErrorCode.WORK_ASSIGNMENT_ASSIGNEE_SCOPE_INVALID,
+            new { reason = "unitPersonalOverlap", conflicts = conflicts.Select(x => new {
+                userId = x.Key, unitId = x.Value.Id, unitName = x.Value.ShortName ?? x.Value.FullName }) },
+            $"{person.FullName} ({person.Username}) thuộc phạm vi của {first.Value.ShortName ?? first.Value.FullName} đã được chọn nhận việc. Bỏ người này hoặc bỏ đơn vị đó để tiếp tục.");
     }
 
-    // Read-side filtering shares the write policy without throwing an exception per candidate.
+    // Branch creation authority is checked separately by the caller.
     public static bool CanAssignTarget(AppUser actor, Unit? actorUnit, AppUser target,
         IReadOnlyDictionary<string, Unit> units, bool hasDescendants, WorkAssignmentTargetScopePolicy? policy = null)
-        => !IsUnitManager(actor) || (actorUnit is not null && actor.Id != target.Id
-            && TargetRejectionReason(actorUnit, target, units, hasDescendants, policy) is null);
-
-    private static string? TargetRejectionReason(Unit actorUnit, AppUser targetUser,
-        IReadOnlyDictionary<string, Unit> unitById, bool hasDescendants, WorkAssignmentTargetScopePolicy? policy)
     {
-        var targetUnit = ResolveUnit(targetUser, unitById);
-        if (IsUnitManager(targetUser))
-            return targetUnit is not null && (IsPeerUnit(actorUnit, targetUnit) || IsDescendantUnit(actorUnit, targetUnit)
-                || policy?.AllowsConfiguredTarget(actorUnit, targetUnit, targetUser) == true)
-                ? null : "unitManagerOutsideAllowedUnit";
-        if (IsNormalUser(targetUser))
-            return targetUnit is not null && ((actorUnit.Id == targetUnit.Id
-                    && (!hasDescendants || IsDepartmentLeader(targetUser)))
-                || policy?.AllowsConfiguredTarget(actorUnit, targetUnit, targetUser) == true)
-                ? null : "normalUserOutsideFinalUnit";
-        return "unsupportedTargetAccountKind";
+        if (actor.IsDeleted || target.IsDeleted || actor.Id == target.Id || !ValidUnit(actorUnit)
+            || !units.TryGetValue(target.UnitId ?? "", out var targetUnit) || !ValidUnit(targetUnit)) return false;
+        if (IsPersonalRecipient(target))
+            return UnitManagementScope.Contains(actorUnit!.Code, targetUnit.Code);
+        if (!IsUnitRecipient(target)) return false;
+        // Retain the existing unit-recipient policy for non-unit-account actors.
+        if (!IsUnitManager(actor)) return true;
+        return IsPeerUnit(actorUnit!, targetUnit)
+            || UnitManagementScope.Contains(actorUnit!.Code, targetUnit.Code, includeSelf: false)
+            || policy?.AllowsConfiguredTargetAccountKind(actorUnit, targetUnit, ManagementAccountKind.UnitManager) == true;
     }
 
-    // A department's child teams do not prevent its unit account from assigning
-    // its own chief/deputy. Position alone never grants access to another unit.
-    private static bool IsDepartmentLeader(AppUser user)
-        => user.PositionCode?.Trim().ToUpperInvariant() is
-            "TRUONG_PHONG" or "PHO_TRUONG_PHONG" or "PHO_TRUONG_PHONG_PHU_TRACH";
-
-    public static bool IsUnitManager(AppUser user)
-        => string.Equals(user.AccountKind, ManagementAccountKind.UnitManager, StringComparison.OrdinalIgnoreCase) ||
-           (user.Username ?? string.Empty).StartsWith(ManagementAccountConvention.UnitManagerPrefix, StringComparison.OrdinalIgnoreCase);
-
-    public static bool IsLevelManager(AppUser user)
-        => string.Equals(user.AccountKind, ManagementAccountKind.LevelManager, StringComparison.OrdinalIgnoreCase) ||
-           (user.Username ?? string.Empty).StartsWith(ManagementAccountConvention.LevelManagerPrefix, StringComparison.OrdinalIgnoreCase);
-
-    private static bool IsNormalUser(AppUser user)
-        => !IsUnitManager(user) &&
-           !IsLevelManager(user) &&
-           (string.IsNullOrWhiteSpace(user.AccountKind) ||
-            string.Equals(user.AccountKind, ManagementAccountKind.NormalUser, StringComparison.OrdinalIgnoreCase));
-
-    private static Unit? ResolveUnit(AppUser user, IReadOnlyDictionary<string, Unit> unitById)
+    public static bool ValidUnit(Unit? unit) => unit is { IsDeleted: false, IsVirtual: false }
+        && UnitManagementScope.Contains(unit.Code, unit.Code);
+    public static bool IsUnitRecipient(AppUser user) => RecipientKind(user) == ManagementAccountKind.UnitManager;
+    public static bool IsPersonalRecipient(AppUser user) => RecipientKind(user) == ManagementAccountKind.NormalUser;
+    // Explicit account kind takes precedence over legacy username conventions.
+    private static string RecipientKind(AppUser user)
     {
-        var unitId = user.UnitId?.Trim();
-        if (string.IsNullOrWhiteSpace(unitId))
-            return null;
-
-        return unitById.TryGetValue(unitId, out var unit) ? unit : null;
+        if (!string.IsNullOrWhiteSpace(user.AccountKind)) return user.AccountKind.Trim().ToUpperInvariant();
+        if (IsUnitManager(user)) return ManagementAccountKind.UnitManager;
+        if (IsLevelManager(user)) return ManagementAccountKind.LevelManager;
+        return ManagementAccountKind.NormalUser;
     }
 
-    private static bool IsPeerUnit(Unit actorUnit, Unit targetUnit)
+    public static Dictionary<string, Unit> FindOverlaps(IEnumerable<AppUser> recipients,
+        IReadOnlyDictionary<string, Unit> units)
     {
-        if (string.Equals(actorUnit.Id, targetUnit.Id, StringComparison.Ordinal))
-            return false;
-
-        return actorUnit.Level == targetUnit.Level &&
-               string.Equals(actorUnit.ParentUnitId ?? string.Empty, targetUnit.ParentUnitId ?? string.Empty, StringComparison.Ordinal);
-    }
-
-    private static bool IsDescendantUnit(Unit actorUnit, Unit targetUnit)
-    {
-        if (string.Equals(actorUnit.Id, targetUnit.Id, StringComparison.Ordinal))
-            return false;
-
-        var actorCode = actorUnit.Code?.Trim();
-        var targetCode = targetUnit.Code?.Trim();
-        if (!string.IsNullOrWhiteSpace(actorCode) &&
-            !string.IsNullOrWhiteSpace(targetCode) &&
-            targetUnit.Level > actorUnit.Level &&
-            targetCode.StartsWith(actorCode, StringComparison.Ordinal))
+        var users = recipients.ToList();
+        var roots = users.Where(IsUnitRecipient).Select(x => units.GetValueOrDefault(x.UnitId ?? ""))
+            .Where(ValidUnit).GroupBy(x => x!.Code!, StringComparer.Ordinal)
+            .ToDictionary(x => x.Key, x => x.First()!, StringComparer.Ordinal);
+        var conflicts = new Dictionary<string, Unit>(StringComparer.Ordinal);
+        foreach (var person in users.Where(IsPersonalRecipient))
         {
-            return true;
+            if (!units.TryGetValue(person.UnitId ?? "", out var unit) || !ValidUnit(unit)) continue;
+            for (var length = 3; length <= unit.Code!.Length; length += 3)
+                if (roots.TryGetValue(unit.Code[..length], out var covering))
+                { conflicts[person.Id] = covering; break; }
         }
-
-        return string.Equals(targetUnit.ParentUnitId, actorUnit.Id, StringComparison.Ordinal);
+        return conflicts;
     }
 
-    private static AppException InvalidScope(
-        string reason,
-        string? actorUserId,
-        string? targetUserId,
-        string? targetUnitId)
-        => AppExceptionFactory.BadRequest(
-            AppErrorCode.WORK_ASSIGNMENT_ASSIGNEE_SCOPE_INVALID,
-            new { reason, actorUserId, targetUserId, targetUnitId });
+    // These actor helpers are shared with handover; retain their existing semantics.
+    public static bool IsUnitManager(AppUser user)
+        => string.Equals(user.AccountKind, ManagementAccountKind.UnitManager, StringComparison.OrdinalIgnoreCase)
+           || (user.Username ?? "").StartsWith(ManagementAccountConvention.UnitManagerPrefix, StringComparison.OrdinalIgnoreCase);
+    public static bool IsLevelManager(AppUser user)
+        => string.Equals(user.AccountKind, ManagementAccountKind.LevelManager, StringComparison.OrdinalIgnoreCase)
+           || (user.Username ?? "").StartsWith(ManagementAccountConvention.LevelManagerPrefix, StringComparison.OrdinalIgnoreCase);
+    private static bool IsPeerUnit(Unit actor, Unit target) => actor.Id != target.Id
+        && actor.Code!.Length == target.Code!.Length && actor.Code[..^3] == target.Code[..^3];
 }

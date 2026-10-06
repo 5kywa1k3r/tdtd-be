@@ -264,6 +264,7 @@ public sealed class DashboardMindMapReportRowDto
 {
     public string WorkReportPeriodId { get; set; } = string.Empty;
     public string? ReportId { get; set; }
+    public string? CurrentReportReadState { get; set; }
     public string AssignmentId { get; set; } = string.Empty;
     public string? AssignmentCode { get; set; }
     public string AssignmentName { get; set; } = string.Empty;

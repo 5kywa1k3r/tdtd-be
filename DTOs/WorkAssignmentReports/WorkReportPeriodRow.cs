@@ -13,6 +13,8 @@ public sealed class WorkReportPeriodRow
     public string AssignmentType { get; set; } = string.Empty;
     public string WorkTemplateAssigneeId { get; set; } = string.Empty;
 
+    public bool IsActive { get; set; }
+
     public string DynamicExcelId { get; set; } = string.Empty;
     public string DynamicExcelCode { get; set; } = string.Empty;
     public string DynamicExcelName { get; set; } = string.Empty;

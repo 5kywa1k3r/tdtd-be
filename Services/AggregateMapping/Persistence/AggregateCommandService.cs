@@ -63,22 +63,35 @@ internal sealed partial class AggregateCommandService(IAggregateTransactionStore
     }
     internal Task<AggregateCommandResult> ApplyAsync(AggregateCommandContext command, AggregatePeriodContextDto context,
         string instanceId, AggregateMappingChange change, string confirmation, CancellationToken ct)
-        => Execute(command, new { instanceId, change, confirmation }, context, AggregateAction.ApplyDraft, async (tx, authority, token) =>
+    {
+        AggregatePreparedChange? prepared = null;
+        string? capturedInstance = null;
+        return Execute(command, new { instanceId, change, confirmation }, context, AggregateAction.ApplyDraft, async (tx, authority, token) =>
         {
             var old = await Required<AggregateInstanceState>(tx, AggregateCollections.Instances, instanceId, token);
-            var prepared = await Prepare(tx, authority, command, instanceId, change, token);
-            var binding = Confirmation(command, "APPLY", instanceId, change, Evidence(prepared.Preview, authority, old.Value), prepared.ExpiresAt);
+            Draft(old.Value, authority, change.ExpectedRevision);
+            if (AggregateCanonical.Hash(old) != capturedInstance) throw new AggregatePreviewException("AGG_REVISION_CONFLICT");
+            var candidate = prepared ?? throw new InvalidOperationException("AGG_PREPARATION_REQUIRED");
+            var binding = Confirmation(command, "APPLY", instanceId, change, Evidence(candidate.Preview, authority, old.Value), candidate.ExpiresAt);
             tokens.Verify(confirmation, binding, command.Now);
             await AggregateLifecycleParticipant.EnsureUnlockedAsync(tx, AggregateTargetIdentity.LockKind(context), AggregateTargetIdentity.Id(context)!, token);
-            await tx.FenceAsync(authority, prepared.Preview.Preview.LinkedSources, prepared.Preview.Preview.Coverage, token);
-            var members = prepared.Recipe.Nodes.Single(n => n.Kind == "TARGET").Inputs.Select(p => p.MemberId!).ToArray();
+            await tx.FenceAsync(authority, candidate.Preview.Preview.LinkedSources, candidate.Preview.Preview.Coverage, token);
+            var members = candidate.Recipe.Nodes.Single(n => n.Kind == "TARGET").Inputs.Select(p => p.MemberId!).ToArray();
             await ClaimTargets(tx, old.Value, members, token);
-            var next = prepared.Instance with { Revision = checked(old.Value.Revision + 1), Generation = checked(old.Value.Generation + 1), Applied = prepared.Preview, RawDraft = null, State = "DRAFT" };
-            var revision = await tx.WriteTargetAsync(authority, new(next, prepared.Recipe, prepared.Preview, members), token);
+            var next = candidate.Instance with { Revision = checked(old.Value.Revision + 1), Generation = checked(old.Value.Generation + 1), Applied = candidate.Preview, RawDraft = null, State = "DRAFT", AppliedGeneration = checked(old.Value.Generation + 1), AppliedInputStamp = null };
+            var revision = await tx.WriteTargetAsync(authority, new(next, candidate.Recipe, candidate.Preview, members), token);
             await PutInstance(tx, next, old.Version, token);
-            await Dependencies(tx, next, prepared.Preview, token);
+            await Dependencies(tx, next, candidate.Preview, token);
             return new(instanceId, next.Revision, revision, authority.Read.Revisions.LifecycleRevision, next.State);
-        }, ct);
+        }, ct, async (authority, token) =>
+        {
+            // Immutable artifacts may acquire/release a scope gate outside Mongo's
+            // session. Finish that work before the publication snapshot begins.
+            var capture = await store.ExecuteAsync((tx, cancel) => CaptureChange(tx, authority, instanceId, change, cancel), token);
+            capturedInstance = AggregateCanonical.Hash(capture.Stored);
+            prepared = await CompleteChange(authority, command, instanceId, change, capture, token);
+        });
+    }
 
     internal Task<AggregateCommandResult> UnlinkAllAsync(AggregateCommandContext command, AggregatePeriodContextDto context,
         string instanceId, long expectedRevision, string confirmation, CancellationToken ct)
@@ -111,9 +124,6 @@ internal sealed partial class AggregateCommandService(IAggregateTransactionStore
                 AggregateCanonical.Hash(new { instance, authority.Read.Revisions, authority.Pins }), command.Now.AddMinutes(5)));
         }, ct);
     }
-    private async Task<AggregatePreparedChange> Prepare(IAggregateTransaction tx, AggregateCommitAuthority authority,
-        AggregateCommandContext command, string id, AggregateMappingChange change, CancellationToken ct)
-        => await CompleteChange(authority, command, id, change, await CaptureChange(tx, authority, id, change, ct), ct);
     private async Task<(AggregateStored<AggregateInstanceState> Stored, AggregateInstanceState Next, AggregateRecipeDto Recipe)> CaptureChange(
         IAggregateTransaction tx, AggregateCommitAuthority authority, string id, AggregateMappingChange change, CancellationToken ct)
     {
@@ -154,7 +164,8 @@ internal sealed partial class AggregateCommandService(IAggregateTransactionStore
         return new(next with { Applied = null }, recipe, preview, signed, expiry);
     }
     private async Task<AggregateCommandResult> Execute<T>(AggregateCommandContext command, T request, AggregatePeriodContextDto context,
-        AggregateAction action, Func<IAggregateTransaction, AggregateCommitAuthority, CancellationToken, Task<AggregateCommandResult>> operation, CancellationToken ct)
+        AggregateAction action, Func<IAggregateTransaction, AggregateCommitAuthority, CancellationToken, Task<AggregateCommandResult>> operation,
+        CancellationToken ct, Func<AggregateCommitAuthority, CancellationToken, Task>? beforeTransaction = null)
     {
         AggregateCanonical.CommandId(command.CommandId);
         var authority = await reader.AuthorizeAsync(context, command.Actor, command.SessionKey, ct);
@@ -169,6 +180,19 @@ internal sealed partial class AggregateCommandService(IAggregateTransactionStore
             ContextIdentity = InstanceKey(authority.Read.Context),
             Occurrence = authority.Read.Context.Kind == "ONCE" ? "ONCE" : authority.Read.Context.PeriodKey
         });
+        if (beforeTransaction != null)
+        {
+            // A lost-response replay must not recalculate or stage new artifacts.
+            // The receipt is checked again in the publication transaction below.
+            var receipt = await store.ExecuteAsync((tx, token) => tx.GetAsync<AggregateReceipt>(AggregateCollections.Receipts, key, token), ct);
+            if (receipt != null)
+            {
+                if (receipt.Value.RequestHash != hash) throw new AggregatePreviewException("AGG_COMMAND_PAYLOAD_MISMATCH");
+                return receipt.Value.Result.Deserialize<AggregateCommandResult>(AggregateCanonical.Json)! with { Replayed = true };
+            }
+            Allow(action, authority);
+            await beforeTransaction(authority, ct);
+        }
         return await store.ExecuteAsync(async (tx, token) =>
         {
             var receipt = await tx.GetAsync<AggregateReceipt>(AggregateCollections.Receipts, key, token);

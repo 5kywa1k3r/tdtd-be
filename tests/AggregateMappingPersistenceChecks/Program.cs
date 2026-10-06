@@ -7,6 +7,22 @@ void Check(bool pass, string name) { if (!pass) throw new Exception(name); check
 async Task Error(Func<Task> run, string code)
 { try { await run(); throw new Exception("Expected " + code); } catch (AggregatePreviewException e) when (e.Code == code) { checks++; } }
 var now = new DateTimeOffset(2026, 9, 28, 10, 0, 0, TimeSpan.Zero);
+AggregateViewGeneration ViewGeneration(int revision) => new("binding" + revision,
+    new("form" + revision, "family", revision, "hash" + revision), "instance" + revision, now.AddDays(revision));
+Check(AggregateViewRetention.HistoryAfterBind(null).Length == 0, "first view has no history");
+var oldView = new AggregateViewState("view", "work", "WORK", "work", ViewGeneration(4),
+    [ViewGeneration(1), ViewGeneration(2), ViewGeneration(3)], 4);
+Check(AggregateViewRetention.HistoryAfterBind(oldView).Select(g => g.Form.VersionNo).SequenceEqual([3,4]),
+    "legacy four-generation view retains newest two histories plus new current");
+Check(AggregateViewRetention.DiscardedAfterBind(oldView).Select(g => g.Form.VersionNo).SequenceEqual([1,2]),
+    "preview identifies every removed legacy history, not only the oldest");
+var viewHead = oldView with { Current=ViewGeneration(5), History=AggregateViewRetention.HistoryAfterBind(oldView) };
+for(var revision=6;revision<=12;revision++) {
+    var retained=AggregateViewRetention.HistoryAfterBind(viewHead);
+    Check(retained.Length+1==3 && retained.Select(g=>g.Form.VersionNo).SequenceEqual([revision-2,revision-1]),
+        "repeated view rebind retains exactly three total versions " + revision);
+    viewHead=viewHead with { Current=ViewGeneration(revision), History=retained };
+}
 AggregateCommandContext Command(string id, string op = "APPLY", string context = "reportB") => new(id, op, context, "B", "sessionB", now);
 Check(AggregateCanonical.Hash(new { a = 1, b = 2 }) == AggregateCanonical.Hash(new { b = 2, a = 1 }), "canonical keys sorted");
 Check(AggregateCanonical.Hash(new { a = 1, b = (string?)null }) == AggregateCanonical.Hash(new { a = 1 }), "null and absent same");
@@ -275,4 +291,7 @@ Check(hint.ClaimDigest==AggregateReportEditHints.Build("report","actor",4,2,"sch
 Check(AggregateReportEditHints.Build("report","actor",4,2,"schema",[]).ReadOnlyMemberIds.Count==0,"no target claims means no aggregate member locks");
 await Error(()=>{AggregateReportEditHints.Build("report","actor",4,2,"schema",[new("i","other","field")]);return Task.CompletedTask;},"AGG_TARGET_CLAIM_INVALID");
 await Error(()=>{AggregateReportEditHints.Build("report","actor",4,2,"schema",Enumerable.Repeat(editClaims[0],1001).ToArray());return Task.CompletedTask;},"AGG_BUDGET_EXCEEDED");
+await StagedPublicationChecks.Run(Check, Error);
+await AsyncComputationChecks.Run(Check, Error);
+await TransientComputationChecks.Run(Check);
 Console.WriteLine($"PASS: {checks} P03 in-memory checks; no Mongo/API/job host executed.");

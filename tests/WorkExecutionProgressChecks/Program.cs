@@ -1,0 +1,91 @@
+using tdtd_be.Common.Time;
+using tdtd_be.Enum;
+using tdtd_be.Models;
+using tdtd_be.Models.Enums;
+using tdtd_be.Services.WorkAssignments.Progress;
+
+var count = 0;
+void Check(bool condition, string scenario) { if (!condition) throw new Exception(scenario); Console.WriteLine("PASS " + scenario); count++; }
+var due = new DateTime(2026, 10, 6, 10, 0, 0, DateTimeKind.Utc);
+var a = new WorkAssignment { Id = "a", WorkId = "w", IsActive = true, AssignmentType = "ONCE", DueAtUtc = due,
+    Assignees = [new() { UserId = "u1" }, new() { UserId = "u2" }], StartDate = due.AddDays(2) };
+var w = new Work { Id = "w", Owner = new() { UserId = "owner" }, DueDate = due.Date };
+var bindings = new List<WorkTemplateAssignee> { new() { WorkAssignmentId = "a", AssigneeUserId = "u1", IsActive = true },
+    new() { WorkAssignmentId = "a", AssigneeUserId = "u2", IsActive = true } };
+var periods = new List<WorkReportPeriod> { new() { Id = "p1", WorkAssignmentId = "a", AssigneeUserId = "u1", IsActive = true,
+    PeriodKey = "20261006", DueAtUtc = due, CurrentReportId = "r1" }, new() { Id = "p2", WorkAssignmentId = "a", AssigneeUserId = "u2", IsActive = true,
+    PeriodKey = "20261006", DueAtUtc = due, CurrentReportId = "r2" } };
+var reports = new List<WorkAssignmentReport> { new() { Id = "r1", WorkAssignmentId = "a", WorkReportPeriodId = "p1", IsActive = true, IsCurrent = true,
+    Status = WorkAssignmentReportStatus.Approved, ApprovedAtUtc = due.AddHours(-1) }, new() { Id = "r2", WorkAssignmentId = "a", WorkReportPeriodId = "p2", IsActive = true, IsCurrent = true,
+    Status = WorkAssignmentReportStatus.Draft } };
+WorkExecutionFacts Facts() => WorkExecutionProgressPolicy.Evaluate(a, w, null, bindings, periods, reports, due.AddHours(1));
+Check(Facts().ExecutionStatus(false) == 1, "First approval starts execution even before planned start");
+Check(!Facts().AllReportsApproved && Facts().ApprovedReports == 1 && Facts().ExpectedReports == 2, "Two recipients: one approval does not complete the assignment");
+Check(Facts().SubmissionOverdue && !Facts().ReviewOverdue, "Missing submission and review overdue are separate");
+reports[1].Status = WorkAssignmentReportStatus.Submitted;
+Check(!Facts().SubmissionOverdue && Facts().ReviewOverdue, "Review deadline is assignment deadline");
+reports[1].Status = WorkAssignmentReportStatus.Approved;
+Check(Facts().AllReportsApproved && Facts().CanAutoComplete(due), "All reports approved plus deadline permits completion");
+Check(!Facts().CanAutoComplete(due.AddTicks(-1)), "Approval before deadline does not auto close");
+Check(!Facts().SubmissionOverdue && !Facts().ReviewOverdue, "Fully approved case has no active late warning");
+a.DueAtUtc = due.AddDays(4);
+Check(Facts().AllReportsApproved, "Once obligation identity survives deadline change without recreating its period");
+periods[0].PeriodKey = "ONCE";
+Check(Facts().AllReportsApproved, "Once legacy key and dated key follow the same single-occurrence materializer contract");
+periods.Add(new() { Id = "duplicate-once", WorkAssignmentId = "a", AssigneeUserId = "u1", IsActive = true, PeriodKey = "OTHER" });
+Check(!Facts().AllReportsApproved, "Duplicate once occurrence fails closed rather than selecting one");
+periods.RemoveAt(2); periods[0].PeriodKey = "20261006"; a.DueAtUtc = due;
+reports[0].Status = WorkAssignmentReportStatus.Draft; reports[0].ApprovedAtUtc = null;
+reports[0].LifecycleProjectionOutbox = [new() { FromStatus = "Submitted", ToStatus = "Approved", ToIsActive = true, CreatedAtUtc = due.AddHours(-1) }];
+Check(Facts().ExecutionStatus(false) == 1, "Return preserves first approval from durable history");
+Check(!Facts().AllReportsApproved, "Returned current version blocks automatic completion");
+reports[0].Status = WorkAssignmentReportStatus.Approved;
+a.CompletionReopenedAtUtc = due; a.CompletionReviewPeriodId = "p1";
+Check(Facts().ReopenHold && !Facts().CanAutoComplete(due.AddDays(1)), "Reopen survives gap before return; job cannot close it");
+reports[0].LifecycleProjectionOutbox.Add(new() { FromStatus = "Approved", ToStatus = "Approved", ToIsActive = true, CreatedAtUtc = due.AddMinutes(1) });
+Check(Facts().ReopenHold, "Confirming an old auto approval does not release reopen hold");
+reports[0].LifecycleProjectionOutbox.Add(new() { FromStatus = "Submitted", ToStatus = "Approved", ToIsActive = true, CreatedAtUtc = due.AddMinutes(2) });
+Check(!Facts().ReopenHold && Facts().CanAutoComplete(due.AddHours(1)), "New approval after resubmission releases hold");
+Check(WorkCompletionWorkflowService.HasFreshCorrectionApproval(reports[0], "p1", due), "Whole Work correction is settled by a fresh approval of selected report");
+Check(!WorkCompletionWorkflowService.HasFreshCorrectionApproval(reports[0], "p2", due), "Another period approval cannot release whole Work hold");
+Check(!WorkCompletionWorkflowService.HasFreshCorrectionApproval(reports[0], "p1", due.AddMinutes(3)), "Old approved reports cannot immediately auto-close reopened Work");
+reports[0].IsActive = false;
+Check(!WorkCompletionWorkflowService.HasFreshCorrectionApproval(reports[0], "p1", due), "Inactive report cannot settle Work correction");
+reports[0].IsActive = true; reports[0].IsCurrent = false;
+Check(!WorkCompletionWorkflowService.HasFreshCorrectionApproval(reports[0], "p1", due), "Old report version cannot settle Work correction");
+reports[0].IsCurrent = true;
+Check(WorkExecutionScopeGuard.IsReopenedPeriod(a, "p1") && !WorkExecutionScopeGuard.IsReopenedPeriod(a, "p2"), "Reopen grants only selected period scope");
+a.CompletedAtUtc = due;
+Check(!WorkExecutionScopeGuard.IsReopenedPeriod(a, "p1"), "Completed assignment has no reopen bypass");
+a.CompletedAtUtc = null; a.CompletionReviewPeriodId = null; a.CompletionReopenedAtUtc = null;
+periods[0].CurrentReportId = "different";
+Check(!Facts().AllReportsApproved, "Stale period current pointer cannot count as approved");
+periods[0].CurrentReportId = "r1";
+reports.Add(new() { Id = "r3", WorkAssignmentId = "a", WorkReportPeriodId = "p1", IsActive = true, IsCurrent = true, Status = WorkAssignmentReportStatus.Approved });
+Check(!Facts().AllReportsApproved, "Ambiguous current versions fail closed"); reports.RemoveAt(2);
+bindings[1].IsActive = false;
+Check(!Facts().AllReportsApproved, "Missing active recipient binding fails closed"); bindings[1].IsActive = true;
+periods.Add(new() { Id = "child", WorkAssignmentId = "childAssignment", AssigneeUserId = "u1", IsActive = true, DueAtUtc = due.AddDays(-5) });
+Check(Facts().AllReportsApproved, "Descendant missing report does not block this level"); periods.RemoveAt(2);
+Check(WorkCompletionAuthority.CanRequest(a, "u1") && !WorkCompletionAuthority.CanDecide(a, w, null, "u1"), "Assignment owner requests, cannot approve self");
+Check(WorkCompletionAuthority.CanDecide(a, w, null, "owner"), "Root assignment escalates to Work owner");
+var parent = new WorkAssignment { Id = "parent", WorkId = "w", IsActive = true, Assignees = [new() { UserId = "manager" }] };
+a.ParentAssignmentId = parent.Id; a.CurrentReviewerUserId = "manager";
+Check(WorkCompletionAuthority.CanDecide(a, w, parent, "manager") && !WorkCompletionAuthority.CanDecide(a, w, parent, "owner"), "Child escalates to immediate parent manager, not arbitrary Work owner");
+parent.IsActive = false;
+Check(!WorkCompletionAuthority.CanDecide(a, w, parent, "manager"), "Inactive parent cannot approve"); parent.IsActive = true;
+a.CurrentReviewerUserId = "newManager";
+Check(!WorkCompletionAuthority.CanDecide(a, w, parent, "manager"), "Old reviewer loses authority after handover");
+a.AssignmentType = "PERIODIC_REPORT"; a.StartDate = new(2026,10,5); a.DueDate = new(2026,10,6); a.DueAtUtc = null;
+a.Schedule = new() { CycleType = "DAILY", StartDate = a.StartDate };
+Check(Facts().ExpectedReports == 4 && !Facts().AllReportsApproved, "Periodic schedule includes not-yet-materialized obligations");
+Check(Facts().DeadlineUtc == new DateTime(2026,10,6,17,0,0,DateTimeKind.Utc).AddTicks(-1), "Calendar deadline uses end of day in Vietnam");
+a.Schedule = null;
+Check(!Facts().CanAutoComplete(due.AddYears(1)), "Invalid schedule never becomes empty successful obligation set");
+a.FirstApprovedAtUtc = due.AddDays(-2); reports.Clear();
+Check(Facts().FirstApprovedAtUtc == due.AddDays(-2), "Persisted first approval survives report changes");
+Check(Facts().ExecutionStatus(true) == 2, "Manual completion remains independent of automatic criteria");
+await CompletionProjectionChecks.RunAsync(Check);
+CompletionDateChecks.Run(Check);
+CompletionScopeChecks.Run(Check);
+Console.WriteLine($"{count} checks passed; policy/auth plus real BSON serialization and intercepted post-processing, no API/DB writes.");

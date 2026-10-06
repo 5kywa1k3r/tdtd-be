@@ -21,7 +21,9 @@ public sealed class AggregateContentController(MongoDbContext db, IWorkReportPay
     public Task<IActionResult> Page(AggregateContentReadRequest request, CancellationToken ct) => Read(request, false, ct);
     [HttpPost("part")]
     public Task<IActionResult> Part(AggregateContentReadRequest request, CancellationToken ct) => Read(request, true, ct);
-    private async Task<IActionResult> Read(AggregateContentReadRequest request, bool textPart, CancellationToken ct)
+    [HttpPost("source")]
+    public Task<IActionResult> Source(AggregateContentReadRequest request, CancellationToken ct) => Read(request, false, ct, source: true);
+    private async Task<IActionResult> Read(AggregateContentReadRequest request, bool textPart, CancellationToken ct, bool source = false)
     {
         Response.Headers.CacheControl = "no-store";
         if (!AggregateIntegrationGate.V2Ready(config)) return Conflict(new { code = "AGG_ACTIVATION_REQUIRED" });
@@ -36,9 +38,11 @@ public sealed class AggregateContentController(MongoDbContext db, IWorkReportPay
                 ?? throw new AggregatePreviewException("AGG_CONTENT_UNAVAILABLE");
             if (!string.IsNullOrEmpty(request.JobId))
                 await new AggregatePreviewJobs(db, payloads, config).AuthorizeContent(request.JobId, targetId, reference, actor, session, ct);
-            else if (request.ViewId != null)
+            else if (request.ViewId != null || !string.IsNullOrEmpty(request.ListReadId))
             {
-                await new AggregateListReadScopes(db, payloads).Authorize(new("", null, reference.Id, reference.Hash,
+                // Submission previews already issue the same actor/session/pin-bound
+                // read evidence for List and content references. It is read-only.
+                await new AggregateListReadScopes(db, payloads).Authorize(new(request.ReportId, null, reference.Id, reference.Hash,
                     ReadId: request.ListReadId, ViewId: request.ViewId), actor, session, ct);
             }
             else
@@ -54,7 +58,15 @@ public sealed class AggregateContentController(MongoDbContext db, IWorkReportPay
                     throw new AggregatePreviewException("AGG_CONTENT_UNAVAILABLE");
             }
             var store = new AggregateContentTableStore(db);
-            if(request.ViewId == null && string.IsNullOrEmpty(request.JobId))try { await AggregateContentSnapshotJob.Schedule(db,HttpContext.RequestServices.GetService<Hangfire.IBackgroundJobClient>(),request.ReportId,ct); }
+            if (source)
+            {
+                // The client selects a row, never a source report. Reuse all target/session/
+                // revision checks above, then independently authorize the sealed row's source.
+                var note = await store.SourceNote(targetId, reference, request.RowKey ?? "", ct);
+                var report = await reports.AuthorizeContentReadAsync(note.ReportId, actor, ct);
+                return Ok(new { reportId = report.Id, workId = report.WorkId });
+            }
+            if(request.ViewId == null && string.IsNullOrEmpty(request.JobId) && string.IsNullOrEmpty(request.ListReadId))try { await AggregateContentSnapshotJob.Schedule(db,HttpContext.RequestServices.GetService<Hangfire.IBackgroundJobClient>(),request.ReportId,ct); }
                 catch(Exception ex) { HttpContext.RequestServices.GetRequiredService<ILogger<AggregateContentController>>().LogWarning(ex,"Content snapshot dispatch remains pending"); }
             return Ok(textPart ? (object)await store.TextPart(targetId, reference, request.RowKey ?? "", request.Part, ct)
                 : await store.Page(targetId, reference, request.Offset, request.Limit, ct));

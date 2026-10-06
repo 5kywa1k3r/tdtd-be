@@ -121,20 +121,28 @@ public sealed class AdminImportService : IAdminImportService
             ? await UnitManagementScope.ResolveAsync(_ctx, me, ct) : null;
 
         var fmt = NormalizeFormat(format);
-        if (fmt == "csv")
-            return BuildCsvTemplate("user-import-template.csv", UserHeaders, new[]
-            {
-                new[] { "nguyenvana", "123456@Aa", "Nguyen Van A", "001", "TRUONG_PHONG", "", "" }
-            });
-
         var positions = await _ctx.Positions.Find(x => !x.IsDeleted).SortBy(x => x.Order).ThenBy(x => x.Code).ToListAsync(ct);
         var units = await _ctx.Units.Find(x => !x.IsDeleted && !x.IsVirtual &&
-            (userScope == null || (x.Code != null && x.Code.StartsWith(userScope)))).SortBy(x => x.Code).Limit(500).ToListAsync(ct);
+            (userScope == null || (x.Code != null && x.Code.StartsWith(userScope)))).SortBy(x => x.Code).ToListAsync(ct);
+        var unitTypes = await _ctx.UnitTypes.Find(x => !x.IsDeleted).ToListAsync(ct);
+        var exampleRows = new List<string[]>();
+        foreach (var unit in units)
+        {
+            if (string.IsNullOrWhiteSpace(unit.Code)) continue;
+            var unitType = unitTypes.FirstOrDefault(x => x.Code == unit.PrimaryUnitTypeCode);
+            if (unitType is null) continue;
+            var position = positions.FirstOrDefault(x => AccountAdministrationRules.PositionAllowed(x, unitType, unit));
+            if (position is null) continue;
+            exampleRows.Add(new[] { "nguyenvana", "123456@Aa", "Nguyễn Văn A", unit.Code, position.Code, "", "Dòng ví dụ: thay bằng người dùng cần nhập." });
+            break;
+        }
+        if (fmt == "csv")
+            return BuildCsvTemplate("user-import-template.csv", UserHeaders, exampleRows);
 
         using var wb = new XLWorkbook();
         var ws = wb.AddWorksheet("Users");
         WriteHeader(ws, UserHeaders);
-        WriteRow(ws, 2, new[] { "nguyenvana", "123456@Aa", "Nguyen Van A", "001", "TRUONG_PHONG", "", "" });
+        for (var i = 0; i < exampleRows.Count; i++) WriteRow(ws, i + 2, exampleRows[i]);
         ws.Columns().AdjustToContents();
 
         var positionWs = wb.AddWorksheet("Positions");

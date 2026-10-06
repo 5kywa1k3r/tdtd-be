@@ -145,17 +145,17 @@ public sealed class WorkAssignmentsController : ControllerBase
     }
 
     [HttpPost("work-assignments/{id}/deactivate")]
-    public async Task<ActionResult> Deactivate([FromRoute] string id, CancellationToken ct)
+    public async Task<ActionResult> Deactivate([FromRoute] string id, [FromBody] AssignmentEffectivenessCommand command, CancellationToken ct)
     {
-        if (!await _service.DeactivateAsync(id, GetActorUserId(), ct))
+        if (!await _service.DeactivateAsync(id, GetActorUserId(), ct, command.Reason))
             throw AppExceptionFactory.NotFound(AppErrorCode.WORK_ASSIGNMENT_NOT_FOUND, new { assignmentId = id });
         return NoContent();
     }
 
     [HttpPost("work-assignments/{id}/activate")]
-    public async Task<ActionResult> Activate([FromRoute] string id, CancellationToken ct)
+    public async Task<ActionResult> Activate([FromRoute] string id, [FromBody] AssignmentEffectivenessCommand command, CancellationToken ct)
     {
-        if (!await _service.ActivateAsync(id, GetActorUserId(), ct))
+        if (!await _service.ActivateAsync(id, GetActorUserId(), ct, command.Reason))
             throw AppExceptionFactory.NotFound(AppErrorCode.WORK_ASSIGNMENT_NOT_FOUND, new { assignmentId = id });
         return NoContent();
     }

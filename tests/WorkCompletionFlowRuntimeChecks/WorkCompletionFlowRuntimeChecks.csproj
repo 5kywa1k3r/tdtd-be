@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net8.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable><AssemblyName>tdtd-be.Tests</AssemblyName></PropertyGroup>
+  <ItemGroup><ProjectReference Include="../../tdtd-be.csproj" /></ItemGroup>
+  <ItemGroup><FrameworkReference Include="Microsoft.AspNetCore.App" /></ItemGroup>
+  <ItemGroup>
+    <Compile Include="../AggregateMappingRuntimeChecks/RuntimeFixture.cs" Link="RuntimeFixture.cs" />
+    <Compile Include="../AggregateMappingRuntimeChecks/PeriodicFixture.cs" Link="PeriodicFixture.cs" />
+    <Compile Include="../AggregateMappingRuntimeChecks/FixtureProvenanceChecks.cs" Link="FixtureProvenanceChecks.cs" />
+  </ItemGroup>
+</Project>

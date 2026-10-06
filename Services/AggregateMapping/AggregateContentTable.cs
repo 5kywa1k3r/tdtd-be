@@ -16,13 +16,18 @@ internal static class AggregateContentTable
             .ThenBy(i => Note(i).SourceKey, StringComparer.Ordinal))
         {
             budget.Spend(); var note = Note(item);
+            note = note with { UnitName = options.UnitDisplay switch {
+                null or "FULL_NAME" => note.UnitFullName ?? note.UnitName,
+                "SHORT_NAME" => note.UnitShortName ?? "",
+                "SYMBOL" => note.UnitSymbol ?? "", "NONE" => "",
+                _ => throw new AggregatePreviewException("AGG_CONTENT_UNIT_DISPLAY") } };
             if (item.Value.Type != "TEXT" || item.Value.State is not ("VALUE" or "BLANK")) throw new AggregatePreviewException("AGG_SOURCE_VALUE_INVALID");
             var occurrence = occurrences.GetValueOrDefault(note.SourceKey); occurrences[note.SourceKey] = occurrence + 1;
             // Stable source identity excludes payload revision/text/display order. Repeated
             // contributions retain their multiplicity, even if values and sources match.
             note = note with { RowKey = AggregateDigest.Of(new { note.SourceKey, occurrence }) };
             notes.Add(note);
-            rows.Add([new(new("TEXT", "VALUE", Text: note.UnitName), item.Trace), new(item.Value, item.Trace)]);
+            rows.Add([new(new("TEXT", "VALUE", Text: note.UnitName), item.Trace), new(AggregateTextProjection.ForContent(item.Value), item.Trace)]);
         }
         var schema = new AggregateTableSchema("REPORT_TEXT_TABLE_V1", "vertical", ["unit", "content"],
             notes.Select(n => n.RowKey).ToArray(), [["TEXT", "TEXT"]]);

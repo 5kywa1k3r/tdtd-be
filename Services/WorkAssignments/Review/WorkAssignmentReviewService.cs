@@ -351,6 +351,11 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
         var isHistoricalApproval = report.IsHistoricalData;
         var confirmsPreviouslyAutoApprovedReport = WorkAssignmentAutoApprovalState.IsAutoApproved(report);
 
+        if (isHistoricalApproval && !report.CompletedDate.HasValue)
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_HISTORICAL_COMPLETED_DATE_REQUIRED,
+                new { reportId = report.Id, workReportPeriodId = report.WorkReportPeriodId });
+
         if (isHistoricalApproval && !req.ConfirmHistoricalDataApproval)
             throw AppExceptionFactory.BadRequest(
                 AppErrorCode.WORK_ASSIGNMENT_REPORT_HISTORICAL_APPROVAL_CONFIRMATION_REQUIRED,
@@ -428,8 +433,7 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
             ct);
 
         var returnApproved = report.Status == WorkAssignmentReportStatus.Approved
-            && !DynamicFlowBranchVisibility.IsFlowAssignment(assignment)
-            && await tdtd_be.Services.AggregateMapping.Persistence.AggregateHostIntegration.IsPeriodicWorkAsync(_ctx, report.WorkId, ct);
+            && !DynamicFlowBranchVisibility.IsFlowAssignment(assignment);
         if (report.Status != WorkAssignmentReportStatus.Submitted && !returnApproved)
             throw InvalidReportStatus(
                 AppErrorCode.WORK_ASSIGNMENT_REPORT_RETURN_STATUS_INVALID,
@@ -441,7 +445,6 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
         if (returnApproved)
         {
             var period = await _ctx.WorkReportPeriods.Find(p => p.Id == report.WorkReportPeriodId && !p.IsDeleted).FirstOrDefaultAsync(ct);
-            await EnsureNoLaterApprovedReportsAsync(period, ct);
             WorkAssignmentHistoricalMutationPolicy.EnsureApprovedMutationAllowed(report, period, me, "REVIEW_RETURN", now);
         }
         var returnCommitted = await TryCommitLifecycleCommandAsync(
@@ -526,7 +529,8 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
         var period = await _ctx.WorkReportPeriods
             .Find(x => x.Id == report.WorkReportPeriodId && !x.IsDeleted)
             .FirstOrDefaultAsync(ct);
-        await EnsureNoLaterApprovedReportsAsync(period, ct);
+        if (DynamicFlowBranchVisibility.IsFlowAssignment(assignment))
+            await EnsureNoLaterApprovedReportsAsync(period, ct);
 
         var now = DateTime.UtcNow;
         WorkAssignmentHistoricalMutationPolicy.EnsureApprovedMutationAllowed(
@@ -534,7 +538,7 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
             period,
             me,
             "REVIEW_RECALL_APPROVED",
-            now);
+            now, useUpdatedAt: !DynamicFlowBranchVisibility.IsFlowAssignment(assignment));
 
         var recallCommitted = await TryCommitLifecycleCommandAsync(
             report,
@@ -608,7 +612,7 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
             .Find(x => x.Id == report.WorkReportPeriodId && !x.IsDeleted)
             .FirstOrDefaultAsync(ct);
 
-        if (report.Status == WorkAssignmentReportStatus.Approved)
+        if (report.Status == WorkAssignmentReportStatus.Approved && DynamicFlowBranchVisibility.IsFlowAssignment(assignment))
             await EnsureNoLaterApprovedReportsAsync(period, ct);
 
         var now = DateTime.UtcNow;
@@ -619,7 +623,7 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
                 period,
                 me,
                 "REVIEW_DEACTIVATE_REPORT",
-                now);
+                now, useUpdatedAt: !DynamicFlowBranchVisibility.IsFlowAssignment(assignment));
         }
 
         var comment = NormalizeOptionalText(req.Comment);
@@ -723,7 +727,7 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
                 period,
                 me,
                 "REVIEW_REACTIVATE_REPORT",
-                now);
+                now, useUpdatedAt: !DynamicFlowBranchVisibility.IsFlowAssignment(assignment));
         }
 
         var comment = NormalizeOptionalText(req.Comment);
@@ -1103,6 +1107,8 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
                     WorkReportLifecycleCommandContract.BuildCommitFilter(report, command, expectedStatus, expectedIsActive))
                     .FirstOrDefaultAsync(transactionCt);
                 if (current is null) return false;
+                await tdtd_be.Services.WorkAssignments.Progress.WorkExecutionScopeGuard.EnsureOpenAsync(
+                    _ctx, current.WorkAssignmentId, current.WorkReportPeriodId, transactionCt, session);
                 await tdtd_be.Services.AggregateMapping.Persistence.AggregateHostIntegration.LifecycleAsync(
                     _ctx, session, _transactions, current, command.Operation, actorUserId, command.CommandId,
                     resultStatus, command.ExpectedLifecycleRevision + 1, transactionCt);
@@ -1117,6 +1123,10 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
                     cancellationToken: transactionCt);
                 if (reportResult.ModifiedCount != 1)
                     throw new tdtd_be.Services.AggregateMapping.AggregatePreviewException("AGG_REVISION_CONFLICT");
+                if (resultStatus == WorkAssignmentReportStatus.Approved && resultIsActive)
+                    await tdtd_be.Services.WorkAssignments.Progress.WorkExecutionScopeGuard.RecordFirstApprovalAsync(
+                        _ctx, session, current.WorkAssignmentId, committedAtUtc, transactionCt,
+                        current.WorkReportPeriodId, current.Status);
                 await tdtd_be.Services.AggregateMapping.Persistence.AggregateHostIntegration.InvalidateReportAsync(
                     _ctx, session, current, command.CommandId, transactionCt);
 
@@ -1242,7 +1252,7 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
             WorstOverdueReasonLabel = x.WorstOverdueReasonLabel
         };
 
-    private static ReviewSummaryRowDto MapToReviewSummaryRow(ReviewAssignmentSummaryDocRole x)
+    private static ReviewSummaryRowDto MapToReviewSummaryRow(ReviewAssignmentSummaryDocRole x, WorkAssignment? assignment)
         => new()
         {
             AssignmentId = x.AssignmentId,
@@ -1251,6 +1261,13 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
             DynamicExcelId = x.DynamicExcelId,
             DynamicExcelCode = x.DynamicExcelCode,
             DynamicExcelName = x.DynamicExcelName,
+
+            DynamicFormTemplateId = assignment?.DynamicFormTemplateId ?? x.DynamicFormTemplateId,
+            DynamicFormTemplateCode = assignment?.DynamicFormTemplateCode ?? x.DynamicFormTemplateCode,
+            DynamicFormTemplateName = assignment?.DynamicFormTemplateName ?? x.DynamicFormTemplateName,
+            DynamicFormFamilyId = assignment?.DynamicFormFamilyId,
+            DynamicFormVersionNo = assignment?.DynamicFormVersionNo,
+            DynamicFormSchemaHash = assignment?.DynamicFormSchemaHash,
 
             Assignees = (x.Assignees ?? new List<UserRef>())
                 .Select(a => new ReviewSummaryAssigneeDto
@@ -1413,7 +1430,15 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
             .Limit(pageSize)
             .ToListAsync(ct);
 
-        var resultRows = rows.Select(MapToReviewSummaryRow).ToList();
+        // Read the assigned pin, never the latest published Form. This also serves
+        // existing projections without a backfill or a write during a query.
+        var pageAssignmentIds = rows.Select(x => x.AssignmentId).Distinct().ToList();
+        var pageAssignments = await _ctx.WorkAssignments
+            .Find(x => x.WorkId == req.WorkId && pageAssignmentIds.Contains(x.Id) && !x.IsDeleted)
+            .ToListAsync(ct);
+        var pageAssignmentById = pageAssignments.ToDictionary(x => x.Id, StringComparer.Ordinal);
+        var resultRows = rows.Select(x => MapToReviewSummaryRow(x,
+            pageAssignmentById.TryGetValue(x.AssignmentId, out var assignment) ? assignment : null)).ToList();
 
         return new PagedResult<ReviewSummaryRowDto>(resultRows, total, page, pageSize);
     }

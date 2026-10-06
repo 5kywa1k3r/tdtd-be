@@ -68,7 +68,9 @@ internal sealed class AggregateListReadScopes(MongoDbContext db, IWorkReportPayl
         foreach (var form in evidence.Forms)
         {
             var schema = await reader.ReadSchemaAsync(form, authority.Read, actor, ct);
-            var listing = await reader.ListSourcesAsync(authority.Read, form, actor, ct);
+            // A page entitlement checks actual report identities and authority. It
+            // does not calculate expected schedule coverage (including future slots).
+            var listing = await reader.ListReportSetSourcesAsync(authority.Read, form, actor, ct);
             if (!listing.Complete || listing.Headers.Any(h => !h.WholeReportReadable) || listing.Slots.Any(s => !s.Readable))
                 throw new AggregatePreviewException("AGG_SOURCE_UNAVAILABLE");
             foreach (var header in listing.Headers) reports.Add(header.Pin.ReportId);
@@ -91,7 +93,7 @@ internal sealed class AggregateListReadScopes(MongoDbContext db, IWorkReportPayl
     {
         if (node.ValueKind == JsonValueKind.Object)
         {
-            if (node.TryGetProperty("kind", out var kind) && kind.ValueKind == JsonValueKind.String && kind.GetString() is AggregateListWire.Kind or AggregateContentTableStore.Kind)
+            if (node.TryGetProperty("kind", out var kind) && kind.ValueKind == JsonValueKind.String && (AggregateListWire.Supported(kind.GetString()) || kind.GetString() == AggregateContentTableStore.Kind))
                 yield return node.Clone();
             else foreach (var p in node.EnumerateObject()) foreach (var value in References(p.Value)) yield return value;
         }

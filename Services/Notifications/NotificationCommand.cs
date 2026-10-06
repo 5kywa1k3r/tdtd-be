@@ -12,6 +12,7 @@ public sealed class NotificationCommand
     public string? WorkId { get; set; }
     public WorkType? WorkType { get; set; }
     public string? WorkName { get; set; }
+    public string? AssignmentName { get; set; }
     public string? WorkAssignmentId { get; set; }
     public string? AssignmentCode { get; set; }
     public string? WorkReportPeriodId { get; set; }

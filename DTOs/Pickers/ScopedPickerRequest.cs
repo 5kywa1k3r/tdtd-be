@@ -28,4 +28,8 @@ public sealed class ScopedPickerRequest
 }
 
 // Internal read scope; never serialized as the picker response.
-public sealed record AssignmentPickerScope(List<Unit> Units, List<AppUser> Users, HashSet<string> SelectableUnitIds);
+public sealed record AssignmentPickerScope(List<Unit> Units, List<AppUser> Users, HashSet<string> SelectableUnitIds)
+{
+    public Dictionary<string, Unit> UserConflicts { get; init; } = new(StringComparer.Ordinal);
+    public long? UserTotalRows { get; init; }
+}

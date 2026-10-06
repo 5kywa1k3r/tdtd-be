@@ -4,6 +4,11 @@ namespace tdtd_be.DashboardModel.DTOs;
 
 public sealed class DashboardOverviewRequest
 {
+    // Opt-in; callers without View retain the legacy five-mode contract.
+    public string? View { get; set; }
+    public string? Section { get; set; }
+    public string? FromDate { get; set; }
+    public string? ToDate { get; set; }
     public string? Mode { get; set; }
     public DateTime? FromUtc { get; set; }
     public DateTime? ToUtc { get; set; }
@@ -15,6 +20,9 @@ public sealed class DashboardOverviewRequest
 
 public sealed class DashboardOverviewResponse
 {
+    public DashboardLeadershipDto? Leadership { get; set; }
+    public string ScopeLabel { get; set; } = string.Empty;
+    public DateTime GeneratedAtUtc { get; set; }
     public string Mode { get; set; } = string.Empty;
     public DashboardRangeDto Range { get; set; } = new();
     public List<DashboardOverviewMetricDto> Cards { get; set; } = new();

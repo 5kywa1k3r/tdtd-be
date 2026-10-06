@@ -9,7 +9,11 @@ internal sealed record AggregateAuthorityFacts(
     bool SameWork, bool DirectChild, bool IntermediateSameContext, bool CanEditReport, bool CanSubmitReport,
     bool CanReviewReport, bool CanReadLineage, bool MutationScopeOpen,
     bool TargetActive, string TargetStatus, bool TargetLockedByConsumer,
-    bool ConfigReadable, bool IsAssignmentAssignee, bool OwnerScopeMatches, bool DelegationValid);
+    bool ConfigReadable, bool IsAssignmentAssignee, bool OwnerScopeMatches, bool DelegationValid)
+{
+    // A selected reopened period does not grant edits to a configuration shared by all periods.
+    public bool? ConfigMutationScopeOpen { get; init; }
+}
 
 internal enum AggregateAction
 {
@@ -33,7 +37,8 @@ internal static class AggregateMappingPolicy
             return facts.SameWork && facts.CanReadLineage && facts.WholeSourceReadable
                 ? new(true, null) : Deny("AGG_SOURCE_UNAVAILABLE");
         if (action == AggregateAction.EditConfig)
-            return facts.IsAssignmentAssignee && facts.OwnerScopeMatches && facts.TargetActive && facts.MutationScopeOpen
+            return facts.IsAssignmentAssignee && facts.OwnerScopeMatches && facts.TargetActive &&
+                (facts.ConfigMutationScopeOpen ?? facts.MutationScopeOpen)
                 ? new(true, null) : Deny("AGG_CONFIG_EDIT_FORBIDDEN");
         if (!facts.TargetActive || !facts.MutationScopeOpen)
             return Deny("AGG_MUTATION_SCOPE_CLOSED");

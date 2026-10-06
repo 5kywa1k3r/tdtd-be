@@ -44,6 +44,9 @@ public sealed partial class WorkAssignmentService
                 filter & Builders<WorkAssignment>.Filter.Eq(a => a.UpdatedAtUtc, observed.UpdatedAtUtc), update, cancellationToken: token);
             if (result.ModifiedCount != 1) throw new AggregatePreviewException("AGG_REVISION_CONFLICT");
             await WorkDirectSourceRevisionFence.IncrementAsync(_ctx, session, current.WorkId, token);
+            await AggregateHostIntegration.RelationshipAsync(_ctx, session, current.WorkId, [current.Id],
+                "ASSIGNMENT_FILTER_COMPLETION:" + current.Id + ":" + completedDate.Ticks,
+                token, preserveIdentity: true);
             return result;
         }, ct);
     }

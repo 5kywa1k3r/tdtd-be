@@ -11,6 +11,20 @@ namespace tdtd_be.Services.AggregateMapping.Persistence;
 
 internal static partial class AggregateHostIntegration
 {
+    internal static async Task EffectivenessAsync(MongoDbContext db, IClientSessionHandle session,
+        string workId, string assignmentId, string eventId, CancellationToken ct)
+    {
+        // All descendants inherit effectiveness, but retain their own IsActive/completion flags.
+        // Check every frozen consumer before changing membership and invalidate every affected target.
+        var nodes = await db.WorkAssignments.Find(session, a => a.WorkId == workId && !a.IsDeleted)
+            .Project(a => new { a.Id, a.ParentAssignmentId }).ToListAsync(ct);
+        var children = nodes.Where(a => a.ParentAssignmentId != null).ToLookup(a => a.ParentAssignmentId!);
+        var affected = new HashSet<string> { assignmentId };
+        var pending = new Queue<string>(); pending.Enqueue(assignmentId);
+        while (pending.TryDequeue(out var id))
+            foreach (var child in children[id]) if (affected.Add(child.Id)) pending.Enqueue(child.Id);
+        await RelationshipAsync(db, session, workId, affected.ToArray(), eventId, ct);
+    }
     internal static Task<bool> IsPeriodicWorkAsync(MongoDbContext db, string workId, CancellationToken ct)
         => db.Db.GetCollection<BsonDocument>(AggregateCollections.Configs).Find(new BsonDocument("workId", workId)).AnyAsync(ct);
     internal static async Task<bool> PeriodicOwnedAsync(MongoDbContext db, string reportId, CancellationToken ct)
@@ -91,20 +105,14 @@ internal static partial class AggregateHostIntegration
     }
 
     internal static async Task<int> DispatchAsync(MongoDbContext db, IDynamicFlowDefinitionTransactionRunner transactions, IConfiguration configuration,
-        int limit, CancellationToken ct)
+        int limit, CancellationToken ct, string? workId = null)
     {
         // This is a handler in the existing lifecycle dispatcher, never a new scheduler.
         if (!AggregateIntegrationGate.RuntimeReady(configuration)) return 0;
-        var rows = await db.Db.GetCollection<BsonDocument>(AggregateCollections.Refresh)
-            .Find(new BsonDocument("keys", "PENDING")).Sort(new BsonDocument("_id", 1)).Limit(Math.Clamp(limit, 1, 100)).ToListAsync(ct);
-        var payload = new WorkReportPayloadService(db);
-        var service = new AggregateRefreshService(new AggregateMongoStore(db, transactions, payload, payload), new AggregateMongoCommandReader(db, payload, AggregateIntegrationGate.V2Ready(configuration)));
-        foreach (var row in rows)
-        {
-            var intent = AggregateMongoTransaction.Read<AggregateRefreshIntent>(row).Value;
-            await service.RunAsync(intent.InstanceId, intent.Generation, ct);
-        }
-        return rows.Count;
+        Hangfire.IBackgroundJobClient? jobs;
+        try { jobs = new Hangfire.BackgroundJobClient(); }
+        catch (InvalidOperationException) { return 0; }
+        return await AggregateMaterializationDispatch.Schedule(db, transactions, jobs, limit, ct, workId);
     }
 
     internal static async Task SeedInstanceAsync(MongoDbContext db, IClientSessionHandle session, WorkAssignmentReport report, CancellationToken ct)

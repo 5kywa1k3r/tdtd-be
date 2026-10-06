@@ -71,6 +71,9 @@ internal static class NativeTableStatisticCalculator
                 throw NativeStatisticCalculationError.Invalid("SOURCE_MEMBERSHIP_DUPLICATE_OR_DRIFT");
             // Reject errors and invalid values even if a type filter would exclude the cell.
             DynamicFormNativeTableValues.ValidateEnvelope(tables, schemaHash, source.Values, submitting: true);
+            // Membership and envelope checks also apply to a plan with no
+            // operations. Such a plan does not need to index paged content.
+            if (plan.Targets.Count == 0) continue;
             var index = IndexSource(source.Values, tables);
             for (var ti = 0; ti < plan.Targets.Count; ti++)
             {

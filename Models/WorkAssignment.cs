@@ -84,6 +84,27 @@ public sealed class WorkAssignment : BaseEntity
     [BsonElement("completedAtUtc")]
     public DateTime? CompletedAtUtc { get; set; }
 
+    [BsonElement("firstApprovedAtUtc")]
+    public DateTime? FirstApprovedAtUtc { get; set; }
+
+    [BsonElement("completionRevision")]
+    public long CompletionRevision { get; set; }
+
+    [BsonElement("completionMode")]
+    public string? CompletionMode { get; set; }
+
+    [BsonElement("pendingCompletionRequestId")]
+    public string? PendingCompletionRequestId { get; set; }
+
+    [BsonElement("completionReopenedAtUtc")]
+    public DateTime? CompletionReopenedAtUtc { get; set; }
+
+    [BsonElement("completionReviewPeriodId")]
+    public string? CompletionReviewPeriodId { get; set; }
+
+    [BsonElement("completionProjectionPending")]
+    public bool CompletionProjectionPending { get; set; }
+
     [BsonElement("completedByUserId")]
     [BsonRepresentation(BsonType.ObjectId)]
     public string? CompletedByUserId { get; set; }

@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType><TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable>
+    <ProductOutputPath Condition="'$(ProductOutputPath)' == ''">../../bin/Debug/net8.0</ProductOutputPath>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="$(ProductOutputPath)/*.dll" />
+    <PackageReference Include="MongoDB.Driver" Version="3.6.0" />
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+</Project>

@@ -12,6 +12,12 @@ namespace tdtd_be.Services.AggregateMapping;
 
 internal static class AggregateNativePayloadAdapter
 {
+    // Only a report's untouched target draft has no native payload yet. An
+    // Approved source or a previously saved/malformed payload stays strict.
+    internal static bool IsUninitializedTarget(WorkReportPayloadSnapshot payload) =>
+        payload.PayloadRevision <= 1 && payload.Values1DJson.Trim() == "[]"
+        && (string.IsNullOrWhiteSpace(payload.FieldValuesJson) || payload.FieldValuesJson.Trim() is "{}" or "{\"values\":{}}")
+        && (string.IsNullOrWhiteSpace(payload.TableValuesJson) || payload.TableValuesJson.Trim() == "{}");
     internal static JsonArray ListRecords(DynamicFormNativeTableDto definition, AggregateListValue? list,
         Func<AggregateListRow, string> identity)
     {
@@ -44,7 +50,7 @@ internal static class AggregateNativePayloadAdapter
         // Validate immutable published snapshot against live structure, never mutate/backfill.
         DynamicFormPublishedSchemaSnapshotBuilder.ValidateAgainstTemplate(template);
         var fields = JsonSerializer.Deserialize<List<DynamicFormFieldDto>>(template.FieldsJson, Json) ?? [];
-        var members = fields.Where(f => f.Type != "evidence").ToDictionary(f => f.Id!, f => new AggregateMember(f.Id!, Type(f.Type),
+        var members = fields.Where(f => f.Type != "evidence").ToDictionary(f => f.Id!, f => new AggregateMember(f.Id!, FieldType(f.Type),
             AllowedChoiceCodes: Type(f.Type) is "CHOICE_ONE" or "CHOICE_MANY"
                 ? (f.ValueSource?.Options ?? f.Options ?? []).Select(o => o.Code!).ToArray() : null));
         foreach (var table in DynamicFormNativeTableDefinition.ReadStored(template.NativeTablesVersion, template.TablesJson) ?? [])
@@ -87,7 +93,8 @@ internal static class AggregateNativePayloadAdapter
                 if (found) throw new AggregatePreviewException("AGG_SOURCE_VALUE_AMBIGUOUS");
                 found = true; value = alias;
             }
-            try { values[definition.Id!] = found ? Scalar(value, member.Type) : AggregateValue.Blank(member.Type); }
+            try { values[definition.Id!] = (found ? definition.Type == "stringList" ? StringListBlock(value) : Scalar(value, member.Type) : AggregateValue.Blank(member.Type))
+                with { TextFormat = definition.Type == "richText" ? "RICH_HTML" : definition.Type == "stringList" ? AggregateTextPolicy.StringListBlock : null }; }
             catch (AggregatePreviewException) when (header == null)
             {
                 // Previous target data can be an invalid draft. Preserve it for the diff;
@@ -96,6 +103,12 @@ internal static class AggregateNativePayloadAdapter
             }
         }
         if (!schema.Members.Values.Any(m => m.Table != null || m.List != null)) return values;
+        if (header == null && IsUninitializedTarget(payload))
+        {
+            foreach (var member in schema.Members.Values.Where(m => m.Table != null || m.List != null))
+                values[member.Id] = AggregateValue.NoResult(member.Type);
+            return values;
+        }
         DynamicFormNativeTableValues.Validate(template, schema.Pin.SchemaHash, payload.TableValuesJson, submitting: false, optionSets: listOptions);
         using var tablesDoc = JsonDocument.Parse(payload.TableValuesJson!);
         var native = tablesDoc.RootElement.GetProperty("nativeTables").GetProperty("tables");
@@ -179,6 +192,18 @@ internal static class AggregateNativePayloadAdapter
                 return t.Fields!.Select(f => resolve(f.Id!, null).ValueSource)
                     .Where(s => s?.SourceType == "ENUM_CATALOG").Select(s => s!.CatalogId!);
             }).Distinct(StringComparer.Ordinal);
+    // Field-only presentation adapter. Native Table/List cell contracts are unchanged.
+    internal static string FieldType(string? type) => type == "stringList" ? "TEXT" : Type(type);
+    private static AggregateValue StringListBlock(JsonElement value)
+    {
+        if (value.ValueKind == JsonValueKind.Null) return AggregateValue.Blank("TEXT");
+        if (value.ValueKind != JsonValueKind.Array || value.EnumerateArray().Any(v => v.ValueKind != JsonValueKind.String))
+            throw new AggregatePreviewException("AGG_SOURCE_VALUE_INVALID");
+        var items = value.EnumerateArray().Select(v => v.GetString()!).ToArray();
+        if (items.Any(s => string.IsNullOrWhiteSpace(s) || s != s.Trim()) || items.Distinct(StringComparer.Ordinal).Count() != items.Length)
+            throw new AggregatePreviewException("AGG_SOURCE_VALUE_INVALID");
+        return items.Length == 0 ? AggregateValue.Blank("TEXT") : new("TEXT", "VALUE", Text: string.Join("\n", items));
+    }
     private static string Type(string? type) => type switch
     {
         "number" => "NUMBER", "longText" or "richText" or "plainText" => "TEXT",

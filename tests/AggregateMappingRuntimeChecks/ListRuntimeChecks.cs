@@ -10,6 +10,7 @@ using tdtd_be.DTOs.AggregateMapping;
 using tdtd_be.DTOs.DynamicForms;
 using tdtd_be.Models;
 using tdtd_be.Models.Enums;
+using tdtd_be.Enum;
 using tdtd_be.Services;
 using tdtd_be.Services.AggregateMapping;
 using tdtd_be.Services.AggregateMapping.Persistence;
@@ -22,7 +23,7 @@ using tdtd_be.Services.WorkAssignmentReports.Runtime;
 internal static class ListRuntimeChecks
 {
     internal static async Task Run(MongoDbContext db, IDynamicFlowDefinitionTransactionRunner runner, IConfiguration configuration,
-        string run, Func<string, object, string?, HttpStatusCode, Task<JsonElement>> post, CancellationToken ct, bool browserFixture = false, bool browserPeriodic = false, bool browserPaging = false)
+        string run, Func<string, object, string?, HttpStatusCode, Task<JsonElement>> post, CancellationToken ct, bool browserFixture = false, bool browserPeriodic = false, bool browserPaging = false, bool operatorsV3 = false)
     {
         if(browserFixture)await Mode(browserPeriodic);else {await Mode(false);await Mode(true);}
         async Task Mode(bool periodic)
@@ -47,7 +48,13 @@ internal static class ListRuntimeChecks
                     new() { Order = 6, Target = new() { Scope = "column", FieldId = "active" }, Spec = new() { Type = "boolean", Required = false } }] } };
             var f = await RuntimeFixture.Seed(db, run + "-" + suffix, ct, configureForm: (form, target) => {
                 if (!target) form.FieldsJson = "[]";
-                form.NativeTablesVersion = 2; form.TablesJson = JsonSerializer.Serialize(new[] { table }, AggregateCanonical.Json);
+                var tables=new List<DynamicFormNativeTableDto>{table};
+                if(target&&operatorsV3){
+                    var fields=new[]{"left_","right_"}.SelectMany(prefix=>table.Fields.Select(field=>field with {Id=prefix+field.Id,Name=prefix+field.Name})).Select((field,index)=>field with {Order=index}).ToList();
+                    var rules=new[]{"left_","right_"}.SelectMany(prefix=>table.TypeConfig!.Rules!.Select(rule=>rule with {Target=rule.Target! with {FieldId=prefix+rule.Target!.FieldId}})).Select((rule,index)=>rule with {Order=index+1}).ToList();
+                    tables.Add(table with {Id="wide",Name="Nối ngang — Dữ liệu giả",Fields=fields,Presentation=table.Presentation! with {SummaryFieldIds=["left_name","right_name"]},TypeConfig=table.TypeConfig! with {Sequence=12,Rules=rules}});
+                }
+                form.NativeTablesVersion = 2; form.TablesJson = JsonSerializer.Serialize(tables, AggregateCanonical.Json);
             }, publishForm: browserFixture ? (form, token) => ListL4BrowserFixture.Publish(db,form,catalogId,run,token) : null);
             var payloads = new WorkReportPayloadService(db); var store = new AggregateMongoStore(db, runner, payloads, payloads);
             var sourceBinding = await db.WorkTemplateAssignees.Find(b => b.WorkAssignmentId == f.Source.WorkAssignmentId).SingleAsync(ct);
@@ -57,8 +64,12 @@ internal static class ListRuntimeChecks
             if (periodic)
             {
                 var schedule = new AssignmentSchedule { CycleType = "MONTHLY", StartDate = new DateTime(2026, 9, 1), MonthDays = [30] };
-                await db.WorkAssignments.UpdateManyAsync(a => a.WorkId == f.WorkId, Builders<WorkAssignment>.Update.Set(a => a.AssignmentType, "PERIODIC").Set(a => a.Schedule, schedule), cancellationToken: ct);
-                await db.WorkTemplateAssignees.UpdateManyAsync(b => b.WorkId == f.WorkId, Builders<WorkTemplateAssignee>.Update.Set(b => b.AssignmentType, "PERIODIC").Set(b => b.Schedule, schedule).Set(b => b.DueDate, new DateTime(2026, 10, 30)), cancellationToken: ct);
+                // Aggregate context kind is PERIODIC; persisted assignments use the product's PERIODIC_REPORT type.
+                await db.WorkAssignments.UpdateManyAsync(a => a.WorkId == f.WorkId, Builders<WorkAssignment>.Update.Set(a => a.AssignmentType, WorkAssignmentTypes.PeriodicReport).Set(a => a.Schedule, schedule), cancellationToken: ct);
+                await db.WorkTemplateAssignees.UpdateManyAsync(b => b.WorkId == f.WorkId, Builders<WorkTemplateAssignee>.Update.Set(b => b.AssignmentType, WorkAssignmentTypes.PeriodicReport).Set(b => b.Schedule, schedule).Set(b => b.DueDate, new DateTime(2026, 10, 30)), cancellationToken: ct);
+                Check(await db.WorkAssignments.CountDocumentsAsync(a=>a.WorkId==f.WorkId&&a.AssignmentType!=WorkAssignmentTypes.PeriodicReport,cancellationToken:ct)==0
+                    &&await db.WorkTemplateAssignees.CountDocumentsAsync(b=>b.WorkId==f.WorkId&&b.AssignmentType!=WorkAssignmentTypes.PeriodicReport,cancellationToken:ct)==0,
+                    "fixture assignment/binding type matches the product periodic contract");
                 f.Report.PeriodKey = "20261030"; f.Report.PeriodInstanceKey = f.Binding.Id + ":20261030";
                 f.Source.PeriodKey = "20260930"; f.Source.PeriodInstanceKey = sourceBinding.Id + ":20260930";
                 source2.PeriodKey = "20261030"; source2.PeriodInstanceKey = sourceBinding.Id + ":20261030";
@@ -77,7 +88,7 @@ internal static class ListRuntimeChecks
                 await db.WorkTemplateAssignees.InsertOneAsync(secondBinding, cancellationToken: ct);
                 source2.WorkAssignmentId = child.Id; source2.PeriodInstanceKey = secondBinding.Id + ":ONCE";
             }
-            if(browserFixture){
+            if(browserFixture||operatorsV3){
                 // The periodic setup changed the stored schedule after these objects were loaded.
                 // Re-read before attaching fixture units so a replacement cannot restore ONCE.
                 if(periodic){sourceBinding=await db.WorkTemplateAssignees.Find(b=>b.Id==sourceBinding.Id).SingleAsync(ct);secondBinding=sourceBinding;}
@@ -110,8 +121,8 @@ internal static class ListRuntimeChecks
                 report.PayloadRevision = saved.PayloadRevision; report.PayloadHash = saved.PayloadHash; report.PayloadSizeBytes = saved.PayloadSizeBytes; report.PayloadStatus = saved.PayloadStatus;
                 await db.WorkAssignmentReports.ReplaceOneAsync(r => r.Id == report.Id, report, new ReplaceOptions { IsUpsert = true }, ct);
             }
-            await SaveSource(f.Source, browserFixture ? browserPaging ? Enumerable.Range(1,22).ToArray() : [12, 9] : [12, 9, 6, 3]);
-            await SaveSource(source2, browserFixture ? browserPaging ? Enumerable.Range(23,23).ToArray() : [11, 10, 8] : [11, 10, 8, 2]);
+            await SaveSource(f.Source, browserFixture||operatorsV3 ? browserPaging ? Enumerable.Range(1,22).ToArray() : [12, 9] : [12, 9, 6, 3]);
+            await SaveSource(source2, browserFixture||operatorsV3 ? browserPaging ? Enumerable.Range(23,23).ToArray() : [11, 10, 8] : [11, 10, 8, 2]);
             // Exercise the authoritative validator without editing any stored/published form.
             var optionSets = new Dictionary<string, RuntimeEnumOptionSet> { [catalogId] = new(catalogId, new HashSet<string> { "A", "B" }) };
             DynamicFormNativeTableValues.Validate(f.SourceForm, f.Source.DynamicFormSchemaHash, Values(f.Source, [12, 9, 6, 3]), true, optionSets);
@@ -189,6 +200,7 @@ internal static class ListRuntimeChecks
                     new() { Id = "t", Kind = "TARGET", Form = Pin(f.TargetForm), Inputs = [new("rows", "LIST", "SINGLE", "items"), new("sum", "NUMBER", "SINGLE", "total")], Outputs = [] }],
                 Edges = [new("e1", new("s", "out"), new("c", "in")), new("e2", new("c", "rows"), new("t", "rows")), new("e3", new("c", "sum"), new("t", "sum"))],
                 TimeRules = [new() { Id = "w", Mode = periodic ? "CUMULATIVE_FROM" : "TARGET_DATA_WINDOW", StartDate = periodic ? "2026-09-01" : null, SourceDateBasis = "DECLARED_DATA_WINDOW", Match = "CONTAINED" }] };
+            if(operatorsV3){await ExtendedRuntimeChecks.Run(db,store,payloads,f,source2,context,recipe,run+suffix,post,runner,configuration,run,ct);return;}
             var config = await Call("configs", new AggregateConfigCreateCommandDto(context, new(run + suffix + "config", context.BindingId, Pin(f.TargetForm), recipe)));
             var configId = config.GetProperty("id").GetString()!;
             var version = (await store.ExecuteAsync((tx, token) => tx.GetAsync<AggregateConfigVersion>(AggregateCollections.Versions, AggregateCommandService.VersionKey(configId, 1), token), ct))!.Value;

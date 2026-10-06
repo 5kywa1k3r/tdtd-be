@@ -38,7 +38,7 @@ foreach (var legacy in new[] { true, false }) {
 actor.AccountKind = ManagementAccountKind.UnitManager;
 Check(!WorkAssignmentTargetScopeValidator.CanAssignTarget(actor, actorUnit, actor, units, true, policy), "self");
 Check(!WorkAssignmentTargetScopeValidator.CanAssignTarget(actor, null, new AppUser(), units, true, policy), "actor unit missing");
-foreach (var (unit, kind, expected) in new[] { ("peer", ManagementAccountKind.UnitManager, true), ("commune", ManagementAccountKind.UnitManager, true), ("outside", ManagementAccountKind.UnitManager, false), ("child", ManagementAccountKind.NormalUser, false) })
+foreach (var (unit, kind, expected) in new[] { ("peer", ManagementAccountKind.UnitManager, true), ("commune", ManagementAccountKind.UnitManager, true), ("outside", ManagementAccountKind.UnitManager, false), ("child", ManagementAccountKind.NormalUser, true) })
     Check(WorkAssignmentTargetScopeValidator.CanAssignTarget(actor, actorUnit, new AppUser { Id = "target", UnitId = unit, AccountKind = kind }, units, true, policy) == expected, $"expected {unit}/{kind}");
 
 var grandchild = new Unit { Id = "grandchild", Code = "100001001001", Level = 5, ParentUnitId = "child" };
@@ -78,7 +78,7 @@ foreach (var unit in new[] { "a", "peer", "child", "outside" })
 foreach (var descendants in new[] { true, false })
 {
     var target = new AppUser { Id = "leader-target", UnitId = unit, AccountKind = ManagementAccountKind.NormalUser, PositionCode = position };
-    var expected = unit == "a" && (!descendants || position.Trim().ToUpperInvariant() is "TRUONG_PHONG" or "PHO_TRUONG_PHONG" or "PHO_TRUONG_PHONG_PHU_TRACH");
+    var expected = unit is "a" or "child";
     Check(WorkAssignmentTargetScopeValidator.CanAssignTarget(actor, actorUnit, target, units, descendants, policy) == expected, $"leader read {unit}/{position}/{descendants}");
     bool write = true;
     try { WorkAssignmentTargetScopeValidator.EnsureCanAssignTargets(actor, actorUnit, [target], units, descendants, policy); }

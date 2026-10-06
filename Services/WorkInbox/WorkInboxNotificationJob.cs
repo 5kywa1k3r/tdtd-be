@@ -24,7 +24,8 @@ public sealed class WorkInboxNotificationJob(MongoDbContext ctx, INotificationSe
                 if (a is null || a.ProgressStatus == 2 || a.CompletedAtUtc is not null || a.CompletedDate is not null || !(a.Assignees ?? new()).Any(x => x.UserId == p.AssigneeUserId)) return;
                 if (p.CurrentReportId is not null) {
                     var report = await ctx.WorkAssignmentReports.Find(x => x.Id == p.CurrentReportId && !x.IsDeleted && x.IsActive && x.IsCurrent).FirstOrDefaultAsync(ct);
-                    if (report is null || report.Status != WorkAssignmentReportStatus.Draft) return;
+                    if (report is null || report.Status != WorkAssignmentReportStatus.Draft || report.WorkAssignmentId != p.WorkAssignmentId
+                        || report.WorkReportPeriodId != p.Id || report.AssigneeUserId != p.AssigneeUserId) return;
                 }
                 var w = await Work(a.WorkId, ct); if (w is null) return;
                 await Due("REPORT", p.Id, p.DueAtUtc!.Value, p.AssigneeUserId, w, a, p.Id, p.ReportTitle, now, ct);
@@ -44,27 +45,20 @@ public sealed class WorkInboxNotificationJob(MongoDbContext ctx, INotificationSe
                 foreach (var actor in new[] { w.CreatedByUserId, w.LeaderDirectiveUserId }.Concat(w.LeaderWatchUserIds ?? new()).Where(x => !string.IsNullOrWhiteSpace(x)).Distinct())
                     await Due("WORK", w.Id, due.Value, actor!, w, null, null, w.Name, now, ct);
             }, ct);
-        // Walk current facts without a lookback cutoff so downtime cannot lose older approvals.
-        await Scan(ctx.WorkAssignmentReports, x => !x.IsDeleted && x.IsActive && x.IsCurrent &&
-            (x.Status == WorkAssignmentReportStatus.Approved || x.Status == WorkAssignmentReportStatus.Submitted), async r => {
+        // The durable outbox is part of the committed report document. Its entries
+        // survive submit -> return -> resubmit between scans, independent of projection state.
+        await Scan(ctx.WorkAssignmentReports, x => !x.IsDeleted &&
+            (x.LifecycleProjectionOutbox.Any() || x.Status == WorkAssignmentReportStatus.Approved || x.Status == WorkAssignmentReportStatus.Submitted), async r => {
                 var a = await Assignment(r.WorkAssignmentId, ct); if (a is null) return;
                 if (!(a.Assignees ?? new()).Any(x => x.UserId == r.AssigneeUserId)) return;
                 var w = await ctx.Works.Find(x => x.Id == a.WorkId && !x.IsDeleted).FirstOrDefaultAsync(ct); if (w is null) return;
-                var approved = r.Status == WorkAssignmentReportStatus.Approved;
-                if (!approved && !inbox.NotifyReviewRequired) return;
-                var occurred = approved ? r.ApprovedAtUtc ?? r.AutoApprovedAtUtc : r.SubmittedAtUtc;
-                if (occurred is null) return;
-                var recipient = approved ? r.AssigneeUserId : WorkAssignmentCurrentAuthority.ReviewerId(a);
-                if (string.IsNullOrWhiteSpace(recipient)) return;
-                await notifications.CreateManyAsync(new[] { new NotificationCommand {
-                    RecipientUserId = recipient, Type = approved ? "REPORT_APPROVED" : "REPORT_REVIEW_REQUIRED",
-                    Title = approved ? "Báo cáo đã được duyệt" : "Có báo cáo cần duyệt", Body = r.ReportTitle ?? a.Name,
-                    WorkId = w.Id, WorkName = w.Name, WorkType = w.Type, WorkAssignmentId = a.Id,
-                    WorkReportPeriodId = r.WorkReportPeriodId, WorkAssignmentReportId = r.Id,
-                    RequiresAction = !approved, Category = approved ? "STATUS" : "ACTION",
-                    OccurredAtUtc = occurred.Value,
-                    EventKey = $"inbox:{(approved ? "approved" : "submitted")}:{r.Id}:{occurred.Value.Ticks}:user:{recipient}"
-                } }, ct);
+                var commands = WorkReportNotificationEvents.Build(r, a, w, inbox.NotifyReviewRequired);
+                var legacyKeys = commands.Select(WorkReportNotificationEvents.LegacyKey).OfType<string>().Distinct().ToList();
+                var existing = legacyKeys.Count == 0 ? new List<string>() : await ctx.Notifications
+                    .Find(x => !x.IsDeleted && x.WorkAssignmentReportId == r.Id && legacyKeys.Contains(x.EventKey))
+                    .Project(x => x.EventKey).ToListAsync(ct);
+                await notifications.CreateManyAsync(WorkReportNotificationEvents.ExcludeAlreadyDeliveredLegacy(commands,
+                    existing.ToHashSet(StringComparer.Ordinal)), ct);
             }, ct);
         logger.LogInformation("Work Inbox notification scan completed");
     }
@@ -77,7 +71,7 @@ public sealed class WorkInboxNotificationJob(MongoDbContext ctx, INotificationSe
     private Task<List<UserNotification>> Due(string kind, string id, DateTime due, string recipient,
         Work w, WorkAssignment? a, string? period, string? body, DateTime now, CancellationToken ct)
     {
-        var overdue = due <= now;
+        var overdue = due < now;
         return notifications.CreateManyAsync(new[] { new NotificationCommand {
             RecipientUserId = recipient, Type = kind + (overdue ? "_DUE" : "_DUE_SOON"),
             Severity = overdue ? "DUE" : "WARNING", Title = overdue ? "Công việc trễ hạn" : "Công việc sắp đến hạn",

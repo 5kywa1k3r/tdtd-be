@@ -11,6 +11,7 @@
   <!-- Infrastructure is exercised by AggregateMappingRuntimeChecks with Mongo/Hangfire/MinIO.
        Keep this isolated transaction/command suite free of host dependencies. -->
   <ItemGroup>
+    <Compile Remove="../../Services/AggregateMapping/Persistence/AggregateMaterializedInputs.cs;../../Services/AggregateMapping/Persistence/AggregateMaterializationWorker.cs" />
     <Compile Remove="../../Services/AggregateMapping/Persistence/AggregateContentTableStore.cs;../../Services/AggregateMapping/Persistence/AggregateContentSnapshotJob.cs;../../Services/AggregateMapping/Persistence/AggregateContentRetentionJob.cs;../../Services/AggregateMapping/Persistence/AggregateContentScopeGate.cs;../../Services/AggregateMapping/Persistence/AggregatePreviewInvalidation.cs;../../Services/AggregateMapping/Persistence/AggregatePreviewJobs.cs;../../Services/AggregateMapping/Persistence/AggregateListStore.cs" />
   </ItemGroup>
 </Project>

@@ -12,7 +12,15 @@ public sealed record AggregateListPipelineDto
     public required List<AggregateListProjectionDto> Project { get; init; }
     public required string Operation { get; init; }
     public string? ValueFieldId { get; init; }
+    [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+    public string? WeightFieldId { get; init; }
+    [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+    public bool? Trim { get; init; }
+    [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+    public bool? CaseSensitive { get; init; }
 }
+public sealed record AggregateListMergeDto(int Version, string Mode, List<AggregateListMergeInputDto> Inputs);
+public sealed record AggregateListMergeInputDto(string Ref, List<AggregateListProjectionDto> Project);
 public sealed record AggregateListPredicateDto
 {
     public required string Operator { get; init; }

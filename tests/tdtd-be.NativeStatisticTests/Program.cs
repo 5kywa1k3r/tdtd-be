@@ -211,6 +211,8 @@ foreach (var fault in new[] { "config-hash", "plan-snapshot", "source-time", "li
         Reject(() => NativeStatisticGenerationStage.Revalidate(result, f.Template, fault == "source-set" ? f.Sources.Take(1).ToArray() : f.Sources));
     }));
 
+await NativeEmptyPlanContentCases.Run(Case);
+
 if (calculationOnly)
 {
     await File.WriteAllTextAsync(Path.Combine(evidence, "results.json"), JsonSerializer.Serialize(

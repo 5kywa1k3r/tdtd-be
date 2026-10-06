@@ -19,6 +19,8 @@ namespace tdtd_be.DashboardModel.Services;
 
 public interface IDashboardMindMapQueryService
 {
+    Task<DashboardMindMapCardSummariesResponse> GetCardSummariesAsync(string workId, DashboardMindMapCardSummariesRequest? req, CancellationToken ct = default);
+    Task<List<DashboardTreeNodeDto>> GetAssignmentFocusPathAsync(string workId, string assignmentId, CancellationToken ct = default);
     Task<PagedResult<DashboardMindMapWorkOptionDto>> SearchWorksAsync(
         WorkType type,
         string? q,
@@ -99,7 +101,7 @@ public interface IDashboardMindMapQueryService
         CancellationToken ct = default);
 }
 
-public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
+public sealed partial class DashboardMindMapQueryService : IDashboardMindMapQueryService
 {
     private const int DefaultGraphLimit = 5;
     private const int MaxGraphLimit = 20;
@@ -143,6 +145,7 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
     private readonly MongoDbContext _ctx;
     private readonly MeAccessor _me;
     private readonly IDocRoleService _docRole;
+    private DashboardUnitReadScope? _unitScope;
 
     public DashboardMindMapQueryService(
         MongoDbContext ctx,
@@ -176,10 +179,18 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
         var safePage = Math.Max(page, 0);
         var safePageSize = ClampPageSize(pageSize);
 
-        if (DashboardAccessPolicy.HasGlobalReadAccess(me))
+        _unitScope = await DashboardUnitReadScope.ResolveAsync(_ctx, me, ct);
+        if (DashboardAccessPolicy.HasGlobalReadAccess(me) || _unitScope is not null)
         {
             var fb = Builders<Work>.Filter;
             var filter = fb.Eq(x => x.IsDeleted, false) & fb.Eq(x => x.Type, type);
+
+            if (_unitScope is not null)
+            {
+                var individualIds = await _ctx.WorkListDocRoles.Find(x => !x.IsDeleted && x.DocType == DocType.WORK && x.UserId == me.Id)
+                    .Project(x => x.WorkId).ToListAsync(ct);
+                filter &= fb.In(x => x.Id, _unitScope.WorkIds.Concat(individualIds).Distinct());
+            }
 
             if (!string.IsNullOrWhiteSpace(q))
             {
@@ -267,6 +278,7 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
         var filter = BuildNodeBaseFilter(workId) & BuildRootAssignmentFilter();
         List<WorkAssignment> roots;
         long total;
+        var rootProgress = new WorkProgressCountSnapshot();
 
         if (!access.FullAccess)
         {
@@ -275,6 +287,7 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
                 : access.EntryAssignments;
 
             total = scopedRoots.Count;
+            foreach (var root in scopedRoots) rootProgress.Add((WorkAssignmentProgressStatus)root.ProgressStatus);
             roots = scopedRoots
                 .Skip(safePage * safePageSize)
                 .Take(safePageSize)
@@ -283,6 +296,10 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
         else if (!normalizedScope.HasFilters)
         {
             total = await _ctx.WorkAssignments.CountDocumentsAsync(filter, cancellationToken: ct);
+            var histogram = await _ctx.WorkAssignments.Aggregate().Match(filter)
+                .Group(x => x.ProgressStatus, group => new { Status = group.Key, Count = group.Count() })
+                .ToListAsync(ct);
+            foreach (var bucket in histogram) rootProgress.Add((WorkAssignmentProgressStatus)bucket.Status, bucket.Count);
             roots = await _ctx.WorkAssignments
                 .Find(filter)
                 .SortByDescending(x => x.HasOverduePeriod)
@@ -311,6 +328,7 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
                 ct);
 
             total = scopedRoots.Count;
+            foreach (var root in scopedRoots) rootProgress.Add((WorkAssignmentProgressStatus)root.ProgressStatus);
             roots = scopedRoots
                 .Skip(safePage * safePageSize)
                 .Take(safePageSize)
@@ -324,9 +342,12 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
                 .AnyAsync(ct)
             : access.EntryAssignments.Any(x => x.HasOverduePeriod);
 
+        var workDto = MapWork(work, workHasOverduePeriod);
+        workDto.RootAssignmentProgressCounts = MapProgressCounts(rootProgress);
+        workDto.ActiveRootAssignmentCount = (int)total;
         return new DashboardMindMapWorkResponse
         {
-            Work = MapWork(work, workHasOverduePeriod),
+            Work = workDto,
             RootAssignments = new PagedResult<DashboardTreeNodeDto>(
                 roots.Select(MapNode).ToList(),
                 total,
@@ -483,12 +504,16 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
                 !x.IsDeleted)
             .ToListAsync(ct);
 
+        if (_unitScope is not null) bindings = bindings.Where(x => _unitScope.AllowsRecipient(node.Id, x.AssigneeUserId)).ToList();
+
         var periods = await _ctx.WorkReportPeriods
             .Find(x =>
                 x.WorkAssignmentId == node.Id &&
                 x.IsActive &&
                 !x.IsDeleted)
             .ToListAsync(ct);
+
+        if (_unitScope is not null) periods = periods.Where(x => _unitScope.AllowsRecipient(node.Id, x.AssigneeUserId)).ToList();
 
         var templateIds = bindings
             .Select(x => x.DynamicFormTemplateId)
@@ -571,6 +596,8 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
                 !x.IsDeleted)
             .ToListAsync(ct);
 
+        if (_unitScope is not null) bindings = bindings.Where(x => _unitScope.AllowsRecipient(node.Id, x.AssigneeUserId)).ToList();
+
         var periods = await _ctx.WorkReportPeriods
             .Find(x =>
                 x.WorkAssignmentId == node.Id &&
@@ -578,6 +605,8 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
                 x.IsActive &&
                 !x.IsDeleted)
             .ToListAsync(ct);
+
+        if (_unitScope is not null) periods = periods.Where(x => _unitScope.AllowsRecipient(node.Id, x.AssigneeUserId)).ToList();
 
         var periodsByUser = periods
             .GroupBy(x => x.AssigneeUserId ?? string.Empty, StringComparer.Ordinal)
@@ -637,8 +666,10 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
         DashboardMindMapTemplateReportsSearchRequest? req,
         CancellationToken ct = default)
     {
-        var me = _me.RequireMe();
-        var node = await LoadAccessibleAssignmentAsync(assignmentId, me.Id, ct);
+        var actorId = _me.RequireMe().Id;
+        _focusActor = await DashboardAuthorityReader.ReadAsync(_ctx, actorId, ct);
+        _unitScope = null;
+        var node = await LoadAccessibleAssignmentAsync(assignmentId, actorId, ct);
         req ??= new DashboardMindMapTemplateReportsSearchRequest();
 
         var safeLimit = ClampGraphLimit(req.Limit <= 0 ? DefaultGraphLimit : req.Limit);
@@ -646,7 +677,8 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
         var assigneeUserIds = NormalizeIds(req.AssigneeUserIds);
         var statusBuckets = NormalizeReportBuckets(req.StatusBuckets);
 
-        var filter = Builders<WorkReportPeriod>.Filter.Eq(x => x.WorkAssignmentId, node.Id)
+        var filter = Builders<WorkReportPeriod>.Filter.Eq(x => x.WorkId, node.WorkId)
+            & Builders<WorkReportPeriod>.Filter.Eq(x => x.WorkAssignmentId, node.Id)
             & Builders<WorkReportPeriod>.Filter.Eq(x => x.DynamicFormTemplateId, dynamicFormTemplateId)
             & Builders<WorkReportPeriod>.Filter.Eq(x => x.IsDeleted, false)
             & Builders<WorkReportPeriod>.Filter.Eq(x => x.IsActive, true);
@@ -674,7 +706,9 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
                 fb.Regex(x => x.ReviewerEvaluation, regex));
         }
 
+        if (_unitScope is not null) filter &= _unitScope.PeriodFilter();
         var total = await _ctx.WorkReportPeriods.CountDocumentsAsync(filter, cancellationToken: ct);
+
         var periods = await _ctx.WorkReportPeriods
             .Find(filter)
             .SortByDescending(x => x.DueAtUtc)
@@ -685,7 +719,7 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
 
         var currentReports = new Dictionary<string, WorkAssignmentReport>(StringComparer.Ordinal);
         var currentReportIds = periods
-            .Where(x => !string.IsNullOrWhiteSpace(x.CurrentReportId))
+            .Where(x => ObjectId.TryParse(x.CurrentReportId, out _))
             .Select(x => x.CurrentReportId!)
             .Distinct(StringComparer.Ordinal)
             .ToList();
@@ -694,19 +728,36 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
         {
             currentReports = (await _ctx.WorkAssignmentReports
                     .Find(Builders<WorkAssignmentReport>.Filter.In(x => x.Id, currentReportIds)
+                          & Builders<WorkAssignmentReport>.Filter.Eq(x => x.WorkId, node.WorkId)
+                          & Builders<WorkAssignmentReport>.Filter.Eq(x => x.WorkAssignmentId, node.Id)
+                          & Builders<WorkAssignmentReport>.Filter.Eq(x => x.DynamicFormTemplateId, dynamicFormTemplateId)
                           & Builders<WorkAssignmentReport>.Filter.Eq(x => x.IsDeleted, false)
                           & Builders<WorkAssignmentReport>.Filter.Eq(x => x.IsCurrent, true)
-                          & Builders<WorkAssignmentReport>.Filter.Ne(x => x.IsActive, false))
+                          & Builders<WorkAssignmentReport>.Filter.Eq(x => x.IsActive, true))
+                    .Project(x => new WorkAssignmentReport
+                    {
+                        Id = x.Id, WorkId = x.WorkId, WorkAssignmentId = x.WorkAssignmentId,
+                        WorkReportPeriodId = x.WorkReportPeriodId, DynamicFormTemplateId = x.DynamicFormTemplateId,
+                        AssigneeUserId = x.AssigneeUserId, IsActive = x.IsActive, IsDeleted = x.IsDeleted, IsCurrent = x.IsCurrent,
+                        Status = x.Status, SubmittedAtUtc = x.SubmittedAtUtc, ApprovedAtUtc = x.ApprovedAtUtc,
+                    })
                     .ToListAsync(ct))
                 .ToDictionary(x => x.Id, x => x, StringComparer.Ordinal);
         }
 
         var bindings = await _ctx.WorkTemplateAssignees
             .Find(x =>
+                x.WorkId == node.WorkId &&
                 x.WorkAssignmentId == node.Id &&
                 x.DynamicFormTemplateId == dynamicFormTemplateId &&
                 x.IsActive &&
                 !x.IsDeleted)
+            .Project(x => new WorkTemplateAssignee
+            {
+                AssigneeUserId = x.AssigneeUserId, AssigneeFullName = x.AssigneeFullName, AssigneeUsername = x.AssigneeUsername,
+                AssigneeUnitId = x.AssigneeUnitId, AssigneeUnitSymbol = x.AssigneeUnitSymbol,
+                AssigneeUnitShortName = x.AssigneeUnitShortName, AssigneeUnitName = x.AssigneeUnitName,
+            })
             .ToListAsync(ct);
 
         var bindingByUserId = bindings
@@ -1951,11 +2002,13 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
         };
     }
 
-    private static FilterDefinition<WorkAssignment> BuildNodeBaseFilter(string workId)
+    private FilterDefinition<WorkAssignment> BuildNodeBaseFilter(string workId)
     {
-        return Builders<WorkAssignment>.Filter.Eq(x => x.WorkId, workId)
+        var filter = Builders<WorkAssignment>.Filter.Eq(x => x.WorkId, workId)
             & Builders<WorkAssignment>.Filter.Eq(x => x.IsDeleted, false)
             & Builders<WorkAssignment>.Filter.Eq(x => x.IsActive, true);
+        if (_unitScope is not null) filter &= Builders<WorkAssignment>.Filter.In(x => x.Id, _unitScope.Assignments.Select(x => x.Id));
+        return filter;
     }
 
     private static FilterDefinition<WorkAssignment> BuildRootAssignmentFilter()
@@ -1985,7 +2038,9 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
                 AppErrorCode.DASHBOARD_WORK_NOT_FOUND,
                 new { workId });
 
-        var hasFullAccess = DashboardAccessPolicy.HasGlobalReadAccess(_me.RequireMe())
+        _unitScope ??= await DashboardUnitReadScope.ResolveAsync(_ctx, _focusActor ?? _me.RequireMe(), ct);
+        var hasFullAccess = (_unitScope?.FullWorkIds.Contains(workId) ?? false)
+            || DashboardAccessPolicy.HasGlobalReadAccess(_focusActor ?? _me.RequireMe())
             || string.Equals(work.CreatedByUserId, actorUserId, StringComparison.Ordinal)
             || await HasFullWorkReadRoleAsync(workId, actorUserId, ct);
 
@@ -2020,12 +2075,14 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
                 new { assignmentId });
 
         var access = await LoadWorkAccessContextAsync(assignment.WorkId, actorUserId, ct);
+        if (_unitScope is not null && !_unitScope.Assignments.Any(x => x.Id == assignment.Id))
+            throw DashboardForbidden(AppErrorCode.DASHBOARD_ASSIGNMENT_READ_FORBIDDEN, new { assignmentId, assignment.WorkId, actorUserId });
         if (!access.FullAccess && !IsAssignmentInAccessibleBranch(assignment, access.EntryAssignments))
             throw DashboardForbidden(
                 AppErrorCode.DASHBOARD_ASSIGNMENT_READ_FORBIDDEN,
                 new { assignmentId, assignment.WorkId, actorUserId });
 
-        return assignment;
+        return _unitScope?.Mask(assignment) ?? assignment;
     }
 
     private async Task<bool> HasFullWorkReadRoleAsync(
@@ -2047,6 +2104,8 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
         string actorUserId,
         CancellationToken ct)
     {
+        if (_unitScope is not null) return _unitScope.Entries(workId);
+
         var roleFilter = Builders<DocRole>.Filter.Eq(x => x.DocType, DocType.WORK_ASSIGNMENT)
             & Builders<DocRole>.Filter.Eq(x => x.UserId, actorUserId)
             & Builders<DocRole>.Filter.Eq(x => x.IsDeleted, false)
@@ -2447,10 +2506,11 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
             .ToList();
     }
 
-    private static FilterDefinition<WorkReportPeriod> ApplyScopeToPeriodFilter(
+    private FilterDefinition<WorkReportPeriod> ApplyScopeToPeriodFilter(
         FilterDefinition<WorkReportPeriod> filter,
         MindMapScope scope)
     {
+        if (_unitScope is not null) filter &= _unitScope.PeriodFilter();
         if (scope.Range != null)
             filter &= BuildPeriodTimeFilter(scope.Range);
 
@@ -2504,6 +2564,11 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
             Code = string.IsNullOrWhiteSpace(work.Code) ? work.AutoCode : work.Code,
             Name = work.Name,
             Status = (int)work.Status,
+            StartDate = work.StartDate,
+            EndDate = work.EndDate,
+            DueDate = work.DueDate,
+            LeaderDirectiveName = work.LeaderDirective?.FullName ?? work.LeaderDirective?.Username,
+            OwnerUnitName = work.Owner?.UnitShortName ?? work.Owner?.UnitName,
             ActiveRootAssignmentCount = work.ActiveRootAssignmentCount,
             HasOverduePeriod = hasOverduePeriod,
             HasManualEvaluations = work.HasManualEvaluations,
@@ -2513,8 +2578,9 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
         };
     }
 
-    private static DashboardTreeNodeDto MapNode(WorkAssignment assignment)
+    private DashboardTreeNodeDto MapNode(WorkAssignment assignment)
     {
+        assignment = _unitScope?.Mask(assignment) ?? assignment;
         return new DashboardTreeNodeDto
         {
             Id = assignment.Id,
@@ -2530,6 +2596,8 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
             DynamicExcelName = assignment.DynamicExcelName,
             Description = assignment.Description,
             SummaryText = BuildNodeSummaryText(assignment),
+            StartDate = assignment.StartDate,
+            DueDate = DashboardAssignmentDeadline.Day(assignment.AssignmentType, assignment.DueAtUtc, assignment.DueDate),
             IsActive = assignment.IsActive,
             ProgressStatus = assignment.ProgressStatus,
             HasAnyDuePeriod = assignment.HasAnyDuePeriod,
@@ -2714,10 +2782,11 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
         return $"{assignmentId.Trim()}::{assigneeUserId.Trim()}::{periodKey.Trim()}";
     }
 
-    private static List<CoverageAssignee> GetCoverageAssignees(
+    private List<CoverageAssignee> GetCoverageAssignees(
         WorkAssignment assignment,
         MindMapScope scope)
     {
+        assignment = _unitScope?.Mask(assignment) ?? assignment;
         var rows = (assignment.Assignees ?? new List<UserRef>())
             .Where(x => !string.IsNullOrWhiteSpace(x.UserId))
             .Where(x => scope.UnitIds.Count == 0 ||
@@ -2822,16 +2891,19 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
         };
     }
 
-    private static DashboardMindMapReportRowDto MapTemplateReportRow(
+    internal static DashboardMindMapReportRowDto MapTemplateReportRow(
         WorkReportPeriod period,
         WorkAssignment assignment,
         WorkTemplateAssignee? binding,
         WorkAssignmentReport? report)
     {
+        var current = DashboardMindMapCardProjection.ResolveCurrentReport(period, report);
+        report = current.Report;
         return new DashboardMindMapReportRowDto
         {
             WorkReportPeriodId = period.Id,
             ReportId = report?.Id,
+            CurrentReportReadState = current.ReadState,
             AssignmentId = assignment.Id,
             AssignmentCode = assignment.Code,
             AssignmentName = ResolveAssignmentName(assignment, period.DynamicExcelName),
@@ -2850,8 +2922,8 @@ public sealed class DashboardMindMapQueryService : IDashboardMindMapQueryService
             PeriodStatus = (int)period.Status,
             ReportStatus = report == null ? null : (int)report.Status,
             DueAtUtc = period.DueAtUtc,
-            SubmittedAtUtc = report?.SubmittedAtUtc ?? period.LastSubmittedAtUtc,
-            ApprovedAtUtc = report?.ApprovedAtUtc ?? period.LastReviewedAtUtc,
+            SubmittedAtUtc = report?.SubmittedAtUtc,
+            ApprovedAtUtc = report?.ApprovedAtUtc,
             LateReason = period.LateReason,
             ReturnReason = period.ReturnReason,
             ReviewerComment = period.ReviewerComment,

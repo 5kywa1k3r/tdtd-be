@@ -80,6 +80,17 @@ internal sealed partial class AggregateMongoTransaction(MongoDbContext db, IClie
     public async Task FenceAsync(AggregateCommitAuthority authority, IReadOnlyList<AggregateSourcePinDto> sources,
         IReadOnlyList<AggregateCoverageSlotDto> slots, CancellationToken ct)
     {
+        if (authority.Read.Context.View == null && authority.Read.Authority.MutationScopeOpen)
+        {
+            // Re-evaluate the reopened period inside the write transaction, not merely
+            // against a capability sampled before its authority pins were collected.
+            var a = await db.WorkAssignments.Find(session, x => x.Id == authority.Read.Context.AssignmentId).FirstOrDefaultAsync(ct);
+            if (a == null || !await tdtd_be.Services.WorkAssignments.Progress.WorkExecutionScopeGuard.IsOpenAsync(
+                db, a, authority.Read.Context.WorkReportPeriodId, ct, session)) throw new AggregatePreviewException("AGG_INPUT_STALE");
+            if (authority.Read.Authority.ConfigMutationScopeOpen == true &&
+                !await tdtd_be.Services.WorkAssignments.Progress.WorkExecutionScopeGuard.IsOpenAsync(db, a, null, ct, session))
+                throw new AggregatePreviewException("AGG_INPUT_STALE");
+        }
         foreach (var pin in authority.Pins.OrderBy(p => p.Collection, StringComparer.Ordinal).ThenBy(p => p.Id, StringComparer.Ordinal))
         {
             var collection = db.Db.GetCollection<BsonDocument>(pin.Collection);

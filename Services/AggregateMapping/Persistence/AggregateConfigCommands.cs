@@ -9,15 +9,8 @@ internal sealed partial class AggregateCommandService
         string configId, AggregateConfigImpactRequestDto request, CancellationToken ct)
     {
         var authority = await reader.AuthorizeAsync(context, command.Actor, command.SessionKey, ct); Allow(AggregateAction.EditConfig, authority);
-        var plan = await store.ExecuteAsync((tx, token) => BuildImpact(tx, command, authority, configId, request, token, evaluate: false), ct);
-        var previews = new Dictionary<string, AggregatePreviewEnvelope>();
-        foreach (var next in plan.Instances.Where(i => plan.Authorities.ContainsKey(i.Id)))
-        {
-            var version = new AggregateConfigVersion(configId, plan.HeadRevision + 1, plan.Recipe, AggregateCanonical.Hash(plan.Recipe), command.Actor, command.Now);
-            var preview = await reader.PreviewAsync(next, AggregateOverlay.Effective(version, next), plan.Authorities[next.Id], ct);
-            ValidPreview(preview); previews.Add(next.Id, preview);
-        }
-        plan = plan with { Previews = previews };
+        var plan = await store.ExecuteAsync((tx, token) => BuildImpact(tx, command, authority, configId, request, token), ct);
+        plan = await CompleteImpact(plan, command, ct);
         var expiry = (previewCompletedAt?.Invoke() ?? command.Now).AddMinutes(5);
         var confirmation = plan.Conflicts.Count > 0 ? null : tokens.Issue(Confirmation(command, "CONFIG_REVISION", configId,
             request, ImpactEvidence(plan), expiry));
@@ -28,12 +21,27 @@ internal sealed partial class AggregateCommandService
             Instances = plan.Instances.Select(i => i with { Applied = null }).ToArray()
         }, confirmation, expiry);
     }
+    private async Task<AggregateConfigImpactPlan> CompleteImpact(AggregateConfigImpactPlan plan, AggregateCommandContext command, CancellationToken ct)
+    {
+        var previews = new Dictionary<string, AggregatePreviewEnvelope>();
+        foreach (var next in plan.Instances.Where(i => plan.Authorities.ContainsKey(i.Id)))
+        {
+            var version = new AggregateConfigVersion(plan.ConfigId, plan.HeadRevision + 1, plan.Recipe, AggregateCanonical.Hash(plan.Recipe), command.Actor, command.Now);
+            var preview = await reader.PreviewAsync(next, AggregateOverlay.Effective(version, next), plan.Authorities[next.Id], ct);
+            ValidPreview(preview); previews.Add(next.Id, preview);
+        }
+        return plan with { Previews = previews };
+    }
     internal Task<AggregateCommandResult> SaveConfigAsync(AggregateCommandContext command, AggregatePeriodContextDto context,
         string configId, AggregateConfigImpactRequestDto request, string confirmation, CancellationToken ct)
-        => Execute(command, new { configId, request, confirmation }, context, AggregateAction.EditConfig, async (tx, authority, token) =>
+    {
+        AggregateConfigImpactPlan? prepared = null;
+        return Execute(command, new { configId, request, confirmation }, context, AggregateAction.EditConfig, async (tx, authority, token) =>
         {
             var head = await Required<AggregateConfigHead>(tx, AggregateCollections.Configs, configId, token);
-            var plan = await BuildImpact(tx, command, authority, configId, request, token);
+            var current = await BuildImpact(tx, command, authority, configId, request, token);
+            var plan = prepared ?? throw new InvalidOperationException("AGG_PREPARATION_REQUIRED");
+            if (ImpactCapture(current) != ImpactCapture(plan)) throw new AggregatePreviewException("AGG_REVISION_CONFLICT");
             if (plan.Conflicts.Count != 0) throw new AggregatePreviewException("AGG_REBASE_REQUIRED");
             tokens.Verify(confirmation, Confirmation(command, "CONFIG_REVISION", configId, request, ImpactEvidence(plan), command.Now.AddMinutes(5)), command.Now);
             await tx.FenceAsync(authority, [], [], token);
@@ -54,15 +62,20 @@ internal sealed partial class AggregateCommandService
                 var members = effective.Nodes.Single(n => n.Kind == "TARGET").Inputs.Select(p => p.MemberId!).ToArray();
                 await ClaimTargets(tx, next, members, token);
                 await tx.WriteTargetAsync(nextAuthority, new(next, effective, preview, members), token);
-                await PutInstance(tx, next with { Applied = preview }, stored.Version, token);
+                await PutInstance(tx, next with { Applied = preview, AppliedGeneration = next.Generation, AppliedInputStamp = null }, stored.Version, token);
                 await Dependencies(tx, next, preview, token);
             }
             // Publish the head only inside the transaction containing every selected Draft write.
             await tx.PutAsync(AggregateCollections.Configs, configId, head.Version, head.Value with { HeadRevision = nextRevision, OwnerUserId = command.Actor }, context.WorkId, context.AssignmentId, [], token);
             return new(configId, nextRevision, authority.Read.Revisions.PayloadRevision, authority.Read.Revisions.LifecycleRevision, "CONFIG_SAVED");
-        }, ct);
+        }, ct, async (authority, token) =>
+        {
+            var capture = await store.ExecuteAsync((tx, cancel) => BuildImpact(tx, command, authority, configId, request, cancel), token);
+            prepared = await CompleteImpact(capture, command, token);
+        });
+    }
     private async Task<AggregateConfigImpactPlan> BuildImpact(IAggregateTransaction tx, AggregateCommandContext command,
-        AggregateCommitAuthority authority, string configId, AggregateConfigImpactRequestDto request, CancellationToken ct, bool evaluate = true)
+        AggregateCommitAuthority authority, string configId, AggregateConfigImpactRequestDto request, CancellationToken ct)
     {
         if (request.MigrateInstances.Count > 100 || request.MigrateInstances.Select(i => i.InstanceId).Distinct().Count() != request.MigrateInstances.Count)
             throw new AggregatePreviewException("AGG_MIGRATION_SELECTION_INVALID");
@@ -100,12 +113,13 @@ internal sealed partial class AggregateCommandService
                 // New source nodes must be selected deliberately; a changed topology is never auto-mapped.
                 if (effective.Nodes.Count(n => n.Kind == "SOURCE") != next.Selection.Sources.Count)
                     throw new AggregatePreviewException("AGG_MIGRATION_SELECTION_REPAIR_REQUIRED");
-                if (evaluate) { var preview = await reader.PreviewAsync(next, effective, currentAuthority, ct); ValidPreview(preview); previews.Add(next.Id, preview); }
                 authorities.Add(next.Id, currentAuthority);
             }
         }
         return new(configId, head.HeadRevision, recipe, instances, conflicts, previews, authorities);
     }
+    private static string ImpactCapture(AggregateConfigImpactPlan plan) => AggregateCanonical.Hash(new
+        { plan.ConfigId, plan.HeadRevision, plan.Recipe, plan.Instances, plan.Conflicts });
     private static string ImpactEvidence(AggregateConfigImpactPlan plan) => AggregateCanonical.Hash(new
     {
         plan.ConfigId, plan.HeadRevision, plan.Recipe, plan.Instances,

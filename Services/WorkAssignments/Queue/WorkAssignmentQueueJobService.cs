@@ -186,6 +186,13 @@ public sealed class WorkAssignmentQueueJobService : IWorkAssignmentQueueJobServi
                     continue;
                 }
 
+                if (string.IsNullOrWhiteSpace(assignment.FlowInstanceId) &&
+                    !await tdtd_be.Services.WorkAssignments.Progress.WorkExecutionScopeGuard.IsOpenAsync(_ctx, assignment, period.Id, ct))
+                {
+                    if (await DisableQueueItemAsync(item, now, ct)) disabled++;
+                    continue;
+                }
+
                 var isHistoricalBackfill =
                     period.IsHistoricalData ||
                     WorkAssignmentBackfillPeriodPolicy.IsBackfillHistoricalPeriod(
@@ -453,6 +460,8 @@ public sealed class WorkAssignmentQueueJobService : IWorkAssignmentQueueJobServi
         Work? work,
         HashSet<string> completedAssignmentIds)
     {
+        if (work != null && tdtd_be.Services.WorkAssignments.Progress.WorkExecutionScopeGuard.IsReopenedPeriod(
+            assignment, assignment.CompletionReviewPeriodId)) return false;
         if (work is null || work.CompletedAtUtc.HasValue || work.Status == WorkStatus.S3)
             return true;
 

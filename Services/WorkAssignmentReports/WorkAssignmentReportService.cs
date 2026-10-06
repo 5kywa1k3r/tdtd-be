@@ -565,6 +565,8 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
             .Where(x => !string.IsNullOrWhiteSpace(x.Id))
             .ToDictionary(x => x.Id!, StringComparer.Ordinal);
 
+        var activeBindingIds = bindings.Where(x => x.IsActive).Select(x => x.Id).ToHashSet(StringComparer.Ordinal);
+
         return new MyReportTemplateDetailResponse
         {
             WorkId = workId,
@@ -589,7 +591,8 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
                 .Select(x => MapToPeriodRow(
                     x,
                     assignmentById.TryGetValue(x.WorkAssignmentId, out var assignment) ? assignment : null,
-                    DateTime.UtcNow))
+                    DateTime.UtcNow,
+                    activeBindingIds.Contains(x.WorkTemplateAssigneeId)))
                 .ToList()
         };
     }
@@ -641,7 +644,7 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
             }
         }
 
-        await EnsureReportMutationScopeOpenAsync(periodAccess.assignment, actorUserId, ct);
+        await EnsureReportMutationScopeOpenAsync(periodAccess.assignment, actorUserId, ct, period.Id);
 
         var created = await CreateDraftForPeriodAsync(period, actorUserId, ct);
         await FinalizeReportStatusOperationAsync(
@@ -1179,7 +1182,7 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
             return await MapPayloadCommandReplayResponseAsync(entity.Id, actorUserId, CancellationToken.None);
         }
 
-        await EnsureReportMutationScopeOpenAsync(reportAccess.assignment, actorUserId, ct);
+        await EnsureReportMutationScopeOpenAsync(reportAccess.assignment, actorUserId, ct, entity.WorkReportPeriodId);
 
         if (entity.Status != WorkAssignmentReportStatus.Draft)
             throw InvalidReportStatus(
@@ -1738,7 +1741,7 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
             entity,
             req,
             actorUserId);
-        await EnsureReportMutationScopeOpenAsync(reportAccess.assignment, actorUserId, ct);
+        await EnsureReportMutationScopeOpenAsync(reportAccess.assignment, actorUserId, ct, entity.WorkReportPeriodId);
         var successorPlan =
             await BuildDynamicFlowMappingSuccessorAsync(entity, ct);
 
@@ -2177,7 +2180,7 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
         await EnsureReportMutationScopeOpenAsync(
             reportAccess.assignment,
             actorUserId,
-            ct);
+            ct, entity.WorkReportPeriodId);
 
         var mappingRuntime = await ResolveDynamicFlowMappingRuntimeAsync(
             reportAccess.assignment,
@@ -4474,7 +4477,7 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
             lifecycleCommand.Operation,
             ct);
 
-        await EnsureReportMutationScopeOpenAsync(reportAccess.assignment, actorUserId, ct);
+        await EnsureReportMutationScopeOpenAsync(reportAccess.assignment, actorUserId, ct, entity.WorkReportPeriodId);
 
         if (entity.Status != WorkAssignmentReportStatus.Draft)
             throw InvalidReportStatus(
@@ -5034,7 +5037,7 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
             lifecycleCommand.Operation,
             ct);
 
-        await EnsureReportMutationScopeOpenAsync(assignment, actorUserId, ct);
+        await EnsureReportMutationScopeOpenAsync(assignment, actorUserId, ct, entity.WorkReportPeriodId);
 
         if (entity.Status != WorkAssignmentReportStatus.Submitted)
             throw InvalidReportStatus(
@@ -5057,6 +5060,10 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
             : req.LateReasonOverride.Trim();
         var completedDatePolicy = ResolveReportCompletedDatePolicy(assignment, entity, period, now);
         var isHistoricalData = IsHistoricalReportData(entity, period, completedDatePolicy);
+        if (isHistoricalData && !entity.CompletedDate.HasValue)
+            throw AppExceptionFactory.BadRequest(
+                AppErrorCode.WORK_ASSIGNMENT_REPORT_HISTORICAL_COMPLETED_DATE_REQUIRED,
+                ReportDetails(entity, actorUserId));
         if (isHistoricalData && !req.ConfirmHistoricalDataApproval)
             throw AppExceptionFactory.BadRequest(
                 AppErrorCode.WORK_ASSIGNMENT_REPORT_HISTORICAL_APPROVAL_CONFIRMATION_REQUIRED,
@@ -5207,7 +5214,7 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
             lifecycleCommand.Operation,
             ct);
 
-        await EnsureReportMutationScopeOpenAsync(assignment, actorUserId, ct);
+        await EnsureReportMutationScopeOpenAsync(assignment, actorUserId, ct, entity.WorkReportPeriodId);
 
         if (entity.Status != WorkAssignmentReportStatus.Submitted)
             throw InvalidReportStatus(
@@ -5347,7 +5354,7 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
             ct);
 
         var assignment = reportAccess.assignment;
-        await EnsureReportMutationScopeOpenAsync(assignment, actorUserId, ct);
+        await EnsureReportMutationScopeOpenAsync(assignment, actorUserId, ct, entity.WorkReportPeriodId);
 
         var withdrawsAutoApproved = entity.Status == WorkAssignmentReportStatus.Approved &&
                                     WorkAssignmentAutoApprovalState.CanReporterWithdraw(entity);
@@ -5495,6 +5502,8 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
                     return new UpdateResult.Acknowledged(0, 0, null);
                 }
                 await AggregateHostIntegration.GuardReportAsync(_ctx, session, before, transactionCt);
+                await tdtd_be.Services.WorkAssignments.Progress.WorkExecutionScopeGuard.EnsureOpenAsync(
+                    _ctx, before.WorkAssignmentId, before.WorkReportPeriodId, transactionCt, session);
                 if (lifecycleCommand is not null && resultStatus.HasValue)
                     await AggregateHostIntegration.LifecycleAsync(_ctx, session, _dynamicFlowTransactions, before,
                         lifecycleCommand.Operation, actorUserId!, lifecycleCommand.CommandId, resultStatus.Value,
@@ -5509,6 +5518,10 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
                         cancellationToken: transactionCt);
                 if (reportCommit.ModifiedCount != 1)
                     throw new AggregatePreviewException("AGG_REVISION_CONFLICT");
+                if (resultStatus == WorkAssignmentReportStatus.Approved)
+                    await tdtd_be.Services.WorkAssignments.Progress.WorkExecutionScopeGuard.RecordFirstApprovalAsync(
+                        _ctx, session, before.WorkAssignmentId, DateTime.UtcNow, transactionCt,
+                        before.WorkReportPeriodId, before.Status);
                 await AggregateHostIntegration.InvalidateReportAsync(_ctx, session, before,
                     lifecycleCommand?.CommandId ?? before.PayloadMutationCommandId ?? "report:" + before.Id + ":" + before.PayloadRevision,
                     transactionCt);
@@ -5704,7 +5717,7 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
                 AppErrorCode.WORK_ASSIGNMENT_REPORT_ASSIGNMENT_INACTIVE,
                 PeriodDetails(period, actorUserId));
 
-        await EnsureReportMutationScopeOpenAsync(assignment, actorUserId, ct);
+        await EnsureReportMutationScopeOpenAsync(assignment, actorUserId, ct, period.Id);
 
         var template = await ResolveDynamicExcelTemplateForPeriodAsync(period, ct);
 
@@ -8692,7 +8705,7 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
                 x.DynamicExcelTemplateId);
         var actorOwnsReport = string.Equals(x.AssigneeUserId, actorUserId, StringComparison.Ordinal);
         var mutationScopeOpen = assignment is not null &&
-                                await IsReportMutationScopeOpenAsync(assignment, ct);
+                                await IsReportMutationScopeOpenAsync(assignment, ct, x.WorkReportPeriodId);
         var canMutate = actorOwnsReport && x.IsActive && mutationScopeOpen;
         var lifecycleProjectionPending = (x.LifecycleProjectionOutbox ?? new List<WorkReportLifecycleProjectionOutboxEntry>())
             .Any(entry => string.Equals(
@@ -10898,10 +10911,11 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
         if (assignment is null)
             return new ReportCompletedDatePolicy(false, false, null, null, "ASSIGNMENT_NOT_FOUND");
 
-        var reportDate = NormalizeDate(report?.ReportDate ?? period?.ReportDate);
-        var sourceStart = NormalizeDate(report?.PeriodStart ?? period?.PeriodStart ?? reportDate);
-        var sourceEnd = NormalizeDate(report?.PeriodEnd ?? period?.PeriodEnd ?? reportDate ?? sourceStart);
-        var sourceAnchor = NormalizeDate(report?.DueAtUtc ?? period?.DueAtUtc ?? reportDate);
+        var reportDate = ReportCivilDate.ReadPeriodDay(report?.ReportDate ?? period?.ReportDate);
+        var sourceStart = ReportCivilDate.ReadPeriodDay(report?.PeriodStart ?? period?.PeriodStart ?? reportDate);
+        var sourceEnd = ReportCivilDate.ReadPeriodDay(report?.PeriodEnd ?? period?.PeriodEnd ?? reportDate ?? sourceStart);
+        var dueInstant = report?.DueAtUtc ?? period?.DueAtUtc;
+        var sourceAnchor = dueInstant.HasValue ? ReportCivilDate.FromInstant(dueInstant.Value) : reportDate;
 
         if (!WorkAssignmentBackfillPeriodPolicy.TryResolveCompletedDateBounds(
                 assignment,
@@ -11227,7 +11241,8 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
     private static WorkReportPeriodRow MapToPeriodRow(
         WorkReportPeriod x,
         WorkAssignment? assignment,
-        DateTime now)
+        DateTime now,
+        bool bindingActive)
     {
         var completedDatePolicy = ResolveReportCompletedDatePolicy(assignment, null, x, now);
         var isHistoricalData = x.IsHistoricalData || IsBackfillCompletedDatePolicy(completedDatePolicy);
@@ -11239,6 +11254,7 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
             WorkAssignmentId = x.WorkAssignmentId,
             AssignmentType = assignment?.AssignmentType ?? string.Empty,
             WorkTemplateAssigneeId = x.WorkTemplateAssigneeId,
+            IsActive = x.IsActive && assignment?.IsActive == true && bindingActive,
             DynamicExcelId = x.DynamicExcelId,
             DynamicExcelCode = x.DynamicExcelCode,
             DynamicExcelName = x.DynamicExcelName,
@@ -11430,9 +11446,9 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
     private async Task EnsureReportMutationScopeOpenAsync(
         WorkAssignment assignment,
         string actorUserId,
-        CancellationToken ct)
+        CancellationToken ct, string? periodId = null)
     {
-        if (await IsReportMutationScopeOpenAsync(assignment, ct))
+        if (await IsReportMutationScopeOpenAsync(assignment, ct, periodId))
             return;
 
         throw AppExceptionFactory.Create(
@@ -11442,8 +11458,10 @@ public sealed partial class WorkAssignmentReportService : IWorkAssignmentReportS
 
     private async Task<bool> IsReportMutationScopeOpenAsync(
         WorkAssignment assignment,
-        CancellationToken ct)
+        CancellationToken ct, string? periodId = null)
     {
+        if (string.IsNullOrWhiteSpace(assignment.FlowInstanceId))
+            return await tdtd_be.Services.WorkAssignments.Progress.WorkExecutionScopeGuard.IsOpenAsync(_ctx, assignment, periodId, ct);
         var work = await _ctx.Works
             .Find(x => x.Id == assignment.WorkId && !x.IsDeleted)
             .FirstOrDefaultAsync(ct);

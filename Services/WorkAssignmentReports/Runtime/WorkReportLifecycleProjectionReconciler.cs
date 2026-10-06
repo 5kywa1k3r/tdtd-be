@@ -94,12 +94,24 @@ public sealed class WorkReportLifecycleProjectionReconciler : IWorkReportLifecyc
         _logger = logger;
     }
 
+    private async Task WakeAggregateAsync(string workId, CancellationToken ct)
+    {
+        try { await Services.AggregateMapping.Persistence.AggregateHostIntegration.DispatchAsync(_ctx, _transactions, _configuration, 100, ct, workId); }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        { _logger.LogWarning(ex, "Aggregate queue wake deferred; durable source invalidation remains pending. workId={WorkId}", workId); }
+    }
+
     public async Task<bool> ReconcileReportAsync(string reportId, CancellationToken ct = default)
     {
         if (string.IsNullOrWhiteSpace(reportId))
             return false;
 
         var claim = await TryClaimAsync(reportId.Trim(), Array.Empty<string>(), ct);
+        // The source command already persisted Aggregate invalidation in its transaction.
+        // Wake its existing queue before slower projections/statistics; never calculate here.
+        var sourceWorkId = claim?.Report.WorkId ?? await _ctx.WorkAssignmentReports.Find(r => r.Id == reportId.Trim())
+            .Project(r => r.WorkId).FirstOrDefaultAsync(ct);
+        if (sourceWorkId != null) await WakeAggregateAsync(sourceWorkId, ct);
         if (claim is null)
             return false;
 
@@ -270,6 +282,7 @@ public sealed class WorkReportLifecycleProjectionReconciler : IWorkReportLifecyc
                     ct);
             await RenewClaimAsync(claim, ct);
             var periodState = await ReconcilePeriodAsync(report, actorUserId, ct);
+            await WakeAggregateAsync(report.WorkId, ct);
 
             await RenewClaimAsync(claim, ct);
             if (periodState.Period is not null)

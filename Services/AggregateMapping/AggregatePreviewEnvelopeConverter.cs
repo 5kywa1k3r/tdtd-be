@@ -13,13 +13,14 @@ internal sealed class AggregatePreviewEnvelopeConverter : JsonConverter<Aggregat
         IReadOnlyDictionary<string, IReadOnlyList<AggregateTrace>> Lineage,
         IReadOnlyList<AggregatePreviewValueDiff> Diff, IReadOnlyList<AggregateFunctionTrace> Functions,
         IReadOnlyList<string> CurrentUnitIds, IReadOnlyList<AggregateSourceValueEvidence> SourceValues,
-        [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] IReadOnlyList<AggregateListPipelineTrace>? ListOperations = null);
+        [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] IReadOnlyList<AggregateListPipelineTrace>? ListOperations = null,
+        [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] AggregateFormulaProbe? FormulaProbe = null);
     private static readonly JsonSerializerOptions Web = new(JsonSerializerDefaults.Web);
     internal const int MaxEntries = 100_000, MaxReferences = 500_000;
     public override void Write(Utf8JsonWriter writer, AggregatePreviewEnvelope value, JsonSerializerOptions options)
     {
         var root = JsonSerializer.SerializeToElement(new Payload(value.Preview, value.Lineage, value.Diff,
-            value.Functions, value.CurrentUnitIds, value.SourceValues, value.ListOperations.Count == 0 ? null : value.ListOperations), Web);
+            value.Functions, value.CurrentUnitIds, value.SourceValues, value.ListOperations.Count == 0 ? null : value.ListOperations, value.FormulaProbe), Web);
         // Leave small envelopes in the established format.
         if (value.Lineage.Values.Sum(t => (long)t.Count) < 512) { root.WriteTo(writer); return; }
         var sources = new List<string[]>(); var sourceIds = new Dictionary<(string, string, string), int>();
@@ -72,7 +73,7 @@ internal sealed class AggregatePreviewEnvelopeConverter : JsonConverter<Aggregat
         var root = document.RootElement;
         var expanded = Expand(root);
         var value = expanded.Deserialize<Payload>(Web) ?? throw new JsonException("AGG_TRACE_DICTIONARY_INVALID");
-        return new(value.Preview, value.Lineage, value.Diff, value.Functions, value.CurrentUnitIds) { SourceValues = value.SourceValues ?? [], ListOperations = value.ListOperations ?? [] };
+        return new(value.Preview, value.Lineage, value.Diff, value.Functions, value.CurrentUnitIds) { SourceValues = value.SourceValues ?? [], ListOperations = value.ListOperations ?? [], FormulaProbe = value.FormulaProbe };
     }
     internal static JsonElement Expand(JsonElement root)
     {
