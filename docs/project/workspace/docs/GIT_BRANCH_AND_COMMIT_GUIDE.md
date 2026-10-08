@@ -26,7 +26,7 @@ deliberately; do not assume an FE or BE commit captures it.
 
 ### Existing-work checkpoint exception — 2026-10-08
 
-When Yud explicitly requests intake, commit and push of accumulated work, checkpoint the current non-production branch so unrelated WIP and existing history remain intact. This exception applies to `P20261008-lam-intake` on `refactor/canvas-unified-form-2026-09-17` in FE and BE. Push the same branch without force, and record both commits and verification limits in the shared handoff. This action does not merge into `dev` or `prod` or approve a deployment. The standard `dev`-to-`prod` flow below remains the rule for future integration and releases.
+When Yud explicitly requests intake, commit and push of accumulated work, checkpoint the current non-production branch so unrelated WIP and existing history remain intact. This exception applies to `P20261008-lam-intake` and its `DOC20261008-lam-handoff` receipt on `refactor/canvas-unified-form-2026-09-17` in FE and BE. Push the same branch without force, and record both commits and verification limits in the shared handoff. This action does not merge into `dev` or `prod` or approve a deployment. The standard `dev`-to-`prod` flow below remains the rule for future integration and releases.
 
 Mandatory branch roles:
 

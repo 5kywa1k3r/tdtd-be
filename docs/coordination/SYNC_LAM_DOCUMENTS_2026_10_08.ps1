@@ -64,7 +64,8 @@ $manifest = [ordered]@{
     sources = $sources
 }
 $manifestPath = Join-Path $coordination 'LAM_DOCUMENT_MANIFEST_2026_10_08.json'
-[System.IO.File]::WriteAllText($manifestPath, ($manifest | ConvertTo-Json -Depth 8) + [Environment]::NewLine, [System.Text.UTF8Encoding]::new($false))
+$manifestText = ($manifest | ConvertTo-Json -Depth 8).Replace("`r`n", "`n") + "`n"
+[System.IO.File]::WriteAllText($manifestPath, $manifestText, [System.Text.UTF8Encoding]::new($false))
 foreach ($repo in @('tdtd-fe', 'tdtd-be')) {
     $repoRoot = Join-Path $workspace $repo
     foreach ($item in $sources) {

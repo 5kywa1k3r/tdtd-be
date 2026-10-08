@@ -60,4 +60,8 @@
 #*.pdf   diff=astextplain
 #*.PDF   diff=astextplain
 #*.rtf   diff=astextplain
+
+# Preserve the original bytes recorded in the Lam document manifest.
+/docs/project/** -text
+/docs/coordination/** -text
 #*.RTF   diff=astextplain

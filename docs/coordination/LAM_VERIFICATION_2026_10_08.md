@@ -27,6 +27,8 @@ Chín lỗi kiểm kiểu test thuộc các file `AssignmentCompletionDialog`, `
 
 Kiểm toàn bộ staged diff có whitespace trong assets guide sinh sẵn và Markdown snapshot lịch sử. Các tệp đó giữ nguyên bytes để bảo toàn hash/bằng chứng; không chỉnh bundle hoặc nguồn lịch sử chỉ để xóa whitespace. Source code và tài liệu điều phối mới qua `diff --check` khi loại hai cây `public/huong-dan/` và `docs/project/`. Log đầy đủ ở `fe-full-staged-whitespace.log`; không báo toàn bộ payload qua whitespace check.
 
+Kiểm thêm sau commit cho thấy Git có thể chuyển line ending trong asset guide và tài liệu snapshot. Đã mở rộng `-text` trong `.gitattributes` chỉ cho `public/huong-dan/**` ở FE và `docs/project/**`, `docs/coordination/**` ở hai repo; stage lại các cây này để blob Git giữ đúng bytes và hash. Chỉnh thuộc tính Git không đổi nội dung guide hoặc source nghiệp vụ.
+
 Audit đã đối chiếu nghi vấn lineage của bảng đếm trong task view: API `AggregateViewsController.ReadInstanceAsync` dùng `AggregateReadCommands.WithoutSourceLineage`, xóa mọi `TABLE` row note, cell lineage và `LineageRef`; do đó persisted task read không cung cấp các ID nguồn cho provider FE. `Applied` cũng được bỏ ở ranh giới đọc này. Nghi vấn từ FE được giải thích bằng contract BE; không gọi đó là sự cố rò rỉ đã xác nhận.
 
 Kiểm tĩnh dấu hiệu JWT/private key/GitHub/OpenAI/AWS key trong gói hướng dẫn và bộ tài liệu không thấy pattern có độ chắc cao. Không rà từng pixel ảnh hoặc xác nhận antivirus sạch. Browser QA guide 08/10 là bằng chứng kế thừa trong `guide/qa/QA-HOSTED-GUIDE-20261008.md`, không phải browser sản phẩm vừa chạy lại.

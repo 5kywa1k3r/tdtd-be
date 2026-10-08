@@ -4,6 +4,10 @@
 
 Lam Tổng tiếp nhận checkpoint FE/BE trên nhánh `refactor/canvas-unified-form-2026-09-17`, rà source và tài liệu của năm Lam, và lập [bàn giao hiện hành](coordination/LAM_CURRENT_2026_10_08.md). Bản này ghi các quy tắc đọc, phạm vi phụ trách, các quyết định đã thay và phần UAT còn mở. Bộ tài liệu chọn lọc được chụp vào Git FE; BE có cùng điểm vào điều phối. Kết quả kiểm, commit và trạng thái push xem hồ sơ checkpoint liên kết trong bàn giao.
 
+## 2026-10-08 — DOC20261008-lam-handoff
+
+Ghi [receipt checkpoint](coordination/LAM_CHECKPOINT_RESULT_2026_10_08.md) với các commit code FE/BE đã được đọc lại trên remote sau xác nhận của Yud cho hai repo public. Snapshot hiện hành có trong cả FE và BE; thuộc tính Git giữ bytes guide/snapshot và các file điều phối để SHA-256 không đổi khi checkout. Kết quả tiếp nhận của năm Lam được ghi tại receipt; giới hạn build/test/UAT giữ riêng tại [hồ sơ kiểm](coordination/LAM_VERIFICATION_2026_10_08.md).
+
 ## 2026-09-24 — Tách seed nền và tài khoản tập huấn
 
 Đã tách `seed-foundation.ps1` (danh mục, 286 đơn vị, 290 tài khoản quản trị) khỏi `seed-training-accounts.ps1` (989 tài khoản chức danh mẫu, có create/remove riêng). Gói không chứa mật khẩu/hash; nền chỉ thêm bản ghi thiếu, không ghi đè/mất dữ liệu; tập huấn nhận diện đúng ID/hồ sơ và gỡ qua API xóa mềm/thu hồi phiên. Chặn script reset gộp cũ. Công cụ seed biên dịch đạt; ba lượt xem trước đầu tiên: nền 0 cần thêm, tập huấn tạo 0 cần thêm, gỡ nhận diện đúng 989 mẫu. Lượt đọc lại cuối bị Mongo local `ReplicaSetGhost`/timeout sau khi tiến trình Mongo đổi; không tự xử lý topology. Không ghi DB, gỡ tài khoản hoặc restart backend trong lượt tách; chưa nghiệm thu ghi/gỡ thật. [Hướng dẫn và hai danh sách CSV](training/SEED_FOUNDATION_AND_TRAINING.md).
