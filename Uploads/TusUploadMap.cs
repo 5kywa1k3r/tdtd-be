@@ -20,6 +20,20 @@ public static class TusUploadMap
         {
             var store = app.Services.GetRequiredService<ITusStore>();
 
+            tusApp.Use(async (context, next) =>
+            {
+                if (HttpMethods.IsPost(context.Request.Method) &&
+                    string.Equals(context.Request.Path.Value?.TrimEnd('/'), "/api/uploads", StringComparison.OrdinalIgnoreCase))
+                    context.Response.OnStarting(() =>
+                    {
+                        var location = context.Response.Headers.Location.ToString();
+                        if (!string.IsNullOrEmpty(location))
+                            context.Response.Headers.Location = UploadEndpointBuilder.SameOriginTusLocation(location);
+                        return Task.CompletedTask;
+                    });
+                await next(context);
+            });
+
             tusApp.UseTus(httpContext => new DefaultTusConfiguration
             {
                 UrlPath = "/api/uploads",

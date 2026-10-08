@@ -1257,6 +1257,7 @@ public sealed class WorkAssignmentReviewService : IWorkAssignmentReviewService
         {
             AssignmentId = x.AssignmentId,
             WorkId = x.WorkId,
+            AssignmentType = assignment?.AssignmentType,
 
             DynamicExcelId = x.DynamicExcelId,
             DynamicExcelCode = x.DynamicExcelCode,

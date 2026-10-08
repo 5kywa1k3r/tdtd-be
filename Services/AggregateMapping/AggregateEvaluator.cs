@@ -76,6 +76,13 @@ internal sealed class AggregateEvaluator(AggregateBudget budget, IReadOnlyList<s
             return e.Kind != "INPUT" ? new("TABLE", type.Shape, true) : type;
         }
         var args = e.Arguments!.Select(a => Infer(a, inputs)).ToArray();
+        if (e.Kind == "CALL" && e.Name == "COUNT_CHOICE" && (e.Arguments!.Count != 2 || e.Arguments[0].Kind != "INPUT"
+            || e.Arguments[1].Kind != "TEXT" || string.IsNullOrWhiteSpace(e.Arguments[1].Value)
+            || e.Arguments[1].Value!.Length > 256)) throw new AggregatePreviewException("AGG_CHOICE_COUNT_CODE");
+        if (e.Kind == "CALL" && e.Name == "CONCAT_UNIT" && e.Arguments![0].Kind != "INPUT")
+            throw new AggregatePreviewException("AGG_CONCAT_UNIT_SOURCE");
+        if (e.Kind == "CALL" && e.Name == "CHOICE_COUNT_TABLE" && e.Arguments![0].Kind != "INPUT")
+            throw new AggregatePreviewException("AGG_CHOICE_TABLE_SOURCE");
         if (e.Kind == "CALL" && AggregateExtendedFunctions.Names.Contains(e.Name ?? ""))
             return AggregateExtendedFunctions.Infer(e.Name!, args[0]);
         if (args.Any(a => a.Type == "LIST")) throw new AggregatePreviewException("AGG_LIST_OPERATOR_REQUIRED");
@@ -150,6 +157,18 @@ internal sealed class AggregateEvaluator(AggregateBudget budget, IReadOnlyList<s
                 _ => new(e.Kind, "VALUE", Text: e.Value)
             }, []);
         var a = Evaluate(e.Arguments![0], inputs);
+        if (e.Kind == "CALL" && e.Name == "COUNT_CHOICE")
+        {
+            _ = Infer(e, inputs.ToDictionary(p => p.Key, p => new AggregateExpressionType(p.Value.Type, p.Value.Shape, p.Value.TableOrigin, p.Value.ListSchema)));
+            var counted = AggregateChoiceCount.Evaluate(a, e.Arguments[1].Value!, budget);
+            FunctionTrace.Add(new("COUNT_CHOICE", e.Arguments[1].Value, a.Items.Count, counted.Items[0].Trace.Count,
+                AggregateEvaluator.Scalar(counted).Value.Number!.ExactKey, counted.Items[0].Trace.Select(t => t.ReportId).ToArray()));
+            return counted;
+        }
+        if (e.Kind == "CALL" && e.Name == "CONCAT_UNIT" && e.Arguments[0].Kind != "INPUT")
+            throw new AggregatePreviewException("AGG_CONCAT_UNIT_SOURCE");
+        if (e.Kind == "CALL" && e.Name == "CHOICE_COUNT_TABLE" && e.Arguments[0].Kind != "INPUT")
+            throw new AggregatePreviewException("AGG_CHOICE_TABLE_SOURCE");
         if (e.Name is "TEXT_CONTAINS" or "TEXT_STARTS" or "TEXT_ENDS" or "TEXT_EQUALS" or "COUNT_DISTINCT"
             || e.Name == "COUNT" && e.Options?.Basis == "VALUES")
             AggregateTextPolicy.CheckValueOperation(e.Name!, a);
@@ -334,7 +353,8 @@ internal sealed class AggregateEvaluator(AggregateBudget budget, IReadOnlyList<s
         }
         return node.Outputs.ToDictionary(p => p.Id, p => new AggregateChannel(p.ValueType, p.Shape, output[p.Id],
             inputs[node.Inputs[node.Outputs.IndexOf(p)].Id].TableOrigin, inputs[node.Inputs[node.Outputs.IndexOf(p)].Id].ListSchema)
-            { EligibleSources = inputs[node.Inputs[node.Outputs.IndexOf(p)].Id].EligibleSources });
+            { EligibleSources = inputs[node.Inputs[node.Outputs.IndexOf(p)].Id].EligibleSources,
+                ChoiceOptions = inputs[node.Inputs[node.Outputs.IndexOf(p)].Id].ChoiceOptions });
     }
     internal Task<IReadOnlyDictionary<string, AggregateChannel>> FilterAsync(AggregateNodeDto node, IReadOnlyDictionary<string, AggregateChannel> inputs,
         IAggregateListSink? store, AggregateReadContext context, CancellationToken ct)

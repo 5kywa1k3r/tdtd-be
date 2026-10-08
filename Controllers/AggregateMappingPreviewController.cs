@@ -44,7 +44,7 @@ public sealed class AggregateMappingPreviewController(MongoDbContext db, IWorkRe
                 formulaProbe = new { supported = V2Enabled && AggregateMappingPolicy.Decide(AggregateAction.ReadLineage, read.Authority).Allowed, version = 1, maxReports = 3 },
                 textPolicy = new { supported = true, semanticProfile = AggregateTextPolicy.Semantics,
                     shortTextLimit = AggregateTextPolicy.ShortTextLimit, lengthBasis = "VISIBLE_GRAPHEMES",
-                    longTextOperations = new[] { "CONCAT", "REPORT_TEXT_TABLE" }, richTextDistinct = false,
+                    longTextOperations = new[] { "CONCAT", "CONCAT_UNIT", "REPORT_TEXT_TABLE" }, richTextDistinct = false,
                     stringListWholeBlock = true, unitDisplays = new[] { "FULL_NAME", "SHORT_NAME", "SYMBOL", "NONE" } },
                 extendedOperators = new { supported = true, recipeVersion = 3, semanticProfile = "REPORT_MAPPING_EXTENDED_V1",
                     scalar = AggregateExtendedFunctions.Names.Order(StringComparer.Ordinal).ToArray(),

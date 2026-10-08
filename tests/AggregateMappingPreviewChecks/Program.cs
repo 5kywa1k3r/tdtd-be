@@ -96,9 +96,9 @@ var nestedDistinct = Call("COUNT_DISTINCT", new() { Trim = false, CaseSensitive 
 Check(AggregateEvaluator.Scalar(evaluator.Evaluate(nestedDistinct, inputs)).Value.Number!.ToWire() == "0", "NO_RESULT is not a DISTINCT blank");
 var instantCompare = Binary("<", new() { Kind = "INSTANT", Value = "2026-01-01T00:00:00Z" }, new() { Kind = "INSTANT", Value = "2026-01-01T00:00:00.1Z" });
 Check(AggregateEvaluator.Scalar(evaluator.Evaluate(instantCompare, inputs)).Value.Boolean == true, "instant comparison uses time not lexical Z order");
-inputs["in"] = new("TEXT", "SET", [new(new("TEXT", "VALUE", Text: "same\nparagraph"), [new("r1", "u1", "p", "txt")]), new(new("TEXT", "VALUE", Text: "same\nparagraph"), [new("r2", "u2", "p", "txt")])]);
-var concat = evaluator.Evaluate(Call("CONCAT", new() { Trim = false, Separator = "|", Order = "UNIT_THEN_PERIOD" }), inputs);
-Check(AggregateEvaluator.Scalar(concat).Value.Text == "same\nparagraph|same\nparagraph", "CONCAT no dedup and preserves paragraph");
+inputs["in"] = new("TEXT", "SET", [new(new("TEXT", "VALUE", Text: "Nội dung\nchi tiết"), [new("r1", "u1", "p", "txt")]), new(new("TEXT", "VALUE", Text: "Nội dung\nchi tiết"), [new("r2", "u2", "p", "txt")])]);
+var concat = evaluator.Evaluate(Call("CONCAT", new() { Trim = false, Separator = " | ", Order = "UNIT_THEN_PERIOD" }), inputs);
+Check(AggregateEvaluator.Scalar(concat).Value.Text == "Nội dung\nchi tiết | Nội dung\nchi tiết", "CONCAT no dedup and preserves paragraph");
 var longText = new string('x', 100_000) + "\nend";
 inputs["in"] = inputs["in"] with { Items = [new(new("TEXT", "VALUE", Text: longText), [])] };
 Check(AggregateEvaluator.Scalar(evaluator.Evaluate(Call("CONCAT", new() { Trim = false, Separator = "", Order = "UNIT_THEN_PERIOD" }), inputs)).Value.Text == longText, "long free text untruncated");
@@ -371,6 +371,7 @@ ContentTableChecks.Run(Check, Error);
 ListPipelineChecks.Run(Check, Error);
 DateFilterChecks.Run(Check, Error);
 ExtendedOperatorChecks.Run(Check, Error);
+await ChoiceCountTableChecks.Run(Check, PreviewError);
 RichTextAggregationChecks.Run(Check, Error);
 await ListMergeChecks.Run(Check, Error);
 await ErrorLocationChecks.Run(Check);
@@ -407,6 +408,8 @@ sealed class Fixture : IAggregatePreviewReader
     internal string[] Units = ["u1", "u2"];
     internal string MemberType = "NUMBER";
     internal IReadOnlyList<string>? TargetChoiceCodes;
+    internal AggregateTableSchema? TargetTable;
+    internal IReadOnlyList<AggregateChoiceOption>? ChoiceOptions;
     private readonly AggregatePeriodContextDto _context = new("PERIODIC", "work", "B", "bindingB", "reportB", "periodB", "piB", "20260930", "2026-09-01", "2026-09-30", null, "scheduleB");
     internal Fixture()
     {
@@ -434,10 +437,10 @@ sealed class Fixture : IAggregatePreviewReader
         return new(_context, "instance", "config", new(1, 1, 0, 0, "schemaB", ""), recipe, new([new("s", "FORM_SELECTOR", [], [])]));
     }
     public Task<AggregateReadContext> ReadContextAsync(AggregatePeriodContextDto selector, string actor, CancellationToken ct)
-        => Task.FromResult(new AggregateReadContext(_context, new(TargetPin, new Dictionary<string, AggregateMember> { ["total"] = new("total", MemberType, AllowedChoiceCodes: TargetChoiceCodes) }),
+        => Task.FromResult(new AggregateReadContext(_context, new(TargetPin, new Dictionary<string, AggregateMember> { ["total"] = new("total", TargetTable == null ? MemberType : "TABLE", TargetTable, AllowedChoiceCodes: TargetChoiceCodes) }),
             Authority, new(1, 1, 0, 0, "schemaB", ""), "B:auth", Dates, new Dictionary<string, AggregateValue>()));
     public Task<AggregateSchema> ReadSchemaAsync(AggregateFormPinDto pin, AggregateReadContext context, string actor, CancellationToken ct)
-        => Task.FromResult(new AggregateSchema(SourcePin, new Dictionary<string, AggregateMember> { ["n"] = new("n", MemberType) }));
+        => Task.FromResult(new AggregateSchema(SourcePin, new Dictionary<string, AggregateMember> { ["n"] = new("n", MemberType) { ChoiceOptions = ChoiceOptions } }));
     public Task<AggregateSourceListing> ListSourcesAsync(AggregateReadContext context, AggregateFormPinDto form, string actor, CancellationToken ct)
         => Task.FromResult(new AggregateSourceListing(Headers, Slots, Complete, "membership1", Units));
     public Task<IReadOnlyList<AggregateSourceHeader>> ReadInactiveSourcesAsync(AggregateReadContext context,AggregateFormPinDto form,IReadOnlyList<string> ids,string actor,CancellationToken ct)

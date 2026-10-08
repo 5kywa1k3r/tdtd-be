@@ -57,7 +57,10 @@ internal static class WorkAssignmentBasicSummaryConfigContractTests
 
         AssertPropertyNames(
             typeof(WorkAssignmentBasicSummaryConfigPayload),
-            ["SourceScope", "PeriodRule", "GroupingHints", "DetailHints", "Targets"]);
+            ["SourceScope", "PeriodRule", "GroupingHints", "DetailHints", "Targets", "NativeTargets"]);
+        AssertPropertyNames(
+            typeof(WorkAssignmentBasicSummaryNativeTargetPayload),
+            ["TableId", "TargetId", "OperationId"]);
         AssertPropertyNames(
             typeof(WorkAssignmentBasicSummarySourceScopePayload),
             ["Mode", "FlowInstanceId", "FlowStepId", "FlowBranchId", "FlowEffectiveStatus"]);
@@ -872,7 +875,8 @@ internal static class WorkAssignmentBasicSummaryConfigContractTests
                 "Labels",
                 "StatConfigCommandReceipts",
                 "WorkAssignmentBasicSummaryConfigs",
-                "WorkAssignments"
+                "WorkAssignments",
+                "Works"
             ],
             StringComparer.Ordinal);
         AssertTrue(

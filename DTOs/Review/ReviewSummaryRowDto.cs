@@ -14,6 +14,7 @@ public sealed class ReviewSummaryRowDto
 {
     public string AssignmentId { get; set; } = default!;
     public string WorkId { get; set; } = string.Empty;
+    public string? AssignmentType { get; set; }
 
     public string DynamicExcelId { get; set; } = default!;
     public string DynamicExcelCode { get; set; } = string.Empty;

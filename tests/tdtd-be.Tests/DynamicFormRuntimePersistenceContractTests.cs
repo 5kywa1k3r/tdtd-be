@@ -320,7 +320,7 @@ internal static class DynamicFormRuntimePersistenceContractTests
             "private async Task<WorkAssignmentReportResponse> MapPayloadCommandReplayResponseAsync(");
 
         AssertContains(mapper, "x.AssigneeUserId, actorUserId", "capabilities must use the authenticated actor identity");
-        AssertContains(mapper, "IsReportMutationScopeOpenAsync(assignment, ct)", "capabilities must honor completed work/assignment locks");
+        AssertContains(mapper, "IsReportMutationScopeOpenAsync(assignment, ct, x.WorkReportPeriodId)", "capabilities must honor completed work/assignment and period locks");
         AssertContains(mapper, "actorOwnsReport && x.IsActive && mutationScopeOpen", "reviewer/admin reads must remain readonly");
         AssertContains(mapper, "CanEditPayload = canMutate && x.Status == WorkAssignmentReportStatus.Draft", "draft edit capability");
         AssertContains(mapper, "CanSubmit = canMutate && x.Status == WorkAssignmentReportStatus.Draft", "draft submit capability");

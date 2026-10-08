@@ -302,7 +302,7 @@ internal static class AggregateMappingValidator
         }
         if (e.Value != null || e.Ref != null || e.Area != null || e.Arguments == null || e.Arguments.Count > 128
             || (e.Kind == "BINARY" ? !Binary.Contains(e.Name ?? "") || e.Arguments.Count != 2 || e.Options != null
-                : e.Kind != "CALL" || !(Calls.Contains(e.Name ?? "") || AggregateExtendedFunctions.Names.Contains(e.Name ?? "")) || e.Arguments.Count != (e.Name == "IF" ? 3 : e.Name is "HAS_CHOICE" or "TEXT_CONTAINS" or "TEXT_STARTS" or "TEXT_ENDS" or "TEXT_EQUALS" ? 2 : 1)))
+                : e.Kind != "CALL" || !(Calls.Contains(e.Name ?? "") || AggregateExtendedFunctions.Names.Contains(e.Name ?? "")) || e.Arguments.Count != (e.Name == "IF" ? 3 : e.Name is "HAS_CHOICE" or "TEXT_CONTAINS" or "TEXT_STARTS" or "TEXT_ENDS" or "TEXT_EQUALS" or "COUNT_CHOICE" ? 2 : 1)))
         { add("AGG_EXPRESSION_SCHEMA", path, "Unknown expression/function or invalid arity."); return; }
         if (e.Name == "COUNT" && e.Options?.Basis is not ("VALUES" or "REPORTS" or "UNITS" or "ROWS" or "PRESENT_ROWS"))
             add("AGG_COUNT_BASIS", path, "COUNT requires explicit basis.");
@@ -314,6 +314,13 @@ internal static class AggregateMappingValidator
             add("AGG_CONCAT_OPTIONS", path, "CONCAT requires explicit separator and deterministic order.");
         if (e.Name == "REPORT_TEXT_TABLE" && e.Options?.Order is not ("UNIT_THEN_PERIOD" or "PERIOD_THEN_UNIT"))
             add("AGG_CONTENT_TABLE_ORDER", path, "Content table requires an explicit deterministic order.");
+        if (e.Name == "COUNT_CHOICE" && (e.Arguments[0].Kind != "INPUT" || e.Arguments[1].Kind != "TEXT"
+            || !Identifier(e.Arguments[1].Value)))
+            add("AGG_CHOICE_COUNT_CODE", path, "Count a choice set by one non-empty stored code, not its display label.");
+        if (e.Name == "CONCAT_UNIT" && e.Arguments[0].Kind != "INPUT")
+            add("AGG_CONCAT_UNIT_SOURCE", path, "Use a directly connected text set so each opinion retains its reporting unit.");
+        if (e.Name == "CHOICE_COUNT_TABLE" && e.Arguments[0].Kind != "INPUT")
+            add("AGG_CHOICE_TABLE_SOURCE", path, "Use one directly connected choice set with its option snapshot.");
         if (e.Options?.Basis == "PRESENT_ROWS" && e.Options.ColumnIndex is not > 0)
             add("AGG_COUNT_COLUMN", path, "PRESENT_ROWS requires a positive column coordinate.");
         if (e.Options?.UnitDisplay != null && (e.Name != "REPORT_TEXT_TABLE" || e.Options.UnitDisplay is not ("FULL_NAME" or "SHORT_NAME" or "SYMBOL" or "NONE")))

@@ -4,7 +4,12 @@
     <ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable><TreatWarningsAsErrors>true</TreatWarningsAsErrors>
   </PropertyGroup>
   <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <Using Include="Microsoft.AspNetCore.Http" />
     <Compile Include="../../DTOs/AggregateMapping/*.cs" LinkBase="Contract" />
     <Compile Include="../../Services/AggregateMapping/*.cs" Exclude="../../Services/AggregateMapping/AggregateMongoPreviewReader*.cs;../../Services/AggregateMapping/AggregateNativePayloadAdapter.cs" LinkBase="Core" />
+    <Compile Include="../../Common/Time/AppTimeService.cs" LinkBase="Core" />
+    <Compile Include="../../Common/Time/ReportCivilDate.cs" LinkBase="Core" />
+    <Compile Include="../../Common/Errors/*.cs" LinkBase="Core" />
   </ItemGroup>
 </Project>

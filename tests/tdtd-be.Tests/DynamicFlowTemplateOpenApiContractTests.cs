@@ -376,6 +376,15 @@ internal static class DynamicFlowTemplateOpenApiContractTests
             .GetRequiredService<ISwaggerProvider>()
             .GetSwagger("v1");
 
+        if (typeof(DynamicFlowTemplatesController).GetCustomAttribute<NonControllerAttribute>() is not null)
+        {
+            Require(
+                !document.Paths.Keys.Any(path => path.StartsWith(
+                    "/api/dynamic-flow-templates", StringComparison.Ordinal)),
+                "Temporarily disabled Dynamic Flow design must not be advertised in OpenAPI");
+            return;
+        }
+
         var searchSchema = ResolveResponseSchema(
             document,
             "/api/dynamic-flow-templates/search",

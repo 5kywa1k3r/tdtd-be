@@ -274,9 +274,11 @@ internal static class WorkReportLifecycleProjectionOutboxContractTests
     private static void DirectProjectionKeepsUnconfiguredStatisticsOutOfScope()
     {
         var source = ReadBackendSource("Services/StatisticsRun/StatRunDirectProjectionService.cs");
+        var nativeSource = ReadBackendSource("Services/StatisticsRun/StatRunDirectProjectionService.Native.cs");
         Contains(source, "STATISTICS_NOT_CONFIGURED", "unconfigured statistics terminal zero-write reason");
-        Contains(source, "GetP804TrustedPersistedView(template)", "trusted persisted footprint authority");
-        Contains(source, "?? throw Fail(\"LOCKED_CONFIG_MISSING\")", "configured callers still require a locked config");
+        Contains(source, "ValidateProjectionStatisticConfig(template)", "projection validates its configured footprint before membership");
+        Contains(nativeSource, "GetP804TrustedPersistedView(template)", "legacy trusted persisted footprint authority");
+        Contains(source, "throw Fail(\"LOCKED_CONFIG_MISSING\")", "configured callers still require a locked config");
         Before(source, "ValidateSourcePeriod(source.Report, source.Period);", "\"STATISTICS_NOT_CONFIGURED\"", "source period must validate before zero-write");
         Before(source, "\"STATISTICS_NOT_CONFIGURED\"", "ResolveMembershipAsync(", "unconfigured forms must not execute statistics membership");
     }

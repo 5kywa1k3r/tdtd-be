@@ -124,7 +124,7 @@ internal sealed partial class AggregatePreviewService(IAggregatePreviewReader re
                     {
                         var type = evaluator.Infer(expression.Expression, inputs.ToDictionary(p => p.Key, p => new AggregateExpressionType(p.Value.Type, p.Value.Shape, p.Value.TableOrigin, p.Value.ListSchema)));
                         if (type.Type != output.ValueType || type.Shape != output.Shape) throw new AggregatePreviewException("AGG_EXPRESSION_OUTPUT_TYPE");
-                        if (type.Type == "TABLE" && expression.Expression.Name != "REPORT_TEXT_TABLE" && AggregateTableAdapter.HasScalarInput(expression.Expression, inputs))
+                        if (type.Type == "TABLE" && expression.Expression.Name is not ("REPORT_TEXT_TABLE" or "CHOICE_COUNT_TABLE") && AggregateTableAdapter.HasScalarInput(expression.Expression, inputs))
                             throw new AggregatePreviewException("AGG_FIELD_TABLE_BRIDGE_DEFERRED");
                         try { result = listSink == null ? evaluator.Evaluate(expression.Expression, inputs)
                             : await evaluator.EvaluateWithListsAsync(expression.Expression, inputs, listSink, context, ct); }
@@ -297,12 +297,20 @@ internal sealed partial class AggregatePreviewService(IAggregatePreviewReader re
         {
             "NUMBER" => value.Number!.ToWire(), "BOOLEAN" => value.Boolean, "CHOICE_MANY" => value.Choices,
             "LIST" => AggregateListWire.Encode(value.List!),
-            "TABLE" => new { columns = value.Table!.Schema.Columns, rows = value.Table.Rows.Select((row, r) =>
-                new { unitId = value.Table.Units[r], note = value.Table.ContentRows?[r], cells = row.Select(cell => new { type = cell.Value.Type, state = cell.Value.State, value = ToWire(cell.Value), lineage = cell.Trace }) }) },
+            "TABLE" => TableWire(value.Table!),
             "TEXT" => AggregateTextProjection.VisibleText(value),
             _ => value.Text
         };
         return JsonSerializer.SerializeToElement(wire, new JsonSerializerOptions(JsonSerializerDefaults.Web));
+    }
+    private static object TableWire(AggregateTable table)
+    {
+        var rows = table.Rows.Select((row, r) => new { unitId = table.Units[r], note = table.ContentRows?[r],
+            cells = row.Select(cell => new { type = cell.Value.Type, state = cell.Value.State,
+                value = ToWire(cell.Value), lineage = cell.Trace }) }).ToArray();
+        return table.Schema.Identity == AggregateChoiceCountTable.Kind
+            ? new { kind = AggregateChoiceCountTable.Kind, columns = table.Schema.Columns, rows }
+            : new { columns = table.Schema.Columns, rows };
     }
     private static JsonElement Evidence(AggregateValue value) => JsonSerializer.SerializeToElement(new
     {
@@ -318,6 +326,12 @@ internal sealed partial class AggregatePreviewService(IAggregatePreviewReader re
     }, new JsonSerializerOptions(JsonSerializerDefaults.Web));
     private static void ValidateTargetTable(AggregateTable source, AggregateTableSchema target)
     {
+        if (source.Schema.Identity == AggregateChoiceCountTable.Kind
+            && (target.Layout != "vertical" || target.Columns.Count != 3 || target.CellTypes.Count != 1
+                || !target.CellTypes[0].SequenceEqual(new[] { "TEXT", "TEXT", "NUMBER" }, StringComparer.Ordinal)))
+            throw new AggregatePreviewException("AGG_CHOICE_TABLE_TARGET");
+        if (source.Schema.Identity == AggregateChoiceCountTable.Kind && source.Rows.Count > AggregateChoiceCountTable.MaxRows)
+            throw new AggregatePreviewException("AGG_CHOICE_TABLE_LIMIT_200");
         if (source.ContentRows != null && (target.Layout != "vertical" || target.Columns.Count != 2
             || target.CellTypes.Count != 1 || target.CellTypes[0].Any(t => t != "TEXT")))
             throw new AggregatePreviewException("AGG_CONTENT_TABLE_TARGET");

@@ -8,7 +8,11 @@ namespace tdtd_be.Services.AggregateMapping;
 
 // Internal, server-owned capture. None of these facts are model-bound from HTTP.
 internal sealed record AggregateMember(string Id, string Type, AggregateTableSchema? Table = null,
-    IReadOnlyList<string>? AllowedChoiceCodes = null, AggregateListSchema? List = null);
+    IReadOnlyList<string>? AllowedChoiceCodes = null, AggregateListSchema? List = null)
+{
+    internal IReadOnlyList<AggregateChoiceOption>? ChoiceOptions { get; init; }
+}
+internal sealed record AggregateChoiceOption(string Code, string Label);
 internal sealed record AggregateTableSchema(string Identity, string Layout, IReadOnlyList<string> Columns,
     IReadOnlyList<string> Rows, IReadOnlyList<IReadOnlyList<string>> CellTypes)
 {
@@ -151,6 +155,7 @@ internal sealed record AggregateChannel(string Type, string Shape, IReadOnlyList
     bool TableOrigin = false, AggregateListSchema? ListSchema = null)
 {
     internal IReadOnlyList<AggregateTrace> EligibleSources { get; init; } = [];
+    internal IReadOnlyList<AggregateChoiceOption>? ChoiceOptions { get; init; }
 }
 internal sealed record AggregateResolvedSource(AggregateNodeDto Node, AggregateSchema Schema,
     IReadOnlyDictionary<string, AggregateChannel> Outputs, IReadOnlyList<AggregateSourcePinDto> Linked,

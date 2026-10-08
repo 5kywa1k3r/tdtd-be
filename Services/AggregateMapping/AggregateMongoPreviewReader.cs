@@ -97,7 +97,11 @@ internal sealed partial class AggregateMongoPreviewReader(MongoDbContext db, IWo
             var fingerprint = AggregateDigest.Of(catalog);
             if (_catalogFingerprints.TryGetValue(catalog.Id, out var old) && old != fingerprint) throw new AggregatePreviewException("AGG_INPUT_STALE");
             _catalogFingerprints[catalog.Id] = fingerprint;
-            members[field.Id!] = members[field.Id!] with { AllowedChoiceCodes = catalog.Options.Where(o => o.IsActive).Select(o => o.Code).ToArray() };
+            members[field.Id!] = members[field.Id!] with {
+                AllowedChoiceCodes = catalog.Options.Where(o => o.IsActive).Select(o => o.Code).ToArray(),
+                // Stable codes remain available after deactivation. Capture each label at preview/Apply.
+                ChoiceOptions = catalog.Options.OrderBy(o => o.Order).ThenBy(o => o.Code, StringComparer.Ordinal)
+                    .Select(o => new AggregateChoiceOption(o.Code, o.Label)).ToArray() };
         }
         foreach (var id in AggregateNativePayloadAdapter.ListCatalogIds(template))
         {

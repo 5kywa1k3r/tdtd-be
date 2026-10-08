@@ -1,6 +1,7 @@
 ﻿using Microsoft.AspNetCore.Mvc;
 using Minio;
 using Minio.DataModel.Args;
+using Minio.Exceptions;
 using MongoDB.Driver;
 using tdtd_be.Common.Auth;
 using tdtd_be.Common.Errors;
@@ -155,6 +156,45 @@ public sealed class UploadsController : ControllerBase
         catch
         {
             throw AppExceptionFactory.NotFound(AppErrorCode.UPLOAD_FILE_NOT_FOUND, new { uploadId, fileName });
+        }
+    }
+
+    [HttpGet("{fileId}/download")]
+    public async Task<IActionResult> DownloadByFileId(string fileId, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(fileId))
+            throw AppExceptionFactory.BadRequest(AppErrorCode.UPLOAD_FILE_ID_REQUIRED);
+
+        var me = _me.RequireMe();
+        var doc = await _ctx.Files.Find(x => x.Id == fileId && !x.IsDeleted).FirstOrDefaultAsync(ct)
+            ?? throw AppExceptionFactory.NotFound(AppErrorCode.UPLOAD_FILE_NOT_FOUND, new { fileId });
+        await _documentPermission.EnsureCanReadFileAsync(doc, me.Id, ct);
+
+        try
+        {
+            await _minio.GetObjectAsync(
+                new GetObjectArgs().WithBucket(doc.Bucket).WithObject(doc.ObjectKey)
+                    .WithCallbackStream((stream, token) =>
+                    {
+                        Response.ContentType = "application/octet-stream";
+                        Response.ContentLength = doc.Size;
+                        Response.Headers.ContentDisposition = $"attachment; filename*=UTF-8''{Uri.EscapeDataString(doc.OriginalName)}";
+                        return stream.CopyToAsync(Response.Body, token);
+                    }), ct);
+            return new EmptyResult();
+        }
+        catch (ObjectNotFoundException) when (!Response.HasStarted)
+        {
+            throw AppExceptionFactory.NotFound(AppErrorCode.UPLOAD_FILE_NOT_FOUND, new { fileId });
+        }
+        catch
+        {
+            if (Response.HasStarted)
+            {
+                HttpContext.Abort();
+                return new EmptyResult();
+            }
+            throw;
         }
     }
 }

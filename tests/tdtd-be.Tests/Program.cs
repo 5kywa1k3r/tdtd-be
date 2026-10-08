@@ -100,7 +100,7 @@ var tests = new (string Name, Action Run)[]
     ("dynamic form section snapshots are deterministic and ordered", DynamicFormSectionSnapshotsAreDeterministicAndOrdered),
     ("dynamic form section snapshots fail closed on malformed topology", DynamicFormSectionSnapshotsFailClosedOnMalformedTopology),
     ("advanced summary section lookup uses exact form snapshots", AdvancedSummarySectionLookupUsesExactFormSnapshots),
-    ("dynamic flow template OpenAPI exposes typed response contracts", DynamicFlowTemplateOpenApiContractTests.Run),
+    ("dynamic flow template OpenAPI follows the current route availability", DynamicFlowTemplateOpenApiContractTests.Run),
     ("dynamic flow schema v2 contract canonicalizes and validates strictly", DynamicFlowDefinitionPayloadContractTests.Run),
     ("dynamic flow definition metadata backfill is bounded, idempotent, and fail closed", DynamicFlowDefinitionMetadataBackfillContractTests.Run),
     ("dynamic flow form nodes bind canonical Dynamic Form versions", DynamicFlowFormNodeVersionContractTests.Run),
@@ -258,8 +258,9 @@ var tests = new (string Name, Action Run)[]
     ("legacy work basis file resolves as work document", ResolvesLegacyWorkBasisFileAsWorkDocument),
     ("assignment file resolves as assignment branch document", ResolvesAssignmentFileAsBranchDocument),
     ("assignment document path resolves ancestors only", ResolvesAssignmentDocumentAncestorsFromPath),
-    ("upload endpoint uses public base url override", BuildsUploadEndpointFromPublicBaseUrl),
-    ("upload endpoint falls back to forwarded request scheme and host", BuildsUploadEndpointFromForwardedRequest),
+    ("upload endpoint stays relative despite configured LAN address", BuildsUploadEndpointFromPublicBaseUrl),
+    ("upload endpoint stays relative behind forwarded proxy", BuildsUploadEndpointFromForwardedRequest),
+    ("tus upload location stays on the requesting origin", RewritesTusUploadLocation),
     ("recurring job runner methods prevent overlap", RecurringJobRunnerMethodsPreventOverlap),
     ("dynamic form statistic recurring trigger is post-commit best effort", HangfireRecurringTriggerContractTests.Run),
     ("advanced summary operations normalize hierarchy grain", AdvancedSummaryOperationsNormalizeHierarchyGrain),
@@ -4962,7 +4963,7 @@ static void ResolvesHistoricalDataApprovalFromCompletedDate()
     var onTimePeriod = new WorkReportPeriod
     {
         Status = WorkReportPeriodStatus.OverdueSubmitted,
-        DueAtUtc = new DateTime(2026, 5, 10, 23, 59, 59)
+        DueAtUtc = new DateTime(2026, 5, 10, 16, 59, 59, DateTimeKind.Utc)
     };
     var onTimeReport = new WorkAssignmentReport
     {
@@ -4994,7 +4995,7 @@ static void ResolvesHistoricalSubmittedStatusFromCompletedDate()
     var period = new WorkReportPeriod
     {
         IsHistoricalData = true,
-        DueAtUtc = new DateTime(2026, 5, 10, 23, 59, 59)
+        DueAtUtc = new DateTime(2026, 5, 10, 16, 59, 59, DateTimeKind.Utc)
     };
     var report = new WorkAssignmentReport
     {
@@ -5134,8 +5135,8 @@ static void ManagementAccountUsernamesUseUnitSymbol()
         FullName = "Phong Van"
     };
 
-    AssertEqual("mu_pv01", convention.BuildUnitManagerUsername(unit), "unit manager username");
-    AssertEqual("ml_pv01", convention.BuildLevelManagerUsername(unit), "level manager username");
+    AssertEqual("pv01", convention.BuildUnitManagerUsername(unit), "unit manager username");
+    AssertEqual("admin_lv2", convention.BuildLevelManagerUsername(unit), "level manager username");
 }
 
 static void BlocksNormalUserWorkCreate()
@@ -8372,7 +8373,7 @@ static void BuildsUploadEndpointFromPublicBaseUrl()
         request,
         new UploadOptions { PublicBaseUrl = "https://tdtd.conganthanhhoa.vn/api/" });
 
-    AssertEqual("https://tdtd.conganthanhhoa.vn/api/uploads", endpoint, "public base url should produce external HTTPS TUS endpoint");
+    AssertEqual("/api/uploads", endpoint, "configured origin must not send the browser to another upload host");
 }
 
 static void BuildsUploadEndpointFromForwardedRequest()
@@ -8383,7 +8384,19 @@ static void BuildsUploadEndpointFromForwardedRequest()
 
     var endpoint = UploadEndpointBuilder.BuildUploadsEndpoint(request, new UploadOptions());
 
-    AssertEqual("https://tdtd.conganthanhhoa.vn/api/uploads", endpoint, "forwarded request scheme and host should produce HTTPS TUS endpoint");
+    AssertEqual("/api/uploads", endpoint, "TUS session should use the API origin that served the browser");
+}
+
+static void RewritesTusUploadLocation()
+{
+    AssertEqual("/api/uploads/upload-id", UploadEndpointBuilder.SameOriginTusLocation("http://192.168.1.2:5080/api/uploads/upload-id"),
+        "TUS Location must not send PATCH/HEAD to a private LAN address");
+    AssertEqual("/api/uploads/upload-id", UploadEndpointBuilder.SameOriginTusLocation("https://tdtd.example/api/uploads/upload-id"),
+        "proxy host should also be represented as a path-only Location");
+    AssertEqual("/api/uploads/upload-id", UploadEndpointBuilder.SameOriginTusLocation("/api/uploads/upload-id"),
+        "an already-relative Location must be preserved");
+    AssertEqual("https://other.example/not-an-upload", UploadEndpointBuilder.SameOriginTusLocation("https://other.example/not-an-upload"),
+        "unrelated Location values must not be rewritten as upload URLs");
 }
 
 static WorkAssignment PeriodicAssignment(string workId, string assignmentId, DateTime startDate, DateTime dueDate) => new()

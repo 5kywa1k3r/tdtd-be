@@ -24,8 +24,11 @@ public sealed class ReportEvidenceController(MongoDbContext db, IWorkAssignmentR
     {
         var actor = me.RequireMe();
         await reports.AuthorizeEvidenceAsync(reportId, fieldId, actor.Id, true, ct);
-        if (file.Length <= 0 || file.Length > MaxBytes)
-            throw AppExceptionFactory.BadRequest(AppErrorCode.UPLOAD_FILE_TOO_LARGE, new { maxBytes = MaxBytes });
+        if (file.Length <= 0)
+            throw AppExceptionFactory.BadRequest(AppErrorCode.UPLOAD_SIZE_INVALID, new { receivedBytes = file.Length });
+        if (file.Length > MaxBytes)
+            throw AppExceptionFactory.BadRequest(AppErrorCode.UPLOAD_FILE_TOO_LARGE,
+                new { receivedBytes = file.Length, maxBytes = MaxBytes });
         var id = ObjectId.GenerateNewId().ToString();
         var bucket = cfg["Minio:Bucket"] ?? "tdtd-attachments";
         var key = $"report-evidence/{reportId}/{id}";

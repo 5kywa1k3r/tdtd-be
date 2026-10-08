@@ -24,6 +24,32 @@ internal static class ExtendedOperatorChecks
         choices = choices with { Items = choices.Items.Append(new(AggregateValue.Blank("CHOICE_MANY"), [])).ToArray() };
         check(Run("CHOICE_UNION", choices).Choices!.Count == 3 && Run("CHOICE_INTERSECTION", choices).Choices!.Count == 0, "valid blank choice is empty set, not a missing source");
         check(Run("CHOICE_UNION", Channel("CHOICE_MANY")).State == "NO_RESULT", "no choice sources is no result");
+        AggregateExpressionDto CountChoice(string code) => new() { Kind = "CALL", Name = "COUNT_CHOICE",
+            Arguments = [new() { Kind = "INPUT", Ref = "A" }, new() { Kind = "TEXT", Value = code }] };
+        AggregateChannel Counted(AggregateChannel input, string code) => new AggregateEvaluator(new(default), [])
+            .Evaluate(CountChoice(code), new Dictionary<string, AggregateChannel> { ["A"] = input });
+        var one = new AggregateChannel("CHOICE_ONE", "SET", [
+            new(new("CHOICE_ONE", "VALUE", Text: "x"), [new("r1", "u1", "p", "f")]),
+            new(new("CHOICE_ONE", "VALUE", Text: "y"), [new("r2", "u2", "p", "f")]),
+            new(AggregateValue.Blank("CHOICE_ONE"), [new("r3", "u3", "p", "f")])]);
+        check(AggregateEvaluator.Scalar(Counted(one, "x")).Value.Number!.ToWire() == "1", "single-choice code count ignores other code and blank");
+        var many = new AggregateChannel("CHOICE_MANY", "SET", [
+            new(new("CHOICE_MANY", "VALUE", Choices: ["x", "y", "x"]), [new("r1", "u1", "p", "f")]),
+            new(new("CHOICE_MANY", "VALUE", Choices: ["x"]), [new("r1", "u1", "p", "f")]),
+            new(new("CHOICE_MANY", "VALUE", Choices: ["y"]), [new("r2", "u2", "p", "f")])]);
+        var counted = AggregateEvaluator.Scalar(Counted(many, "x"));
+        check(counted.Value.Number!.ToWire() == "1" && counted.Trace.Single().ReportId == "r1", "multi-choice code counts each report once and traces matching report");
+        check(AggregateEvaluator.Scalar(Counted(many, "y")).Value.Number!.ToWire() == "2", "second target code counts independently on the same source set");
+        check(AggregateEvaluator.Scalar(Counted(many, "z")).Value.Number!.ToWire() == "0", "unselected code is zero, not report count");
+        error(() => Counted(Channel("TEXT", new AggregateValue("TEXT", "VALUE", Text: "x")), "x"), "AGG_EXPRESSION_TYPE");
+        error(() => Counted(one, ""), "AGG_CHOICE_COUNT_CODE");
+        var opinions = new AggregateChannel("TEXT", "SET", [
+            new(new("TEXT", "VALUE", Text: "Ý kiến A"), [new("r1", "u2", "p1", "f")]) { SourceNote = new("", "s1", "r1", "u2", "Đơn vị B", null, "p1", "f", null, null) },
+            new(new("TEXT", "VALUE", Text: "Ý kiến B"), [new("r2", "u1", "p1", "f")]) { SourceNote = new("", "s2", "r2", "u1", "Đơn vị A", null, "p1", "f", null, null) }]);
+        var joined = new AggregateEvaluator(new(default), []).Evaluate(Call("CONCAT_UNIT"), new Dictionary<string, AggregateChannel> { ["A"] = opinions });
+        check(AggregateEvaluator.Scalar(joined).Value.Text == "Đơn vị A - Ý kiến B\n\nĐơn vị B - Ý kiến A"
+            && AggregateEvaluator.Scalar(joined).Trace.Count == 2, "unit-opinion text is ordered and retains both source traces");
+        error(() => Run("CONCAT_UNIT", Channel("TEXT", new AggregateValue("TEXT", "VALUE", Text: "ý kiến"))), "AGG_UNIT_NAME_UNAVAILABLE");
         AggregateChannel Text(AggregateValue value) => AggregateEvaluator.Single(value, []);
         check(Run("LEN", Text(new("TEXT", "VALUE", Text: "a\u0301👨‍👩‍👧‍👦🇻🇳"))).Number!.ToWire() == "3", "LEN counts Vietnamese combining and emoji graphemes");
         check(Run("LEN", Text(new("TEXT", "VALUE", Text: "<b>x</b>"))).Number!.ToWire() == "8", "LEN never treats plain text as markup");
@@ -56,5 +82,12 @@ internal static class ExtendedOperatorChecks
         string Json(AggregateRecipeDto r) => JsonSerializer.Serialize(r, new JsonSerializerOptions(JsonSerializerDefaults.Web));
         check(AggregateMappingValidator.Parse(Json(recipe)).Issues.Any(i => i.Code == "AGG_EXTENDED_PROFILE_REQUIRED"), "v1 rejects new call, no silent semantic upgrade");
         check(AggregateMappingValidator.Parse(Json(recipe with { SchemaVersion = 3, SemanticProfile = "REPORT_MAPPING_EXTENDED_V1" })).StructurallyValid, "v3 accepts opt-in new call");
+        var choiceRecipe = new Fixture().Request(CountChoice("x") with { Arguments = [new() { Kind = "INPUT", Ref = "in" }, new() { Kind = "TEXT", Value = "x" }] }).Recipe;
+        check(AggregateMappingValidator.Parse(Json(choiceRecipe)).Issues.Any(i => i.Code == "AGG_EXTENDED_PROFILE_REQUIRED"), "choice count requires v3 profile");
+        check(AggregateMappingValidator.Parse(Json(choiceRecipe with { SchemaVersion = 3, SemanticProfile = "REPORT_MAPPING_EXTENDED_V1" })).StructurallyValid,
+            "v3 structurally accepts exact choice code literal");
+        var invalidCode = choiceRecipe with { SchemaVersion = 3, SemanticProfile = "REPORT_MAPPING_EXTENDED_V1",
+            Nodes = choiceRecipe.Nodes.Select(n => n.Kind == "CALCULATION" ? n with { Expressions = [new("out", CountChoice(""))] } : n).ToList() };
+        check(AggregateMappingValidator.Parse(Json(invalidCode)).Issues.Any(i => i.Code == "AGG_CHOICE_COUNT_CODE"), "blank choice code rejected by recipe validator");
     }
 }

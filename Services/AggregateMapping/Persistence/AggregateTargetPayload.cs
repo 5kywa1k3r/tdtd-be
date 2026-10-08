@@ -94,13 +94,21 @@ internal static class AggregateTargetPayload
                     continue;
                 }
                 var rows = result.Value?.GetProperty("rows").EnumerateArray().ToArray() ?? [];
+                var choiceTable = result.Value is { } tableWire && tableWire.TryGetProperty("kind", out var tableKind)
+                    && tableKind.GetString() == AggregateChoiceCountTable.Kind;
+                if (choiceTable && rows.Length > AggregateChoiceCountTable.MaxRows)
+                    throw new AggregatePreviewException("AGG_CHOICE_TABLE_LIMIT_200");
                 var rowCount = matrix ? definition.Rows!.Count : rows.Length;
                 if (result.State == "RESULT" && matrix && rows.Length != rowCount) throw new AggregatePreviewException("AGG_TABLE_SHAPE");
                 var compiled = DynamicFormNativeTableDefinition.CompileCellTypes(definition);
                 var records = new JsonArray();
                 for (var r = 0; r < rowCount; r++)
                 {
-                    var rowId = matrix ? definition.Rows![r].Id! : "agg_" + AggregateCanonical.Key(write.Instance.Id, member, r.ToString(CultureInfo.InvariantCulture))[..24];
+                    var choiceCode = choiceTable ? rows[r].GetProperty("cells")[0].GetProperty("value").GetString() : null;
+                    if (choiceTable && string.IsNullOrWhiteSpace(choiceCode)) throw new AggregatePreviewException("AGG_CHOICE_TABLE_CODE_UNAVAILABLE");
+                    var rowId = matrix ? definition.Rows![r].Id! : "agg_" + (choiceTable
+                        ? AggregateCanonical.Key(write.Instance.Id, member, choiceCode!)[..32]
+                        : AggregateCanonical.Key(write.Instance.Id, member, r.ToString(CultureInfo.InvariantCulture))[..24]);
                     var cells = new JsonObject();
                     if (r < rows.Length)
                     {

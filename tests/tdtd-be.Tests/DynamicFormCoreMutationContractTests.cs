@@ -415,7 +415,7 @@ internal static class DynamicFormCoreMutationContractTests
             "statistics-only update must not bind a mutable full-document DTO");
         AssertContains(
             command,
-            "new[] { \"isStatistic\", \"statisticLabelCodes\", \"statistic\" }",
+            "new[] { \"isStatistic\", \"statisticLabelCodes\", \"statistic\", \"showOnOverview\" }",
             "statistics-only update must freeze the exact field-property allowlist");
         AssertBefore(
             updateBody,
@@ -552,7 +552,7 @@ internal static class DynamicFormCoreMutationContractTests
                 $"{context} must revalidate enum catalog visibility and active state");
             AssertContains(
                 body,
-                "ExtractEnumCatalogIds(doc.FieldsJson, excelBlockJson, blocksJson)",
+                "ExtractEnumCatalogIds(doc.FieldsJson, excelBlockJson, blocksJson, doc.TablesJson)",
                 $"{context} must inspect the complete resulting Form schema");
             AssertBefore(
                 body,

@@ -79,7 +79,8 @@ internal sealed class AggregateSourceResolver(IAggregatePreviewReader reader, IA
         var coverage = node.Outputs.Where(p => windows.ContainsKey(p.Id)).SelectMany(p => AggregateCoverageResolver.Resolve(listing, schema.Pin, [windows[p.Id]], budget, rules[p.Id].ReportFilter))
             .GroupBy(c => c.SlotKey).Select(g => g.FirstOrDefault(c => c.State == "UNKNOWN") ?? g.First()).ToArray();
         AggregateChannel Channel(AggregatePortDto p) => new(p.ValueType, p.Shape, outputs[p.Id].ToArray(), p.ValueType == "TABLE", schema.Members[p.MemberId!].List)
-            { EligibleSources = outputs[p.Id].SelectMany(o => o.Trace).Distinct().ToArray() };
+            { EligibleSources = outputs[p.Id].SelectMany(o => o.Trace).Distinct().ToArray(),
+                ChoiceOptions = schema.Members[p.MemberId!].ChoiceOptions };
         AggregateResolvedSource Capture() => new(node, schema, node.Outputs.ToDictionary(p => p.Id, Channel),
             linked.Values.ToArray(), eligible.Values.ToArray(), coverage, windows.Values.Distinct().ToArray(), issues.ToArray(),
             listing.MembershipRevision, listing.CurrentUnitIds, !coverage.Any(c => c.State == "UNKNOWN"));

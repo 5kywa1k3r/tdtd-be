@@ -1,0 +1,262 @@
+{
+  "schemaVersion": 1,
+  "workCode": "P20261008-lam-intake",
+  "date": "2026-10-08",
+  "timezone": "Asia/Saigon",
+  "canonical": "docs/coordination/LAM_CURRENT_2026_10_08.md",
+  "note": "Selected source documents; historical links outside this snapshot require the original workspace. Generated coordination receipts are copied separately.",
+  "sources": [
+    {
+      "source": "D:\\Job\\CA\\tdtd\\ARCHITECTURE_MAP.md",
+      "snapshot": "docs/project/workspace/ARCHITECTURE_MAP.md",
+      "bytes": 48161,
+      "sha256": "d952a3eccebc518fa85e83178ffaf32bacdaf14fd9baadc6bfe36c0fef9ead3e"
+    },
+    {
+      "source": "D:\\Job\\CA\\tdtd\\DOCUMENTATION_MAP.md",
+      "snapshot": "docs/project/workspace/DOCUMENTATION_MAP.md",
+      "bytes": 21349,
+      "sha256": "d19b9cda06bb19820447524d629124786bd0dcc2d6053682ea4e5b4069647a62"
+    },
+    {
+      "source": "D:\\Job\\CA\\tdtd\\FEATURE_MAP.md",
+      "snapshot": "docs/project/workspace/FEATURE_MAP.md",
+      "bytes": 84295,
+      "sha256": "1399cce9a0a2e2f15f3f025ad3f1d0f290e63eff0ee9505159d58915c40d66b4"
+    },
+    {
+      "source": "D:\\Job\\CA\\tdtd\\docs\\GIT_BRANCH_AND_COMMIT_GUIDE.md",
+      "snapshot": "docs/project/workspace/docs/GIT_BRANCH_AND_COMMIT_GUIDE.md",
+      "bytes": 7282,
+      "sha256": "1b06e0f84acf646519310ff14e7429623218e1cd38af44fdbe57ff865d2dac3e"
+    },
+    {
+      "source": "D:\\Job\\CA\\tdtd\\docs\\WORK_DONE.md",
+      "snapshot": "docs/project/workspace/docs/WORK_DONE.md",
+      "bytes": 260397,
+      "sha256": "164ccf5e251e29554de08fe0a8c4f209e503bb542b870d7eeadd2f586becf851"
+    },
+    {
+      "source": "D:\\Job\\CA\\tdtd\\docs\\WORK_PLANNED.md",
+      "snapshot": "docs/project/workspace/docs/WORK_PLANNED.md",
+      "bytes": 85521,
+      "sha256": "6bab6f778f837ce57d4d50177e96422ac3ec0ff5eb5188800b667f027df12b0d"
+    },
+    {
+      "source": "D:\\Job\\CA\\tdtd\\docs\\features\\FEATURE_12_REQUEST_CENTER_AND_ACTION_NOTIFICATIONS.md",
+      "snapshot": "docs/project/workspace/docs/features/FEATURE_12_REQUEST_CENTER_AND_ACTION_NOTIFICATIONS.md",
+      "bytes": 23651,
+      "sha256": "fe79e7da3ef092882c1870a47ff020a1b9dc44d1002cd79585bf243d8ac72819"
+    },
+    {
+      "source": "D:\\Job\\CA\\tdtd\\docs\\features\\FEATURE_10_OPERATIONS_HISTORY_AND_JOB_RUNS.md",
+      "snapshot": "docs/project/workspace/docs/features/FEATURE_10_OPERATIONS_HISTORY_AND_JOB_RUNS.md",
+      "bytes": 14276,
+      "sha256": "ca343f324d27942bd7b6a13a9323b8c3b644750ddfbbbdce18b55e0c2d3377e2"
+    },
+    {
+      "source": "D:\\Job\\CA\\tdtd\\docs\\features\\PATCH_2026_05_20_MONGO_PHASE4_JOB_RUN_OPS_OVERLAP_GUARD.md",
+      "snapshot": "docs/project/workspace/docs/features/PATCH_2026_05_20_MONGO_PHASE4_JOB_RUN_OPS_OVERLAP_GUARD.md",
+      "bytes": 2385,
+      "sha256": "3ffe31edb9b85ccf0713589efe07a3d3c2dd7a521a15ee9592ccbfbbfcc4bad0"
+    },
+    {
+      "source": "D:\\Job\\CA\\tdtd\\docs\\training\\tap-huan-3-gio\\README.md",
+      "snapshot": "docs/project/workspace/docs/training/tap-huan-3-gio/README.md",
+      "bytes": 25232,
+      "sha256": "ca1c1be0663872c434c6de7499efd0e940225e47d710380cd821a72c15a3b38b"
+    },
+    {
+      "source": "D:\\Job\\CA\\tdtd\\docs\\training\\tap-huan-3-gio\\CONTRACT_THEO_DOI_TIEN_DO_WORK_ASSIGNMENT_REPORT_2026_10_06.md",
+      "snapshot": "docs/project/workspace/docs/training/tap-huan-3-gio/CONTRACT_THEO_DOI_TIEN_DO_WORK_ASSIGNMENT_REPORT_2026_10_06.md",
+      "bytes": 27241,
+      "sha256": "e0e64cd593b34362e7c87494a01df0f8c563f206765acc638729fd0984f3f706"
+    },
+    {
+      "source": "D:\\Job\\CA\\tdtd\\docs\\training\\tap-huan-3-gio\\HANDOFF_HOAN_THIEN_LUONG_VA_INP_2026_10_06.md",
+      "snapshot": "docs/project/workspace/docs/training/tap-huan-3-gio/HANDOFF_HOAN_THIEN_LUONG_VA_INP_2026_10_06.md",
+      "bytes": 18209,
+      "sha256": "0ecac46e63cda1074b49cb5b06fc44a57521fa48a795e1339aa9139e6e8d5131"
+    },
+    {
+      "source": "D:\\Job\\CA\\tdtd\\docs\\training\\tap-huan-3-gio\\HANDOFF_FIX_LIFECYCLE_CHUONG_NGAY_UAT_2026_10_06.md",
+      "snapshot": "docs/project/workspace/docs/training/tap-huan-3-gio/HANDOFF_FIX_LIFECYCLE_CHUONG_NGAY_UAT_2026_10_06.md",
+      "bytes": 28271,
+      "sha256": "a5d18af6c172b08d1ba1492b8505dce149c0eaf518df45de3dae68a05ea3fa71"
+    },
+    {
+      "source": "D:\\Job\\CA\\tdtd\\docs\\training\\tap-huan-3-gio\\HANDOFF_UAT_MAU_2_FOUR_FIXES_2026_10_07.md",
+      "snapshot": "docs/project/workspace/docs/training/tap-huan-3-gio/HANDOFF_UAT_MAU_2_FOUR_FIXES_2026_10_07.md",
+      "bytes": 37017,
+      "sha256": "7f948c76cd40738f3d4987041eed1c180fe726460c2b0dbad6f9582702d09363"
+    },
+    {
+      "source": "D:\\Job\\CA\\tdtd\\docs\\training\\tap-huan-3-gio\\HANDOFF_UAT_MAU_2_M02_2026_10_07.md",
+      "snapshot": "docs/project/workspace/docs/training/tap-huan-3-gio/HANDOFF_UAT_MAU_2_M02_2026_10_07.md",
+      "bytes": 13324,
+      "sha256": "32b535ccabb798856852378a5128d5bf852c040e2b5187bd6cbc37f7ebe7b29c"
+    },
+    {
+      "source": "D:\\Job\\CA\\tdtd\\docs\\training\\tap-huan-3-gio\\HANDOFF_UAT_MAU_2_PA02_2026_10_07.md",
+      "snapshot": "docs/project/workspace/docs/training/tap-huan-3-gio/HANDOFF_UAT_MAU_2_PA02_2026_10_07.md",
+      "bytes": 18777,
+      "sha256": "98ce1c770c5322cd67267368f2dc2af0185e19aaef0ffd584b6ee95d9f664f4b"
+    },
+    {
+      "source": "D:\\Job\\CA\\tdtd\\docs\\training\\tap-huan-3-gio\\HANDOFF_RA_SOAT_TAI_LIEU_VA_GIAO_AN_2026_10_07.md",
+      "snapshot": "docs/project/workspace/docs/training/tap-huan-3-gio/HANDOFF_RA_SOAT_TAI_LIEU_VA_GIAO_AN_2026_10_07.md",
+      "bytes": 11420,
+      "sha256": "20730ab1eac96981bc1891a75d21c9a017aeb46c1820bb2a02a24676c9bc53a9"
+    },
+    {
+      "source": "D:\\Job\\CA\\tdtd\\docs\\training\\tap-huan-3-gio\\GIAO_AN_180_PHUT_2026_10_07.md",
+      "snapshot": "docs/project/workspace/docs/training/tap-huan-3-gio/GIAO_AN_180_PHUT_2026_10_07.md",
+      "bytes": 8905,
+      "sha256": "2fab87f7e7bea045c4bbbe11e280fbda68c9d7eed742fd400a664e69c622c7a3"
+    },
+    {
+      "source": "D:\\Job\\CA\\tdtd\\docs\\training\\tap-huan-3-gio\\HANDOFF_THEME_REFACTOR_2026_10_06.md",
+      "snapshot": "docs/project/workspace/docs/training/tap-huan-3-gio/HANDOFF_THEME_REFACTOR_2026_10_06.md",
+      "bytes": 5267,
+      "sha256": "ea6ebabde63afe5a977dfe66fd17040c6172886b002f359a7d8cceda96dee604"
+    },
+    {
+      "source": "D:\\Job\\CA\\tdtd\\docs\\training\\tap-huan-3-gio\\HANDOFF_DASHBOARD_DB_PAGING_RECIPIENTS_2026_10_07.md",
+      "snapshot": "docs/project/workspace/docs/training/tap-huan-3-gio/HANDOFF_DASHBOARD_DB_PAGING_RECIPIENTS_2026_10_07.md",
+      "bytes": 5260,
+      "sha256": "758495ddf8644a0efba366517ba14a9aefce3aa72f0c8b4a73882931d4f5d89b"
+    },
+    {
+      "source": "D:\\Job\\CA\\tdtd\\docs\\training\\tap-huan-3-gio\\HANDOFF_MINDMAP_POPUP_NOTICE_2026_10_07.md",
+      "snapshot": "docs/project/workspace/docs/training/tap-huan-3-gio/HANDOFF_MINDMAP_POPUP_NOTICE_2026_10_07.md",
+      "bytes": 3093,
+      "sha256": "4d6778f6a616cf1a53aa0046d5ab714841f0cec2ecaacfea771b3aa5a0ff0ac0"
+    },
+    {
+      "source": "D:\\Job\\CA\\tdtd\\docs\\training\\tap-huan-3-gio\\HANDOFF_CONG_VIEC_GOM_NHOM_THONG_BAO_PHAN_TRANG_2026_10_06.md",
+      "snapshot": "docs/project/workspace/docs/training/tap-huan-3-gio/HANDOFF_CONG_VIEC_GOM_NHOM_THONG_BAO_PHAN_TRANG_2026_10_06.md",
+      "bytes": 10072,
+      "sha256": "484e05bb02bacbbe8aa93085bd5933e90324aa181666c580d7d05b354ae6ecbd"
+    },
+    {
+      "source": "D:\\Job\\CA\\tdtd\\tdtd-fe\\src\\theme\\README.md",
+      "snapshot": "docs/project/workspace/tdtd-fe/src/theme/README.md",
+      "bytes": 3748,
+      "sha256": "e0b8566ab60af02f24c7f65b57cb46fec767f7c18c117dba24a9ca5b39c2835d"
+    },
+    {
+      "source": "D:\\Job\\CA\\tdtd\\docs\\training\\aggregate-canvas-v1\\handoffs\\PERIODIC_P05_APPLICATION_UAT_HANDOFF_2026_10_07.md",
+      "snapshot": "docs/project/workspace/docs/training/aggregate-canvas-v1/handoffs/PERIODIC_P05_APPLICATION_UAT_HANDOFF_2026_10_07.md",
+      "bytes": 36008,
+      "sha256": "e64480483acb32510e61f008f4f0d6d10e7028bf0a7f5efa087bf9ae8d69fd69"
+    },
+    {
+      "source": "D:\\Job\\CA\\tdtd\\docs\\training\\aggregate-canvas-v1\\handoffs\\PERIODIC_P05_CLOSEOUT_2026_10_07.md",
+      "snapshot": "docs/project/workspace/docs/training/aggregate-canvas-v1/handoffs/PERIODIC_P05_CLOSEOUT_2026_10_07.md",
+      "bytes": 17126,
+      "sha256": "8559c842cc03dc0bebdfc42fff2a31279fae67f1b94a3bdc16d90d0d84a891dc"
+    },
+    {
+      "source": "D:\\Job\\CA\\tdtd\\docs\\training\\aggregate-canvas-v1\\handoffs\\PERIODIC_P05_QUEUE_MINIO_RETRY_2026_10_06.md",
+      "snapshot": "docs/project/workspace/docs/training/aggregate-canvas-v1/handoffs/PERIODIC_P05_QUEUE_MINIO_RETRY_2026_10_06.md",
+      "bytes": 7879,
+      "sha256": "37f5ce7e6d678b8791323595f06a575c75de244f792642019eea89a547c28578"
+    },
+    {
+      "source": "D:\\Job\\CA\\tdtd\\docs\\training\\aggregate-canvas-v1\\handoffs\\KHCN_UI_ISSUES_FOR_OWNERS_2026_10_07.md",
+      "snapshot": "docs/project/workspace/docs/training/aggregate-canvas-v1/handoffs/KHCN_UI_ISSUES_FOR_OWNERS_2026_10_07.md",
+      "bytes": 17947,
+      "sha256": "cb52cebba4c018902de4eb4ce0086e06dbfeccada498b1b57efed22be27c8024"
+    },
+    {
+      "source": "D:\\Job\\CA\\tdtd\\docs\\training\\aggregate-canvas-v1\\handoffs\\KHCN_SAMPLE_UI_REPLAY_2026_10_07.md",
+      "snapshot": "docs/project/workspace/docs/training/aggregate-canvas-v1/handoffs/KHCN_SAMPLE_UI_REPLAY_2026_10_07.md",
+      "bytes": 21786,
+      "sha256": "e58466ff6178ae5ed04c007184c95e8ef21e3d7e9fa35f31600e92e5f42da7df"
+    },
+    {
+      "source": "D:\\Job\\CA\\tdtd\\docs\\training\\aggregate-canvas-v1\\handoffs\\M01_PRACTICE_HANDOFF_FOR_COORDINATOR_2026_10_07.md",
+      "snapshot": "docs/project/workspace/docs/training/aggregate-canvas-v1/handoffs/M01_PRACTICE_HANDOFF_FOR_COORDINATOR_2026_10_07.md",
+      "bytes": 16722,
+      "sha256": "4e41484f78dda41d3b866f351bcabc23fb2f14c6fbce13142312746e48c7f628"
+    },
+    {
+      "source": "D:\\Job\\CA\\tdtd\\docs\\training\\aggregate-canvas-v1\\handoffs\\AGGREGATE_OPERATORS_V3_IMPLEMENTATION_2026_10_05.md",
+      "snapshot": "docs/project/workspace/docs/training/aggregate-canvas-v1/handoffs/AGGREGATE_OPERATORS_V3_IMPLEMENTATION_2026_10_05.md",
+      "bytes": 21993,
+      "sha256": "176c046beeead1cb132200f54d862bc6cecc1a6ba5c08d47bec1fe3fb381f4c6"
+    },
+    {
+      "source": "D:\\Job\\CA\\tdtd\\docs\\training\\aggregate-canvas-v1\\handoffs\\AGGREGATE_DATA_TYPE_TEST_MATRIX_2026_10_05.md",
+      "snapshot": "docs/project/workspace/docs/training/aggregate-canvas-v1/handoffs/AGGREGATE_DATA_TYPE_TEST_MATRIX_2026_10_05.md",
+      "bytes": 28133,
+      "sha256": "230788ae1c6934b19f61e2aa69177e0d2657fa8b87ce3f9a0c9bf10baedc9cd2"
+    },
+    {
+      "source": "D:\\Job\\CA\\tdtd\\docs\\training\\aggregate-canvas-v1\\handoffs\\AGGREGATE_FORMULA_SOURCE_STATUS_IMPLEMENTATION_2026_10_06.md",
+      "snapshot": "docs/project/workspace/docs/training/aggregate-canvas-v1/handoffs/AGGREGATE_FORMULA_SOURCE_STATUS_IMPLEMENTATION_2026_10_06.md",
+      "bytes": 26298,
+      "sha256": "e3e4bca9f4d8bd1c850cf6aeeecf26b7ac79635f91fdf46175a2105ee9c2076f"
+    },
+    {
+      "source": "D:\\Job\\CA\\tdtd-guide\\README.md",
+      "snapshot": "docs/project/guide/README.md",
+      "bytes": 18435,
+      "sha256": "a6bc1ab26e7ea0c3bfa13b6a1a859ed891cce826cf4d58cd30dde581397bed32"
+    },
+    {
+      "source": "D:\\Job\\CA\\tdtd-guide\\AGENTS.md",
+      "snapshot": "docs/project/guide/AGENTS.md",
+      "bytes": 23017,
+      "sha256": "e5a0e837823ab73549849d5ee9c38cf19b733342ebe7cd7bd84c79479e8baa0e"
+    },
+    {
+      "source": "D:\\Job\\CA\\tdtd-guide\\REQUIREMENTS.md",
+      "snapshot": "docs/project/guide/REQUIREMENTS.md",
+      "bytes": 30853,
+      "sha256": "c770d5ac97571ad433fcb53e3087c11445266dc10ef20d4e7e252114ace40a33"
+    },
+    {
+      "source": "D:\\Job\\CA\\tdtd-guide\\PLAN.md",
+      "snapshot": "docs/project/guide/PLAN.md",
+      "bytes": 20246,
+      "sha256": "a3034e1906b601b9f425b5fd4bc5a24ece186d9e486cb29f4f5b9caa1feadcfc"
+    },
+    {
+      "source": "D:\\Job\\CA\\tdtd-guide\\qa\\TRAINING-V087-HANDOFF.md",
+      "snapshot": "docs/project/guide/qa/TRAINING-V087-HANDOFF.md",
+      "bytes": 6555,
+      "sha256": "a4b8dedaae5d431cd3079202789426cdf222f5fb1defda8b505a980ef42dcc49"
+    },
+    {
+      "source": "D:\\Job\\CA\\tdtd-guide\\qa\\QA-V087.md",
+      "snapshot": "docs/project/guide/qa/QA-V087.md",
+      "bytes": 8523,
+      "sha256": "e2b7f0775d7ebbf15cb4264001b3574e4d803d9565dbe28930d84580be966cb7"
+    },
+    {
+      "source": "D:\\Job\\CA\\tdtd-guide\\qa\\QA-HOSTED-GUIDE-20261008.md",
+      "snapshot": "docs/project/guide/qa/QA-HOSTED-GUIDE-20261008.md",
+      "bytes": 4973,
+      "sha256": "55da6ed39dcd4ffde5f81c58a6826a2cfa71d041a16229a6b610c0db971b69ad"
+    },
+    {
+      "source": "D:\\Job\\CA\\tdtd-guide\\qa\\training-v087\\IMAGE-GAPS.md",
+      "snapshot": "docs/project/guide/qa/training-v087/IMAGE-GAPS.md",
+      "bytes": 13507,
+      "sha256": "39210021f174d7e508bc1d75f126a2aefe651ff29d430c2b069b947085f4e661"
+    },
+    {
+      "source": "D:\\Job\\CA\\tdtd-guide\\qa\\SOURCE-MAP.md",
+      "snapshot": "docs/project/guide/qa/SOURCE-MAP.md",
+      "bytes": 20902,
+      "sha256": "257f916249320038a956e138cc39f81f992bb0b5061fc0193fe19ca3c7864cb6"
+    },
+    {
+      "source": "D:\\Job\\CA\\tdtd-guide\\qa\\UAT-MATRIX.md",
+      "snapshot": "docs/project/guide/qa/UAT-MATRIX.md",
+      "bytes": 37931,
+      "sha256": "0dc3954b04b9c5e7518f3941d3b1e71712873f04046707e6cef1e5fa4bac53be"
+    }
+  ]
+}

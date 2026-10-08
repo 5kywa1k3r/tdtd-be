@@ -6,23 +6,19 @@ public static class UploadEndpointBuilder
 {
     public static string BuildUploadsEndpoint(HttpRequest request, UploadOptions options)
     {
-        var publicBaseUrl = NormalizePublicBaseUrl(options.PublicBaseUrl);
-        if (!string.IsNullOrWhiteSpace(publicBaseUrl))
-            return $"{publicBaseUrl}/api/uploads";
-
-        return $"{request.Scheme}://{request.Host.Value}/api/uploads";
+        // The browser resolves this against the API origin it is already using.
+        // An absolute configured LAN address may be unreachable from that browser.
+        return $"{request.PathBase}/api/uploads";
     }
 
-    private static string? NormalizePublicBaseUrl(string? value)
+    public static string SameOriginTusLocation(string location)
     {
-        var trimmed = value?.Trim().TrimEnd('/');
-        if (string.IsNullOrWhiteSpace(trimmed))
-            return null;
+        if (!Uri.TryCreate(location, UriKind.Absolute, out var url) ||
+            url.Scheme is not ("http" or "https") ||
+            !string.IsNullOrEmpty(url.UserInfo) ||
+            !url.AbsolutePath.StartsWith("/api/uploads/", StringComparison.OrdinalIgnoreCase))
+            return location;
 
-        const string apiSuffix = "/api";
-        if (trimmed.EndsWith(apiSuffix, StringComparison.OrdinalIgnoreCase))
-            trimmed = trimmed[..^apiSuffix.Length];
-
-        return trimmed;
+        return url.PathAndQuery;
     }
 }

@@ -52,7 +52,9 @@ internal static class AggregateNativePayloadAdapter
         var fields = JsonSerializer.Deserialize<List<DynamicFormFieldDto>>(template.FieldsJson, Json) ?? [];
         var members = fields.Where(f => f.Type != "evidence").ToDictionary(f => f.Id!, f => new AggregateMember(f.Id!, FieldType(f.Type),
             AllowedChoiceCodes: Type(f.Type) is "CHOICE_ONE" or "CHOICE_MANY"
-                ? (f.ValueSource?.Options ?? f.Options ?? []).Select(o => o.Code!).ToArray() : null));
+                ? (f.ValueSource?.Options ?? f.Options ?? []).Select(o => o.Code!).ToArray() : null) {
+            ChoiceOptions = Type(f.Type) is "CHOICE_ONE" or "CHOICE_MANY"
+                ? (f.ValueSource?.Options ?? f.Options ?? []).Select(o => new AggregateChoiceOption(o.Code!, o.Label ?? o.Code!)).ToArray() : null });
         foreach (var table in DynamicFormNativeTableDefinition.ReadStored(template.NativeTablesVersion, template.TablesJson) ?? [])
         {
             var columns = table.Fields!.Select(f => f.Id!).ToArray();
